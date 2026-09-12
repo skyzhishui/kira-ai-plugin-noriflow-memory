@@ -1,0 +1,1478 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NoriFlow 长期记忆维护</title>
+<style>
+  /* Light (white) palette is the default; the host-injected plugin-bridge
+     sets html[data-theme="dark"|"light"] from the WebUI theme, live. */
+  :root {
+    --bg: #f5f7fb; --panel: #ffffff; --panel2: #f0f3f9; --line: #dde3ee;
+    --text: #24304a; --muted: #7d8aa5; --accent: #3b82f6; --ok: #16a34a;
+    --warn: #d97706; --bad: #dc2626; --pink: #db2777;
+    --halo: rgba(255, 255, 255, 0.88);
+  }
+  html[data-theme="dark"] {
+    --bg: #0f1420; --panel: #161d2e; --panel2: #1b2436; --line: #26324a;
+    --text: #dbe4f3; --muted: #7d8aa5; --accent: #4aa8ff; --ok: #43c78d;
+    --warn: #e0a83c; --bad: #e06c6c; --pink: #e07ab8;
+    --halo: rgba(15, 20, 32, 0.85);
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px 18px 40px; background: var(--bg); color: var(--text);
+         font: 13px/1.55 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; }
+  h1 { font-size: 16px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+  .tab { padding: 6px 14px; border: 1px solid var(--line); border-radius: 8px;
+         background: var(--panel); cursor: pointer; user-select: none; }
+  .tab.active { background: var(--accent); border-color: var(--accent); color: #06121f; font-weight: 600; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          padding: 14px 16px; margin-bottom: 14px; }
+  .card h3 { margin: 0 0 10px; font-size: 13.5px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
+  .pod { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .pod .lbl { color: var(--muted); font-size: 11.5px; }
+  .pod .num { font-size: 22px; font-weight: 700; margin-top: 2px; }
+  .filter-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 10px; }
+  .f { display: flex; flex-direction: column; gap: 3px; }
+  .f label { color: var(--muted); font-size: 11px; }
+  input, select, textarea { background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+        border-radius: 6px; padding: 5px 8px; font: inherit; outline: none; }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+  textarea { min-width: 340px; min-height: 90px; }
+  button { background: var(--accent); color: #06121f; border: none; border-radius: 6px;
+           padding: 5px 12px; font: inherit; font-weight: 600; cursor: pointer; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  button.danger { background: transparent; color: var(--bad); border: 1px solid var(--bad); }
+  button:hover { filter: brightness(1.1); }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11.5px;
+       padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  td { padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  .wrap { max-width: 460px; word-break: break-all; }
+  .mono { font-family: Consolas, monospace; }
+  .muted { color: var(--muted); }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 9px; font-size: 11px;
+           background: var(--panel2); border: 1px solid var(--line); }
+  .badge.ok { color: var(--ok); border-color: var(--ok); }
+  .badge.warn { color: var(--warn); border-color: var(--warn); }
+  .badge.bad { color: var(--bad); border-color: var(--bad); }
+  .badge.sky { color: var(--accent); border-color: var(--accent); }
+  .badge.pink { color: var(--pink); border-color: var(--pink); }
+  .badge.gray { color: var(--muted); border-color: var(--line); }
+  .score-bar { position: relative; width: 90px; height: 8px; background: var(--panel2);
+               border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
+  .score-bar i { position: absolute; inset: 0 auto 0 0; background: linear-gradient(90deg, #3f8fd8, var(--accent)); }
+  .pager { display: flex; gap: 8px; align-items: center; justify-content: flex-end; margin-top: 10px; }
+  .empty { color: var(--muted); text-align: center; padding: 22px 0; }
+  .pre { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+         padding: 10px 12px; white-space: pre-wrap; word-break: break-all;
+         font: 12px/1.6 Consolas, monospace; max-height: 420px; overflow: auto; }
+  .kv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; }
+  .kv-item { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .kv-item .lbl { color: var(--muted); font-size: 11.5px; }
+  .kv-item .val { margin-top: 5px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+                  font-size: 12.5px; word-break: break-all; }
+  .kv-item .raw { margin-top: 4px; color: var(--muted); font-size: 10.5px; word-break: break-all; }
+  .modal-mask { position: fixed; inset: 0; background: rgba(4, 8, 16, .62); display: flex;
+                align-items: center; justify-content: center; z-index: 50; }
+  .modal { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+           padding: 18px 20px; width: min(560px, 92vw); max-height: 86vh; overflow: auto; }
+  .modal h3 { margin: 0 0 12px; }
+  .modal .field { margin-bottom: 10px; }
+  .modal .field label { display: block; color: var(--muted); font-size: 11.5px; margin-bottom: 3px; }
+  .modal textarea { width: 100%; }
+  .modal .acts { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
+  #toast { position: fixed; top: 18px; right: 18px; z-index: 99; display: flex; flex-direction: column; gap: 8px; }
+  .toast-item { background: var(--panel2); border: 1px solid var(--ok); color: var(--text);
+                border-radius: 8px; padding: 9px 14px; box-shadow: 0 6px 22px rgba(0,0,0,.4); }
+  .toast-item.err { border-color: var(--bad); }
+  /* ---------------- 关系图谱（力导向 SVG + 回填任务） ---------------- */
+  .graph-toolbar { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
+  .graph-chk { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); cursor: pointer; }
+  .graph-chk input { accent-color: var(--accent); }
+  .graph-wrap { display: grid; grid-template-columns: minmax(0, 1fr) 265px; gap: 12px; }
+  @media (max-width: 980px) { .graph-wrap { grid-template-columns: 1fr; } }
+  .graph-box { position: relative; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--panel2); }
+  .graph-box svg { display: block; width: 100%; height: 560px; cursor: grab; touch-action: none; user-select: none; }
+  .graph-box svg.dragging { cursor: grabbing; }
+  .graph-side { display: flex; flex-direction: column; gap: 12px; }
+  .graph-side .card { margin-bottom: 0; }
+  .fg-node circle { fill: var(--accent); stroke: var(--bg); stroke-width: 2; cursor: pointer; }
+  .fg-node.bot circle { fill: var(--pink); }
+  .fg-node text { fill: var(--text); font-size: 12px; font-weight: 600; text-anchor: middle; pointer-events: none; paint-order: stroke; stroke: var(--halo); stroke-width: 3px; }
+  .fg-edge line { stroke: var(--muted); stroke-opacity: 0.55; stroke-width: 1.6; }
+  .fg-edge.pending line { stroke-dasharray: 7 5; stroke-opacity: 0.4; }
+  .fg-edge.superseded line { stroke-dasharray: 2 4; stroke-opacity: 0.28; }
+  .fg-edge.superseded text { fill: var(--muted); opacity: 0.5; }
+  .fg-edge line.hit { stroke: transparent; stroke-width: 16; stroke-opacity: 0; cursor: pointer; }
+  .fg-edge text { fill: var(--muted); font-size: 10.5px; text-anchor: middle; pointer-events: none; paint-order: stroke; stroke: var(--halo); stroke-width: 3px; }
+  .fg-dim { opacity: 0.12; }
+  .fg-node.sel circle { stroke: var(--text); stroke-width: 3; }
+  .fg-edge.sel line { stroke: var(--text); stroke-opacity: 1; stroke-width: 2.6; }
+  .fg-edge.sel text { fill: var(--text); font-weight: 700; }
+  .graph-legend { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--muted); }
+  .graph-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: -1px; }
+  .graph-bf-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .bf-progress { height: 8px; border-radius: 6px; background: var(--panel2); border: 1px solid var(--line); overflow: hidden; margin-top: 8px; }
+  .bf-progress i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, #3f8fd8, var(--accent)); transition: width 0.4s; }
+  /* ---------------- 设置页（插件配置） ---------------- */
+  .cfg-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 2px 26px; }
+  .cfg-grid .cfg-field.wide { grid-column: 1 / -1; }
+  .cfg-field { margin-bottom: 10px; }
+  .cfg-field > label { display: flex; align-items: center; gap: 8px; font-weight: 600; margin-bottom: 4px; }
+  .cfg-field > label .mono { font-family: Consolas, monospace; font-size: 12px; }
+  .cfg-field > label .re-badge { font-size: 10.5px; font-weight: 400; padding: 1px 8px; border-radius: 8px;
+    background: rgba(224, 168, 60, .14); color: var(--warn); border: 1px solid rgba(224, 168, 60, .4); }
+  .cfg-field .desc { color: var(--muted); font-size: 11.5px; margin-top: 3px; }
+  .cfg-grid input[type="text"], .cfg-grid input[type="password"], .cfg-grid input[type="number"],
+  .cfg-grid textarea { width: 100%; }
+  .cfg-grid textarea { min-height: 54px; font: 12px/1.5 Consolas, monospace; }
+  .cfg-grid input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent); }
+  .settings-actions { position: sticky; bottom: 0; z-index: 5; display: flex; gap: 10px; align-items: center;
+    padding: 12px 0 4px; margin-top: 6px; background: linear-gradient(to top, var(--bg) 55%, transparent); }
+</style>
+</head>
+<body>
+<h1>长期记忆维护</h1>
+<div class="sub">NoriFlow 本地记忆引擎：事实 · 簇 · 画像 · 注入语料</div>
+<div class="tabs" id="tabs"></div>
+<div id="view"></div>
+<div id="toast"></div>
+
+<script>
+"use strict";
+const API = "/api/plugin/kira-ai-plugin-noriflow-memory";
+const CATEGORIES = ["identity", "stable", "interaction", "naming", "recent", "uncertain"];
+const STATUSES = ["active", "profiled", "pending_uncertain", "dead"];
+// 过滤侧含 replaced（待定栏数据源含 replaced 陈述，需可按状态筛到）
+const STATUS_FILTER = [...STATUSES, "replaced"];
+
+const $view = document.getElementById("view");
+const $tabs = document.getElementById("tabs");
+let currentTab = "overview";
+
+function el(tag, attrs, children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    else if (v !== null && v !== undefined) node.setAttribute(k, v);
+  }
+  for (const c of children || []) if (c !== null && c !== undefined) node.append(c);
+  return node;
+}
+function badge(text, cls) { return el("span", { class: "badge " + (cls || "") }, [text]); }
+function scoreBar(score) {
+  const pct = Math.max(0, Math.min(100, (Number(score) || 0) * 10));
+  const bar = el("div", { class: "score-bar" }, [el("i", { style: "width:" + pct + "%" })]);
+  bar.title = String(score);
+  return bar;
+}
+function fmtTime(s) { return s ? String(s).replace("T", " ").slice(0, 19) : "-"; }
+function toast(msg, cls) {
+  const item = el("div", { class: "toast-item " + (cls || "") }, [msg]);
+  document.getElementById("toast").appendChild(item);
+  setTimeout(() => item.remove(), 3200);
+}
+async function api(path, opts) {
+  const resp = await fetch(API + path, Object.assign({ credentials: "same-origin" }, opts));
+  if (resp.status === 401) {
+    throw new Error("登录已过期，请刷新页面重新登录");
+  }
+  if (!resp.ok) {
+    let detail = resp.statusText;
+    try {
+      const d = (await resp.json()).detail;
+      // FastAPI request-validation 422 returns detail as an ARRAY of
+      // {loc,msg,...} objects — stringify instead of "[object Object],..."
+      if (Array.isArray(d)) detail = d.map((x) => (x && x.msg) ? x.msg : JSON.stringify(x)).join("; ");
+      else if (d) detail = d;
+    } catch (e) { /* keep */ }
+    throw new Error(detail);
+  }
+  return resp.json();
+}
+function confirmModal(title, text, onOk) {
+  const mask = el("div", { class: "modal-mask" });
+  const box = el("div", { class: "modal" }, [
+    el("h3", {}, [title]),
+    el("p", {}, [text]),
+    el("div", { class: "acts" }, [
+      el("button", { class: "ghost", onclick: () => mask.remove() }, ["取消"]),
+      el("button", { onclick: () => { mask.remove(); onOk(); } }, ["确定"]),
+    ]),
+  ]);
+  mask.appendChild(box); mask.addEventListener("click", (e) => { if (e.target === mask) mask.remove(); });
+  document.body.appendChild(mask);
+}
+function tableCard(title, head, rows, pagerNode) {
+  const card = el("div", { class: "card" }, [el("h3", {}, [title])]);
+  if (!rows.length) { card.appendChild(el("div", { class: "empty" }, ["没有匹配的数据"])); }
+  else {
+    card.appendChild(el("table", {}, [
+      el("thead", {}, [el("tr", {}, head.map((t) => el("th", {}, [t])))]),
+      el("tbody", {}, rows),
+    ]));
+  }
+  if (pagerNode) card.appendChild(pagerNode);
+  return card;
+}
+function errorCard(e, onRetry) {
+  // 翻页/编辑后的刷新失败兜底：此前裸 Promise 失败会让列表区永久
+  // 停留在「加载中」假死，无任何提示
+  const card = el("div", { class: "card" }, [el("div", { class: "empty" }, ["加载失败：" + e.message])]);
+  if (onRetry) card.appendChild(el("div", { style: "text-align:center;margin-top:8px" }, [
+    el("button", { class: "ghost", onclick: onRetry }, ["重试"]),
+  ]));
+  return card;
+}
+function pager(total, page, size, onGo) {
+  const pages = Math.max(1, Math.ceil(total / size));
+  const wrap = el("div", { class: "pager" });
+  wrap.append(`${total} 条 · ${page}/${pages}`);
+  if (page > 1) wrap.appendChild(el("button", { class: "ghost", onclick: () => onGo(page - 1) }, ["上一页"]));
+  if (page < pages) wrap.appendChild(el("button", { class: "ghost", onclick: () => onGo(page + 1) }, ["下一页"]));
+  return wrap;
+}
+function filterBar(fields, onSearch) {
+  const inputs = {};
+  const row = el("div", { class: "filter-row" });
+  for (const [key, label, ph, options] of fields) {
+    let node;
+    if (options) {
+      node = el("select");
+      for (const [v, l] of options) node.appendChild(el("option", { value: v }, [l]));
+    } else node = el("input", { type: "text", placeholder: ph || "" });
+    inputs[key] = node;
+    row.appendChild(el("div", { class: "f" }, [el("label", {}, [label]), node]));
+  }
+  row.appendChild(el("button", { onclick: () => onSearch(Object.fromEntries(Object.entries(inputs).map(([k, n]) => [k, n.value.trim()]))) }, ["查询"]));
+  return row;
+}
+
+/* ============================================================
+   力导向关系图谱（零依赖 SVG：力模拟 + 拖拽/平移/缩放/选中；
+   所有力 × alpha 线性降温归零 → 未拖动时静止悬浮不漂移）
+   ============================================================ */
+class ForceGraph {
+  constructor(host, opts = {}) {
+    this.host = host;
+    this.onSelect = opts.onSelect || (() => {});
+    this.W = 1000; this.H = 560;
+    this.scale = 1; this.tx = 0; this.ty = 0;
+    this.showActive = true; this.showPending = true; this.showSuperseded = true;
+    this.selected = null;
+    this.rawNodes = []; this.rawEdges = [];
+    this.nodes = []; this.edges = [];
+    this._alpha = 1; this._raf = null;
+    this._build();
+  }
+
+  _svg(tag) { return document.createElementNS("http://www.w3.org/2000/svg", tag); }
+
+  _build() {
+    this.svg = this._svg("svg");
+    this.svg.setAttribute("viewBox", `${-this.W / 2} ${-this.H / 2} ${this.W} ${this.H}`);
+    this.svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+    this.gRoot = this._svg("g");
+    this.gEdges = this._svg("g");
+    this.gNodes = this._svg("g");
+    this.gRoot.appendChild(this.gEdges);
+    this.gRoot.appendChild(this.gNodes);
+    this.svg.appendChild(this.gRoot);
+    this.host.appendChild(this.svg);
+    this._bind();
+  }
+
+  setData(nodes, edges) {
+    this.rawNodes = nodes || [];
+    this.rawEdges = edges || [];
+    this._applyFilter(true);
+  }
+
+  setFilter(showActive, showPending, showSuperseded) {
+    this.showActive = showActive; this.showPending = showPending;
+    this.showSuperseded = showSuperseded;
+    this._applyFilter(false);
+  }
+
+  select(type, id) {
+    this.selected = type ? { type, id } : null;
+    this._applyDim();
+    this.onSelect(this.selected);
+  }
+
+  resetView() {
+    this.scale = 1; this.tx = 0; this.ty = 0;
+    this._applyTransform();
+    this.reheat();
+  }
+
+  reheat() { this._alpha = 1; this._loop(); }
+
+  _applyFilter(fresh) {
+    const vis = (s) => s === "active" ? this.showActive
+      : s === "pending" ? this.showPending : this.showSuperseded;
+    const edges = this.rawEdges.filter((e) => vis(e.status));
+    const used = new Set();
+    edges.forEach((e) => { used.add(e.subject); used.add(e.object); });
+    const prev = new Map(this.nodes.map((n) => [n.id, n]));
+    this.nodes = this.rawNodes.filter((n) => used.has(n.id)).map((n, i) => {
+      const old = prev.get(n.id);
+      const ang = (i / Math.max(1, this.rawNodes.length)) * Math.PI * 2;
+      return Object.assign({}, n, {
+        x: old ? old.x : Math.cos(ang) * 160,
+        y: old ? old.y : Math.sin(ang) * 160,
+        vx: 0, vy: 0, fx: null, fy: null, el: null,
+      });
+    });
+    const byId = new Map(this.nodes.map((n) => [n.id, n]));
+    this.edges = edges
+      .map((e) => Object.assign({}, e, { s: byId.get(e.subject), o: byId.get(e.object) }))
+      .filter((e) => e.s && e.o);
+    this._renderDom();
+    this._applyDim();
+    this.reheat();
+  }
+
+  _renderDom() {
+    this.gEdges.innerHTML = "";
+    this.gNodes.innerHTML = "";
+    for (const e of this.edges) {
+      const g = this._svg("g");
+      g.setAttribute("class", "fg-edge" + (e.status !== "active" ? " " + e.status : ""));
+      g.dataset.edge = String(e.id);
+      const line = this._svg("line");
+      const hit = this._svg("line");
+      hit.setAttribute("class", "hit");
+      const text = this._svg("text");
+      text.textContent = e.label;
+      g.appendChild(line); g.appendChild(hit); g.appendChild(text);
+      this.gEdges.appendChild(g);
+      e.el = g; e.line = line; e.text = text;
+    }
+    for (const n of this.nodes) {
+      const g = this._svg("g");
+      g.setAttribute("class", "fg-node" + (n.is_bot ? " bot" : ""));
+      g.dataset.node = n.id;
+      const circle = this._svg("circle");
+      circle.setAttribute("r", String(9 + Math.min(n.degree, 10)));
+      const label = this._svg("text");
+      label.setAttribute("dy", "1.4em");
+      label.textContent = n.name;
+      g.appendChild(circle); g.appendChild(label);
+      this.gNodes.appendChild(g);
+      n.el = g;
+    }
+    this._applyTransform();
+  }
+
+  _applyDim() {
+    const sel = this.selected;
+    if (!sel) {
+      [...this.gEdges.children, ...this.gNodes.children].forEach((g) => g.classList.remove("fg-dim", "sel"));
+      return;
+    }
+    const keepNodes = new Set(); const keepEdges = new Set();
+    if (sel.type === "node") {
+      keepNodes.add(sel.id);
+      for (const e of this.edges) {
+        if (e.subject === sel.id || e.object === sel.id) {
+          keepEdges.add(String(e.id));
+          keepNodes.add(e.subject); keepNodes.add(e.object);
+        }
+      }
+    } else {
+      const e = this.edges.find((x) => String(x.id) === String(sel.id));
+      if (e) { keepEdges.add(String(e.id)); keepNodes.add(e.subject); keepNodes.add(e.object); }
+    }
+    for (const e of this.edges) {
+      e.el.classList.toggle("fg-dim", !keepEdges.has(String(e.id)));
+      e.el.classList.toggle("sel", sel.type === "edge" && String(e.id) === String(sel.id));
+    }
+    for (const n of this.nodes) {
+      n.el.classList.toggle("fg-dim", !keepNodes.has(n.id));
+      n.el.classList.toggle("sel", sel.type === "node" && n.id === sel.id);
+    }
+  }
+
+  _tick() {
+    const ns = this.nodes, es = this.edges;
+    const a = this._alpha;
+    const REP = 5200, SPR = 0.03, L = 132, FRICTION = 0.86, GRAV = 0.05;
+    // Repulsion is O(n²); with big graphs (e.g. hundreds of disjoint edges)
+    // the pair loop alone can freeze the tab. Above the node threshold the
+    // loop strides so ~the same pair budget is spent per tick (skipped nodes
+    // still get spring + centering forces, layout stays readable).
+    const stride = ns.length > 160 ? Math.ceil(ns.length / 160) : 1;
+    for (let i = 0; i < ns.length; i += stride) {
+      for (let j = i + stride; j < ns.length; j += stride) {
+        let dx = ns[j].x - ns[i].x, dy = ns[j].y - ns[i].y;
+        let d2 = dx * dx + dy * dy;
+        if (d2 < 1) { dx = Math.random() + 0.1; dy = Math.random() + 0.1; d2 = dx * dx + dy * dy; }
+        const d = Math.sqrt(d2), f = (REP / d2) * a, fx = (dx / d) * f, fy = (dy / d) * f;
+        ns[i].vx -= fx; ns[i].vy -= fy; ns[j].vx += fx; ns[j].vy += fy;
+      }
+    }
+    for (const e of es) {
+      const dx = e.o.x - e.s.x, dy = e.o.y - e.s.y;
+      const d = Math.sqrt(dx * dx + dy * dy) || 1;
+      const f = (d - L) * SPR * a, fx = (dx / d) * f, fy = (dy / d) * f;
+      e.s.vx += fx; e.s.vy += fy; e.o.vx -= fx; e.o.vy -= fy;
+    }
+    for (const n of ns) {
+      n.vx += -n.x * GRAV * a; n.vy += -n.y * GRAV * a;
+      n.vx *= FRICTION; n.vy *= FRICTION;
+      if (n.fx != null) { n.x = n.fx; n.y = n.fy; n.vx = 0; n.vy = 0; }
+      else {
+        n.x += Math.max(-28, Math.min(28, n.vx));
+        n.y += Math.max(-28, Math.min(28, n.vy));
+      }
+    }
+    this._alpha = Math.max(0, a - 0.006);
+  }
+
+  _draw() {
+    for (const e of this.edges) {
+      const x1 = e.s.x, y1 = e.s.y, x2 = e.o.x, y2 = e.o.y;
+      e.line.setAttribute("x1", x1); e.line.setAttribute("y1", y1);
+      e.line.setAttribute("x2", x2); e.line.setAttribute("y2", y2);
+      e.el.querySelector(".hit").setAttribute("x1", x1);
+      e.el.querySelector(".hit").setAttribute("y1", y1);
+      e.el.querySelector(".hit").setAttribute("x2", x2);
+      e.el.querySelector(".hit").setAttribute("y2", y2);
+      e.text.setAttribute("x", (x1 + x2) / 2);
+      e.text.setAttribute("y", (y1 + y2) / 2 - 4);
+    }
+    for (const n of this.nodes) {
+      n.el.setAttribute("transform", `translate(${n.x},${n.y})`);
+    }
+  }
+
+  _loop() {
+    if (this._raf) return;
+    const step = () => {
+      this._tick(); this._tick();
+      this._draw();
+      const energy = this.nodes.reduce((s, n) => s + Math.abs(n.vx) + Math.abs(n.vy), 0);
+      const dragging = this._dragNode != null;
+      if (this._alpha <= 0 && energy < 0.5 && !dragging) {
+        this._raf = null;
+        return;
+      }
+      this._raf = requestAnimationFrame(step);
+    };
+    this._raf = requestAnimationFrame(step);
+  }
+
+  _clientToWorld(ev) {
+    const pt = this.svg.createSVGPoint();
+    pt.x = ev.clientX; pt.y = ev.clientY;
+    const p = pt.matrixTransform(this.svg.getScreenCTM().inverse());
+    return { x: (p.x - this.tx) / this.scale, y: (p.y - this.ty) / this.scale };
+  }
+
+  _bind() {
+    const svg = this.svg;
+    svg.addEventListener("pointerdown", (ev) => {
+      svg.setPointerCapture(ev.pointerId);
+      this._down = { x: ev.clientX, y: ev.clientY, moved: false };
+      const nodeG = ev.target.closest && ev.target.closest("[data-node]");
+      if (nodeG) {
+        const n = this.nodes.find((x) => x.id === nodeG.dataset.node);
+        if (n) this._dragNode = n;
+      } else {
+        this._panFrom = { x: ev.clientX, y: ev.clientY, tx: this.tx, ty: this.ty };
+        svg.classList.add("dragging");
+      }
+    });
+    svg.addEventListener("pointermove", (ev) => {
+      if (!this._down) return;
+      if (Math.hypot(ev.clientX - this._down.x, ev.clientY - this._down.y) > 4) this._down.moved = true;
+      if (this._dragNode) {
+        const w = this._clientToWorld(ev);
+        this._dragNode.fx = w.x; this._dragNode.fy = w.y;
+        this.reheat();
+      } else if (this._panFrom) {
+        const k = this.W / this.svg.getBoundingClientRect().width || 1;
+        this.tx = this._panFrom.tx + (ev.clientX - this._panFrom.x) * k;
+        this.ty = this._panFrom.ty + (ev.clientY - this._panFrom.y) * k;
+        this._applyTransform();
+      }
+    });
+    const up = (ev) => {
+      const wasMoved = this._down && this._down.moved;
+      const dragNode = this._dragNode;
+      if (dragNode) { dragNode.fx = null; dragNode.fy = null; this.reheat(); }
+      this._dragNode = null; this._panFrom = null; this._down = null;
+      this.svg.classList.remove("dragging");
+      if (wasMoved || !ev.target.closest) return;
+      const nodeG = ev.target.closest("[data-node]");
+      if (nodeG) { this.select("node", nodeG.dataset.node); return; }
+      const edgeG = ev.target.closest("[data-edge]");
+      if (edgeG) { this.select("edge", edgeG.dataset.edge); return; }
+      this.select(null, null);
+    };
+    svg.addEventListener("pointerup", up);
+    svg.addEventListener("pointercancel", up);
+    svg.addEventListener("wheel", (ev) => {
+      ev.preventDefault();
+      const old = this.scale;
+      this.scale = Math.max(0.3, Math.min(3, this.scale * (ev.deltaY < 0 ? 1.12 : 0.89)));
+      const pt = this.svg.createSVGPoint();
+      pt.x = ev.clientX; pt.y = ev.clientY;
+      const p = pt.matrixTransform(this.svg.getScreenCTM().inverse());
+      this.tx = p.x - (p.x - this.tx) * (this.scale / old);
+      this.ty = p.y - (p.y - this.ty) * (this.scale / old);
+      this._applyTransform();
+    }, { passive: false });
+  }
+
+  _applyTransform() {
+    this.gRoot.setAttribute("transform", `translate(${this.tx},${this.ty}) scale(${this.scale})`);
+  }
+}
+
+const TABS = [["overview", "总览"], ["clusters", "事实簇（确信度）"], ["facts", "原始事实"], ["profile", "用户画像"], ["graph", "关系图谱"], ["summaries", "注入语料"], ["settings", "设置"]];
+
+function renderTabs() {
+  $tabs.innerHTML = "";
+  for (const [key, label] of TABS) {
+    $tabs.appendChild(el("div", {
+      class: "tab" + (currentTab === key ? " active" : ""),
+      onclick: () => { currentTab = key; renderTabs(); renderView(); },
+    }, [label]));
+  }
+}
+
+async function renderView() {
+  $view.innerHTML = '<div class="card"><div class="empty">加载中</div></div>';
+  try {
+    if (currentTab === "overview") await renderOverview();
+    else if (currentTab === "clusters") await renderClusters();
+    else if (currentTab === "facts") await renderFacts();
+    else if (currentTab === "profile") await renderProfile();
+    else if (currentTab === "graph") await renderGraph();
+    else if (currentTab === "summaries") await renderSummaries();
+    else if (currentTab === "settings") await renderSettings();
+  } catch (e) {
+    $view.innerHTML = "";
+    // Same retry affordance as the list paths (errorCard) — a dead top-level
+    // load used to leave the tab stuck with no recovery.
+    $view.appendChild(errorCard(e, () => renderView()));
+  }
+}
+
+// ---------------- 总览 · 状态机 kv 卡片 ----------------
+const KV_META = {
+  adjudicate_skip_state: { label: "裁定遍 · 毒丸行名单", kind: "skip" },
+  reencode_skip_state: { label: "补编码遍 · 毒丸行名单", kind: "skip" },
+  last_decay_at: { label: "上次分数衰减/降级", kind: "date" },
+  relation_audit_edge_id: { label: "关系边审计水位", kind: "audit-watermark" },
+  relation_audit_fail_count: { label: "审计连续失败计数", kind: "audit-fails" },
+  relation_audit_fail_mark: { label: "审计跳批标记", kind: "raw" },
+  _backend_migration_done: { label: "后端数据迁移", kind: "migration" },
+  kira_memory_import_last_run: { label: "Kira 记忆数据迁入", kind: "kira_memory" },
+};
+
+function kvSkipSummary(raw) {
+  let state;
+  try { state = JSON.parse(raw); } catch (e) { return null; }
+  if (!state || typeof state !== "object") return null;
+  const entries = Object.entries(state);
+  if (!entries.length) return { cls: "ok", label: "正常", text: "无卡住行" };
+  const head = entries.slice(0, 3).map(([id, n]) => "#" + id + "（" + n + " 次）").join("、");
+  return { cls: "warn", label: "注意",
+    text: entries.length + " 行被跳过：" + head + (entries.length > 3 ? " …" : "") };
+}
+function kvDaysAgo(s) {
+  const t = Date.parse(s);
+  if (Number.isNaN(t)) return "";
+  const days = Math.floor((Date.now() - t) / 86400000);
+  return days <= 0 ? "今天" : days + " 天前";
+}
+// Backend-cutover markers store UTC ISO ("...Z") — fmtTime's naive prefix
+// slice would show UTC wall time; render those via the browser clock instead.
+function kvLocalTs(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return String(iso);
+  const p = (n) => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate())
+    + " " + p(d.getHours()) + ":" + p(d.getMinutes());
+}
+function kvItem(key, value, updatedAt) {
+  const meta = KV_META[key];
+  const raw = String(value);
+  // Tooltip keeps the exact raw payload for debugging
+  const item = el("div", { class: "kv-item", title: key + " = " + raw });
+  item.appendChild(el("div", { class: "lbl" }, [meta ? meta.label : key]));
+  const val = el("div", { class: "val" });
+  if (!meta) {
+    val.append(raw.length > 80 ? raw.slice(0, 80) + "…" : raw);
+  } else if (meta.kind === "skip") {
+    const sum = kvSkipSummary(raw);
+    if (sum) val.append(badge(sum.label, sum.cls), sum.text);
+    else val.append(badge("注意", "warn"), "值无法解析：" + raw);
+  } else if (meta.kind === "date") {
+    const ago = kvDaysAgo(raw);
+    val.append(fmtTime(raw) + (ago ? "（" + ago + "）" : ""));
+  } else if (meta.kind === "audit-watermark") {
+    const n = parseInt(raw, 10);
+    val.append(badge("正常", "ok"), Number.isNaN(n) ? raw : "已审至边 id ≤ " + n);
+  } else if (meta.kind === "audit-fails") {
+    const n = parseInt(raw, 10) || 0;
+    val.append(badge(n > 0 ? "注意" : "正常", n > 0 ? "warn" : "ok"),
+      n > 0 ? "连续失败 " + n + " / 3（满 3 跳批）" : "无连续失败");
+  } else if (meta.kind === "migration") {
+    let m; try { m = JSON.parse(raw); } catch (e) { m = null; }
+    if (m && m.migrated_at) {
+      const total = m.copied && typeof m.copied === "object"
+        ? Object.values(m.copied).reduce((a, b) => a + (Number(b) || 0), 0) : null;
+      val.append(badge("已完成", "ok"),
+        "已从 " + (m.source || "?") + " 迁入" + (total != null ? " " + total + " 行" : "")
+        + "（" + kvLocalTs(m.migrated_at) + "）");
+    } else val.append(badge("注意", "warn"), "值无法解析：" + raw);
+  } else if (meta.kind === "kira_memory") {
+    let m; try { m = JSON.parse(raw); } catch (e) { m = null; }
+    if (m && m.finished_at) {
+      const parts = [];
+      if (m.summary_rows != null) parts.push("摘要 +" + m.summary_rows);
+      if (m.fact_rows != null) parts.push("事实 +" + m.fact_rows);
+      if (m.aliases_upserted != null) parts.push("别名 +" + m.aliases_upserted);
+      val.append(badge("已完成", "ok"),
+        (parts.length ? parts.join(" / ") : "完成") + "（" + kvLocalTs(m.finished_at) + "）");
+    } else val.append(badge("注意", "warn"), "值无法解析：" + raw);
+  }
+  item.appendChild(val);
+  item.appendChild(el("div", { class: "raw" }, [fmtTime(updatedAt) + " 更新"]));
+  return item;
+}
+
+// ---------------- 总览 ----------------
+async function renderOverview() {
+  $view.innerHTML = "";  // 清掉 renderView 的"加载中"占位（其余标签各自清空，唯独这里曾遗漏）
+  const d = await api("/memory/overview");
+  const stat = (num, lbl) => el("div", { class: "pod" }, [el("div", { class: "lbl" }, [lbl]), el("div", { class: "num" }, [String(num)])]);
+  const card = el("div", { class: "card" }, [
+    el("h3", {}, ["记忆库总览"]),
+    el("div", { class: "grid" }, [
+      stat(d.summaries, "对话摘要（recall 语料）"), stat(d.facts_raw, "原始事实"),
+      stat(d.facts_pending, "待处理事实"), stat(d.users_with_clusters, "有簇用户"),
+    ]),
+    el("div", { style: "height:10px" }),
+    el("div", { class: "grid" }, [
+      stat(d.clusters_active, "活跃簇"), stat(d.clusters_profiled, "已入画像簇"),
+      stat(d.clusters_pending, "待定簇"), stat(d.profile_rows, "画像投影行"),
+    ]),
+  ]);
+  if (d.summaries_no_vec) card.appendChild(el("p", { class: "muted" }, [`${d.summaries_no_vec} 条摘要向量待补算`]));
+  if (d.summaries_unsummarized) card.appendChild(el("p", { class: "muted" }, [`${d.summaries_unsummarized} 条原文待补编码（暂不参与召回）`]));
+  $view.appendChild(card);
+  if (d.kv && d.kv.length) {
+    $view.appendChild(el("div", { class: "card" }, [
+      el("h3", {}, ["状态机持久化状态（合并 agent）"]),
+      // Known keys render as friendly cards; unknown future kv keys fall
+      // through to a generic card so nothing silently disappears.
+      el("div", { class: "kv-grid" }, d.kv.map((k) => kvItem(k.key, k.value, k.updated_at))),
+    ]));
+  }
+}
+
+// ---------------- 事实簇 ----------------
+function clusterFilterRow(onSearch) {
+  return filterBar([
+    ["user_id", "用户 ID", "裸 uid"], ["session_id", "会话 ID", "按证据键前缀"],
+    ["category", "分类", "", [["", "全部"], ...CATEGORIES.map((c) => [c, c])]],
+    ["status", "状态", "", [["", "全部"], ...STATUS_FILTER.map((s) => [s, s])]],
+    ["q", "内容包含", "陈述关键词"],
+  ], onSearch);
+}
+function editClusterModal(c, refresh) {
+  const mask = el("div", { class: "modal-mask" });
+  const stmt = el("textarea", {}, [c.statement]);
+  const score = el("input", { type: "number", step: "0.5", min: "0", max: "10", value: String(c.score) });
+  const status = el("select");
+  const statusOpts = c.status === "replaced" ? ["replaced", ...STATUSES] : STATUSES;
+  for (const s of statusOpts) status.appendChild(el("option", { value: s }, [s]));
+  status.value = c.status;
+  // replaced tombstones can never transition out server-side; lock the
+  // dropdown so a same-status submit can't even appear to change anything.
+  if (c.status === "replaced") status.disabled = true;
+  const box = el("div", { class: "modal" }, [
+    el("h3", {}, [`修正簇 #${c.id}（用户 ${c.user_id}）`]),
+    el("div", { class: "field" }, [el("label", {}, ["规范陈述（改陈述会重置向量待重算）"]), stmt]),
+    el("div", { class: "field" }, [el("label", {}, ["确信度分数（0~10）"]), score]),
+    el("div", { class: "field" }, [el("label", {}, ["状态（切出 profiled 会同步移除画像投影）"]), status]),
+    c.status === "replaced"
+      ? el("p", { class: "muted" }, ["replaced 是合并管线墓碑状态：不可手工迁出，仅可改陈述/分数。"])
+      : el("p", { class: "muted" }, ["提示：置 dead 后若再出现新证据合并，簇会被自动复活为 active。"]),
+    el("p", { class: "muted" }, [`证据键：${(c.evidence_keys || []).join("、") || "无"}`]),
+    el("div", { class: "acts" }, [
+      el("button", { class: "ghost", onclick: () => mask.remove() }, ["取消"]),
+      el("button", { onclick: async () => {
+        try {
+          // 分数留空 = 不修改（此前空串被 Number("") 置 0 悄悄改分）
+          const body = { canonical_statement: stmt.value, status: status.value };
+          if (score.value.trim() !== "") body.score = Number(score.value);
+          await api(`/memory/clusters/${c.id}`, { method: "PUT", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body) });
+          toast("簇已修正"); mask.remove(); refresh();
+        } catch (e) { toast("修正失败：" + e.message, "err"); }
+      } }, ["保存修正"]),
+    ]),
+  ]);
+  mask.appendChild(box); mask.addEventListener("click", (e) => { if (e.target === mask) mask.remove(); });
+  document.body.appendChild(mask);
+}
+async function renderClusters() {
+  $view.innerHTML = "";
+  let query = { page: 1 };
+  const listBox = el("div");
+  const refresh = async () => {
+    listBox.innerHTML = '<div class="card"><div class="empty">加载中</div></div>';
+    try {
+      const p = new URLSearchParams(Object.assign({ size: 30 }, query));
+      const d = await api("/memory/clusters?" + p.toString());
+      const statusColor = { active: "sky", profiled: "ok", pending_uncertain: "warn", dead: "bad", replaced: "gray" };
+      const rows = d.items.map((c) => el("tr", {}, [
+        el("td", { class: "mono" }, [String(c.id)]),
+        el("td", {}, [el("div", { class: "mono" }, [c.user_id]), el("div", {}, [badge(c.category, "pink")])]),
+        el("td", { class: "wrap" }, [c.statement]),
+        el("td", {}, [scoreBar(c.score)]),
+        el("td", {}, [badge(c.status, statusColor[c.status] || "gray")]),
+        el("td", {}, [`${c.evidence_count} 证据`]),
+        el("td", {}, [fmtTime(c.updated_at)]),
+        el("td", {}, [el("button", { class: "ghost", onclick: () => editClusterModal(c, refresh) }, ["修正"])]),
+      ]));
+      listBox.innerHTML = "";
+      listBox.appendChild(tableCard(`事实簇（共 ${d.total} 条，按确信度排序）`,
+        ["ID", "用户/分类", "规范陈述", "确信度", "状态", "证据", "更新时间", "操作"], rows,
+        pager(d.total, d.page, d.size, (p2) => { query.page = p2; refresh(); })));
+    } catch (e) {
+      listBox.innerHTML = "";
+      listBox.appendChild(errorCard(e, refresh));
+    }
+  };
+  $view.appendChild(clusterFilterRow((vals) => { query = Object.assign({}, vals, { page: 1 }); refresh(); }));
+  $view.appendChild(listBox);
+  await refresh();
+}
+
+// ---------------- 原始事实 ----------------
+async function renderFacts() {
+  $view.innerHTML = "";
+  let query = { page: 1 };
+  const listBox = el("div");
+  const refresh = async () => {
+    listBox.innerHTML = '<div class="card"><div class="empty">加载中</div></div>';
+    try {
+      const p = new URLSearchParams(Object.assign({ size: 30 }, query));
+      const d = await api("/memory/facts?" + p.toString());
+      const rows = d.items.map((f) => el("tr", {}, [
+        el("td", { class: "mono" }, [String(f.id)]),
+        el("td", {}, [el("div", {}, [f.display_name || f.user_id]), el("div", { class: "muted mono" }, [f.user_id])]),
+        el("td", {}, [badge(f.category, "pink")]),
+        el("td", { class: "wrap" }, [f.statement]),
+        el("td", {}, [badge(f.confidence, f.confidence === "high" ? "ok" : "warn")]),
+        el("td", {}, [badge(f.extracted ? "已入簇" : "待处理", f.extracted ? "gray" : "sky")]),
+        el("td", { class: "mono" }, [f.session_id]),
+        el("td", {}, [fmtTime(f.occurred_at)]),
+        el("td", {}, [el("button", { class: "danger", onclick: () => confirmModal("删除原始事实",
+          `确定删除事实 #${f.id} 吗？${f.extracted ? "该事实已入簇，删除不影响簇本身。" : "该事实还未入簇，删除后不会再参与合并。"}`,
+          async () => {
+            try { await api(`/memory/facts/${f.id}`, { method: "DELETE" }); toast("事实已删除"); refresh(); }
+            catch (e) { toast("删除失败：" + e.message, "err"); }
+          }) }, ["删除"])]),
+      ]));
+      listBox.innerHTML = "";
+      listBox.appendChild(tableCard(`原始事实（共 ${d.total} 条）`,
+        ["ID", "用户", "分类", "事实陈述", "确信度", "状态", "来源会话", "发生时间", "操作"], rows,
+        pager(d.total, d.page, d.size, (p2) => { query.page = p2; refresh(); })));
+    } catch (e) {
+      listBox.innerHTML = "";
+      listBox.appendChild(errorCard(e, refresh));
+    }
+  };
+  $view.appendChild(filterBar([
+    ["user_id", "用户 ID", "裸 uid"], ["session_id", "会话 ID", ""],
+    ["category", "分类", "", [["", "全部"], ...CATEGORIES.map((c) => [c, c])]],
+    ["confidence", "确信度", "", [["", "全部"], ["high", "high"], ["medium", "medium"]]],
+    ["extracted", "处理状态", "", [["", "全部"], ["0", "待处理"], ["1", "已入簇"]]],
+    ["q", "内容包含", "事实关键词"],
+  ], (vals) => { query = Object.assign({}, vals, { page: 1 }); refresh(); }));
+  $view.appendChild(listBox);
+  await refresh();
+}
+
+// ---------------- 用户画像 ----------------
+async function renderProfile() {
+  $view.innerHTML = "";
+  const pickerCard = el("div", { class: "card" });
+  const profileCard = el("div");
+  $view.appendChild(pickerCard); $view.appendChild(profileCard);
+
+  let page = 1, kw = "";
+  const loadProfile = async (platform, userId) => {
+    profileCard.innerHTML = '<div class="card"><div class="empty">加载中</div></div>';
+    try {
+      const d = await api(`/memory/profile/${encodeURIComponent(platform)}/${encodeURIComponent(userId)}`);
+      profileCard.innerHTML = "";
+      const sectionNames = { identity: "基本信息", naming: "称呼偏好", stable: "已知事实", interaction: "互动偏好", recent: "近期动态" };
+      const sectionCards = Object.entries(sectionNames).map(([cat, title]) =>
+        el("div", { class: "card" }, [
+          el("h3", {}, [title]),
+          (d.sections[cat] && d.sections[cat].length)
+            ? el("ul", {}, d.sections[cat].map((s) => el("li", {}, [s])))
+            : el("div", { class: "muted" }, ["暂无"]),
+        ]));
+      sectionCards.push(el("div", { class: "card" }, [
+        el("h3", {}, ["待定信息"]),
+        d.uncertain.length ? el("ul", {}, d.uncertain.map((s) => el("li", {}, [s])))
+          : el("div", { class: "muted" }, ["暂无"]),
+      ]));
+      profileCard.appendChild(el("div", { class: "card" }, [
+        el("h3", {}, [`${d.display_name} 的画像（与注入内容逐字一致）`]),
+        d.injection_text ? el("div", { class: "pre" }, [d.injection_text])
+          : el("div", { class: "empty" }, ["该用户暂无可注入的画像内容"]),
+      ]));
+      profileCard.appendChild(el("div", { class: "grid", style: "grid-template-columns:repeat(auto-fill,minmax(280px,1fr))" }, sectionCards));
+      profileCard.scrollIntoView({ behavior: "smooth" });
+    } catch (e) {
+      profileCard.innerHTML = "";
+      profileCard.appendChild(errorCard(e, () => loadProfile(platform, userId)));
+    }
+  };
+  const loadUsers = async () => {
+    pickerCard.innerHTML = '<div class="empty">加载中</div>';
+    try {
+      const d = await api(`/memory/users?page=${page}&size=30&q=${encodeURIComponent(kw)}`);
+      pickerCard.innerHTML = "";
+      pickerCard.appendChild(el("h3", {}, [`选择用户查看画像（共 ${d.total} 个有簇用户）`]));
+      const inp = el("input", { type: "text", placeholder: "user_id", value: kw });
+      pickerCard.appendChild(el("div", { class: "filter-row" }, [
+        el("div", { class: "f" }, [el("label", {}, ["搜索用户 ID"]), inp]),
+        el("button", { onclick: () => { kw = inp.value.trim(); page = 1; loadUsers(); } }, ["查询"]),
+      ]));
+      const rows = d.items.map((u) => el("tr", { style: "cursor:pointer", onclick: () => loadProfile(u.platform, u.user_id) }, [
+        el("td", {}, [el("div", { style: "font-weight:700" }, [u.display_name || "（无名）"]),
+          el("div", { class: "muted mono" }, [u.user_id])]),
+        el("td", {}, [u.platform]),
+        el("td", {}, [badge(`画像 ${u.profiled}`, u.profiled ? "ok" : "gray"), " ",
+          badge(`活跃 ${u.active}`, "sky"), " ",
+          u.pending ? badge(`待定 ${u.pending}`, "warn") : null]),
+        el("td", {}, [scoreBar(u.max_score)]),
+        el("td", {}, [fmtTime(u.updated_at)]),
+        el("td", {}, [el("button", { class: "danger", onclick: (ev) => {
+          ev.stopPropagation(); // 行点击是查看画像，按钮点击是删除
+          confirmModal("清除该用户的全部记忆",
+            `确定删除 ${u.platform}:${u.user_id} 的画像/事实簇/原始事实/别名与关系边吗？此操作不可恢复（对话摘要为会话维度、可能涉及他人，不随此级联删除）。`,
+            async () => {
+              try {
+                const r = await api(`/memory/users/${encodeURIComponent(u.platform)}/${encodeURIComponent(u.user_id)}`, { method: "DELETE" });
+                toast(`已删除：簇 ${r.clusters} · 事实 ${r.facts} · 画像 ${r.profiles} · 别名 ${r.aliases} · 边 ${r.edges}`);
+                loadUsers();
+              } catch (e) { toast("删除失败：" + e.message, "err"); }
+            });
+        } }, ["清除记忆"])]),
+      ]));
+      pickerCard.appendChild(el("table", {}, [
+        el("thead", {}, [el("tr", {}, ["用户", "平台", "簇构成", "最高确信度", "最近更新", "操作"].map((t) => el("th", {}, [t])))]),
+        el("tbody", {}, rows),
+      ]));
+      pickerCard.appendChild(pager(d.total, d.page, d.size, (p) => { page = p; loadUsers(); }));
+    } catch (e) {
+      pickerCard.innerHTML = "";
+      pickerCard.appendChild(errorCard(e, loadUsers));
+    }
+  };
+  await loadUsers();
+}
+
+// ---------------- 关系图谱 ----------------
+async function renderGraph() {
+  $view.innerHTML = "";  // clear the "loading" placeholder card left by renderView (was missed here, leaving a permanent loading card)
+  const d = await api("/memory/relations/graph");
+
+  const stat = (num, lbl) => el("div", { class: "pod" }, [el("div", { class: "lbl" }, [lbl]), el("div", { class: "num" }, [String(num)])]);
+  const bfStatus = el("div", { class: "muted", style: "font-size:12px" });
+  const bfBar = el("div", { class: "bf-progress", style: "display:none" }, [el("i", { style: "width:0%" })]);
+  const bfBtn = el("button", { disabled: d.backfill_available ? null : "" }, ["从已确认事实回填关系"]);
+  const bfFullBtn = el("button", { class: "ghost", title: "忽略水位，对全部已确认簇重新提取（不计分，只刷新）", disabled: d.backfill_available ? null : "" }, ["全量重跑"]);
+  if (!d.backfill_available) bfStatus.textContent = "fast LLM 未配置，回填不可用";
+  const startBackfill = (full) => {
+    api("/memory/relations/backfill" + (full ? "?full=true" : ""), { method: "POST" })
+      .then(() => { toast(full ? "全量重跑已启动" : "回填已启动（每批一次 LLM 调用，完成后自动刷新）"); pollBackfill(); })
+      .catch((e) => toast("回填启动失败：" + e.message, "err"));
+  };
+  bfBtn.addEventListener("click", () => startBackfill(false));
+  bfFullBtn.addEventListener("click", () => startBackfill(true));
+  const reload = async () => {
+    $view.innerHTML = "";
+    try { await renderGraph(); } catch (e) { /* 切页竞态忽略 */ }
+  };
+  let pollTimer = null;
+  // 只在「本次驻留期间出现的新完成」时整页刷新——首次轮询把已完成的
+  // finished_at 记为基线，否则每次进 tab 都会重渲染造成画面闪动
+  let seenFinished = null;
+  let pollFails = 0;
+  const pollBackfill = async () => {
+    if (pollTimer) clearTimeout(pollTimer);
+    let s;
+    try { s = await api("/memory/relations/backfill/status"); }
+    catch (e) {
+      // Transient failures keep polling (a single 401/500 used to kill the
+      // poller forever with a frozen progress bar and disabled buttons);
+      // give up after 5 consecutive failures with the reason surfaced.
+      if (++pollFails >= 5) { bfStatus.textContent = "回填状态获取失败：" + e.message; return; }
+      pollTimer = setTimeout(pollBackfill, 3000);
+      return;
+    }
+    pollFails = 0;
+    if (!bfStatus.isConnected) return; // 已切页，停止轮询
+    if (seenFinished === null) seenFinished = s.running ? "" : s.finished_at;
+    if (s.running) {
+      bfBtn.disabled = true;
+      bfFullBtn.disabled = true;
+      bfBar.style.display = "";
+      const pct = s.total ? Math.round((s.done / s.total) * 100) : 0;
+      bfBar.firstChild.style.width = pct + "%";
+      bfStatus.textContent = `回填进行中（${s.mode === "full" ? "全量" : "增量"}）：批次 ${s.done}/${s.total} · 已产出 ${s.relations} 条边`;
+      pollTimer = setTimeout(pollBackfill, 1500);
+    } else {
+      bfBtn.disabled = !d.backfill_available;
+      bfFullBtn.disabled = !d.backfill_available;
+      bfBar.style.display = "none";
+      bfStatus.textContent = s.finished_at
+        ? (s.error
+            ? `上次回填异常终止：${s.error}`
+            : `上次回填（${s.mode === "full" ? "全量" : "增量"}）：${s.done} 批完成（失败 ${s.failed_batches}）· 产出 ${s.relations} 条边 · ${fmtTime(s.finished_at)}`)
+        : "";
+      if (s.finished_at && !s.error && s.relations > 0 && s.finished_at !== seenFinished) {
+        seenFinished = s.finished_at;
+        reload();
+      }
+    }
+  };
+  $view.appendChild(el("div", { class: "card" }, [
+    el("h3", {}, ["关系图谱（memory_entity_edge）"]),
+    el("div", { class: "grid" }, [
+      stat(d.stats.nodes, "实体节点"), stat(d.stats.edges, "关系边"),
+      stat(d.stats.edges_active, "active（P3 可注入）"), stat(d.stats.edges_pending, "pending（bot 边待双证据）"),
+      stat(d.stats.edges_superseded, "superseded（墓碑，不注入）"),
+    ]),
+    el("div", { style: "height:10px" }),
+    el("div", { class: "graph-bf-row" }, [bfBtn, bfFullBtn, bfStatus]),
+    bfBar,
+  ]));
+  if (!d.stats.edges) {
+    $view.appendChild(el("div", { class: "card" }, [
+      el("div", { class: "empty" }, ["暂无边数据：开启 P2 关系提取开关积累增量，或点上方按钮从已确认事实回填存量。"]),
+    ]));
+    // Poll even with an empty edge table: a backfill started elsewhere (or
+    // still finishing) must still reflect its progress here.
+    pollBackfill();
+    return;
+  }
+
+  const edgeStatusColor = { active: "ok", pending: "warn", superseded: "gray" };
+  const side = el("div", { class: "graph-side" });
+  const graphHost = el("div", { class: "graph-box" });
+  const chkActive = el("input", { type: "checkbox" });
+  const chkPending = el("input", { type: "checkbox" });
+  const chkSuperseded = el("input", { type: "checkbox" });
+  chkActive.checked = true; chkPending.checked = true; chkSuperseded.checked = true;
+  const renderDetail = (sel) => {
+    side.innerHTML = "";
+    if (!sel) {
+      side.appendChild(el("div", { class: "card" }, [
+        el("h3", {}, ["图例与操作"]),
+        el("div", { class: "graph-legend" }, [
+          el("span", {}, [el("i", { style: "background:var(--accent)" }), "成员节点（大小=边数）"]),
+          el("span", {}, [el("i", { style: "background:var(--pink)" }), "bot 节点"]),
+          el("span", {}, [el("i", { style: "background:var(--muted)" }), "active 边"]),
+          el("span", {}, [el("i", { style: "background:var(--muted);opacity:.4" }), "pending 边（虚线，bot 边待双证据）"]),
+          el("span", {}, [el("i", { style: "background:var(--muted);opacity:.25" }), "superseded 边（点线，墓碑不注入）"]),
+        ]),
+        el("p", { class: "muted", style: "font-size:12px" }, [
+          "拖拽节点调整布局，空白处拖拽平移，滚轮缩放；点击节点/边查看详情（点击空白取消）。",
+        ]),
+      ]));
+      return;
+    }
+    if (sel.type === "node") {
+      const n = d.nodes.find((x) => x.id === sel.id);
+      if (!n) return;
+      const conn = d.edges.filter((e) => e.subject === n.id || e.object === n.id);
+      side.appendChild(el("div", { class: "card" }, [
+        el("h3", {}, [`${n.is_bot ? "🤖 " : ""}${n.name}`]),
+        el("div", { class: "mono muted", style: "font-size:11px" }, [`${n.platform || "-"} · ${n.uid}`]),
+        el("p", {}, [`${n.degree} 条关系边`]),
+        conn.length
+          ? el("ul", { style: "margin:8px 0 0;padding-left:16px" }, conn.map((e) => {
+              const other = e.subject === n.id ? e.object_name : e.subject_name;
+              const arrow = e.subject === n.id ? "→" : "←";
+              return el("li", { style: "cursor:pointer;font-size:13px", onclick: () => fg.select("edge", String(e.id)) }, [
+                `${arrow} ${other}（${e.label}${e.status !== "active" ? " · " + e.status : ""}）`,
+              ]);
+            }))
+          : null,
+      ]));
+    } else {
+      const e = d.edges.find((x) => String(x.id) === String(sel.id));
+      if (!e) return;
+      // 状态修正（墓碑保护：置 superseded 后新证据不再自动激活）+ 物理删除
+      const statusSel = el("select");
+      for (const s of ["active", "pending", "superseded"]) {
+        statusSel.appendChild(el("option", Object.assign({ value: s }, s === e.status ? { selected: "" } : {}), [s]));
+      }
+      const saveBtn = el("button", {}, ["保存状态"]);
+      saveBtn.addEventListener("click", async () => {
+        try {
+          await api(`/memory/relations/edges/${e.id}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ status: statusSel.value }),
+          });
+          toast("边状态已修正"); reload();
+        } catch (err) { toast("修正失败：" + err.message, "err"); }
+      });
+      const delBtn = el("button", { class: "danger" }, ["删除边"]);
+      delBtn.addEventListener("click", () => confirmModal(
+        "删除关系边",
+        `确定物理删除边 #${e.id}（${e.subject_name || "?"}→${e.object_name || "?"} ${e.label}）吗？日常下线建议改状态为 superseded（保留可回溯）。`,
+        async () => {
+          try {
+            await api(`/memory/relations/edges/${e.id}`, { method: "DELETE" });
+            toast("关系边已删除"); reload();
+          } catch (err) { toast("删除失败：" + err.message, "err"); }
+        }
+      ));
+      side.appendChild(el("div", { class: "card" }, [
+        el("h3", {}, [`${e.subject_name || "?"} → ${e.object_name || "?"}`]),
+        el("p", {}, [badge(e.label, "pink"), " ", badge(e.status, edgeStatusColor[e.status] || "gray"), " ", badge(e.confidence, e.confidence === "high" ? "ok" : "gray")]),
+        el("div", { class: "pre" }, [e.statement]),
+        el("p", { class: "muted", style: "font-size:12px" }, [
+          `${e.evidence_count} 证据 · 最近 ${fmtTime(e.last_seen)} · 首次 ${fmtTime(e.occurred_at)}`,
+        ]),
+        e.supersede_reason
+          ? el("p", { class: "muted", style: "font-size:12px" }, [`降级原因：${e.supersede_reason}`])
+          : null,
+        el("div", { class: "mono muted", style: "font-size:11px" }, [`${e.subject} → ${e.object}`]),
+        el("div", { style: "display:flex;gap:8px;align-items:center;margin-top:10px" }, [
+          statusSel, saveBtn, delBtn,
+        ]),
+      ]));
+    }
+  };
+  const fg = new ForceGraph(graphHost, { onSelect: renderDetail });
+  fg.setData(d.nodes, d.edges);
+  renderDetail(null);
+  const applyFilter = () => fg.setFilter(chkActive.checked, chkPending.checked, chkSuperseded.checked);
+  chkActive.addEventListener("change", applyFilter);
+  chkPending.addEventListener("change", applyFilter);
+  chkSuperseded.addEventListener("change", applyFilter);
+  $view.appendChild(el("div", { class: "card" }, [
+    el("h3", {}, ["动态图谱"]),
+    el("div", { class: "graph-toolbar" }, [
+      el("label", { class: "graph-chk" }, [chkActive, "active 边"]),
+      el("label", { class: "graph-chk" }, [chkPending, "pending 边"]),
+      el("label", { class: "graph-chk" }, [chkSuperseded, "superseded 边"]),
+      el("button", { class: "ghost", onclick: () => fg.resetView() }, ["重置视图"]),
+      el("span", { class: "muted", style: "font-size:12px;margin-left:auto" }, [
+        d.stats.edges_shown < d.stats.edges
+          ? `${d.stats.nodes} 节点 · 仅展示 ${d.stats.edges_shown}/${d.stats.edges} 边`
+          : `${d.stats.nodes} 节点 · ${d.stats.edges} 边`,
+      ]),
+    ]),
+    el("div", { class: "graph-wrap" }, [graphHost, side]),
+  ]));
+
+  const listBox = el("div");
+  const q = el("input", { type: "text", placeholder: "label / 名字 / uid / 陈述关键词" });
+  const refreshTable = () => {
+    const kw = q.value.trim().toLowerCase();
+    const rows = d.edges
+      .filter((e) => !kw || [e.label, e.statement, e.subject_name, e.object_name, e.subject, e.object]
+        .some((v) => String(v || "").toLowerCase().includes(kw)))
+      .map((e) => el("tr", { style: "cursor:pointer", onclick: () => { fg.select("edge", String(e.id)); graphHost.scrollIntoView({ behavior: "smooth", block: "center" }); } }, [
+        el("td", {}, [badge(e.label, "pink")]),
+        el("td", {}, [`${e.subject_name || "?"} → ${e.object_name || "?"}`]),
+        el("td", {}, [badge(e.status, edgeStatusColor[e.status] || "gray")]),
+        el("td", {}, [`${e.evidence_count} 证据`]),
+        el("td", { class: "wrap" }, [e.statement]),
+        el("td", {}, [fmtTime(e.last_seen)]),
+      ]));
+    listBox.innerHTML = "";
+    listBox.appendChild(tableCard(
+      d.stats.edges_shown < d.stats.edges
+        ? `关系边（共 ${d.stats.edges} 条，按证据数排序，仅展示前 ${d.stats.edges_shown} 条）`
+        : `关系边（共 ${d.stats.edges} 条，按证据数排序）`,
+      ["label", "端点", "状态", "证据", "陈述", "最近证据"],
+      rows
+    ));
+  };
+  q.addEventListener("input", refreshTable);
+  $view.appendChild(el("div", { class: "card" }, [
+    el("h3", {}, ["关系边清单"]),
+    el("div", { class: "filter-row" }, [el("div", { class: "f" }, [el("label", {}, ["过滤"]), q])]),
+    listBox,
+  ]));
+  refreshTable();
+  pollBackfill();
+}
+
+// ---------------- 注入语料（摘要） ----------------
+function editSummaryModal(s, refresh) {
+  const mask = el("div", { class: "modal-mask" });
+  const ta = el("textarea", { style: "width:100%;min-height:180px" }, [s.content]);
+  const box = el("div", { class: "modal" }, [
+    el("h3", {}, [`修正摘要 #${s.id}`]),
+    el("p", { class: "muted" }, ["修改内容会把向量置空，由记忆插件的补算任务自动重算（约 5 分钟内生效）。"]),
+    ta,
+    el("div", { class: "acts" }, [
+      el("button", { class: "ghost", onclick: () => mask.remove() }, ["取消"]),
+      el("button", { onclick: async () => {
+        try {
+          await api(`/memory/summaries/${s.id}`, { method: "PUT", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ content: ta.value }) });
+          toast("摘要已修正，向量待重算"); mask.remove(); refresh();
+        } catch (e) { toast("修正失败：" + e.message, "err"); }
+      } }, ["保存修正"]),
+    ]),
+  ]);
+  mask.appendChild(box); mask.addEventListener("click", (e) => { if (e.target === mask) mask.remove(); });
+  document.body.appendChild(mask);
+}
+async function renderSummaries() {
+  $view.innerHTML = "";
+  let query = { page: 1 };
+  const listBox = el("div");
+  // ---- Manual encode kick: the merge loop stays the only runner; the
+  // button just resolves its inter-cycle wait early. Polling keeps the
+  // backlog count and cycle state fresh; the button enables only after a
+  // successful status probe (a not-yet-restarted backend keeps it off).
+  const encBtn = el("button", { disabled: "" }, ["立即执行补编码"]);
+  const encStatus = el("span", { class: "muted", style: "font-size:12px" });
+  let encTimer = null;
+  let encFails = 0;
+  const pollEncode = async () => {
+    if (encTimer) clearTimeout(encTimer);
+    let s;
+    try { s = await api("/memory/encode/backfill/status"); }
+    catch (e) {
+      if (++encFails >= 5) { encStatus.textContent = "补编码状态获取失败：" + e.message; return; }
+      encTimer = setTimeout(pollEncode, 5000);
+      return;
+    }
+    encFails = 0;
+    if (!encStatus.isConnected) return; // tab switched away, stop polling
+    if (!s.available) {
+      encBtn.disabled = true;
+      encStatus.textContent = "合并管线未启用（fast LLM 未配置），补编码不可用";
+      return;
+    }
+    const backlog = (s.backlog === null || s.backlog === undefined)
+      ? "未知" : (s.backlog_capped ? "1000+" : String(s.backlog));
+    if (s.cycle_running) {
+      encBtn.disabled = true;
+      encStatus.textContent = `补编码进行中：待补编码 ${backlog} 条（周期完成自动刷新）`;
+      encTimer = setTimeout(pollEncode, 3000);
+    } else {
+      encBtn.disabled = false;
+      const last = s.last_cycle
+        ? ` · 上轮周期 ${kvLocalTs(s.last_cycle.finished_at)} 完成，重编码 ${(s.last_cycle.stats && s.last_cycle.stats.reencoded) || 0} 条`
+        : "";
+      encStatus.textContent = `待补编码 ${backlog} 条` + last;
+    }
+  };
+  encBtn.addEventListener("click", async () => {
+    encBtn.disabled = true;
+    try {
+      await api("/memory/encode/backfill", { method: "POST" });
+      toast("已触发补编码：合并周期立即开始");
+    } catch (e) { toast("触发失败：" + e.message, "err"); }
+    pollEncode();
+  });
+  $view.appendChild(el("div", { class: "card", style: "display:flex;align-items:center;gap:12px;flex-wrap:wrap" }, [encBtn, encStatus]));
+  pollEncode();
+  const refresh = async () => {
+    listBox.innerHTML = '<div class="card"><div class="empty">加载中</div></div>';
+    try {
+      const p = new URLSearchParams(Object.assign({ size: 20 }, query));
+      const d = await api("/memory/summaries?" + p.toString());
+      const rows = d.items.map((s) => el("tr", {}, [
+        el("td", { class: "mono" }, [String(s.id)]),
+        el("td", { class: "mono" }, [s.session_id]),
+        el("td", {}, [badge(s.kind, s.kind === "bot_self" ? "pink" : "sky")]),
+        el("td", { class: "wrap" }, [s.content]),
+        el("td", {}, [fmtTime(s.occurred_at)]),
+        el("td", {}, [s.unsummarized ? badge("待补编码", "warn") : (s.has_embedding ? badge("已向量化", "ok") : badge("待补算", "warn"))]),
+        el("td", {}, [
+          el("button", { class: "ghost", onclick: () => editSummaryModal(s, refresh) }, ["修正"]), " ",
+          el("button", { class: "danger", onclick: () => confirmModal("删除摘要",
+            "删除后该轮内容不再参与 recall，确定吗？", async () => {
+              try { await api(`/memory/summaries/${s.id}`, { method: "DELETE" }); toast("摘要已删除"); refresh(); }
+              catch (e) { toast("删除失败：" + e.message, "err"); }
+            }) }, ["删除"]),
+        ]),
+      ]));
+      listBox.innerHTML = "";
+      listBox.appendChild(tableCard(`对话摘要 = recall 注入语料（共 ${d.total} 条）`,
+        ["ID", "会话", "类型", "内容", "发生时间", "向量", "操作"], rows,
+        pager(d.total, d.page, d.size, (p2) => { query.page = p2; refresh(); })));
+    } catch (e) {
+      listBox.innerHTML = "";
+      listBox.appendChild(errorCard(e, refresh));
+    }
+  };
+  $view.appendChild(filterBar([
+    ["session_id", "会话 ID", ""], ["user_id", "触发用户", "裸 uid"],
+    ["kind", "类型", "", [["", "全部"], ["chat_summary", "chat_summary"], ["bot_self", "bot_self"]]],
+    ["q", "内容包含", "摘要关键词"],
+  ], (vals) => { query = Object.assign({}, vals, { page: 1 }); refresh(); }));
+  $view.appendChild(listBox);
+  await refresh();
+}
+
+// ---------------- Kira 记忆数据迁入（源只读 + 幂等键去重） ----------------
+async function appendKiraMemoryImportCard() {
+  const pathInput = el("input", { type: "text", class: "mono", style: "flex:1; min-width:220px" });
+  const scanBtn = el("button", { class: "ghost" }, ["扫描"]);
+  const infoBox = el("div", { class: "desc", style: "font-size:12px; line-height:1.9; margin:10px 0" });
+  const runBtn = el("button", {}, ["开始迁入"]);
+  runBtn.disabled = true;
+
+  // el() 的 children 必须是数组：加粗分支也要包一层 []
+  const line = (text, strong) =>
+    el("div", {}, strong ? [el("b", {}, [text])] : [text]);
+  const renderInfo = (d) => {
+    const p = d.preview || {};
+    infoBox.replaceChildren(
+      line(`源目录：${d.source_path}${p.exists ? "" : "（不存在）"}`, true),
+      line(p.exists
+        ? `可迁入：${p.sessions} 个会话 / ${p.chunks} 个对话批次（${p.messages} 条消息）、${p.toml_files} 条事实·洞察（TOML）、${p.profiles} 份画像别名${p.archive_files ? `；另有 ${p.archive_files} 个已归档文件（按 KiraAI 语义不迁入）` : ""}`
+        : "目录不存在或不可访问，请检查路径。"),
+      line("迁入方式：会话批次以「待提炼原文」入库，由后台合并管线逐步 LLM 提炼为摘要/事实/关系边（耗时取决于 LLM 预算，属正常现象）。", false),
+      line("安全边界：KiraAI 原始数据只读不改不删；全部写入走幂等键，重复执行自动去重、不产生重复记忆。", false),
+    );
+    if (d.last_run) {
+      const r = d.last_run;
+      infoBox.appendChild(line(
+        `上次迁入：${fmtTime(r.finished_at)} @ ${r.source_path} — 实插摘要 ${r.summary_rows} / 事实 ${r.fact_rows} / 别名 ${r.aliases_upserted}`,
+        true,
+      ));
+    }
+  };
+
+  async function refresh(pathOverride) {
+    runBtn.disabled = true;
+    scanBtn.disabled = true;
+    infoBox.replaceChildren(line("扫描中…"));
+    try {
+      const q = pathOverride ? "?source_path=" + encodeURIComponent(pathOverride) : "";
+      const d = await api("/memory/kira_memory/import" + q);
+      if (!pathInput.value) pathInput.value = d.source_path || d.default_path || "";
+      renderInfo(d);
+      runBtn.disabled = !(d.preview && d.preview.exists);
+    } catch (e) {
+      infoBox.replaceChildren(line(`扫描失败：${e.message}`));
+    } finally {
+      scanBtn.disabled = false;
+    }
+  }
+
+  scanBtn.addEventListener("click", () => refresh(pathInput.value.trim()));
+  runBtn.addEventListener("click", () => {
+    const p = pathInput.value.trim();
+    confirmModal("确认迁入 KiraAI 数据",
+      `将从 ${p} 只读迁入记忆数据到本插件。KiraAI 原始数据不会被修改或删除；重复执行按幂等键自动去重。导入的会话批次将由后台管线逐步提炼生效。确认执行？`,
+      async () => {
+        runBtn.disabled = true;
+        try {
+          const r = await api("/memory/kira_memory/import", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ source_path: p }),
+          });
+          const s = r.stats || {};
+          toast(`迁入完成：摘要 ${s.summary_rows || 0} 条、事实 ${s.fact_rows || 0} 条、别名 ${s.aliases_upserted || 0} 条（跳过重复：摘要 ${s.summary_skipped || 0}、事实 ${s.facts_skipped || 0}）`);
+        } catch (e) {
+          toast(`迁入失败：${e.message}`, "danger");
+        }
+        pathInput.value = "";
+        await refresh();
+      });
+  });
+
+  $view.appendChild(el("div", { class: "card" }, [
+    el("h3", {}, ["Kira 记忆数据迁入"]),
+    el("p", { class: "desc", style: "font-size:12px" }, [
+      "把 KiraAI 的会话历史（chat_memory.json）、事实/洞察（TOML）与画像别名一次性迁入本插件；源数据只读，写入幂等可重复执行。",
+    ]),
+    el("div", { style: "display:flex; gap:8px; align-items:center; flex-wrap:wrap" }, [pathInput, scanBtn]),
+    infoBox,
+    runBtn,
+  ]));
+  await refresh();
+}
+
+// ---------------- 设置（插件配置） ----------------
+async function renderSettings() {
+  $view.innerHTML = "";
+  const d = await api("/memory/config");
+  const schema = d.schema;
+  const controls = {}; // field -> input 节点
+  // Initial (masked) values per field — the "did the user touch it" baseline
+  // for sensitive-field omission in collect().
+  const initialValues = {};
+
+  const buildControl = (name) => {
+    const f = schema[name], v = d.values[name];
+    if (f.type === "bool") {
+      const c = el("input", { type: "checkbox" });
+      c.checked = !!v;
+      return c;
+    }
+    if (f.type === "int" || f.type === "float") {
+      const attrs = { type: "number", step: f.type === "float" ? "any" : "1" };
+      // Backend-derived bounds keep the input itself from offering invalid
+      // values (e.g. score_cap=0 would pin scores and stall promotion).
+      if (f.min !== undefined && f.min !== null) attrs.min = String(f.min);
+      if (f.max !== undefined && f.max !== null) attrs.max = String(f.max);
+      const c = el("input", attrs);
+      if (v !== null && v !== undefined) c.value = String(v);
+      return c;
+    }
+    if (f.type === "list") {
+      const c = el("textarea", { placeholder: "每行一项" });
+      c.value = (v || []).join("\n");
+      return c;
+    }
+    return el("input", { type: f.sensitive ? "password" : "text", value: v === null || v === undefined ? "" : String(v) });
+  };
+
+  const fieldRow = (name) => {
+    const f = schema[name];
+    const ctl = buildControl(name);
+    controls[name] = ctl;
+    initialValues[name] = ctl.value;
+    const row = el("div", { class: "cfg-field" + (f.type === "list" || f.type === "str" ? " wide" : "") }, [
+      el("label", {}, [
+        el("span", { class: "mono" }, [name]),
+        f.restart ? el("span", { class: "re-badge", title: "组件装配期取值：保存已写入配置，需重初始化/重启进程才改变行为" }, ["重启生效"]) : null,
+      ]),
+      ctl,
+      el("div", { class: "desc", title: f.description }, [f.description]),
+    ]);
+    return row;
+  };
+
+  $view.appendChild(el("div", { class: "card" }, [
+    el("h3", {}, ["插件配置"]),
+    el("p", { class: "desc", style: "font-size:12px" }, [
+      "保存写入宿主插件配置存储并即时生效（kernel/合并 agent/编码器等运行时读取）；标「重启生效」的字段需重初始化插件或重启进程。",
+    ]),
+    el("p", { class: "desc", style: "font-size:12px" }, [
+      "enabled 总开关、enabled_tools、allowed_users/allowed_sessions 请在宿主控制台「插件管理」页配置。",
+    ]),
+  ]));
+  await appendKiraMemoryImportCard();
+  for (const g of d.groups) {
+    $view.appendChild(el("div", { class: "card" }, [
+      el("h3", {}, [g.label]),
+      el("div", { class: "cfg-grid" }, g.fields.map(fieldRow)),
+    ]));
+  }
+
+  const saveBtn = el("button", {}, ["保存配置"]);
+  const resetBtn = el("button", { class: "ghost" }, ["表单还原默认值"]);
+  $view.appendChild(el("div", { class: "settings-actions" }, [saveBtn, resetBtn]));
+
+  const collect = () => {
+    const out = {};
+    for (const [name, ctl] of Object.entries(controls)) {
+      const t2 = schema[name].type;
+      if (t2 === "bool") out[name] = ctl.checked;
+      else if (t2 === "int" || t2 === "float") {
+        // Empty/non-numeric input = "leave unchanged" (omit the key), NOT a
+        // silent 0 — score_cap=0 would stall promotion, embedding_dims=0
+        // would kill the plugin on restart.
+        const raw = ctl.value.trim();
+        if (raw === "") continue;
+        const n = t2 === "int" ? parseInt(raw, 10) : parseFloat(raw);
+        if (isNaN(n)) continue;
+        out[name] = n;
+      }
+      else if (t2 === "list") out[name] = ctl.value.split("\n").map((s) => s.trim()).filter(Boolean);
+      else if (schema[name].sensitive && ctl.value === initialValues[name]) {
+        // Untouched secret (still showing the mask) is not sent back — the
+        // backend then keeps the stored value; this also avoids the mask
+        // sentinel ever overwriting a secret that legitimately equals it.
+        continue;
+      }
+      else out[name] = ctl.value;
+    }
+    return out;
+  };
+
+
+  saveBtn.addEventListener("click", async () => {
+    saveBtn.disabled = true;
+    try {
+      const r = await api("/memory/config", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ values: collect() }),
+      });
+      if (!r.saved) { toast("配置没有变化"); return; }
+      toast(`已保存 ${r.changes} 项配置`);
+      if (r.persistence_error) {
+        // Hot-applied but not persisted: the change dies with the host
+        // process. Surface it instead of a silent "saved" that rolls back
+        // after the next restart.
+        toast(`已热生效但落盘失败，重启后将回退：${r.persistence_error}`, "err");
+      }
+      if (r.restart_required && r.restart_required.length) {
+        confirmModalSaveRestart(r.restart_required);
+      }
+    } catch (e) {
+      toast("保存失败：" + e.message, "err");
+    } finally {
+      saveBtn.disabled = false;
+    }
+  });
+
+  resetBtn.addEventListener("click", () => {
+    confirmModal("还原默认值", "把表单恢复为出厂默认值？（不保存，还原后仍需点「保存配置」才会写入）", () => {
+      for (const [name, ctl] of Object.entries(controls)) {
+        const f = schema[name], dv = f.default;
+        if (f.type === "bool") ctl.checked = !!dv;
+        else if (f.type === "list") ctl.value = (dv || []).join("\n");
+        else ctl.value = dv === null || dv === undefined ? "" : String(dv);
+      }
+    });
+  });
+}
+
+function confirmModalSaveRestart(restartFields) {
+  const mask = el("div", { class: "modal-mask" });
+  const box = el("div", { class: "modal" }, [
+    el("h3", {}, ["部分配置需重初始化/重启生效"]),
+    el("p", {}, ["以下字段在组件装配期取值，已写入配置，需重初始化插件或重启进程才改变行为："]),
+    el("div", { class: "pre" }, [restartFields.join("\n")]),
+    el("div", { class: "acts" }, [
+      el("button", { onclick: () => mask.remove() }, ["知道了"]),
+    ]),
+  ]);
+  mask.appendChild(box); mask.addEventListener("click", (e) => { if (e.target === mask) mask.remove(); });
+  document.body.appendChild(mask);
+}
+
+renderTabs();
+renderView();
+</script>
+</body>
+</html>

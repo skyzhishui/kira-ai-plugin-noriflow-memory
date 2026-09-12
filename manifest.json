@@ -1,0 +1,21 @@
+{
+  "display_name": "NoriFlow 长期记忆",
+  "plugin_id": "kira-ai-plugin-noriflow-memory",
+  "version": "1.16.1",
+  "core_version": ">=2.31.0",
+  "author": "skyzhishui",
+  "license": "AGPL-3.0",
+  "description": "NoriFlow 长期记忆框架：对话自动落盘长期记忆，通过向量检索+重排序完成记忆召回并注入上下文；基于事实簇表确定性拼装用户画像；内置LLM主动记忆工具，附带WebUI可视化记忆维护界面。存储后端二选一：PostgreSQL+pgvector 或 SQLite（零外部服务）。",
+  "tags": [
+    "memory",
+    "knowledge"
+  ],
+  "repo": "https://github.com/skyzhishui/kira-ai-plugin-noriflow-memory",
+  "icon": "icon.svg",
+  "locales": {
+    "en": {
+      "display_name": "NoriFlow Long-term Memory",
+      "description": "NoriFlow long-term memory framework: conversations are automatically persisted to long-term memory; recall combines vector retrieval with rerank and injects the results into context; user personas are deterministically assembled from the fact-cluster table; includes built-in LLM active memory tools and a WebUI visual memory maintenance page."
+    }
+  }
+}

@@ -1,0 +1,5 @@
+# kira-ai-plugin-noriflow-memory 插件独立依赖（KiraAI 核心已含的依赖不在此列出）
+asyncpg>=0.30
+json_repair>=0.30.0
+aiosqlite>=0.19
+tomli>=2.0; python_version < "3.11"

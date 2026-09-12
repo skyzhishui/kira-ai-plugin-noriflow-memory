@@ -1,0 +1,482 @@
+{
+  "enabled": {
+    "type": "switch",
+    "name": "启用插件",
+    "default": true,
+    "hint": "总开关。关闭后本插件不装配（内置简单记忆插件不会被自动禁用）。"
+  },
+  "dsn": {
+    "type": "sensitive",
+    "name": "PostgreSQL 连接串",
+    "default": "",
+    "hint": "postgres://user:password@host:5432/dbname。数据库需启用 pgvector 扩展。留空则记忆功能整体关闭。示例请勿直接照抄：填你自己的实例地址。"
+  },
+  "storage_backend": {
+    "type": "string",
+    "name": "Storage Backend",
+    "default": "auto",
+    "options": ["auto", "postgres", "sqlite"],
+    "hint": "auto = use postgres when dsn is set, otherwise sqlite. Startup-time only; switching backends means switching databases (use the migration tool). pool/pool_min/pool_max/db_command_timeout are ignored under sqlite.",
+    "locales": {
+      "zh": {
+        "name": "存储后端",
+        "hint": "auto=配置了 dsn 用 postgres，否则 sqlite。启动期只读，运行中不可切换（切后端=换库，须走迁移工具）；sqlite 下连接池参数忽略。"
+      }
+    }
+  },
+  "sqlite_path": {
+    "type": "string",
+    "name": "SQLite Path",
+    "default": "",
+    "hint": "SQLite database file path (effective when storage_backend=sqlite). Empty = <plugin data dir>/memory.sqlite3.",
+    "locales": {
+      "zh": {
+        "name": "SQLite 库文件路径",
+        "hint": "storage_backend=sqlite 时生效；留空 = 插件数据目录/memory.sqlite3。"
+      }
+    }
+  },
+  "enabled_tools": {
+    "type": "multi_select",
+    "name": "Enabled Tools",
+    "default": [
+      "memory_search",
+      "memory_write",
+      "memory_remove"
+    ],
+    "options": [
+      "memory_search",
+      "memory_write",
+      "memory_remove"
+    ],
+    "hint": "Select which memory tools to expose to the AI. Deselect to disable.",
+    "locales": {
+      "zh": {
+        "name": "启用的工具",
+        "hint": "选择要提供给 AI 的记忆工具；取消选择即可禁用对应工具"
+      }
+    }
+  },
+  "allowed_users": {
+    "type": "list",
+    "name": "Allowed Tool Users",
+    "default": [],
+    "hint": "User whitelist for the proactive memory tools, enforced in code at each tool entry and keyed on the triggering user id. Entries match a bare user id or `<platform>:<user_id>` (e.g. napcat:10086). A caller passes when matched here OR in allowed_sessions; both empty rejects every caller.",
+    "locales": {
+      "zh": {
+        "name": "工具白名单用户",
+        "hint": "允许调用主动记忆工具（memory_search/write/remove）的用户 ID 白名单，代码级拦截（按触发用户 ID 匹配）。条目支持纯 user_id 或 <平台>:<user_id>（如 napcat:10086）。与 allowed_sessions 任一命中即放行；两者均留空 = 全部拒绝（fail-closed）。"
+      }
+    }
+  },
+  "allowed_sessions": {
+    "type": "list",
+    "name": "Allowed Tool Sessions",
+    "default": [],
+    "hint": "Session whitelist for the proactive memory tools, keyed on the triggering session (any member of a listed session may call). Entries match a bare session id, `<platform>:<session_id>` (covers both dm and gm of that peer) or the full sid `<platform>:<type>:<session_id>` (e.g. napcat:gm:10086). A caller passes when matched here OR in allowed_users; both empty rejects every caller.",
+    "locales": {
+      "zh": {
+        "name": "工具白名单会话",
+        "hint": "允许调用主动记忆工具（memory_search/write/remove）的会话白名单（命中会话内任何成员都可调用），按触发会话匹配。条目支持纯 session_id（群号/用户号）、<平台>:<session_id>（同时覆盖该对端 dm 与 gm）或完整 sid <平台>:<类型>:<session_id>（如 napcat:gm:10086）。与 allowed_users 任一命中即放行；两者均留空 = 全部拒绝（fail-closed）。"
+      }
+    }
+  },
+  "pool_min": {
+    "type": "integer",
+    "name": "连接池最小连接数",
+    "default": 2
+  },
+  "pool_max": {
+    "type": "integer",
+    "name": "连接池最大连接数",
+    "default": 8
+  },
+  "db_command_timeout": {
+    "type": "integer",
+    "name": "DB 语句超时（秒）",
+    "default": 60,
+    "hint": "每条 SQL 的执行超时（0 = 不启用）。防单条挂起查询永久占用池槽位，累积后饿死整个记忆子系统（recall/合并/维护页共用同一池）。"
+  },
+  "embedding_dims": {
+    "type": "integer",
+    "name": "向量维度",
+    "default": 1024,
+    "hint": "必须与库表向量列一致——迁移 DDL 固定为 1024，除非手工改表（ALTER ... TYPE vector(768)）否则保持默认。不一致时插件拒绝启动（写入会反复失败）。"
+  },
+  "embedding_model": {
+    "type": "string",
+    "name": "Embedding 模型覆盖",
+    "default": "",
+    "hint": "格式 provider_id:model_id（与 KiraAI WebUI 模型标识一致）。留空使用 default_embedding；解析失败自动回退 default_embedding 并告警。"
+  },
+  "encode_input_max_chars": {
+    "type": "integer",
+    "name": "编码输入字符上限",
+    "default": 30000,
+    "hint": "超长对话文本送编码 LLM 前截断保底（0 = 不截断）：防用户粘贴超长文本导致编码必败、降级原文入库后补编码遍反复失败的毒丸行阻塞。"
+  },
+  "backfill_interval_seconds": {
+    "type": "float",
+    "name": "向量补算周期（秒）",
+    "default": 300.0
+  },
+  "backfill_batch_size": {
+    "type": "integer",
+    "name": "向量补算单批行数",
+    "default": 64
+  },
+  "merge_interval_hours": {
+    "type": "float",
+    "name": "合并 agent 周期（小时）",
+    "default": 6.0,
+    "hint": "四遍扫描（归一化/LLM 裁定/衰减+晋档/补编码）的执行周期；DB 熔断拒绝期整周期跳过。"
+  },
+  "merge_batch_size": {
+    "type": "integer",
+    "name": "归一化遍单批事实数",
+    "default": 200
+  },
+  "candidate_top_k": {
+    "type": "integer",
+    "name": "候选簇向量检索 top-K",
+    "default": 20
+  },
+  "llm_budget_per_cycle": {
+    "type": "integer",
+    "name": "每周期 LLM 裁定预算",
+    "default": 200,
+    "hint": "超出预算的待裁定事实顺延下周期。"
+  },
+  "recall_top_k": {
+    "type": "integer",
+    "name": "召回条数上限",
+    "default": 5
+  },
+  "recall_relevance_threshold": {
+    "type": "float",
+    "name": "召回相关度阈值",
+    "default": 0.0,
+    "hint": "低于此值过滤（0=不过滤）。"
+  },
+  "recall_max_tokens": {
+    "type": "integer",
+    "name": "注入 token 预算",
+    "default": 2048,
+    "hint": "注入文本按字符数保守估算截断。"
+  },
+  "recall_time_decay_enabled": {
+    "type": "switch",
+    "name": "召回时间衰减",
+    "default": false,
+    "hint": "开启后召回排序叠加时间衰减：score × 2^(-年龄/半衰期) 再重排，越新越靠前。只改排序不过滤。"
+  },
+  "recall_time_decay_half_life_days": {
+    "type": "float",
+    "name": "衰减半衰期（天）",
+    "default": 90.0,
+    "hint": "距今天数达到该值的记忆排序分减半；数值越小越偏好近期记忆。"
+  },
+  "summary_recall_session_scoped": {
+    "type": "switch",
+    "name": "摘要记忆会话隔离",
+    "default": true,
+    "hint": "开启后 recall 仅检索本会话的摘要记忆；默认开启（会话隔离）。关闭则跨会话召回。画像不在此开关范围内（画像按用户跨会话聚合）。"
+  },
+  "max_persona_profiles": {
+    "type": "integer",
+    "name": "群聊画像人数上限",
+    "default": 3,
+    "hint": "群聊单轮注入画像的参与者人数上限。"
+  },
+  "topic_blacklist": {
+    "type": "list",
+    "name": "话题黑名单",
+    "default": [],
+    "hint": "包含这些关键词的记忆在召回候选层结构性排除，不占召回名额；画像条目仍按注入前过滤。"
+  },
+  "score_start_high": {
+    "type": "integer",
+    "name": "high 置信事实起步分",
+    "default": 3,
+    "hint": "high 置信度提取的事实进入簇时的初始分数。"
+  },
+  "score_start_medium": {
+    "type": "integer",
+    "name": "medium 置信事实起步分",
+    "default": 2,
+    "hint": "medium 置信度事实的初始分数。"
+  },
+  "score_cap": {
+    "type": "float",
+    "name": "分数封顶",
+    "default": 10.0,
+    "hint": "簇分数上限（达到 promote_threshold 即入画像，封顶防无限增长）。"
+  },
+  "promote_threshold": {
+    "type": "float",
+    "name": "进入画像阈值",
+    "default": 10.0,
+    "hint": "簇分数达到该值进入用户画像。"
+  },
+  "demote_threshold": {
+    "type": "float",
+    "name": "画像降级阈值",
+    "default": 3.0,
+    "hint": "迟滞下界：衰减低于该值才跌出画像。"
+  },
+  "decay_factor": {
+    "type": "float",
+    "name": "每周期衰减系数",
+    "default": 0.8,
+    "hint": "每个衰减周期簇分数乘以该系数（0-1，越小衰减越快）。"
+  },
+  "decay_interval_days": {
+    "type": "integer",
+    "name": "衰减周期（天）",
+    "default": 14,
+    "hint": "分数衰减的执行周期，兼缺席冻结的窗口粒度（缺席用户的簇整组冻结）；pending 死亡窗口由「待定事实死亡窗口」独立控制。"
+  },
+  "recent_expire_days": {
+    "type": "integer",
+    "name": "近期维度过期天数",
+    "default": 30,
+    "hint": "recent 动态条目的过期天数。"
+  },
+  "recent_promote_threshold": {
+    "type": "float",
+    "name": "近期进画像阈值",
+    "default": 4.0,
+    "hint": "recent 动态分数达到该值进入画像。"
+  },
+  "decay_requires_activity": {
+    "type": "switch",
+    "name": "缺席冻结",
+    "default": true,
+    "hint": "开启后衰减/降级仅作用于本周期出现过活跃的用户（缺席画像冻结不衰减）。"
+  },
+  "sticky_evidence_count": {
+    "type": "integer",
+    "name": "证据地板阈值",
+    "default": 4,
+    "hint": "证据数达此值的簇衰减不低于画像降级阈值（0=禁用；被裁定更正/演变的簇豁免地板）。"
+  },
+  "pending_dead_days": {
+    "type": "integer",
+    "name": "待定事实死亡窗口（天）",
+    "default": 90,
+    "hint": "降级/过期后无新证据超此天数才判 dead，与衰减周期解耦；期内可被再确认复活。"
+  },
+  "anchor_profile_size": {
+    "type": "integer",
+    "name": "画像锚定条数",
+    "default": 5,
+    "hint": "每维度按注入排序前 N 条豁免衰减与降级，被新确认事实顶替掉出前 N 名才恢复自然衰减（0=禁用；应与注入每栏条数一致）。"
+  },
+  "rerank_enabled": {
+    "type": "switch",
+    "name": "启用重排序",
+    "default": true,
+    "hint": "需要 KiraAI 模型配置 default_rerank；未配置时自动退化为纯向量序。"
+  },
+  "rerank_candidates": {
+    "type": "integer",
+    "name": "重排序候选数",
+    "default": 50
+  },
+  "failure_threshold": {
+    "type": "integer",
+    "name": "DB 熔断阈值",
+    "default": 5,
+    "hint": "连续失败次数达到阈值后熔断（期间读写跳过，不阻断对话）。"
+  },
+  "recovery_seconds": {
+    "type": "float",
+    "name": "熔断恢复时间（秒）",
+    "default": 60.0
+  },
+  "tool_scope_locked": {
+    "type": "switch",
+    "name": "工具作用域锁定",
+    "default": true,
+    "hint": "开启时 memory_search/write/remove 忽略 AI 显式传入的 session_id/user_id，钉死为触发会话/触发者（memory_remove 只能删触发作用域内的行）——防白名单命中后借参数横向读写他人记忆。关闭恢复显式参数语义（群聊白名单 = 全群成员可跨用户操作，慎开）。"
+  },
+  "recall_expansion_enabled": {
+    "type": "switch",
+    "name": "召回扩选",
+    "default": true,
+    "hint": "把会话最近 N 批摘要的参与者并入用户过滤：『问及未在场成员』可命中其参与过的同会话摘要；扩展命中恒钉死当前会话（防跨会话泄漏，与跨会话开关无关）。"
+  },
+  "recall_expansion_recent_batches": {
+    "type": "integer",
+    "name": "扩选取样批次数",
+    "default": 20,
+    "hint": "扩选参与者取样的最近摘要批次数（按时间倒序取 participants）。"
+  },
+  "recall_exclude_history_window": {
+    "type": "switch",
+    "name": "近时排除",
+    "default": true,
+    "hint": "最近 K 批摘要（K = 宿主可见窗口块数 max_memory_length）不参与召回：这些内容已在宿主 history 窗口内可见，不再占用召回名额。"
+  },
+  "recall_hint_enabled": {
+    "type": "switch",
+    "name": "实体命中匹配",
+    "default": true,
+    "hint": "窗口词典 + 持久别名层的名字匹配总开关：命中喂画像候选（含私聊提及他人）与 P3 关系注入节点匹配。v1.7.1 起不再驱动召回候选拉取（旁路已移除——引用原文并入 recall query 走主路，会话隔离由『仅本会话召回』开关统一管）。"
+  },
+  "alias_enabled": {
+    "type": "switch",
+    "name": "持久实体别名层",
+    "default": true,
+    "hint": "memory_entity_alias 表（变体拆分后的历史名字流，每回合批次自动积累）作为窗口词典之后的持久命中来源——提起久未发言/历史改名成员可命中其 uid，喂给召回实体路与画像候选；重名歧义时跳过（确定性优先）。"
+  },
+  "alias_variant_cap": {
+    "type": "integer",
+    "name": "别名变体上限",
+    "default": 8,
+    "hint": "每用户保留的名字变体上限（按最近时间倒序截断，抑制状态播报式名片的变体风暴）。"
+  },
+  "alias_stopwords": {
+    "type": "list",
+    "name": "别名停用词",
+    "default": [],
+    "hint": "与常用词撞车的名字（如有人昵称叫『谢谢』），命中也不注入。"
+  },
+  "relation_extract_enabled": {
+    "type": "switch",
+    "name": "关系提取（P2）",
+    "default": false,
+    "hint": "编码时附加关系提取扩展节：从用户发言提取『A 的姐姐是 B』式结构化三元组，零 LLM 合并落边表（bot 可作端点；人-人边单次声明即生效，bot 边需两次独立证据）。开启后先进入只写不查审计期（注入由『边注入』开关另行控制）。"
+  },
+  "relation_bot_edge_min_evidence": {
+    "type": "integer",
+    "name": "bot 边激活门槛",
+    "default": 2,
+    "hint": "bot 端点关系边的激活证据数（按会话+日期去重计数）；达到才从 pending 转 active，防玩笑/幻想自我强化。"
+  },
+  "relation_inject_enabled": {
+    "type": "switch",
+    "name": "关系边注入（P3）",
+    "default": false,
+    "hint": "提起某人并出现其关系词（如『小张的姐姐』）时，在记忆注入尾部追加『相关人物关系』小节：关系陈述行为主体 + 对端画像（仅未提及的成员）。bot 边需本轮 @bot 或引用 bot 消息才可命中。"
+  },
+  "relation_inject_max_neighbors": {
+    "type": "integer",
+    "name": "每节点邻居上限",
+    "default": 2,
+    "hint": "场景 A 每个命中节点最多注入的关系边数（按证据数/最近时间倒序）。"
+  },
+  "relation_inject_max_profiles": {
+    "type": "integer",
+    "name": "对端画像上限",
+    "default": 2,
+    "hint": "关系边对端画像人数上限（独立于主画像预算；0 = 只注入关系陈述行）。"
+  },
+  "relation_inject_max_lines": {
+    "type": "integer",
+    "name": "陈述行总上限",
+    "default": 3,
+    "hint": "每轮注入的关系陈述行总上限。"
+  },
+  "relation_label_stopwords": {
+    "type": "list",
+    "name": "关系词停用表",
+    "default": [
+      "朋友",
+      "认识",
+      "熟人",
+      "网友"
+    ],
+    "hint": "写侧拦截（命中 label 的边不落库、已有边不再刷新）+ 读侧不触发边注入双生效；按场景人工维护。"
+  },
+  "relation_audit_enabled": {
+    "type": "switch",
+    "name": "关系边语义审计",
+    "default": false,
+    "hint": "挂合并 agent 周期：LLM 按 id 水位增量审计 active/pending 边，判定为互动描述/称呼复合词/陈述与端点错位/方向矛盾的边直接置 superseded（墓碑不删，可人工恢复）。"
+  },
+  "relation_audit_batch_size": {
+    "type": "integer",
+    "name": "语义审计批大小",
+    "default": 20,
+    "hint": "语义审计遍单批送审边数（每批一次 LLM 调用；每周期调用次数另有独立上限）。"
+  },
+  "dedup_similarity_threshold": {
+    "type": "float",
+    "name": "近重复去重阈值",
+    "default": 0.85,
+    "hint": "召回最终序中与已保留条目 embedding cosine ≥ 此值的丢弃（0 = 关闭）；抑制相邻轮次摘要近重复占满条数上限。"
+  },
+  "write_dedup_enabled": {
+    "type": "switch",
+    "name": "写入侧近重去重",
+    "default": true,
+    "hint": "retain 编码摘要落库前与同会话最近 write_dedup_window 批摘要比对，cosine ≥ write_dedup_threshold 的跳过写入；抑制历史上下文泄漏导致的同事件重复摘要，facts/relations 通道不受影响。"
+  },
+  "write_dedup_window": {
+    "type": "int",
+    "name": "写入去重窗口",
+    "default": 8,
+    "hint": "写入侧近重去重的比对窗口（同会话最近批次数）。"
+  },
+  "write_dedup_threshold": {
+    "type": "float",
+    "name": "写入去重阈值",
+    "default": 0.85,
+    "hint": "与窗口内摘要 cosine ≥ 此值跳过写入（0 = 关闭）。"
+  },
+  "recall_time_label_enabled": {
+    "type": "switch",
+    "name": "相对时间标注",
+    "default": true,
+    "hint": "注入记忆尾部追加相对时间（今天/昨天/N天前/约N周前/约N个月前，按本地时区换算），让模型可区分久远记忆与近况。"
+  },
+  "timezone": {
+    "type": "string",
+    "name": "本地时区",
+    "default": "",
+    "hint": "IANA 时区名（如 Asia/Shanghai）。留空优先取宿主 locale.TZ，再回退服务器本地时区；相对时间标注按此时区换算。"
+  },
+  "recall_log_enabled": {
+    "type": "switch",
+    "name": "召回评估日志",
+    "default": false,
+    "hint": "开启后每次检索与注入各落一条 JSONL（默认插件数据目录 memory_recall_log.jsonl；写入失败不影响召回）。"
+  },
+  "recall_log_path": {
+    "type": "string",
+    "name": "召回日志路径",
+    "default": "",
+    "hint": "留空 = 插件数据目录/memory_recall_log.jsonl。"
+  },
+  "hybrid_search_enabled": {
+    "type": "switch",
+    "name": "混合检索（向量+BM25）",
+    "default": true,
+    "hint": "两路候选 RRF 融合：稀有条目（人名/游戏名/黑话）经 BM25 路进入候选池。关闭 = 纯向量。存量行分词由后台任务自动回填。"
+  },
+  "hybrid_rrf_k": {
+    "type": "integer",
+    "name": "RRF 融合常数 k",
+    "default": 60,
+    "hint": "越大两路排名越平权。"
+  },
+  "recent_rollout_enabled": {
+    "type": "switch",
+    "name": "滚动补回",
+    "default": true,
+    "hint": "注入最近 N 批滚动出宿主可见窗口的同会话摘要（跳过窗口内 K 批）；召回同轮排除这些行防重复注入。"
+  },
+  "recent_rollout_batches": {
+    "type": "integer",
+    "name": "滚动补回批次数",
+    "default": 3,
+    "hint": "滚动补回取的最近批次数。"
+  },
+  "recent_rollout_max_chars": {
+    "type": "integer",
+    "name": "滚动补回字符预算",
+    "default": 1500,
+    "hint": "补回块字符预算：超限按批丢弃更旧批次，单批超限截断。"
+  }
+}
