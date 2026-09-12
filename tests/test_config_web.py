@@ -15,7 +15,10 @@ import importlib.util
 import json
 import sys
 import tempfile
-import tomllib  # noqa: F401  # 与上游 nori 版测试对齐的占位（本侧用 json 存储）
+try:
+    import tomllib  # noqa: F401  # placeholder kept for parity with the upstream nori tests (this side stores config as json)
+except ModuleNotFoundError:  # Python 3.10 has no stdlib tomllib; tomli ships via requirements.txt
+    import tomli as tomllib  # noqa: F401
 import unittest
 from pathlib import Path
 
