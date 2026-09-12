@@ -35,8 +35,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           # tomli is pulled in automatically on Python 3.10 via the
-          # python_version marker in requirements.txt
-          pip install -r requirements.txt
+          # python_version marker in requirements.txt; requirements-dev.txt
+          # adds the host-provided deps the suites need (pydantic)
+          pip install -r requirements.txt -r requirements-dev.txt
 
       # Suites are self-contained direct-run scripts (python tests/test_x.py),
       # not pytest collections; each exits non-zero on the first failed check.

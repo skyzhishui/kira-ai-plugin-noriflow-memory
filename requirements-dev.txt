@@ -1,0 +1,9 @@
+# Host-provided dependencies needed to run the test suites outside KiraAI.
+# requirements.txt intentionally omits them because KiraAI core ships them
+# at runtime. fastapi is NOT listed here: tests/_harness.py installs a
+# fastapi stub. numpy is optional (brute-force cosine falls back to pure
+# Python without it).
+pydantic>=2.0
+# IANA tz database via pip: only needed where the OS lacks /usr/share/zoneinfo
+# (e.g. Windows dev machines); Linux CI resolves ZoneInfo from system tzdata
+tzdata
