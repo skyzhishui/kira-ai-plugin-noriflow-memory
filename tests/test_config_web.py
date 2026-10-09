@@ -1,11 +1,11 @@
-"""config_web（维护页设置栏：插件配置读写）自包含测试。
+"""Self-contained tests for config_web (maintenance-page settings pane: plugin config read/write).
 
-运行：python tests/test_config_web.py
+Run: python tests/test_config_web.py
 
-覆盖：schema 推导（PydanticUndefined 缺省/restart/敏感键标注）/ 掩码与
-哨兵还原 / payload 组装（缺键补默认）/ prepare_save 的 partial 语义与
-校验拒绝 / persist_host_config 落盘合并 / GET/PUT handler 编排（宿主
-plugin_mgr 桩 + 运行时实例热更新断言）。
+Covers: schema derivation (PydanticUndefined default / restart / sensitive-key annotations) / masking and
+sentinel restore / payload assembly (missing keys filled with defaults) / prepare_save partial semantics and
+validation rejection / persist_host_config on-disk merge / GET/PUT handler orchestration (host
+plugin_mgr stub + runtime instance hot-update assertions).
 """
 
 from __future__ import annotations

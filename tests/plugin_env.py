@@ -1,18 +1,21 @@
-"""共享测试引导：core.* 宿主桩 + 插件包装载（pytest 与 python 直跑两用）。
+"""Shared test bootstrap: core.* host stubs + plugin package loader (works both under pytest and python direct-run).
 
-此前 7 个测试文件各自复制 ~100-140 行桩设施（review 2026-09-12 冗余项 1），
-本模块统一为单一实现：
+Previously the 7 test files each copied ~100-140 lines of stub facilities
+(review 2026-09-12 redundancy item 1); this module unifies them into a
+single implementation:
 
-- install_host_stubs(): 幂等注入 core.* 桩（logging/plugin/chat/prompt/
-  provider；fastapi 未安装时的兜底桩）。core.plugin 的 on/register 桩
-  记录装饰调用（test_noriflow_memory 的生命周期/订阅断言依赖；其余文件
-  不消费记录，仅无害）。
-- load_modules(*names): 确保 noriflow_memory_pkg 就绪后按名 import，
-  返回模块元组——依赖模块经 pkg.__path__ 由常规导入机制解析，
-  sys.modules 去重保证跨文件单实例。
+- install_host_stubs(): idempotently injects core.* stubs (logging/plugin/chat/prompt/
+  provider; fallback stub when fastapi is missing). The core.plugin on/register
+  stubs record decoration calls (test_noriflow_memory lifecycle/subscription
+  assertions depend on that; the other files do not consume the records, harmless).
+- load_modules(*names): ensures noriflow_memory_pkg is ready, then imports
+  by name and returns a tuple of modules — dependency modules resolve via
+  normal import machinery through pkg.__path__, and sys.modules dedup keeps
+  a single instance across files.
 
-导入本模块依赖 tests/ 在 sys.path：pytest（非包测试目录自动插入）与
-直跑（脚本目录即 sys.path[0]）均满足；各测试文件显式 insert 兜底。
+Importing this module relies on tests/ being on sys.path: pytest (auto-inserts
+a non-package test dir) and direct-run (script dir is sys.path[0]) both satisfy
+that; each test file also inserts explicitly as a fallback.
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ PKG_NAME = "noriflow_memory_pkg"
 
 
 def install_host_stubs() -> None:
-    """幂等注入 core.* 宿主桩（已安装时跳过）。"""
+    """Idempotently injects core.* host stubs (no-op when already installed)."""
     if "core.plugin" in sys.modules:
         return
 
@@ -188,7 +191,7 @@ def install_host_stubs() -> None:
 
 
 def load_modules(*names: str):
-    """按名加载插件模块（返回元组；重复加载经 sys.modules 去重）。"""
+    """Loads plugin modules by name (returns a tuple; repeated loads dedup via sys.modules)."""
     install_host_stubs()
     if PKG_NAME not in sys.modules:
         pkg = types.ModuleType(PKG_NAME)
@@ -198,5 +201,5 @@ def load_modules(*names: str):
 
 
 def load_plugin_module():
-    """加载插件主模块（连带全依赖；幂等，返回同一实例）。"""
+    """Loads the plugin main module (with all dependencies; idempotent, returns the same instance)."""
     return load_modules("main")[0]

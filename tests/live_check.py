@@ -1,19 +1,19 @@
-"""部署环境回环验证：对真实 PostgreSQL（pgvector）验证本插件数据层。
+"""Deployment-environment loopback verification: validates this plugin's data layer against real PostgreSQL (pgvector).
 
-用法（在部署机上）：
+Usage (on the deployment host):
     python tests/live_check.py
-可选环境变量：
-    NORIFLOW_MEMORY_CONFIG  插件配置 JSON 路径
-                            （默认 /data/KiraAI/data/config/plugins/kira-ai-plugin-noriflow-memory.json）
+Optional environment variables:
+    NORIFLOW_MEMORY_CONFIG  Plugin config JSON path
+                            (default /data/KiraAI/data/config/plugins/kira-ai-plugin-noriflow-memory.json)
 
-检查项：
-1. 配置加载与 dsn
-2. 连接 + schema 迁移（幂等）
-3. 摘要写入 / 按幂等键清理（memory_chat_summary 双向通路）
-4. 事实簇/画像/摘要维护查询（webui_store 数据层）
-5. 画像拼装（确定性投影，空画像合法）
+Checks:
+1. Config loading and dsn
+2. Connection + schema migration (idempotent)
+3. Summary write / cleanup by idempotency key (memory_chat_summary two-way path)
+4. Fact cluster / persona / summary maintenance queries (webui_store data layer)
+5. Persona assembly (deterministic projection; empty persona is legal)
 
-不依赖 KiraAI 进程；LLM 编码/向量检索不在本脚本范围（需宿主模型配置）。
+Does not depend on a KiraAI process; LLM encoding/vector retrieval are out of scope for this script (they need a host model config).
 """
 
 from __future__ import annotations

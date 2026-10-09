@@ -1,13 +1,16 @@
-"""本地记忆库（PostgreSQL）调用熔断器。
+"""Circuit breaker for local memory store (PostgreSQL) calls.
 
-实现状态机：CLOSED -> OPEN -> HALF_OPEN -> CLOSED
-连续失败达到阈值后进入熔断状态，熔断期间拒绝所有 DB 操作（recall 返回空；
-retain 路径上抛 MemoryDBUnavailable，由插件 pending 队列延迟重放——均不
-阻断主流程）。熔断到期后允许一次探测调用（HALF_OPEN），
-成功则重置，失败则继续熔断。
+Implements the state machine: CLOSED -> OPEN -> HALF_OPEN -> CLOSED.
+After consecutive failures reach the threshold it enters the tripped state;
+while tripped, all DB operations are rejected (recall returns empty; the
+retain path raises MemoryDBUnavailable, deferred-replayed by the plugin
+pending queue, neither of which blocks the main flow). When the trip expires
+one probe call is allowed (HALF_OPEN); success resets the breaker, failure
+keeps it tripped.
 
-与 hindsight 插件的 HindsightCircuitBreaker 同参数同语义（对齐现有降级行为），
-覆盖对象从 HTTP 服务换成 PG 连接池。
+Shares the same parameters and semantics as the HindsightCircuitBreaker of
+the hindsight plugin (aligned with the existing degradation behavior), with
+the covered object switched from an HTTP service to a PG connection pool.
 """
 
 from __future__ import annotations
@@ -21,14 +24,18 @@ if TYPE_CHECKING:
 
 
 class MemoryDBCircuitBreaker:
-    """记忆库调用熔断器。
+    """Circuit breaker for memory store calls.
 
-    连续 failure_threshold 次失败后，进入熔断状态（recovery_seconds 秒）。
-    熔断期间所有 DB 操作直接拒绝，不实际建连。
-    熔断到期后允许一次探测调用，成功则重置，失败则继续熔断。
+    After failure_threshold consecutive failures, enters the tripped state
+    for recovery_seconds seconds. While tripped, all DB operations are
+    rejected without actually establishing a connection. When the trip
+    expires, one probe call is allowed; success resets it, failure keeps it
+    tripped.
 
-    config 提供时阈值/恢复时长运行时读该实例（维护页保存配置后热生效），
-    构造参数作为 config 缺省时的回退（测试/独立构造场景）。
+    When config is provided, threshold/recovery values are read from that
+    instance at runtime (hot-effective after saving config on the
+    maintenance page); constructor parameters serve as the fallback when
+    config is absent (testing / standalone construction scenarios).
     """
 
     def __init__(
@@ -37,13 +44,13 @@ class MemoryDBCircuitBreaker:
         recovery_seconds: float = 60.0,
         config: "LocalMemoryConfig | None" = None,
     ) -> None:
-        """初始化熔断器。
+        """Initialize the circuit breaker.
 
         Args:
-            failure_threshold: 连续失败阈值（达到即熔断）。
-            recovery_seconds: 熔断恢复等待时长（秒）。
-            config: 插件运行时配置（可选）：提供时运行时按次读其
-                failure_threshold/recovery_seconds。
+            failure_threshold: Consecutive failure threshold (trips when reached).
+            recovery_seconds: Trip recovery wait duration (seconds).
+            config: Plugin runtime config (optional): when provided, its
+                failure_threshold/recovery_seconds are read per call at runtime.
         """
         self._config = config
         self._static_failure_threshold = failure_threshold
@@ -67,14 +74,16 @@ class MemoryDBCircuitBreaker:
         return self._static_recovery_seconds
 
     async def is_available(self) -> bool:
-        """判断当前是否允许发起请求（加锁，保证 HALF_OPEN 只允许一次探测）。
+        """Return whether a request may be sent now (locked, so HALF_OPEN allows only one probe).
 
-        CLOSED 状态：允许请求。
-        OPEN 状态：检查是否已过 recovery_seconds，若已过期则转为 HALF_OPEN 并允许一次探测；否则拒绝。
-        HALF_OPEN 状态：仅允许一次探测请求，其余拒绝（防并发打满恢复中的服务）。
+        CLOSED state: requests allowed.
+        OPEN state: check whether recovery_seconds has elapsed; if expiry has
+        passed, switch to HALF_OPEN and allow one probe; otherwise reject.
+        HALF_OPEN state: only one probe request is allowed, the rest rejected
+        (to prevent concurrent requests from saturating a recovering service).
 
         Returns:
-            bool: True 表示允许请求，False 表示熔断中拒绝。
+            bool: True allows the request, False means rejected while tripped.
         """
         async with self._lock:
             if self._state == "CLOSED":
@@ -93,17 +102,21 @@ class MemoryDBCircuitBreaker:
             return False
 
     async def peek_available(self) -> bool:
-        """非消费式探测：当前是否允许新请求（不迁移状态、不占用探测名额）。
+        """Non-consuming probe: whether new requests are allowed now (no state transition, no probe slot consumed).
 
-        供调用方在昂贵前置操作（如 retain 编码 LLM 调用）前判断：熔断
-        明确拒绝时跳过前置操作直接走降级路径，避免白烧 LLM/embedding。
-        与 is_available 的差异：不触发 OPEN -> HALF_OPEN 迁移、不置
-        probe_inflight——探测名额仍由后续真正的 DB 操作（is_available）
-        消费，不会出现「查询即占坑」导致探测永久卡死。
+        Lets callers decide before an expensive pre-step (such as the retain
+        encoding LLM call): when the breaker explicitly rejects, skip the
+        pre-step and take the degraded path directly, avoiding wasted
+        LLM/embedding calls. Difference from is_available: it does not
+        trigger the OPEN -> HALF_OPEN transition nor set probe_inflight, so
+        the probe slot is still consumed by the subsequent real DB operation
+        (is_available), and a "query claims the slot" situation that
+        permanently stalls probing cannot occur.
 
         Returns:
-            bool: True 表示当前放行（CLOSED，或 OPEN 到期/HALF_OPEN 空闲
-            即将有探测机会）；False 表示明确拒绝中。
+            bool: True means currently allowed (CLOSED, or OPEN expired /
+            HALF_OPEN idle with a probe opportunity coming); False means
+            explicitly rejected.
         """
         async with self._lock:
             if self._state == "CLOSED":
@@ -113,16 +126,16 @@ class MemoryDBCircuitBreaker:
             return time.time() >= self._trip_until
 
     async def record_success(self) -> None:
-        """记录一次成功调用，重置失败计数，状态回到 CLOSED。"""
+        """Record a successful call, reset the failure count, and return to CLOSED."""
         async with self._lock:
             self._failure_count = 0
             self._state = "CLOSED"
             self._probe_inflight = False
 
     async def record_failure(self) -> None:
-        """记录一次失败调用，递增失败计数。
+        """Record a failed call and increment the failure count.
 
-        若达到阈值则进入 OPEN 状态，并记录熔断到期时间。
+        If the threshold is reached, enter the OPEN state and record the trip expiry time.
         """
         async with self._lock:
             self._failure_count += 1

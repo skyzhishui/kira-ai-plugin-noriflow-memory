@@ -1,20 +1,20 @@
-"""实体关系边（P2 提取落库 / P3 边注入）测试（python 直跑，无 pytest 依赖）。
+"""Entity relation edge (P2 extraction + storage / P3 edge injection) tests (python direct-run, no pytest dependency).
 
-覆盖（KiraAI 侧，2026-09-09 P2/P3 批）：
-- parse_relation 校验（合法/bot 端点/自环/label 越界/statement 超长）；
-- select_relation_edges 场景裁决（A 节点+边 / B 退化 / C bot 边门槛 /
-  停用词 / 邻居与总行预算 / 边 id 去重）；
-- 陈述行组装与邻居画像 uid 收集；
-- db.upsert_entity_edge SQL 组装（结构键合并 / evidence 去重 / bot 边
-  pending + 内联激活 CASE）+ fetch_active_edges 参数；
-- kernel 通道：retain relations 落库（开关/失败上抛/bot 端点行）；
-- encoder relations 提示词门控 + 结构化 schema 含 relations；
-- build_injection_text 边小节（A/C 注入、开关关闭零变化、主路空时
-  小节独立产出、邻居画像、预算上限）；
-- main._bot_addressed（At pid 命中 / @all 不算 / Reply 命中 bot 消息
-  ID 追踪 / 裸"你"不触发）+ _track_bot_message_ids 有界。
+Coverage (KiraAI side, 2026-09-09 P2/P3 batch):
+- parse_relation validation (valid / bot endpoint / self-loop / label out-of-range / statement too long);
+- select_relation_edges scenario decisions (A node+edge / B degradation / C bot-edge threshold /
+  stopwords / neighbor and total-line budgets / edge id dedup);
+- statement-line assembly and neighbor persona uid collection;
+- db.upsert_entity_edge SQL assembly (structural-key merge / evidence dedup / bot-edge
+  pending + inline activation CASE) + fetch_active_edges params;
+- kernel channel: retain relations to storage (switch / failure re-raise / bot-endpoint rows);
+- encoder relations prompt gating + structured schema including relations;
+- build_injection_text edge section (A/C injection, zero change when disabled, section
+  produced standalone when the main path is empty, neighbor personas, budget cap);
+- main._bot_addressed (At pid hit / @all not counted / Reply hitting a bot message
+  ID trace / bare "you" does not trigger) + bounded _track_bot_message_ids.
 
-运行（插件目录）：
+Run (plugin dir):
     python tests/test_entity_edge.py
 """
 
@@ -112,7 +112,7 @@ def test_parse_relation_invalid_variants() -> None:
 
 
 def test_parse_relation_label_with_endpoint_name_rejected() -> None:
-    """label 撞端点名（含端点显示名）丢弃——"A的X是X"式陈述行必然破碎。"""
+    """Label colliding with an endpoint name (including endpoint display names) is dropped — "A's X is X"-style statement lines are necessarily broken."""
     row = {
         "subject_user_id": "u1", "subject_display_name": "小张",
         "object_user_id": "u2", "object_display_name": "老王",
@@ -128,7 +128,7 @@ def test_parse_relation_label_with_endpoint_name_rejected() -> None:
 
 
 def test_split_reverse_echo_rows() -> None:
-    """镜像在库且正向不在 -> 跳过；正向在库保留；同批双向往先到者胜。"""
+    """Mirror already in store and forward absent -> skip; forward in store -> keep; same-batch bidirectional rows: first-arrival wins."""
     existing = {("qq", "u2", "u1", "主人")}
     rows = [
         {"platform": "qq", "subject_uid": "u1", "object_uid": "u2",
@@ -203,7 +203,7 @@ def test_scenario_a_node_plus_label() -> None:
 
 
 def test_scenario_a_cross_platform_uid_collision() -> None:
-    """复合键匹配：同数字 uid 跨平台撞号不得互相命中（P3-p 修复面）。"""
+    """Composite-key matching: identical numeric uids on different platforms must not cross-match (P3-p fix surface)."""
     edge_qq = _edge(21, "u1", "u2", "姐姐", sname="小张")
     # tg:u1 是另一个平台的人：qq 边不作为其节点关系注入
     assert _select([edge_qq], "小张的姐姐", ["tg:u1"]) == []
@@ -337,7 +337,7 @@ async def test_upsert_entity_edge_sql_and_params() -> None:
 
 
 async def test_upsert_reverse_echo_skipped() -> None:
-    """反向回声：镜像方向键已在库而正向不在 -> 整行跳过；正向已在库照常 upsert。"""
+    """Reverse echo: the mirrored direction key already exists while the forward one does not -> entire row skipped; forward already present -> upsert normally."""
     mirror_row = {"platform": "qq", "subject_uid": "u2", "object_uid": "u1",
                   "relation_label": "主人"}
     pool = FakeConnPool(fetch_rows=[mirror_row])
@@ -380,11 +380,11 @@ async def test_fetch_active_edges_params() -> None:
 
 
 async def test_fetch_alias_names_by_owner_owners_contract() -> None:
-    """owners 三态契约（真实 MemoryDatabase 层，非桩）。
+    """The owners three-state contract (real MemoryDatabase layer, not a stub).
 
-    None = 全表 SQL（原语义）；空列表/过滤后空 = 短路不发查询返回 {}；
-    含非空 uid 条目 = 照常发起参数化过滤查询——短路与过滤分支须直接
-    对 db 层断言，桩测兜不住。
+    None = full-table SQL (original semantics); empty list / empty after filtering = short-circuit, no query, returns {};
+    entries with non-empty uids = normal parameterized filter query — the short-circuit and filter branches must be
+    asserted directly against the db layer; stub tests cannot cover them.
     """
     pool = FakeConnPool(fetch_rows=[
         {"platform": "qq", "user_id": "u1", "name": "新昵称"},
@@ -501,8 +501,8 @@ async def test_retain_relations_channel_and_gating() -> None:
 
 
 async def test_retain_relations_failure_no_half_commit() -> None:
-    """边表写入失败 -> MemoryDBUnavailable 上抛（kira 侧由 main 回滚水位线，
-    本批下轮重编码——evidence_key 幂等保证重试不重复计数）；summary 未写。
+    """Edge-table write failure -> MemoryDBUnavailable is raised (the kira side rolls back the watermark via main,
+    this batch is re-encoded next round — evidence_key idempotency ensures retries do not double-count); summary is not written.
     """
     db = FakeWriteDB(fail_edges=True)
     kernel = _write_kernel(
@@ -630,7 +630,7 @@ async def test_injection_scenario_a_appends_section() -> None:
 
 
 async def test_injection_canonical_name_override() -> None:
-    """注入陈述行端点名以别名表最新规范名优先（边表冗余名可能过期）。"""
+    """Injected statement-line endpoint names prefer the alias table's latest canonical name (edge-table redundant names may be stale)."""
     db = FakeRecallDB(
         edges=[_edge(1, "u1", "u2", "姐姐", sname="旧昵称", oname="小李")],
         canonical={("qq", "u1"): "新昵称"},
@@ -667,7 +667,7 @@ async def test_injection_scenario_c_and_gate() -> None:
 
 
 def test_select_relation_edges_dual_bot_forms() -> None:
-    """bot uid 集合语义：会话标识/平台 uid 双形态任一命中即 bot 端点边。"""
+    """Bot uid set semantics: a hit on either form (session id / platform uid) marks a bot-endpoint edge."""
     plat_edge = _edge(12, "9900000004", "u1", "姐姐", oname="小张")
     # 双形态集合：平台 uid 端点边照常走场景 C
     hit = _select([plat_edge], "你姐姐是谁", [], bot=[BOT, "9900000004"], addressed=True)
@@ -678,11 +678,11 @@ def test_select_relation_edges_dual_bot_forms() -> None:
 
 
 def test_select_relation_edges_cross_platform_bot_collision() -> None:
-    """跨平台 bot 撞号：他平台真人边裸 uid 恰等 bot uid 不误判为 bot 边。
+    """Cross-platform bot id collision: another platform's real-person edge whose bare uid equals the bot uid must not be misjudged as a bot edge.
 
-    bot 端点判定为复合键（形态 × session_platform）——web 平台 uid=BOT
-    的边端点键 web:BOT ∉ qq:BOT，走普通节点匹配路（未命中 node_keys
-    即不注入），不误入场景 C 把真人端点渲染成 bot 昵称。
+    Bot-endpoint detection uses a composite key (form x session_platform) — a web-platform edge endpoint with uid=BOT
+    yields key web:BOT not-in qq:BOT, goes through the normal node-matching path (no injection unless node_keys hit),
+    and does not slip into scenario C and render a real-person endpoint as the bot nickname.
     """
     web_edge = dict(_edge(30, "u1", BOT, "姐姐", sname="小张"))
     web_edge["platform"] = "web"
@@ -693,8 +693,8 @@ def test_select_relation_edges_cross_platform_bot_collision() -> None:
 
 
 async def test_injection_scenario_c_platform_uid_form() -> None:
-    """场景 C 端到端（双形态）：hints 带平台 uid，平台 uid 端点边命中且
-    陈述行以 bot 昵称渲染该端点。"""
+    """Scenario C end-to-end (dual-form): hints carry the platform uid, platform-uid endpoint edges hit, and
+    the statement line renders that endpoint with the bot nickname."""
     edges = [_edge(11, "9900000004", "u1", "姐姐", oname="小张")]
     db = FakeRecallDB(edges=edges)
     kernel = _recall_kernel(db, relation_inject_enabled=True)
@@ -713,8 +713,8 @@ async def test_injection_scenario_c_platform_uid_form() -> None:
 
 
 def test_make_recall_hints_learns_platform_uid_form() -> None:
-    """hints 学习式形态备忘：平台 uid 进集合后，写侧 is_bot 判定通吃双形态
-    （平台 uid 形态边正确走 pending/双证据门槛）。"""
+    """hints learn-the-form memo: once a platform uid joins the set, the write-side is_bot check handles both forms
+    (platform-uid-form edges correctly go through the pending/dual-evidence threshold)."""
     kernel = _recall_kernel(FakeRecallDB())
     assert kernel._bot_uid_forms_all() == [BOT]
     kernel.make_recall_hints(match_text="x", bot_user_id="9900000004")

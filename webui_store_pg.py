@@ -1,12 +1,12 @@
-"""记忆维护 API 数据层——PostgreSQL SQL 体（自 webui_store.py 下沉）。
+"""Memory maintenance API data layer: PostgreSQL SQL body (sunk down from webui_store.py).
 
-双后端拆分（docs/plans/noriflow-dual-storage-backend-plan.md §6）：
-webui_store.py 保留共享层（行装配/分页校验/常量），本模块持有 PG 方言
-SQL；SQL 与拆分前逐字一致，行为零变化。SQLite 方言的对应实现见
-webui_store_sqlite.py（函数一一对应）。
+Dual-backend split (docs/plans/noriflow-dual-storage-backend-plan.md §6):
+webui_store.py keeps the shared layer (row assembly/page validation/constants), this module
+holds the PG dialect SQL, verbatim identical to the pre-split version with zero behavior change.
+The SQLite dialect counterpart lives in webui_store_sqlite.py (functions map one-to-one).
 
-约定：函数首个参数为 backend（MemoryDatabase / SQLiteMemoryDatabase），
-``backend.supersede_backfill_edges_of(conn, ids)`` 派发双后端墓碑传播。
+Convention: the first parameter of each function is backend (MemoryDatabase / SQLiteMemoryDatabase),
+and ``backend.supersede_backfill_edges_of(conn, ids)`` dispatches dual-backend tombstone propagation.
 """
 
 from __future__ import annotations
@@ -16,12 +16,12 @@ from fastapi import HTTPException
 
 
 def _pool(backend):
-    """连接池解析：backend 对象取 .pool；裸池（旧调用方/测试桩）原样。"""
+    """Pool resolution: take .pool from the backend object; bare pools (legacy callers/test stubs) passed through as-is."""
     return backend.pool if hasattr(backend, "pool") else backend
 
 
 async def fetch_overview(backend) -> tuple[dict, list]:
-    """概览 KPI 原始查询：各表行数/待处理量/状态分布 + kv 任务状态。"""
+    """Overview KPI raw query: per-table row counts/pending amounts/status breakdown plus kv task states."""
     async with _pool(backend).acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -49,7 +49,7 @@ async def fetch_overview(backend) -> tuple[dict, list]:
 
 
 async def fetch_users_data(backend, keyword: str, page: int, size: int) -> dict:
-    """有事实/簇的用户清单（画像页用户选择器数据源）——原始查询。"""
+    """Users with facts/clusters (persona page user selector data source): raw query."""
     params: list = []
     where = ""
     if keyword:
@@ -110,7 +110,7 @@ async def fetch_users_data(backend, keyword: str, page: int, size: int) -> dict:
 
 
 async def delete_fact(backend, fact_id: int) -> dict:
-    """删除原始事实并同步清理簇表 source_fact_ids 引用（同一事务）。"""
+    """Delete a raw fact and clean up the source_fact_ids references in the cluster table within the same transaction."""
     async with _pool(backend).acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow(
@@ -132,10 +132,10 @@ async def delete_fact(backend, fact_id: int) -> dict:
 async def fetch_clusters_data(
     backend, page: int, size: int, filters: dict
 ) -> dict:
-    """事实簇分页浏览（画像来源，含确信度分值）——原始查询。
+    """Fact cluster paginated browsing (persona source, includes confidence scores): raw query.
 
-    filters 为 webui_store 层白名单校验后的取值（user_id/category/status/
-    session_id/q）。
+    filters holds the values after whitelist validation in the webui_store layer
+    (user_id/category/status/session_id/q).
     """
     conditions: list[str] = []
     params: list = []
@@ -184,7 +184,7 @@ async def fetch_clusters_data(
 
 
 async def select_cluster_for_update(conn, cluster_id: int):
-    """簇行读取并加行锁（PG：FOR UPDATE，防并发修正互踩）。"""
+    """Read a cluster row and take a row lock (PG: FOR UPDATE, prevents concurrent edits from stomping each other)."""
     return await conn.fetchrow(
         "SELECT * FROM memory_fact_cluster WHERE id = $1 FOR UPDATE",
         cluster_id,
@@ -195,7 +195,7 @@ async def update_cluster_row(
     conn, cluster_id: int, statement: str, score, status: str,
     statement_changed: bool,
 ) -> None:
-    """簇修正 UPDATE（PG：now() 生成时间戳）。"""
+    """Cluster correction UPDATE (PG: now() generates the timestamp)."""
     await conn.execute(
         """
         UPDATE memory_fact_cluster
@@ -219,7 +219,7 @@ async def update_cluster_row(
 
 
 async def fetch_relation_graph_data(backend) -> dict:
-    """关系图谱原始查询：全量边（含 pending）+ 别名行（当前页 uid 过滤）。"""
+    """Relation graph raw query: all edges (including pending) plus alias rows (filtered by current-page uids)."""
     async with _pool(backend).acquire() as conn:
         rows = await conn.fetch(
             """
@@ -263,7 +263,7 @@ async def fetch_relation_graph_data(backend) -> dict:
 
 
 async def update_relation_edge(backend, edge_id: int, new_status: str) -> dict:
-    """人工修正边状态（墓碑保护语义见 webui_store.update_relation_edge）。"""
+    """Manually correct an edge status (tombstone protection semantics: see webui_store.update_relation_edge)."""
     async with _pool(backend).acquire() as conn:
         # Capture the pre-update status first: RETURNING only exposes the NEW
         # row, logging "old->new" from it would print new->new.

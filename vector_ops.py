@@ -1,12 +1,14 @@
-"""embedding 服务：写入时批量计算（fail-open）+ 后台补算任务。
+"""Embedding service: batch computation on write (fail-open) + background backfill task.
 
-设计（见开发方案 §9.1）：
-- 写入时：retain 异步链路内对 summary 单条、facts 批量各算一次，随行存储；
-  计算失败不阻塞写入（行内 embedding 置 NULL，无向量的行不参与语义检索
-  但保留标量检索能力）；
-- 补算任务：插件后台 asyncio 周期任务，扫描两表 embedding IS NULL 的行回填；
-- 服务端：复用 KiraAI provider 体系 default_embedding（OpenAI 兼容
-  /v1/embeddings，维度由插件配置 embedding_dims 校验）。
+Design (see dev plan section 9.1):
+- on write: inside the retain async path, compute once for the single
+  summary and once for the facts batch, stored alongside the rows; compute
+  failure does not block the write (the in-row embedding is set to NULL; a
+  row without a vector skips semantic retrieval but keeps scalar search);
+- backfill task: a plugin background asyncio periodic task scans rows with
+  embedding IS NULL in both tables and backfills;
+- server side: reuses the KiraAI provider system default_embedding (OpenAI
+  compatible /v1/embeddings; dimension validated by plugin config embedding_dims).
 """
 
 from __future__ import annotations
@@ -32,12 +34,13 @@ logger = get_logger("noriflow_memory.vector", "cyan")
 
 
 class EmbeddingService:
-    """向量计算服务（写入链路 fail-open 语义）。
+    """Vector computation service (fail-open semantics on the write path).
 
     Attributes:
-        client: KiraEmbeddingClient 实例；None 表示 embedding 不可用
-            （default_embedding 未配置时），所有计算返回 None，行内向量置 NULL。
-        dims: 向量维度（写入校验用）。
+        client: KiraEmbeddingClient instance; None means embedding is
+            unavailable (default_embedding not configured); every computation
+            returns None and the in-row vector is set to NULL.
+        dims: Vector dimension (for write validation).
     """
 
     def __init__(
@@ -45,28 +48,29 @@ class EmbeddingService:
         client: Optional["KiraEmbeddingClient"],
         dims: int = 1024,
     ) -> None:
-        """初始化。
+        """Initialize.
 
         Args:
-            client: embedding 客户端（可为 None，表示服务不可用）。
-            dims: 向量维度（与 schema 向量列一致）。
+            client: Embedding client (may be None, meaning the service is unavailable).
+            dims: Vector dimension (must match the schema vector column).
         """
         self.client = client
         self.dims = dims
 
     @property
     def available(self) -> bool:
-        """embedding 服务是否可用。"""
+        """Whether the embedding service is available."""
         return self.client is not None
 
     async def embed_one(self, text: str) -> list[float] | None:
-        """单条文本向量化（fail-open：任何失败返回 None，不抛异常）。
+        """Vectorize a single text (fail-open: any failure returns None, never raises).
 
         Args:
-            text: 待编码文本（空串直接返回 None，不发起请求）。
+            text: Text to encode (empty string returns None directly without a request).
 
         Returns:
-            向量；服务不可用 / 请求失败 / 维度不符时返回 None。
+            Vector; None when the service is unavailable / the request fails /
+            the dimension mismatches.
         """
         if self.client is None or not text.strip():
             return None
@@ -78,16 +82,18 @@ class EmbeddingService:
         return self._validate(vec)
 
     async def embed_batch(self, texts: list[str]) -> list[Optional[list[float]]]:
-        """批量文本向量化（fail-open：调用失败整批返回 None 占位）。
+        """Vectorize texts in batch (fail-open: on call failure the whole batch returns None placeholders).
 
-        单次 embeddings 请求承载整批（retain 每轮 facts 通常 0-5 条 + summary 1 条，
-        批量规模可控）；请求失败时整批置 None 由补算任务兜底，绝不阻塞写入。
+        One embeddings request carries the whole batch (per retain turn the
+        facts are typically 0-5 plus one summary, so the batch size is
+        controllable); on request failure the whole batch is set to None and
+        covered by the backfill task, never blocking the write.
 
         Args:
-            texts: 待编码文本列表（空元素返回 None 占位）。
+            texts: Text list to encode (empty elements return None placeholders).
 
         Returns:
-            与输入等长的列表；不可用/失败的元素为 None。
+            A list of the same length as the input; unavailable/failed elements are None.
         """
         if self.client is None:
             return [None] * len(texts)
@@ -143,10 +149,11 @@ class EmbeddingService:
 
 
 class EmbeddingBackfillTask:
-    """embedding 补算后台任务：周期扫描两表 NULL 向量行并回填。
+    """Background embedding backfill task: periodically scans NULL-vector rows in both tables and backfills.
 
-    生命周期归插件（on_start 启动 / on_stop 停止）；单批失败只记 warning
-    顺延下周期，任务循环本身不退出。
+    Lifecycle owned by the plugin (on_start starts it / on_stop stops it);
+    a single-batch failure only logs a warning and defers to the next cycle;
+    the task loop itself never exits.
     """
 
     def __init__(
@@ -155,12 +162,12 @@ class EmbeddingBackfillTask:
         service: EmbeddingService,
         config: LocalMemoryConfig,
     ) -> None:
-        """初始化。
+        """Initialize.
 
         Args:
-            db: 记忆库访问层。
-            service: embedding 服务（不可用时任务直接空转）。
-            config: 补算周期/批量配置。
+            db: Memory store access layer.
+            service: Embedding service (the task just idles when unavailable).
+            config: Backfill interval/batch-size config.
         """
         self._db = db
         self._service = service
@@ -169,11 +176,11 @@ class EmbeddingBackfillTask:
 
     @property
     def running(self) -> bool:
-        """任务是否在运行。"""
+        """Whether the task is running."""
         return self._task is not None and not self._task.done()
 
     def start(self) -> None:
-        """启动后台任务（幂等：已运行时跳过）。"""
+        """Start the background task (idempotent: skipped when already running)."""
         if self.running:
             return
         self._task = asyncio.create_task(self._run(), name="memory-embedding-backfill")
@@ -183,7 +190,7 @@ class EmbeddingBackfillTask:
         )
 
     async def stop(self) -> None:
-        """停止后台任务（幂等，等待当前循环退出）。"""
+        """Stop the background task (idempotent, waits for the current loop to exit)."""
         if self._task is None:
             return
         self._task.cancel()
@@ -195,7 +202,7 @@ class EmbeddingBackfillTask:
         logger.info("embedding 补算任务已停止")
 
     async def _run(self) -> None:
-        """任务主循环：周期执行补算，异常只记录不退出。"""
+        """Task main loop: periodically runs backfill; exceptions only log, never exit."""
         while True:
             await asyncio.sleep(self._config.backfill_interval_seconds)
             try:
@@ -204,16 +211,20 @@ class EmbeddingBackfillTask:
                 logger.warning("embedding 补算周期执行失败（顺延下周期）", exc_info=True)
 
     async def run_once(self) -> int:
-        """执行单轮补算（search_text 分词遍 + 三张表向量补算）。
+        """Run one backfill round (search_text tokenization pass + vector backfill on three tables).
 
-        search_text 遍在最前且不依赖 embedding 服务（纯 Python 分词 + UPDATE，
-        服务不可用时也要回填——BM25 路可用性不应被向量服务状态绑架）；
-        簇表排在最后：新簇建簇时从 raw 事实继承向量，先补 raw 再补簇，
-        让簇的回填能覆盖「建簇时 raw 向量仍缺失」的窗口期残留（否则该簇
-        永久 NULL 向量、对候选检索不可见，同义事实会重复建簇）。
+        The search_text pass runs first and does not depend on the embedding
+        service (pure Python tokenization + UPDATE; it must be backfilled
+        even when the service is unavailable, the BM25 path's availability
+        should not be held hostage by the vector service state); the cluster
+        table runs last: new clusters inherit vectors from raw facts when
+        created, so backfilling raw before cluster lets the cluster backfill
+        cover the window where a raw vector was still missing at cluster
+        creation (otherwise that cluster stays NULL forever, invisible to
+        candidate retrieval, and synonymous facts would keep creating clusters).
 
         Returns:
-            本轮回填成功的行数。
+            Number of rows successfully backfilled this round.
         """
         filled = 0
         try:
@@ -245,13 +256,14 @@ class EmbeddingBackfillTask:
         return filled
 
     async def _backfill_search_text(self) -> int:
-        """扫描摘要表 search_text IS NULL 的行并回填分词（存量迁移 006 数据）。
+        """Scan summary-table rows with search_text IS NULL and backfill their tokenization (legacy migration 006 data).
 
-        纯 Python 分词 + UPDATE（无 API 调用），扫描批量放大 8 倍
-        （默认 64→512/周期；embedding 遍受 API 吞吐约束维持原批量）。
+        Pure Python tokenization + UPDATE (no API calls); the scan batch is
+        amplified 8x (default 64->512/cycle; the embedding pass keeps its
+        original batch constrained by API throughput).
 
         Returns:
-            本轮回填行数。
+            Number of rows backfilled this round.
         """
         scan_limit = self._config.backfill_batch_size * 8
         rows = await self._db.fetch_missing_search_text(scan_limit)

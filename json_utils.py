@@ -1,7 +1,8 @@
-"""LLM 输出 JSON 解析容错工具（自 nori-core 同名工具 vendor）。
+"""Fault-tolerant JSON parsing utilities for LLM output (vendored from the nori-core same-name utility).
 
-剥离 markdown 围栏 -> 提取 JSON 主体 -> 修复 Python 字面量与尾逗号 ->
-json.loads -> json_repair 兜底 -> 全部失败返回 None（不抛异常）。
+Strips markdown fences -> extracts the JSON body -> repairs Python literals
+and trailing commas -> json.loads -> json_repair fallback -> returns None
+when everything fails (never raises).
 """
 
 from __future__ import annotations
@@ -23,13 +24,14 @@ _JSON_REPAIR = getattr(json_repair, "repair", None) or getattr(
 
 
 def safe_parse_llm_json(text: str) -> dict[str, Any] | list[Any] | None:
-    """安全解析 LLM 返回的 JSON 文本。
+    """Safely parse JSON text returned by an LLM.
 
     Args:
-        text: LLM 原始输出文本（可能含 markdown 围栏、说明文字、畸形 JSON）。
+        text: Raw LLM output text (may contain markdown fences, explanatory
+            text, or malformed JSON).
 
     Returns:
-        解析成功的 dict 或 list；完全无法解析时 None。
+        The parsed dict or list; None when nothing can be parsed.
     """
     if not text:
         return None

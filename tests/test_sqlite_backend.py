@@ -1,16 +1,16 @@
-"""SQLite 后端真库集成 harness（python 直跑，无 pytest 依赖）。
+"""SQLite backend real-db integration harness (python direct-run, no pytest dependency).
 
-双存储后端方案 §9.2 验收：tempfile 起真 SQLite 库，覆盖
-- 四条收敛管线：embedding 补算 / search_text 补算 / 补编码遍消费
-  summarized=false / pending facts 入簇（含 merge/replace/衰减/晋档）；
-- recall 双路（向量 + FTS5 BM25）RRF 融合、近时排除、黑名单、行排除；
-- alias / edge 幂等（evidence 去重、bot 边双证据激活、反向回声、墓碑）；
-- WebUI 数据层（pg/sqlite 双方言派发的 sqlite 路全函数）。
+Dual-storage-backend plan §9.2 acceptance: a real SQLite db is spun up under tempfile, covering:
+- four convergence pipelines: embedding backfill / search_text backfill / re-encode pass consuming
+  summarized=false / pending facts into clusters (with merge/replace/decay/promotion);
+- recall dual legs (vector + FTS5 BM25) RRF fusion, recency exclusion, blacklist, row exclusion;
+- alias / edge idempotency (evidence dedup, bot-edge dual-evidence activation, reverse echo, tombstone);
+- WebUI data layer (the sqlite branch of the pg/sqlite dual-dialect dispatch, full function surface).
 
-PG 侧行为回归由既有桩测试覆盖（拆包零变化）；真机 live_check 保持
-postgres 路径。本 harness 首次让集成测试不需要 PG 服务。
+PG-side behavior regression is covered by the existing stub tests (zero change from the package split); the
+real-machine live_check keeps the postgres path. This harness is the first to run integration tests without a PG service.
 
-运行（插件目录）：
+Run (plugin dir):
     python tests/test_sqlite_backend.py
 """
 

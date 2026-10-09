@@ -1,8 +1,9 @@
-"""本地记忆插件配置模型（pydantic）。
+"""Local memory plugin config model (pydantic).
 
-对应插件 config.toml 顶层字段（enabled 除外——那是插件管理器语义）。
-M2（写入链路）只消费连接池 / embedding / 补算 / 熔断字段；
-recall、合并 agent、评分状态机字段随 M3-M5 里程碑接入。
+Corresponds to the plugin config.toml top-level fields (except enabled,
+which is plugin-manager semantics). M2 (write path) only consumes the
+connection pool / embedding / backfill / breaker fields; recall, merge
+agent, and scoring-state-machine fields land with M3-M5 milestones.
 """
 
 from typing import Literal
@@ -11,7 +12,7 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class LocalMemoryConfig(BaseModel):
-    """本地记忆后端（PostgreSQL + pgvector / SQLite 双后端）运行时配置。"""
+    """Runtime config for the local memory backend (PostgreSQL + pgvector / SQLite dual backend)."""
 
     storage_backend: str = Field(
         default="auto",

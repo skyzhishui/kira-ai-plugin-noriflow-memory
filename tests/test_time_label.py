@@ -1,10 +1,10 @@
-"""注入时间标注（_relative_time_label）分层精度与模式测试。
+"""Injection time-label (_relative_time_label) layered-precision and mode tests.
 
-对齐 nori 侧 PR#7（recall_time_label_mode：relative/absolute/both）：
-固定时钟 + 固定时区（Asia/Shanghai），覆盖三种模式、绝对部分精度分层
-（7 天内带时分 / 更久只到日期 / 跨年带年份 / 跨年近事不丢年份）、
-将来时间戳完整时刻守卫、naive/UTC 时区换算、Literal 装配期白名单
-与未知 mode 运行时兜底。
+Aligned with nori-side PR#7 (recall_time_label_mode: relative/absolute/both):
+fixed clock + fixed timezone (Asia/Shanghai), covering all three modes, absolute-part precision layering
+(within 7 days carries time-of-day / older goes date-only / cross-year keeps the year / cross-year recent items keep the year),
+full-timestamp guard for future timestamps, naive/UTC timezone conversion, the Literal assembly-time whitelist,
+and the runtime fallback for unknown modes.
 
 Run (plugin dir):
     python tests/test_time_label.py
@@ -54,7 +54,7 @@ def _make_kernel(**cfg_over) -> LocalMemoryKernel:
 
 
 def test_relative_mode_unchanged() -> None:
-    """relative 模式回归：输出与旧版逐字一致。"""
+    """relative-mode regression: output identical to the old version, character for character."""
     kernel = _make_kernel(recall_time_label_mode="relative")
     cases = [
         (_NOW - timedelta(hours=2), "今天"),
@@ -69,7 +69,7 @@ def test_relative_mode_unchanged() -> None:
 
 
 def test_both_mode_layered_precision() -> None:
-    """both 模式：7 天内带时分，更久只到日期，跨年带年份。"""
+    """both mode: within 7 days carries time-of-day, older goes date-only, cross-year keeps the year."""
     kernel = _make_kernel(recall_time_label_mode="both")
     d3 = _NOW - timedelta(days=3)
     assert kernel._relative_time_label(d3) == "3天前 · 9月28日 22:16"
@@ -85,7 +85,7 @@ def test_both_mode_layered_precision() -> None:
 
 
 def test_absolute_mode_no_relative() -> None:
-    """absolute 模式：只有绝对锚点。"""
+    """absolute mode: only the absolute anchor."""
     kernel = _make_kernel(recall_time_label_mode="absolute")
     d3 = _NOW - timedelta(days=3)
     assert kernel._relative_time_label(d3) == "9月28日 22:16"
@@ -93,7 +93,7 @@ def test_absolute_mode_no_relative() -> None:
 
 
 def test_none_ts_and_mode_switch() -> None:
-    """ts=None 恒空串；mode 动态切换即时生效（配置热加载路径）。"""
+    """ts=None always yields an empty string; dynamic mode switching takes effect immediately (config hot-reload path)."""
     kernel = _make_kernel(recall_time_label_mode="relative")
     assert kernel._relative_time_label(None) == ""
     ts = _NOW - timedelta(days=3)
@@ -103,13 +103,13 @@ def test_none_ts_and_mode_switch() -> None:
 
 
 def test_naive_ts_treated_as_local() -> None:
-    """naive 时间戳视为配置时区的本地时间（kernel._to_local 同款约定）。
+    """Naive timestamps are treated as local time in the configured timezone (same convention as kernel._to_local).
 
-    旧断言钉的是 astimezone 的兜底语义（naive 按服务器时区解释）——
-    配置时区与服务器不一致时日期与"今天/昨天"判定漂移，且与
-    kernel._to_local / _edge_time_qualifier 的 naive 约定相悖。标注层
-    现先钉配置时区再换算；断言 naive 与显式挂配置时区的 aware 输入
-    等价——不依赖运行机器的系统时区，UTC runner 上同样成立。
+    The old assertion pinned astimezone's fallback semantics (naive interpreted in the server timezone) — when the
+    configured timezone differs from the server's, date and "today/yesterday" determinations drift, and it contradicts
+    the naive convention shared by kernel._to_local and _edge_time_qualifier. The label layer now pins the configured
+    timezone before converting; the assertion checks naive input equals an aware input explicitly stamped with the
+    configured timezone — it does not depend on the running machine's system timezone and holds on UTC runners.
     """
     kernel = _make_kernel(recall_time_label_mode="both")
     naive = datetime(2026, 9, 28, 22, 16)
@@ -120,7 +120,7 @@ def test_naive_ts_treated_as_local() -> None:
 
 
 def test_utc_ts_converts_to_local() -> None:
-    """aware UTC 时间戳换算到本地时区再标注（跨日边界按本地日期算）。"""
+    """Aware UTC timestamps convert to the local timezone before labeling (cross-day boundaries use the local date)."""
     kernel = _make_kernel(recall_time_label_mode="both")
     utc = datetime(2026, 9, 28, 22, 16, tzinfo=dt_timezone.utc)
     # UTC 22:16 = 上海 9月29日 06:16 → days=2
@@ -128,7 +128,7 @@ def test_utc_ts_converts_to_local() -> None:
 
 
 def test_cross_year_near_past_keeps_year() -> None:
-    """跨年近事（days<7 且跨年）：绝对部分带年份，不被时分短路丢掉。"""
+    """Cross-year recent items (days<7 and crossing the year): the absolute part keeps the year, not dropped by the time-of-day short-circuit."""
     kernel = _make_kernel(recall_time_label_mode="both")
     kernel._now = staticmethod(
         lambda: datetime(2027, 1, 1, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -138,9 +138,9 @@ def test_cross_year_near_past_keeps_year() -> None:
 
 
 def test_future_ts_no_label() -> None:
-    """将来时间戳（时钟偏差/批次预置）：空串不标注，各模式一致。
+    """Future timestamps (clock skew / batch pre-set): empty string, no label, consistent across all modes.
 
-    按完整时刻比较：同日内未来时刻（不跨午夜）也一并拦截。
+    Comparison uses the full timestamp: future instants within the same day (not crossing midnight) are intercepted too.
     """
     kernel = _make_kernel(recall_time_label_mode="both")
     assert kernel._relative_time_label(_NOW + timedelta(days=2)) == ""
@@ -151,7 +151,7 @@ def test_future_ts_no_label() -> None:
 
 
 def test_invalid_mode_rejected_at_config() -> None:
-    """非法 mode 在装配期被 Literal 白名单拒绝，不再静默退化。"""
+    """Invalid modes are rejected at assembly time by the Literal whitelist, no longer silently degrading."""
     import pydantic
 
     # 断言收窄到具体错误位/类型：dsn 等字段均有默认值（零参构造成功），
@@ -168,7 +168,7 @@ def test_invalid_mode_rejected_at_config() -> None:
 
 
 def test_unknown_mode_warns_falls_back_relative() -> None:
-    """绕过 pydantic 直赋未知 mode（热切换路径）：按 relative 兜底不炸。"""
+    """Bypassing pydantic and assigning an unknown mode directly (hot-switch path): falls back to relative without blowing up."""
     kernel = _make_kernel(recall_time_label_mode="relative")
     ts = _NOW - timedelta(days=3)
     kernel.config.recall_time_label_mode = "weird"  # type: ignore[assignment]
@@ -176,8 +176,8 @@ def test_unknown_mode_warns_falls_back_relative() -> None:
 
 
 def test_resolve_local_tz_chain() -> None:
-    """时区解析链（画像/记忆注入唯一入口）：配置名 > 宿主 provider >
-    服务器本地；非法名/宿主缺位逐档回退。"""
+    """Timezone resolution chain (sole entry for persona/memory injection): config name > host provider >
+    server local; invalid names and missing host fall back level by level."""
     tl = load_module("time_labels")
     utc = ZoneInfo("UTC")
     assert tl.resolve_local_tz("Asia/Tokyo", lambda: utc) == ZoneInfo("Asia/Tokyo")

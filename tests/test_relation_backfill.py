@@ -1,18 +1,18 @@
-"""存量关系回填 + 关系图谱数据层测试（python 直跑，无 pytest 依赖）。
+"""Existing-relation backfill + relation-graph data-layer tests (python direct-run, no pytest dependency).
 
-覆盖（v1.8.0 关系图谱栏配套，与上游 nori 版测试同构）：
-- build_directory：歧义名字整名跳过、bot 显式入目录（通配平台）；
-- RelationBackfill.run：批内名字预筛（无可解析名批次跳过 LLM）、
-  行构造（evidence_key=backfill|簇id、bot 边判定、min_evidence 透传、
-  occurred_at 取簇值）、校验链丢弃（未知簇/subject 锁归属/object 锁
-  词典/label 词形锁源陈述/平台一致/label 越界）、同批重复结构键留首条、
-  单批失败计数继续、bot 名下簇不作源、进度回调；
-- BackfillController：运行中拒绝二次启动、完成后状态翻转、factory
-  异常/None 不可用、stop 幂等；
-- webui_store.fetch_relation_graph：节点组装（platform:uid 复合键、
-  无名回退 uid、bot 标注、degree）+ 统计。
+Coverage (v1.8.0 relation-graph pane companion, isomorphic with the upstream nori tests):
+- build_directory: ambiguous names skipped wholesale, bot explicitly entered into the directory (wildcard platform);
+- RelationBackfill.run: in-batch name pre-filter (batches with no resolvable names skip the LLM),
+  row construction (evidence_key=backfill|cluster-id, bot-edge detection, min_evidence passthrough,
+  occurred_at taken from the cluster value), validation-chain drops (unknown cluster / subject locked to owner / object locked to
+  directory / label form locked to source statement / platform consistency / label out-of-range), duplicate structural keys within a batch keep the first row,
+  per-batch failure counting continues, bot-owned clusters are not sources, progress callback;
+- BackfillController: rejects a second start while running, flips state on completion, factory
+  exception/None means unavailable, stop is idempotent;
+- webui_store.fetch_relation_graph: node assembly (platform:uid composite key,
+  unnamed falls back to uid, bot annotation, degree) + stats.
 
-运行（插件目录）：
+Run (plugin dir):
     python tests/test_relation_backfill.py
 """
 
@@ -84,7 +84,7 @@ class _FakeDB:
 
 
 class _FakeRouter:
-    """LLM 出口桩：按序弹出响应（Exception 实例则抛出）。"""
+    """LLM exit stub: pops responses in order (Exception instances are raised)."""
 
     def __init__(self, responses):
         self.responses = list(responses)
@@ -361,7 +361,7 @@ async def t_controller():
 
 
 def _graph_pool(edge_rows, alias_rows):
-    """图谱查询桩：按 SQL 目标表分发（边表 / 别名表各一次 fetch）。"""
+    """Graph-query stub: dispatches by SQL target table (one fetch for the edge table / one for the alias table)."""
 
     class _GraphPool:
         def acquire(self):
@@ -410,7 +410,7 @@ async def t_graph_assembly():
 
 
 async def t_graph_canonical_names():
-    """读侧规范名：别名最新 > 边名（非占位）> uid；边级端点名同步规范化。"""
+    """Read-side canonical names: latest alias > edge name (non-placeholder) > uid; edge-level endpoint names normalized in sync."""
     edges = [
         {
             "id": 1, "platform": "qq", "subject_uid": "1",
@@ -441,7 +441,7 @@ async def t_graph_canonical_names():
 
 
 async def t_backfill_placeholder_names():
-    """回填写侧守卫：LLM 占位端点名用目录规范名顶替，未命中留空。"""
+    """Backfill write-side guard: LLM placeholder endpoint names are replaced with directory canonical names, left empty when no hit."""
 
     class _Router:
         def __init__(self, payload):

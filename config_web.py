@@ -1,19 +1,22 @@
-"""维护页「设置」tab 的配置读写核心逻辑（自 nori-core nori_plugin_noriflow_memory
-web_api.py 的配置端点平移适配）。
+"""Read/write core logic for the "Settings" tab of the maintenance page (adapted from the config endpoints of nori-core nori_plugin_noriflow_memory web_api.py).
 
-与上游 nori 版同构的关键语义：
-- schema 从 LocalMemoryConfig.model_fields 推导（单一真相源）；
-- 敏感键掩码哨兵与宿主 WebUI 一致；
-- 保存 = 校验 -> diff -> 写宿主真相源 -> 就地更新运行时 LocalMemoryConfig
-  实例（kernel/merge_agent/encoder/熔断器运行时按次读同一实例，保存即生效）；
-- 装配期展开的字段（连接池/embedding 客户端/别名层装配等）标 restart，
-  如实提示需重初始化/重启进程。
+Key semantics isomorphic to the upstream nori version:
+- schema is derived from LocalMemoryConfig.model_fields (single source of truth);
+- sensitive-key mask sentinel matches the host WebUI;
+- save = validate -> diff -> write host source of truth -> update the runtime
+  LocalMemoryConfig instance in place (kernel/merge_agent/encoder/breaker
+  read the same instance per call, so the save takes effect immediately);
+- fields expanded at assembly time (connection pool / embedding client /
+  alias layer assembly etc.) are marked restart, honestly prompting that a
+  re-initialize / process restart is required.
 
-与上游 nori 版的差异（KiraAI 宿主语义）：
-- 配置真相源在宿主（plugin_mgr.plugin_configs + PLUGIN_CONFIG_DIR/<pid>.json），
-  保存同步宿主但不走 update_plugin_config——那会触发 init_plugin 整体重
-  初始化（拆池重建），与热生效目标冲突；直接更新宿主内存 dict 并落盘，
-  与宿主配置页读内存的口径一致。
+Differences from the upstream nori version (KiraAI host semantics):
+- the config source of truth lives in the host (plugin_mgr.plugin_configs +
+  PLUGIN_CONFIG_DIR/<pid>.json); save syncs the host but does not call
+  update_plugin_config, which would trigger a full init_plugin re-initialization
+  (pool teardown/rebuild) in conflict with the hot-effect goal; instead it
+  directly updates the host in-memory dict and persists to disk, consistent
+  with how the host config page reads memory.
 """
 
 from __future__ import annotations
@@ -109,7 +112,7 @@ _CONFIG_GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
 
 
 def _field_type(annotation) -> str:
-    """pydantic 注解 -> 前端控件类型。"""
+    """pydantic annotation -> frontend control type."""
     if annotation is bool:
         return "bool"
     if annotation is int:
@@ -126,7 +129,7 @@ def _field_type(annotation) -> str:
 
 
 def _literal_options(annotation) -> list[str] | None:
-    """Literal 注解的可选值列表（非 Literal 注解返回 None）。"""
+    """Optional values of a Literal annotation (None for non-Literal annotations)."""
     if get_origin(annotation) is Literal:
         return [str(v) for v in get_args(annotation)]
     return None
@@ -165,7 +168,7 @@ def _numeric_bounds(field) -> tuple[Any, Any]:
 
 
 def config_schema() -> dict:
-    """从 LocalMemoryConfig.model_fields 推导前端 schema（单一真相源）。"""
+    """Derive the frontend schema from LocalMemoryConfig.model_fields (single source of truth)."""
     schema: dict[str, dict[str, Any]] = {}
     for name, f in LocalMemoryConfig.model_fields.items():
         if f.default_factory is not None:
@@ -195,7 +198,7 @@ def config_schema() -> dict:
 
 
 def mask_values(values: dict) -> dict:
-    """掩码敏感键字符串值。"""
+    """Mask string values of sensitive keys."""
     return {
         k: (_MASK if (_SENSITIVE_KEY_RE.search(k) and isinstance(v, str) and v) else v)
         for k, v in values.items()
@@ -203,10 +206,10 @@ def mask_values(values: dict) -> dict:
 
 
 def unmask_values(new: dict, current: dict) -> dict:
-    """提交值中的掩码哨兵还原为现值（未修改的敏感字段不回填掩码）。
+    """Restore mask sentinels in submitted values to current values (unmodified sensitive fields are not refilled with the mask).
 
     Collision guard: a submitted mask is only treated as "unchanged" when
-    the stored value is itself not the mask string — if the real secret
+    the stored value is itself not the mask string, if the real secret
     literally equals the sentinel, submitting it must be honored as a value
     (otherwise that secret could never be set).
     """
@@ -220,7 +223,7 @@ def unmask_values(new: dict, current: dict) -> dict:
 
 
 def build_payload(host_values: dict) -> dict:
-    """组装 GET /memory/config 的 data 段（schema + 分组 + 掩码后现值）。"""
+    """Assemble the data section of GET /memory/config (schema + groups + masked current values)."""
     schema = config_schema()
     current = {k: v for k, v in host_values.items() if k in schema}
     values = {k: f["default"] for k, f in schema.items()}
@@ -236,14 +239,14 @@ def build_payload(host_values: dict) -> dict:
 
 
 def prepare_save(submitted: dict, host_values: dict) -> dict:
-    """校验 + diff 提交值。
+    """Validate and diff submitted values.
 
     Returns:
-        {"merged", "validated", "changed", "restart_required"}。
+        {"merged", "validated", "changed", "restart_required"}.
 
     Raises:
-        ValueError: 校验失败（消息含 pydantic 详情）。
-        SaveBlocked: dsn 清空等业务性拒绝。
+        ValueError: validation failed (message includes pydantic details).
+        SaveBlocked: business-level rejection such as clearing dsn.
     """
     schema = config_schema()
     merged = unmask_values(
@@ -293,10 +296,12 @@ def prepare_save(submitted: dict, host_values: dict) -> dict:
 
 def persist_host_config(config_dir: "Path", plugin_id: str, changed: dict,
                         current_host: dict) -> None:
-    """把变更合并进宿主配置文件（PLUGIN_CONFIG_DIR/<pid>.json）。
+    """Merge changes into the host config file (PLUGIN_CONFIG_DIR/<pid>.json).
 
-    与宿主 update_plugin_config 的落盘行为一致（读现文件 -> 合并 -> 写回），
-    但不触发 init_plugin（热生效由调用方就地更新运行时实例承担）。
+    Consistent with the host update_plugin_config disk behavior (read the
+    current file -> merge -> write back), but does not trigger init_plugin
+    (hot effect is handled by the caller updating the runtime instance in
+    place).
     """
     config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / f"{plugin_id}.json"
@@ -330,4 +335,4 @@ def persist_host_config(config_dir: "Path", plugin_id: str, changed: dict,
 
 
 class SaveBlocked(Exception):
-    """业务性拒绝保存（如 dsn 清空），HTTP 400。"""
+    """Business-level save rejection (e.g. clearing dsn), HTTP 400."""

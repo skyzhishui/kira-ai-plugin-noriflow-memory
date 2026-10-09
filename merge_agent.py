@@ -1,31 +1,47 @@
-"""合并 agent：四遍扫描 + LLM 四分类裁定 + 评分状态机编排（开发方案 §8）。
+"""Merge agent: four-pass scan + LLM four-way adjudication + scoring state
+machine orchestration (dev plan section 8).
 
-每 merge_interval_hours 周期执行一次 run_cycle：
-1. 归一化遍：raw 表 flag=0 事实 -> 同 (platform, user, category) 簇候选
-   （向量 top-K，含墓碑簇；事实无向量时标量退化）-> LLM 四分类裁定
-   （same/drift/correction/unrelated）-> 单事务处置 + 翻 flag；
-2. 衰减遍：每 decay_interval_days 一次（上次执行时间 kv 持久化，重启不丢；
-   首次运行只初始化时间戳不衰减）；
-3. 晋档遍：达阈值 active 簇 -> profiled + 画像表 upsert（recent 低阈值）；
-4. 补编码遍：编码降级期写入摘要表的对话原文行（summarized=false，不参与
-   召回）重跑端侧编码——summary 回写原行（翻状态、向量重算），facts 走
-   fact 原始表正常通道（evidence_key 沿用原行 occurred_at）；
-5. 关系遍：结构自检（零 LLM 哨兵，违例计数记日志）+ 语义审计（开关
-   relation_audit_enabled，LLM 按 id 水位增量审计 active/pending 边，
-   判定 bad 直接置 superseded）。
+One run_cycle runs per merge_interval_hours:
+1. Normalization pass: raw table facts with flag=0 -> candidate clusters for
+   the same (platform, user, category), using vector top-K (including
+   tombstone clusters; scalar fallback when a fact has no vector) -> LLM
+   four-way adjudication (same/drift/correction/unrelated) -> single
+   transaction disposition + flag flip;
+2. Decay pass: once per decay_interval_days (last-run time persisted in kv,
+   survives restarts; the first run only initializes the timestamp, it does
+   not decay);
+3. Promotion pass: active clusters reaching the threshold -> profiled +
+   profile table upsert (recent uses a lower threshold);
+4. Encode-backfill pass: dialogue raw rows written into the summary table
+   during the encode-degradation window (summarized=false, excluded from
+   recall) are re-run through on-device encoding; summary is written back to
+   the original row (status flipped, embedding recomputed), facts go through
+   the normal fact raw table channel (evidence_key reuses the row's
+   occurred_at);
+5. Relation pass: structural self-check (a zero-LLM sentinel, violations
+   counted into logs) + semantic audit (gated by relation_audit_enabled,
+   LLM incrementally audits active/pending edges by id watermark, edges
+   judged bad are superseded directly).
 
-可靠性：
-- LLM 调用预算 llm_budget_per_cycle 限流，超出顺延下周期；
-- 裁定 unsure / LLM 失败 / 处置异常均不翻 flag（下周期重处理，幂等由
-  evidence_key 去重 + 乐观锁双重兜底）；
-- 补编码遍：编码或写入失败不翻状态（行保持 summarized=false 下周期
-  重试，facts/边表幂等键保证重试不重复入库），连续 3 次 ok=False 视为
-  LLM 整体不可用，提前结束本遍不烧剩余预算；
-- 语义审计遍：批失败/unsure 即停（水位停在最后成功批，下周期同批重审；
-  同一批连续 3 次失败/unsure 跳批推水位——毒丸批不得钉死水位），
-  每周期调用次数独立上限，耗尽顺延；
-- 处置数值计算全部下沉 db 层 SQL（见 db.apply_fact_merge），本层只做
-  裁定解读与动作选择。
+Reliability:
+- LLM call budget is throttled by llm_budget_per_cycle, overshoot is carried
+  over to the next cycle;
+- unsure verdicts / LLM failures / disposition errors never flip the flag
+  (reprocessed next cycle; idempotence is backed by evidence_key dedup plus
+  optimistic locking);
+- Encode-backfill pass: encode or write failures do not flip status (rows
+  stay summarized=false and retry next cycle; fact/edge idempotence keys
+  prevent duplicate inserts), 3 consecutive ok=False results treat the LLM
+  as unavailable and end the pass early without burning the remaining
+  budget;
+- Semantic audit pass: a batch failure/unsure stops the pass (the watermark
+  stays at the last successful batch, the same batch re-audits next cycle;
+  3 consecutive failures/unsures on one batch skip it and advance the
+  watermark so a poison batch cannot pin the watermark), each cycle has an
+  independent call cap, exhaustion is carried over;
+- All disposition scoring is pushed down to db-layer SQL (see
+  db.apply_fact_merge); this layer only interprets verdicts and picks
+  actions.
 """
 
 from __future__ import annotations
@@ -161,19 +177,22 @@ _INITIAL_DELAY_SECONDS = 60.0
 
 
 def _bump_skip(state: dict[str, int], row_id: str) -> None:
-    """毒丸行失败计数 +1（达到上限后调用方过滤不再拉取该行）。"""
+    """Increment the poison-row failure count; once the cap is reached, the
+    caller filters the row out of fetches."""
     state[row_id] = state.get(row_id, 0) + 1
 
 
 class FactAdjudicator:
-    """LLM 四分类裁定器：新事实 vs 候选簇列表 -> 逐簇 verdict。
+    """LLM four-way adjudicator: a new fact vs a list of candidate clusters
+    yields a per-cluster verdict.
 
-    fail-soft：LLM 调用失败 / 输出不可解析时返回 None，由调用方跳过
-    本条事实（不翻 flag，下周期重审），绝不盲目建簇。
+    fail-soft: an LLM call failure or an unparseable output returns None,
+    letting the caller skip this fact (the flag is not flipped, re-audited
+    next cycle), and it never blindly creates a cluster.
 
     Attributes:
-        llm: FastLlmExit 实例（run_structured 出口）。
-        prompt_dir: 裁定提示词模板目录。
+        llm: FastLlmExit instance (run_structured exit).
+        prompt_dir: directory of adjudication prompt templates.
     """
 
     def __init__(
@@ -181,11 +200,12 @@ class FactAdjudicator:
         llm: FastLlmExit,
         prompt_dir: Optional[str | Path] = None,
     ) -> None:
-        """初始化裁定器。
+        """Initialize the adjudicator.
 
         Args:
-            llm: FastLlmExit 实例（fast LLM 文本出口）。
-            prompt_dir: 提示词目录；None 时默认本插件 prompts/ 目录。
+            llm: FastLlmExit instance (fast LLM text exit).
+            prompt_dir: prompt directory; None defaults to this plugin's
+                prompts/ directory.
         """
         self.llm = llm
         self.prompt_dir = Path(
@@ -196,15 +216,18 @@ class FactAdjudicator:
     async def adjudicate(
         self, fact: dict, candidates: list[dict]
     ) -> Optional[dict]:
-        """裁定新事实与全部候选簇的关系（一次 LLM 调用）。
+        """Adjudicate the relation between a new fact and all candidate clusters
+        (one LLM call).
 
         Args:
-            fact: raw 事实行（fetch_pending_facts 产出）。
-            candidates: 候选簇列表（search_cluster_candidates 产出）。
+            fact: raw fact row (produced by fetch_pending_facts).
+            candidates: candidate cluster list (produced by
+                search_cluster_candidates).
 
         Returns:
-            {"verdicts": [(cluster_id, verdict), ...], "unsure": bool}；
-            LLM 失败 / 输出不可解析时 None（调用方跳过本条）。
+            {"verdicts": [(cluster_id, verdict), ...], "unsure": bool};
+            None on LLM failure or unparseable output (the caller skips
+            this fact).
         """
         payload = {
             "new_fact": {
@@ -271,15 +294,17 @@ class FactAdjudicator:
 
 
 class RelationAuditor:
-    """关系边语义审计器：一批 active/pending 边 -> 逐边 ok/bad 判定。
+    """Relation edge semantic auditor: a batch of active/pending edges yields
+    a per-edge ok/bad judgement.
 
-    fail-soft：LLM 调用失败 / 输出不可解析 / unsure 时返回 None 或
-    unsure 标记，由调用方停止本遍（不推水位，下周期从同批重审），
-    绝不盲目降级。
+    fail-soft: an LLM call failure, an unparseable output, or an unsure
+    result returns None or an unsure marker, letting the caller stop this
+    pass (the watermark is not advanced, the same batch re-audits next
+    cycle), and it never blindly downgrades.
 
     Attributes:
-        llm: FastLlmExit 实例（run_structured 出口）。
-        prompt_dir: 审计提示词模板目录。
+        llm: FastLlmExit instance (run_structured exit).
+        prompt_dir: directory of audit prompt templates.
     """
 
     def __init__(
@@ -287,11 +312,12 @@ class RelationAuditor:
         llm: FastLlmExit,
         prompt_dir: Optional[str | Path] = None,
     ) -> None:
-        """初始化审计器。
+        """Initialize the auditor.
 
         Args:
-            llm: FastLlmExit 实例（fast LLM 文本出口）。
-            prompt_dir: 提示词目录；None 时默认本插件 prompts/ 目录。
+            llm: FastLlmExit instance (fast LLM text exit).
+            prompt_dir: prompt directory; None defaults to this plugin's
+                prompts/ directory.
         """
         self.llm = llm
         self.prompt_dir = Path(
@@ -300,14 +326,16 @@ class RelationAuditor:
         self._loader = PromptLoader(self.prompt_dir)
 
     async def audit(self, edges: list[dict]) -> Optional[dict]:
-        """判定一批边是否为合格的关系边（一次 LLM 调用）。
+        """Judge whether a batch of edges are valid relation edges (one LLM call).
 
         Args:
-            edges: 待审边行（fetch_edges_for_audit 产出）。
+            edges: edge rows awaiting audit (produced by
+                fetch_edges_for_audit).
 
         Returns:
-            {"edges": [(edge_id, verdict, reason), ...], "unsure": bool}；
-            LLM 失败 / 输出不可解析时 None（调用方停遍）。
+            {"edges": [(edge_id, verdict, reason), ...], "unsure": bool};
+            None on LLM failure or unparseable output (the caller stops
+            this pass).
         """
         payload = {
             "edges": [
@@ -375,10 +403,12 @@ class RelationAuditor:
 
 
 class FactMergeAgent:
-    """四遍扫描合并 agent（后台 asyncio 任务，生命周期归插件 initialize/terminate）。
+    """Four-pass scan merge agent (a background asyncio task whose lifecycle
+    belongs to the plugin's initialize/terminate).
 
-    依赖 FastLlmExit（LLM 裁定）：缺失时不应启动本 agent——盲目建簇会造成
-    簇爆炸，raw 事实保持 flag=0 堆积等待（数据不丢）。
+    Depends on FastLlmExit (LLM adjudication): do not start this agent when
+    it is missing. Blind cluster creation would cause cluster explosion,
+    while raw facts keep flag=0 and pile up waiting (no data loss).
     """
 
     def __init__(
@@ -397,31 +427,44 @@ class FactMergeAgent:
         alias_name_resolver: Optional[Callable[[str, str], str]] = None,
         alias_store: Optional[AliasStore] = None,
     ) -> None:
-        """初始化（不启动任务）。
+        """Initialize (does not start the task).
 
         Args:
-            db: 记忆库访问层。
-            llm: FastLlmExit 实例（LLM 裁定出口）。
-            config: 合并 agent 与评分状态机配置。
-            prompt_dir: 裁定提示词目录；None 时默认本插件 prompts/ 目录。
-            encoder: 端侧记忆编码器（补编码遍消费；None 时补编码遍跳过，
-                降级原文行保持 summarized=false 不参与召回）。
-            embedding_service: 向量计算服务（补编码 facts 入表向量化用）。
-            bot_nickname: Bot 昵称（编码器提示词排除项）。
-            bot_id: Bot 平台 ID（编码器提示词排除项 + facts 硬过滤兜底）。
-            circuit_breaker: 记忆库熔断器（None 时周期任务不做事前熔断
-                检查——DB 故障期每周期空转重试；传入时拒绝期整周期跳过，
-                不烧 LLM 预算）。
-            tz_provider: 本地时区读取器（kernel._local_tz 同源；补编码
-                幂等键的日期口径对齐 retain 路径用。None 回退服务器本地）。
-            bot_forms_provider: bot uid 全形态集合读取器（kernel.
-                _bot_uid_forms_all 语义——补编码关系通道的 bot 端点判定
-                与 retain 通道对齐；None 退化为单形态 self._bot_id）。
-            alias_name_resolver: (platform, uid) -> 最新非占位别名（写侧
-                占位名守卫的顶替源，与 kernel._endpoint_name 同源；
-                None 时空名留给 upsert 保旧名）。
-            alias_store: 持久别名内存视图（事实代号别名回填遍的 apply_rows
-                同步口；None 时该遍跳过——别名层被禁用的降级形态）。
+            db: memory database access layer.
+            llm: FastLlmExit instance (LLM adjudication exit).
+            config: merge agent and scoring state-machine configuration.
+            prompt_dir: adjudication prompt directory; None defaults to
+                this plugin's prompts/ directory.
+            encoder: on-device memory encoder (consumed by the encode-backfill
+                pass; None skips that pass, degraded raw rows keep
+                summarized=false and stay out of recall).
+            embedding_service: embedding computation service (vectorizes
+                encode-backfill facts on insert).
+            bot_nickname: bot nickname (encoder prompt exclusion item).
+            bot_id: bot platform ID (encoder prompt exclusion item plus a
+                facts hard-filter fallback).
+            circuit_breaker: memory DB circuit breaker (None disables the
+                pre-cycle breaker check, so the periodic task just idles
+                and retries during a DB outage; when provided, an open
+                period skips the whole cycle without burning LLM budget).
+            tz_provider: local timezone reader (same source as
+                kernel._local_tz; aligns the encode-backfill idempotency
+                key date basis with the retain path. None falls back to
+                the server's local timezone).
+            bot_forms_provider: all-form bot uid set reader (same
+                semantics as kernel._bot_uid_forms_all; aligns the bot
+                endpoint detection of the encode-backfill relation channel
+                with the retain channel; None degrades to the single form
+                self._bot_id).
+            alias_name_resolver: (platform, uid) -> latest non-placeholder
+                alias (the replacement source for the write-side
+                placeholder-name guard, same source as
+                kernel._endpoint_name; None leaves blank names to the
+                upsert, which keeps the old name).
+            alias_store: persistent alias in-memory view (the apply_rows
+                sync channel for the fact-code alias backfill pass; None
+                skips that pass, the degraded form when the alias layer is
+                disabled).
         """
         self._db = db
         self._adjudicator = FactAdjudicator(llm, prompt_dir)
@@ -449,7 +492,8 @@ class FactMergeAgent:
         self._last_cycle: Optional[dict] = None
 
     def _bot_forms(self) -> list[str]:
-        """Bot uid 全形态集合（provider 优先；退化为单形态 self._bot_id）。"""
+        """Full-form bot uid set (provider first; degrades to the single form
+        self._bot_id)."""
         if self._bot_forms_provider is not None:
             try:
                 forms = [f for f in (self._bot_forms_provider() or []) if f]
@@ -460,7 +504,8 @@ class FactMergeAgent:
         return [self._bot_id] if self._bot_id else []
 
     def _alias_name_for(self, platform: str, uid: str) -> str:
-        """占位名顶替源：别名视图该 uid 的最新可用名（未命中返回空串）。"""
+        """Placeholder-name replacement source: the alias view's latest
+        available name for this uid (empty string when there is no hit)."""
         if self._alias_name_resolver is None:
             return ""
         try:
@@ -470,27 +515,31 @@ class FactMergeAgent:
 
     @property
     def bot_id(self) -> str:
-        """Bot 平台 ID（宿主插件学到真实 self_id 后运行期回填）。"""
+        """Bot platform ID (backfilled at runtime once the host plugin learns
+        the real self_id)."""
         return self._bot_id
 
     @bot_id.setter
     def bot_id(self, value: str) -> None:
-        """回填真实 Bot 平台 ID（facts 硬过滤 + 补编码 prompt 渲染消费）。"""
+        """Backfill the real bot platform ID (consumed by the facts hard
+        filter and the encode-backfill prompt rendering)."""
         self._bot_id = (value or "").strip()
 
     @property
     def bot_nickname(self) -> str:
-        """Bot 昵称（宿主 persona 热切换后运行期回填）。"""
+        """Bot nickname (backfilled at runtime after the host persona
+        hot-swaps)."""
         return self._bot_nickname
 
     @bot_nickname.setter
     def bot_nickname(self, value: str) -> None:
-        """回填昵称（补编码 prompt 的 bot 排除规则消费）。"""
+        """Backfill the nickname (consumed by the encode-backfill prompt's
+        bot exclusion rule)."""
         self._bot_nickname = (value or "").strip()
 
     @property
     def running(self) -> bool:
-        """任务是否在运行。"""
+        """Whether the task is running."""
         return self._task is not None and not self._task.done()
 
     @property
@@ -504,7 +553,8 @@ class FactMergeAgent:
         return self._last_cycle
 
     def start(self) -> None:
-        """启动后台任务（幂等：已运行时跳过）。"""
+        """Start the background task (idempotent: a no-op when already
+        running)."""
         if self.running:
             return
         self._task = asyncio.create_task(self._run(), name="memory-fact-merge")
@@ -516,7 +566,8 @@ class FactMergeAgent:
         )
 
     async def stop(self) -> None:
-        """停止后台任务（幂等，等待当前周期退出）。"""
+        """Stop the background task (idempotent; waits for the current cycle
+        to exit)."""
         if self._task is None:
             return
         self._task.cancel()
@@ -531,7 +582,8 @@ class FactMergeAgent:
         logger.info("合并 agent 已停止")
 
     async def _run(self) -> None:
-        """任务主循环：启动缓冲后先跑一轮，此后按周期执行，异常只记录不退出。"""
+        """Task main loop: run one cycle after the startup grace window, then
+        run per interval; exceptions are only logged, never fatal."""
         await asyncio.sleep(_INITIAL_DELAY_SECONDS)
         while True:
             self._in_cycle = True
@@ -573,11 +625,11 @@ class FactMergeAgent:
         return True
 
     async def run_cycle(self) -> dict:
-        """执行单个合并周期（四遍扫描）。
+        """Run a single merge cycle (four-pass scan).
 
         Returns:
-            统计 dict：facts/merged/created/replaced/skipped_unsure/
-            deferred/llm_calls/promoted/reencoded。
+            stats dict: facts/merged/created/replaced/skipped_unsure/
+            deferred/llm_calls/promoted/reencoded.
         """
         cfg = self._config
         stats = {
@@ -767,14 +819,20 @@ class FactMergeAgent:
         return stats
 
     async def _fact_code_alias_pass(self) -> int:
-        """生效事实簇的「用户<uid>（<代号>）」登记为 uid 别名。
+        """Register "user<uid> (<code name>)" of active fact clusters as uid
+        aliases.
 
-        消息流别名 upsert 只能学到名片形态的名字，群聊真实称呼（代号/
-        缩写）与名片不同形时（名片 undefined𝕩𝕩𝕪 vs 群称 xxy）永远
-        学不到——事实陈述里 LLM 写出的「用户3429924750（xxy）」才是
-        代号与 uid 的显式绑定。retain 通道实时登记增量（kernel.
-        _register_fact_code_aliases），本遍全量兜底：存量簇（含部署前
-        历史）下周期即补齐，upsert 幂等可重入。别名层被禁用时整遍跳过。
+        The message-flow alias upsert can only learn card-shaped names; a
+        group chat's real form of address (code name / abbreviation), when
+        it differs from the card (card "undefined𝕩𝕩𝕪" vs group "xxy"), is
+        never learned. The "user3429924750 (xxy)" form the LLM writes into
+        fact statements is the explicit uid-to-code-name binding. The
+        retain channel registers increments in real time (kernel.
+        _register_fact_code_aliases); this pass is the full backstop:
+        existing clusters (including pre-deployment history) are filled in
+        from the next cycle on, and the upsert is idempotent and
+        re-entrant. The whole pass is skipped when the alias layer is
+        disabled.
         """
         if self._alias_store is None:
             return 0
@@ -800,24 +858,32 @@ class FactMergeAgent:
         return len(rows)
 
     async def _reencode_pass(self, budget: int) -> int:
-        """补编码遍：对编码降级写入的对话原文行重跑端侧编码。
+        """Encode-backfill pass: re-run on-device encoding on dialogue raw rows
+        that were written through encode degradation.
 
-        summarized=false 的 chat_summary 行不参与召回（防上下文污染），
-        由本遍在 LLM 恢复后重编码：先写 facts（失败方向安全——UPDATE 后
-        该行不再被扫描，先保 facts 落库；document_id 幂等兜底重复），再
-        UPDATE 原行（summary 回写 + 向量按摘要重算 + 翻状态）。
+        chat_summary rows with summarized=false do not participate in
+        recall (a context-pollution guard); this pass re-encodes them once
+        the LLM recovers: facts are written first (failure-direction safe:
+        after the UPDATE the row is no longer scanned, so facts landing
+        first matters; document_id idempotence guards duplicates), then
+        the raw row is updated (summary written back, embedding recomputed
+        from the summary, status flipped).
 
-        失败语义：encode 降级（ok=False）、facts/关系写入失败或回写异常均
-        不翻状态，行保持 summarized=false 下周期重试（facts/边表幂等键
-        保证重试不重复入库）；连续 _REENCODE_FAIL_LIMIT 次降级视为
-        LLM 整体不可用，提前结束本遍。预算与归一化遍共享，逐行调用前扣减
-        （对齐归一化遍模式），耗尽即止。
+        Failure semantics: an encode downgrade (ok=False), a failure to
+        write facts/relations, or a write-back error never flips status;
+        the row stays summarized=false and retries next cycle (the
+        fact/edge idempotency keys guarantee retries do not duplicate
+        inserts). _REENCODE_FAIL_LIMIT consecutive downgrades treat the
+        LLM as fully unavailable and end this pass early. The budget is
+        shared with the normalization pass, deducted per-row before each
+        call (mirroring the normalization pass), and stops when exhausted.
 
         Args:
-            budget: 归一化遍消耗后剩余的 LLM 调用预算。
+            budget: remaining LLM call budget after the normalization pass.
 
         Returns:
-            本遍成功重编码（翻状态）的行数。
+            Number of rows successfully re-encoded (status flipped) in
+            this pass.
         """
         if self._encoder is None or budget <= 0:
             return 0
@@ -921,19 +987,26 @@ class FactMergeAgent:
         return done
 
     async def _reingest_facts(self, facts: list, row: dict) -> None:
-        """补编码产出的事实批量写入 fact 原始表（对齐 kernel 通道语义）。
+        """Batch-write the encode-backfill facts into the raw fact table
+        (aligned with kernel channel semantics).
 
-        evidence_key 沿用原行 session_id，日期按本地时区换算后取值（与
-        retain 路径的 naive 本地日期口径对齐，见 _to_local 注释）；bot
-        自身事实硬过滤兜底（对齐 retain_encoded）；任一条插入失败立即
-        上抛（对齐 kernel._ingest_facts 的失败语义）——调用方据此跳过
-        summary 回写，行保持 summarized=false 由下周期补编码重试再产出，
-        事实不永久丢失（document_id 幂等保证重试不重复入表）。
+        evidence_key reuses the raw row's session_id, and the date is
+        taken after local-timezone conversion (aligned with the retain
+        path's naive local date basis; see the _to_local note). Facts
+        about the bot itself are hard-filtered as a fallback (aligned
+        with retain_encoded). Any insert failure is raised immediately
+        (aligned with kernel._ingest_facts failure semantics), so the
+        caller skips the summary write-back; the row stays
+        summarized=false and the next cycle's encode-backfill outputs it
+        again, so facts are never permanently lost (document_id
+        idempotence guarantees retries do not re-insert).
 
         Args:
-            facts: 编码产出的人物事实列表（EncodedFact）。
-            row: 摘要表原行（fetch_unsummarized_summaries 产出，含
-                session_id/group_id/platform/occurred_at）。
+            facts: encoded persona fact list (EncodedFact) produced by
+                encoding.
+            row: raw summary-table row (produced by
+                fetch_unsummarized_summaries; carries
+                session_id/group_id/platform/occurred_at).
         """
         if not facts:
             return
@@ -993,19 +1066,26 @@ class FactMergeAgent:
     async def _reingest_relations(
         self, relations: list[EncodedRelation], row: dict
     ) -> None:
-        """补编码产出的关系三元组合并落边表（对齐 kernel 通道语义）。
+        """Merge the relation triples produced by encode-backfill into the edge
+        table (aligned with kernel channel semantics).
 
-        evidence_key 沿用原行 session_id + 本地日期（与 _reingest_facts
-        同口径——同批重编码/重放不重复计数）；写侧三项不变式与 retain 路
-        对齐——label 停用表拦截（label_stopwords）、bot 端点多形态集合
-        判定（kernel 学习形态经 provider 桥接）、端点占位名守卫（别名
-        视图最新名顶替，空名留给 upsert 保旧名）。整批单次 upsert，失败
-        上抛——调用方跳过 summary 回写，行保持未摘要由下周期重试（边表
-        evidence_key 幂等，重试不重复计数）。
+        evidence_key reuses the raw row's session_id plus the local date
+        (same basis as _reingest_facts; re-encoding or replaying the same
+        batch does not double-count). The write-side invariants align with
+        the retain path: label stopword interception (label_stopwords),
+        multi-form bot endpoint detection (forms learned by the kernel are
+        bridged through the provider), and the endpoint placeholder-name
+        guard (the alias view's latest name replaces placeholders; blank
+        names are left to the upsert, which keeps the old name). The whole
+        batch upserts in a single call; a failure is raised, so the caller
+        skips the summary write-back and the row stays unsummarized for a
+        retry next cycle (the edge-table evidence_key is idempotent, so a
+        retry does not double-count).
 
         Args:
-            relations: 编码产出并校验后的关系三元组列表。
-            row: 摘要表原行（含 session_id/platform/occurred_at）。
+            relations: validated relation triples produced by encoding.
+            row: raw summary-table row (carries
+                session_id/platform/occurred_at).
         """
         if not relations:
             return
@@ -1053,10 +1133,12 @@ class FactMergeAgent:
         )
 
     def _to_local(self, dt: datetime) -> datetime:
-        """aware 时间转本地时区（naive 原样返回，视为已是本地口径）。
+        """Convert an aware datetime to the local timezone (naive values are
+        returned as-is, treated as already in local basis).
 
-        时区解析链与 kernel._local_tz 同源（tz_provider 注入），provider
-        不可用时回退服务器本地时区。
+        The timezone resolution chain shares its source with
+        kernel._local_tz (injected via tz_provider); it falls back to the
+        server's local timezone when the provider is unavailable.
         """
         if dt.tzinfo is None:
             return dt
@@ -1093,7 +1175,8 @@ class FactMergeAgent:
             pass
 
     async def _load_skip_state(self, key: str) -> dict[str, int]:
-        """读取毒丸行跳过状态（{"<行id>": 连续失败次数}；读取失败视为空）。"""
+        """Load the poison-row skip state ({"<row id>": consecutive failure
+        count}; a failed read is treated as empty)."""
         try:
             raw = await self._db.get_kv(key)
             state = json.loads(raw) if raw else {}
@@ -1103,7 +1186,8 @@ class FactMergeAgent:
             return {}
 
     async def _save_skip_state(self, key: str, state: dict[str, int]) -> None:
-        """持久化跳过状态（超容量对半 FIFO 截断；失败只记日志）。"""
+        """Persist the skip state (over-capacity is trimmed by half-FIFO;
+        failures are only logged)."""
         try:
             if len(state) > _SKIP_STATE_MAX_ENTRIES:
                 state = dict(list(state.items())[_SKIP_STATE_MAX_ENTRIES // 2:])
@@ -1116,19 +1200,23 @@ class FactMergeAgent:
         candidates: list[dict],
         verdicts: Optional[list[tuple[int, str]]],
     ) -> list[int]:
-        """same 裁定命中 replaced 簇时，返回其继任簇 id 列表（打矛盾标记用）。
+        """When a same verdict lands on a replaced cluster, return the id list
+        of its successors (used for contradiction marking).
 
-        新事实重申已被更正替代的旧说法，语义上是对继任簇（更正后的说法）
-        的否定——继任簇打 contradicted_at 豁免证据地板，随衰减出清；即使
-        继任簇已 dead/replaced 再被标记也无害（标记只作用于衰减路径，且
-        复活时会被清除）。
+        A new fact restating an old claim already superseded by a
+        correction semantically negates the successor cluster (the
+        corrected claim); the successor gets contradicted_at and is
+        exempt from the evidence floor, flushed out by decay. Marking a
+        successor that is already dead/replaced is harmless (the mark only
+        acts on the decay path and is cleared on revival).
 
         Args:
-            candidates: 候选簇列表（含 replaced_by 字段）。
-            verdicts: 裁定结果。
+            candidates: candidate cluster list (carries the replaced_by
+                field).
+            verdicts: adjudication result.
 
         Returns:
-            继任簇 id 列表（去重，可能为空）。
+            Successor id list (deduplicated, may be empty).
         """
         by_id = {c["id"]: c for c in candidates}
         successors: list[int] = []
@@ -1150,29 +1238,42 @@ class FactMergeAgent:
         candidates: list[dict],
         verdicts: Optional[list[tuple[int, str]]],
     ) -> tuple[str, Optional[int]]:
-        """从裁定结果派生处置动作（优先级 correction > same > drift > 建新簇）。
+        """Derive the disposition action from the adjudication result
+        (priority: correction > same > drift > create a new cluster).
 
-        - correction 且 confidence=high 且新事实不早于簇首次出现：
-          replace（快速通道，替代旧簇）；
-        - correction 不满足快速通道（medium 置信或时序倒置）：降级建新簇；
-        - same：并入相似度最高的 same 簇（候选序即相似度序，标量退化时为
-          最近更新序）——一条事实只入一个簇，防多簇重复计分；
-        - drift / unrelated：建新簇独立计分；
-        - 候选为空（verdicts=None，未走 LLM）：建新簇是唯一出路；
-          「有候选但裁定全非法」由 run_cycle 拦截为 unsure（不落入本
-          方法——空 verdicts 直达此处等于盲目建簇，违反绝不盲目建簇契约）；
-        - replaced 簇不作为任何处置目标（merge/replace 都不指向它）：它有
-          明确继任簇，same 复活会与新簇矛盾并存；same 命中 replaced 时
-          由调用方对继任簇打矛盾标记，本条走建新簇。dead/pending_uncertain
-          簇可正常 same 入簇复活（衰减死亡无语义继任者）。
+        - correction with confidence=high and a fact not older than the
+          cluster's first appearance: replace (fast track, supersedes the
+          old cluster);
+        - correction that misses the fast track (medium confidence or a
+          time-order inversion): downgrade to creating a new cluster;
+        - same: merge into the highest-similarity same cluster (candidate
+          order is similarity order; scalar fallback uses last-update
+          order). A fact joins exactly one cluster, preventing duplicate
+          scoring across clusters;
+        - drift / unrelated: create a new cluster with independent
+          scoring;
+        - no candidates (verdicts=None, no LLM call): creating a new
+          cluster is the only path. "Candidates exist but every verdict
+          was invalid" is intercepted by run_cycle as unsure (it never
+          reaches this method: empty verdicts arriving here would equal
+          blind cluster creation, violating the never-blindly-create
+          contract);
+        - a replaced cluster is never a disposition target (neither merge
+          nor replace points at it): it has an explicit successor, and a
+          same revival would coexist in contradiction with the new
+          cluster. When a same verdict hits a replaced cluster, the caller
+          marks its successor as contradicted and this path creates a new
+          cluster. dead/pending_uncertain clusters can be normally revived
+          by a same merge (decay-death has no semantic successor).
 
         Args:
-            fact: raw 事实行。
-            candidates: 候选簇列表。
-            verdicts: 裁定结果（None 表示无候选簇，未走 LLM）。
+            fact: raw fact row.
+            candidates: candidate cluster list.
+            verdicts: adjudication result (None means there were no
+                candidate clusters, so no LLM call ran).
 
         Returns:
-            (action, cluster_id) 二元组（action: merge|create|replace）。
+            (action, cluster_id) tuple (action: merge|create|replace).
         """
         if not verdicts:
             return "create", None
@@ -1208,25 +1309,29 @@ class FactMergeAgent:
         return "create", None
 
     def _start_score(self, fact: dict) -> float:
-        """按事实置信度取起步分（high/medium）。
+        """Pick the start score from the fact's confidence (high/medium).
 
         Args:
-            fact: raw 事实行。
+            fact: raw fact row.
 
         Returns:
-            起步分（score_start_high / score_start_medium）。
+            The start score (score_start_high / score_start_medium).
         """
         if fact["confidence"] == "high":
             return float(self._config.score_start_high)
         return float(self._config.score_start_medium)
 
     async def _relation_integrity_check(self) -> None:
-        """关系遍·结构自检（第一层，零 LLM 哨兵）：不变式违例计数记日志。
+        """Relation pass, structural self-check (layer 1, a zero-LLM sentinel):
+        invariant violations are counted and logged.
 
-        只观测不处置——结构性违例（证据计数错位/双向镜像 active/词长
-        越界）通常意味着管线 bug 或迁移遗留，静默修数会掩盖根因。
-        stale_names 是已知观测项（读侧有规范名解析兜底、非告警面），
-        不计入告警判定。
+        Observation only, no disposition. Structural violations (an
+        evidence count mismatch / a bidirectional mirror both active /
+        word-length overflow) usually signal a pipeline bug or migration
+        residue; silently fixing the numbers would hide the root cause.
+        stale_names is a known observational item (the read side has a
+        canonical-name resolution fallback, not an alert surface) and is
+        excluded from the alert decision.
         """
         try:
             report = await self._db.relation_integrity_report(
@@ -1244,24 +1349,37 @@ class FactMergeAgent:
             logger.debug("关系边结构自检通过: %s", report)
 
     async def _relation_audit_pass(self) -> tuple[int, int]:
-        """关系遍·语义审计（第二层，开关 relation_audit_enabled，LLM）。
+        """Relation pass, semantic audit (layer 2, gated by
+        relation_audit_enabled, LLM).
 
-        按 id 水位（kv relation_audit_edge_id）增量审计 active/pending
-        边：每批 relation_audit_batch_size 条一次 LLM 调用，判定 bad
-        （互动描述/称呼复合词/陈述与端点错位/方向矛盾）的边直接置
-        superseded（墓碑不物理删，可人工恢复），降级原因写入
-        supersede_reason 留痕。降级带乐观锁（updated_at 与送审快照一致
-        才置墓碑——审计飞行期间被人工改过/收到新证据的边跳过）。水位
-        只推到已判定批的最大 id；LLM 失败 / unsure / 处置异常即停本遍，
-        下周期从同批重审（已推部分不回退）。毒丸批防护：同一水位批连续
-        _RELATION_AUDIT_MAX_BATCH_FAILS 次失败/unsure 即跳批推水位并记
-        warning（需人工全量重审 = 清空该 kv 值）。全量重审入口同。
+        Audit active/pending edges incrementally by the id watermark (kv
+        relation_audit_edge_id): one LLM call per batch of
+        relation_audit_batch_size edges; edges judged bad (interaction
+        description / compound form of address / statement-endpoint
+        mismatch / direction contradiction) are marked superseded directly
+        (a tombstone, not physically deleted, humanly recoverable) with
+        the downgrade reason written into supersede_reason for the record.
+        Downgrades carry an optimistic lock (the tombstone is only set
+        when updated_at still matches the submitted snapshot; edges
+        manually edited or given new evidence while the audit was in
+        flight are skipped). The watermark only advances to the max id of
+        a judged batch; an LLM failure / unsure / disposition error stops
+        this pass, and the next cycle re-audits from the same batch (the
+        advanced part does not roll back). Poison-batch protection: the
+        same watermark batch failing/unsure for
+        _RELATION_AUDIT_MAX_BATCH_FAILS consecutive times skips the batch,
+        advances the watermark, and logs a warning (a manual full
+        re-audit means clearing that kv value). Same entry point for a
+        full re-audit.
 
-        预算独立于事实合并（每周期最多 _RELATION_AUDIT_MAX_CALLS 批，
-        耗尽顺延；边增量为 trickle，常态一轮即清完积压）。
+        Budget is independent of the fact merge (at most
+        _RELATION_AUDIT_MAX_CALLS batches per cycle; exhaustion defers to
+        the next cycle. Edge increments are a trickle, so one normal
+        cycle clears the backlog).
 
         Returns:
-            (本周期送审边数, 降级 superseded 边数)。
+            (number of edges submitted this cycle, number of edges
+            superseded).
         """
         if not self._config.relation_audit_enabled:
             return 0, 0
@@ -1390,11 +1508,14 @@ class FactMergeAgent:
             pass
 
     async def _maybe_decay(self) -> None:
-        """衰减遍触发判定：距上次执行不足一个周期则跳过。
+        """Decay-pass trigger decision: skip when less than one interval has
+        passed since the last run.
 
-        上次执行时间经 kv 表持久化（进程重启不丢）；首次运行（无记录）
-        只初始化时间戳不衰减——新装/迁移数据保真一个完整周期。
-        开启 decay_requires_activity 时活跃窗口取 [上次衰减, now)。
+        The last run time is persisted in the kv table (survives process
+        restarts); the first run (no record) only initializes the
+        timestamp and does not decay, keeping fresh/migrated data intact
+        for one full interval. With decay_requires_activity enabled, the
+        activity window is [last decay, now).
         """
         now = datetime.now().astimezone()
         if self._last_decay_at is None:
@@ -1430,21 +1551,32 @@ class FactMergeAgent:
         logger.info("衰减遍完成: %s", stats)
 
     async def _maybe_summary_lifecycle(self) -> int:
-        """摘要归档遍触发判定（011 生命周期）：周期门控 + 判据下发 db。
+        """Summary-archive-pass trigger decision (011 lifecycle): interval
+        gating plus the criteria handed down to the db.
 
-        与衰减遍同款保真语义：上次执行时间 kv 持久化。首遍延后至强化
-        窗口之后——存量行部署前无强化记录（last_recall_at 恒 NULL，判据
-        按「从未召回」处理），若按常规 interval 触发首遍，升级前一个窗口
-        内被召回过的高龄行会被误归档——初始时间戳前推（首跑打点后
-        max(window, interval) 天才实际执行），窗口内被召回的行届时已获
-        强化记录豁免。归档时限 = 最低保留期 + 3×半衰期（衰减权重降至
-        12.5% 以下），强化窗口内被召回过的行豁免（判据实现见 db 层）。
+        Same freshness semantics as the decay pass: the last run time is
+        kv-persisted. The first pass is deferred past the reinforce
+        window. Legacy rows have no reinforcement record before deploy
+        (last_recall_at is always NULL, so the criteria treat them as
+        "never recalled"); if the first pass fired at the regular
+        interval, high-age rows recalled within the window before the
+        upgrade would be mis-archived. The initial timestamp is therefore
+        pushed forward (the pass actually runs max(window, interval) days
+        after the first-run checkpoint), by which point rows recalled
+        within the window already carry reinforcement records and are
+        exempt. Archive deadline = minimum retention + 3x half-life (the
+        decay weight falls below 12.5%); rows recalled within the
+        reinforce window are exempt (the criteria implementation lives in
+        the db layer).
 
-        关闭 summary_lifecycle_enabled 时本遍整体跳过（已归档行不回流，
-        强化计数仍由召回侧独立累积）。
+        The whole pass is skipped when summary_lifecycle_enabled is off
+        (already-archived rows do not flow back; reinforcement counts
+        still accumulate independently on the recall side).
 
         Returns:
-            本次归档行数（未到周期/未开启/首跑打点返回 0）。
+            Number of rows archived this run (0 when the interval has not
+            elapsed, the feature is off, or it is the first-run
+            checkpoint).
         """
         if not self._config.summary_lifecycle_enabled:
             return 0

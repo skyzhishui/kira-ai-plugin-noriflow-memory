@@ -1,15 +1,15 @@
-"""持久实体别名层（P1）测试（python 直跑，无 pytest 依赖）。
+"""Persistent entity alias layer (P1) tests (python direct-run, no pytest dependency).
 
-覆盖（KiraAI 侧，2026-09-09 别名层批）：
-- 变体拆分/清洗：括号主干/内段、单字与符号过滤、"用户<数字>" fallback；
-- build_alias_rows：同名取更晚 last_seen、每 uid 变体上限截断；
-- AliasStore：唯一归属命中、重名歧义（窗口背书胜出/无背书跳过）、
-  停用词、apply_rows 增量同步；
-- db.alias_upsert：SQL 组装与参数、空列表短路；
-- kernel 两层合并：窗口优先 + 持久补位 + pair 去重 + 上限 4；
-- main._alias_upsert_batch：批次 sender upsert（bot 跳过、fail-open）。
+Coverage (KiraAI side, 2026-09-09 alias layer batch):
+- Variant splitting/cleaning: bracket trunk/segments, single-char and symbol filtering, "user<digits>" fallback;
+- build_alias_rows: same-name keeps later last_seen, per-uid variant cap truncation;
+- AliasStore: unique owner hit, same-name ambiguity (window endorsement wins / no endorsement skips),
+  stopwords, apply_rows incremental sync;
+- db.alias_upsert: SQL assembly and params, empty-list short-circuit;
+- kernel two-layer merge: window-first + persistent backfill + pair dedup + cap 4;
+- main._alias_upsert_batch: per-batch sender upsert (bot skipped, fail-open).
 
-运行（插件目录）：
+Run (plugin dir):
     python tests/test_alias_store.py
 """
 
@@ -167,7 +167,7 @@ def test_alias_store_apply_rows_last_seen_monotonic() -> None:
 
 
 def test_is_placeholder_name() -> None:
-    """占位名判定（规范名解析/写侧守卫共用）：空/未知[用户][数字]/unknown/用户\\d+/纯数字。"""
+    """Placeholder-name check (shared by canonical-name resolution / write-side guard): empty / unknown[user][digit] / unknown / user<digits> / pure digits."""
     assert is_placeholder_name("")
     assert is_placeholder_name("  ")
     assert is_placeholder_name("未知")
@@ -189,7 +189,7 @@ def test_is_placeholder_name() -> None:
 
 
 def test_alias_store_name_for_reverse_view() -> None:
-    """name_for：uid -> 最新非占位名；占位名/纯数字不入反向视图。"""
+    """name_for: uid -> latest non-placeholder name; placeholder names / pure digits never enter the reverse view."""
     store = AliasStore(db=None, variant_cap=8)
     store.apply_rows([
         {"platform": "qq", "user_id": "1", "name": "旧名",
@@ -386,7 +386,7 @@ def test_normalize_alias_text() -> None:
 
 
 def test_alias_store_match_unicode_variants() -> None:
-    """名片 Unicode 变体名 vs 文本 ASCII/半角写法：归一化后子串命中。"""
+    """Card-name Unicode variants vs ASCII/half-width text forms: substring hit after normalization."""
     store = _store_with({
         "𝕩𝕩𝕪": [("qq", "3429924750")],  # 数学字母名片（NFKC 后即 xxy）
         "Ｓｈｉｚｕｋｕ": [("qq", "u2")],  # 全角名片
@@ -401,7 +401,7 @@ def test_alias_store_match_unicode_variants() -> None:
 
 
 def test_extract_uid_code_names() -> None:
-    """「用户<uid>（<代号>）」提取：全角/半角括号、多对去重、uid 位数下限。"""
+    """Extraction of "user<uid>(<codename>)" forms: full/half-width brackets, multi-pair dedup, uid length floor."""
     stmt = "与用户3429924750（xxy）关系亲密，同时与用户2374893963(忆熙阿)互动频繁。"
     assert extract_uid_code_names(stmt) == [
         ("3429924750", "xxy"),
@@ -419,7 +419,7 @@ def test_extract_uid_code_names() -> None:
 
 
 def test_build_fact_code_alias_rows() -> None:
-    """代号行构建：清洗+占位过滤+同键取更晚 last_seen。"""
+    """Codename row build: cleaning + placeholder filtering + same-key keeps later last_seen."""
     ts_old = datetime(2026, 9, 1, tzinfo=timezone.utc)
     ts_new = datetime(2026, 9, 11, tzinfo=timezone.utc)
     rows = build_fact_code_alias_rows([
@@ -463,7 +463,7 @@ def test_build_fact_code_alias_rows() -> None:
 
 
 def test_alias_store_fact_code_alias_end_to_end() -> None:
-    """事实代号行 apply 后：文本命中 -> (display, platform, uid)。"""
+    """After fact-codename rows apply: text hit -> (display, platform, uid)."""
     store = AliasStore(db=None, variant_cap=8)
     store.apply_rows([{
         "platform": "qq", "user_id": "3429924750", "name": "xxy",
@@ -476,7 +476,7 @@ def test_alias_store_fact_code_alias_end_to_end() -> None:
 
 
 def test_alias_store_display_per_pair() -> None:
-    """同归一化键多 uid：命中条目各带各的观测原名，不串贴他人称呼。"""
+    """Multiple uids under the same normalized key: each hit carries its own observed original name, no cross-grafting another person's address term."""
     store = AliasStore(db=None, variant_cap=8)
     store.apply_rows([
         {"platform": "qq", "user_id": "20001", "name": "Shizuku",
@@ -497,8 +497,8 @@ def test_alias_store_display_per_pair() -> None:
 
 
 async def test_entity_directory_display_per_pair() -> None:
-    """会话实体词典同归一化键多 uid：命中条目各带各的观测原名，不串贴
-    （与 AliasStore._display_by_pair 同款口径）。"""
+    """Session entity directory, multiple uids under the same normalized key: each hit carries its own observed original name, no cross-grafting
+    (same semantics as AliasStore._display_by_pair)."""
     async def source(session_id: str):
         return [("Shizuku", "qq", "400"), ("Ｓｈｉｚｕｋｕ", "web", "500")]
 
@@ -521,8 +521,8 @@ class _RefreshDbStub:
 
 
 async def test_alias_store_refresh_display_by_pair() -> None:
-    """refresh 路径（TTL 整表重载）与 apply_rows 同口径：uid 统一 str，
-    同键多 uid 展示名按对命中——DB 返回整数 uid 时不回退键级兜底串贴。"""
+    """The refresh path (TTL full-table reload) shares apply_rows semantics: uids normalized to str,
+       same-key multi-uid display names match per-pair — when the DB returns integer uids it never falls back to key-level cross-grafting."""
     store = AliasStore(db=_RefreshDbStub(), variant_cap=8)
     await store.refresh_if_due(force=True)
     hits, skipped = store.match(

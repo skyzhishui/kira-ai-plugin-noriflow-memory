@@ -1,19 +1,22 @@
-"""KiraAI 客户端适配层：把 KiraAI provider 体系包装成本插件内部接口。
+"""KiraAI client adaptation layer: wraps the KiraAI provider system into this plugin's internal interface.
 
-插件内部模块（kernel/vector_ops/encoder/merge_agent）沿用既定接口形态
-（embed/embed_batch、rerank 返回 (index, score) 对、run_structured
-结构化文本出口），本模块做单向适配：
+Internal plugin modules (kernel/vector_ops/encoder/merge_agent) keep the
+established interface shapes (embed/embed_batch, rerank returns (index,
+score) pairs, run_structured structured-text exit); this module adapts
+one-way:
 
-- KiraEmbeddingClient：EmbeddingModelClient.embed(texts) 批量接口
-  -> embed 单条 + embed_batch 批量；
-- KiraRerankClient：RerankModelClient.rerank -> list[RerankResult]
-  -> (index, score) 对列表（kernel 以 dict(ranked) 消费）；
-- FastLlmExit：ctx 默认 fast LLM -> run_structured(system, user, schema)
-  -> str（结构化输出走 KiraAI 原生 tool calling）。
+- KiraEmbeddingClient: EmbeddingModelClient.embed(texts) batch interface
+  -> single embed + batch embed_batch;
+- KiraRerankClient: RerankModelClient.rerank -> list[RerankResult]
+  -> list of (index, score) pairs (consumed by kernel via dict(ranked));
+- FastLlmExit: ctx default fast LLM -> run_structured(system, user, schema)
+  -> str (structured output goes through native KiraAI tool calling).
 
-未配置的模型（default_embedding/default_rerank 抛 ValueError）由 main.py
-在装配时 try/except 落 None -> 插件内部对应功能降级（行内向量置 NULL 待
-补算 / 纯向量序），与 graceful degradation 语义一致。
+Unconfigured models (default_embedding/default_rerank raise ValueError)
+are caught by main.py at assembly with try/except falling to None -> the
+corresponding plugin feature degrades (in-row vectors set to NULL awaiting
+backfill / pure-vector ordering), consistent with the graceful degradation
+semantics.
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ logger = get_logger("noriflow_memory.clients", "cyan")
 
 
 class KiraEmbeddingClient:
-    """embedding 适配器（单条接口封装批量底层）。"""
+    """Embedding adapter (single-call interface wrapping a batch backend)."""
 
     def __init__(self, client) -> None:
         # KiraAI EmbeddingModelClient：embed(texts: list[str]) -> list[list[float]]
@@ -40,11 +43,11 @@ class KiraEmbeddingClient:
         return await self._client.embed(list(texts))
 
     async def close(self) -> None:
-        """宿主托管客户端无需关闭（接口兼容上游 nori 版客户端）。"""
+        """Host-managed client needs no closing (interface-compatible with the upstream nori client)."""
 
 
 class KiraRerankClient:
-    """重排序适配器（RerankResult -> (index, score) 对）。"""
+    """Rerank adapter (RerankResult -> (index, score) pairs)."""
 
     def __init__(self, client) -> None:
         self._client = client
@@ -56,20 +59,22 @@ class KiraRerankClient:
         return [(int(r.index), float(r.score)) for r in results]
 
     async def close(self) -> None:
-        """宿主托管客户端无需关闭（接口兼容上游 nori 版客户端）。"""
+        """Host-managed client needs no closing (interface-compatible with the upstream nori client)."""
 
 
 class FastLlmExit:
-    """后台结构化任务的 LLM 出口（快模型单次调用）。
+    """LLM exit for background structured tasks (single fast-model call).
 
-    使用 ctx 默认 fast LLM（编码/裁定均为后台任务，快速档足够）。
-    传入 schema 时结构化输出走 KiraAI 原生 tool calling：以
-    tool_choice="required" 强制模型调用唯一的提交工具，tool_call 的
-    arguments 即符合 schema 的结果 JSON（response_format json_object
-    的通用等价物）。
+    Uses the ctx default fast LLM (encoding/arbitration are both background
+    tasks; the fast tier is enough). When a schema is passed, structured
+    output goes through native KiraAI tool calling: tool_choice="required"
+    forces the model to call the single submit tool, whose tool_call
+    arguments are the result JSON matching the schema (the generic
+    equivalent of response_format json_object).
 
-    兜底：个别模型/网关不返回 tool_call 时回退文本输出，由提示词强
-    指令 + 调用方 safe_parse_llm_json 容错解析承接（fail-open 降级）。
+    Fallback: when a particular model/gateway returns no tool_call, fall
+    back to text output, handled by the strong prompt instruction plus the
+    caller's safe_parse_llm_json lenient parsing (fail-open degradation).
     """
 
     def __init__(self, ctx) -> None:

@@ -1,8 +1,9 @@
-"""Prompt 模板加载器（自 nori-core 同名模块 vendor 的精简版）。
+"""Prompt template loader (trimmed version vendored from the nori-core same-name module).
 
-从插件 prompts/ 目录读取 .prompt 文件，用安全的正则替换渲染 {var}
-占位符：{{/}} 转义为字面花括号（支持模板内 JSON 示例），缺失变量保留
-占位原样。mtime 缓存——提示词文件热更即时生效。
+Reads .prompt files from the plugin prompts/ directory and renders {var}
+placeholders with safe regex substitution: {{/}} escapes to literal braces
+(supports JSON examples inside templates); missing variables keep the
+placeholder as-is. mtime cache, prompt files hot-reload on change.
 """
 
 from __future__ import annotations
@@ -12,10 +13,11 @@ from pathlib import Path
 
 
 def render_template(template: str, **kwargs: object) -> str:
-    """渲染 {var} 占位符模板，{{/}} 转义为字面花括号。
+    """Render a {var} placeholder template; {{/}} escapes to literal braces.
 
-    转义先于占位符替换（哨兵保护）：占位符值原样插入，其中的花括号
-    不被二次转义。
+    Escaping happens before placeholder substitution (sentinel protection):
+    placeholder values are inserted verbatim, and their braces are not
+    escaped a second time.
     """
     escaped = template.replace("{{", "\x00").replace("}}", "\x01")
     rendered = re.sub(
@@ -27,7 +29,7 @@ def render_template(template: str, **kwargs: object) -> str:
 
 
 class PromptLoader:
-    """Prompt 模板加载器。从 prompts/ 目录读取 .prompt 文件并渲染。"""
+    """Prompt template loader. Reads .prompt files from prompts/ and renders."""
 
     def __init__(self, prompts_dir: str | Path = "prompts") -> None:
         self.prompts_dir = Path(prompts_dir)
@@ -35,7 +37,7 @@ class PromptLoader:
         self._cache: dict[str, tuple[float, str]] = {}
 
     def load(self, name: str) -> str:
-        """加载模板（不含 .prompt 后缀）。缓存复用，文件 mtime 变化时失效。"""
+        """Load a template (without the .prompt suffix). Cache-reused; invalidated when the file mtime changes."""
         file_path = self.prompts_dir / f"{name}.prompt"
         try:
             mtime = file_path.stat().st_mtime
@@ -52,5 +54,5 @@ class PromptLoader:
         return template
 
     def render(self, name: str, **kwargs: object) -> str:
-        """加载并渲染模板（缺失变量保留占位符原样）。"""
+        """Load and render a template (missing variables keep the placeholder as-is)."""
         return render_template(self.load(name), **kwargs)
