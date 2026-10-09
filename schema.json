@@ -310,7 +310,7 @@
     "type": "switch",
     "name": "工具作用域锁定",
     "default": true,
-    "hint": "开启时全部记忆工具忽略 AI 显式传入的 session_id/user_id，钉死为触发会话/触发者（fact 检索/写入/更正/删除同样钉死：memory_write 的 replace 目标簇必须属于触发者）——防白名单命中后借参数横向读写他人记忆。关闭恢复显式参数语义（群聊白名单 = 全群成员可跨用户操作，慎开）。"
+    "hint": "开启时 memory_search/write 忽略 AI 显式传入的 session_id/user_id（write 另含 platform），钉死为触发会话/触发者（memory_write 的 replace 目标簇必须属于触发者）；memory_remove 删除限定触发作用域（无法推导时拒绝）；memory_profile/lookup/correct 与指名检索恒钉死触发者、不受本开关控制——防白名单命中后借参数横向读写他人记忆。关闭恢复显式参数语义（群聊白名单 = 全群成员可跨用户操作，慎关）。"
   },
   "memory_tools_enabled": {
     "type": "switch",
