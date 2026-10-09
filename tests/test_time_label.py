@@ -103,15 +103,17 @@ def test_none_ts_and_mode_switch() -> None:
 
 
 def test_naive_ts_treated_as_local() -> None:
-    """naive 时间戳按系统本地时区解释后换算（astimezone 兜底不炸）。
+    """naive 时间戳视为配置时区的本地时间（kernel._to_local 同款约定）。
 
-    astimezone 对 naive 输入先挂系统时区再换算到 config 时区，
-    故断言 naive 与显式挂系统时区的 aware 输入等价——不依赖
-    运行机器的系统时区，UTC runner 上同样成立。
+    旧断言钉的是 astimezone 的兜底语义（naive 按服务器时区解释）——
+    配置时区与服务器不一致时日期与"今天/昨天"判定漂移，且与
+    kernel._to_local / _edge_time_qualifier 的 naive 约定相悖。标注层
+    现先钉配置时区再换算；断言 naive 与显式挂配置时区的 aware 输入
+    等价——不依赖运行机器的系统时区，UTC runner 上同样成立。
     """
     kernel = _make_kernel(recall_time_label_mode="both")
     naive = datetime(2026, 9, 28, 22, 16)
-    equivalent_aware = naive.astimezone()
+    equivalent_aware = naive.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
     assert kernel._relative_time_label(naive) == (
         kernel._relative_time_label(equivalent_aware)
     )
