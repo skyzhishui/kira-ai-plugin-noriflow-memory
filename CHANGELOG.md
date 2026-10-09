@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### docs: README 口径修正 + 同源描述同步
+
+- mermaid「LLM 记忆工具」节点与功能简介补齐六件套口径
+  （search/write/remove + profile/lookup/correct，此前分别只列 3/5 件）；
+- `tool_scope_locked` 配置行「慎开」→「慎关」（风险在关闭侧：关闭才
+  解锁显式参数跨会话/跨用户语义），并按实现改写为全工具准确描述——
+  search/write 忽略显式 session_id/user_id（write 另含 platform）、
+  remove 无作用域入参删除限定触发作用域（无法推导时拒绝）、
+  profile/lookup/correct 与指名检索恒钉死触发者不受开关影响；
+  schema.json WebUI hint 同步（含「全部记忆工具忽略」过度表述修正）；
+- 双后端方案指引由本仓不存在的 `docs/plans/` 改指本仓 CHANGELOG；
+- 本地测试清单补 test_time_label.py 与 test_fix_batch_20260912.py
+  两行；桩基建描述改双文件口径（_harness.py + plugin_env.py：主套件
+  与回归批依赖后者，真库/真文件套件自带桩）——_harness.py 头部
+  「主套件自包含」过时注释同步修正。
+
 ## v1.17.0 (2026-10-07, main 分支)
 
 ### feat: 画像 8 维度扩展对齐 nori（preference/commitment + 生命周期）
