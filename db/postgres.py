@@ -25,7 +25,7 @@ semantics; this layer lets exceptions propagate unchanged.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import asyncpg
@@ -43,8 +43,11 @@ from .base import (
     FACT_CLUSTER_TABLE,
     FACT_RAW_TABLE,
     MemoryBackend,
+    _BACKFILL_TABLES,
+    _BACKFILL_TEXT_COLUMNS,
     _MIGRATION_NAME_RE,
     _Params,
+    _dedupe_keep_time,
     _ensure_tz,
     _like_contains_pattern,
     _rrf_fuse,
@@ -430,6 +433,8 @@ class MemoryDatabase(MemoryBackend):
         exclude_document_ids: list[str] | None = None,
         with_embedding: bool = True,
         with_participants: bool = False,
+        include_archived: bool = False,
+        only_archived: bool = False,
     ) -> list[dict]:
         """Vector search over the summary table (optional BM25 hybrid;
         scope filtering + cosine ranking, single-pool mode).
@@ -710,13 +715,31 @@ class MemoryDatabase(MemoryBackend):
                 scope,
                 session_id or "",
             )
-        where = (
-            " AND ".join(conds) if conds else "(summarized OR kind = 'bot_self')"
-        )
+        # Lifecycle structural exclusion (011 migration): archived rows
+        # never enter recall candidates — appended after the degenerate-
+        # recall warning so the constant condition doesn't suppress it,
+        # and applied to BOTH branches so it can never mask the fallback
+        # summarized filter by keeping conds non-empty.
+        # include_archived (memory_lookup maintenance path) opens the
+        # tombstones and returns the flag column for status annotation.
+        # only_archived (memory_lookup deep-dig path) narrows further
+        # to tombstones only — pushed into SQL so active rows never
+        # crowd the similarity-ordered candidate window (a fixed
+        # oversized pool + caller-side filtering false-negatives once
+        # active rows outnumber the pool).
+        if only_archived:
+            arch_cond = " AND archived"
+        else:
+            arch_cond = "" if include_archived else " AND NOT archived"
+        if conds:
+            where = " AND ".join(conds) + arch_cond
+        else:
+            where = "(summarized OR kind = 'bot_self')" + arch_cond
         select_cols = (
             "id, document_id, kind, session_id, user_id, content, "
             "occurred_at"
             + (", participants" if with_participants else "")
+            + ", archived"
             + (", embedding" if with_embedding else "")
             + ", 1 - (embedding <=> $1::vector) AS relevance"
         )
@@ -1423,24 +1446,32 @@ class MemoryDatabase(MemoryBackend):
         demote_threshold: float,
         pending_dead_days: int,
         recent_expire_days: int,
+        commitment_expire_days: int = 60,
         activity_since: datetime | None = None,
         sticky_evidence_count: int = 0,
         anchor_profile_size: int = 0,
     ) -> dict:
         """Decay pass (single transaction, dev plan §8.2).
 
-        Order: recent-dimension expiry demotion -> non-recent score decay
-        -> profiled demotion check (on decayed scores) -> pending_uncertain
-        death after pending_dead_days (counted from demoted_at). Every
-        demotion cascades into profile-row deletion (data-modifying CTE).
+        Order: recent-dimension expiry demotion -> commitment-dimension
+        expiry demotion (same calendar semantics: an un-reconfirmed promise
+        past its window demotes to pending_uncertain out of the profile,
+        the cluster body survives and can revive; counted from
+        last_evidence_at — merged clusters push the last confirmation
+        forward, so repeatedly mentioned commitments never count as
+        "un-reconfirmed"; the promise date lives inside the statement text,
+        not a structured column) -> non-recent score decay -> profiled
+        demotion check (on decayed scores) -> pending_uncertain death after
+        pending_dead_days (counted from demoted_at). Every demotion
+        cascades into profile-row deletion (data-modifying CTE).
 
         Activity gating (when activity_since is not None): the decay/
         demotion/dead steps apply only to users seen (triggering or
         participating) in memory_chat_summary since activity_since; absent
         users freeze entirely — profiles are never emptied by silence
-        alone. Recent expiry is calendar semantics and stays ungated
-        (demotes into the uncertain section; the cluster body stays
-        protected by the dead gate and can revive on return).
+        alone. Recent/commitment expiry is calendar semantics and stays
+        ungated (demotes into the uncertain section; the cluster body
+        stays protected by the dead gate and can revive on return).
 
         Evidence floor (when sticky_evidence_count > 0): clusters whose
         evidence count reached the threshold never decay below
@@ -1466,13 +1497,16 @@ class MemoryDatabase(MemoryBackend):
             pending_dead_days: pending_uncertain death window in days,
                 decoupled from the decay cycle.
             recent_expire_days: recent-dimension expiry days.
+            commitment_expire_days: commitment-dimension expiry days
+                (60 = fallback default; callers should pass the config).
             activity_since: activity window start (None = no gating, decay
                 everything).
             sticky_evidence_count: evidence-floor threshold (0 = disabled).
             anchor_profile_size: profile anchor count (0 = disabled).
 
         Returns:
-            Stats dict: expired_recent/demoted/profile_rows_deleted/deaded.
+            Stats dict: expired_recent/expired_commitment/demoted/
+            profile_rows_deleted/deaded.
         """
         gate = ""
         if sticky_evidence_count > 0:
@@ -1540,18 +1574,28 @@ class MemoryDatabase(MemoryBackend):
                         UPDATE memory_fact_cluster
                         SET status = 'pending_uncertain', demoted_at = now(),
                             updated_at = now()
-                        WHERE category = 'recent' AND status IN ('active', 'profiled')
-                          AND occurred_at < now() - make_interval(days => $1)
-                        RETURNING id
+                        WHERE status IN ('active', 'profiled')
+                          AND (
+                                (category = 'recent'
+                                 AND occurred_at < now() - make_interval(days => $1))
+                             OR (category = 'commitment'
+                                 AND COALESCE(last_evidence_at, occurred_at)
+                                     < now() - make_interval(days => $2))
+                              )
+                        RETURNING id, category
                     ), cleaned AS (
                         DELETE FROM memory_user_profile
                         WHERE cluster_id IN (SELECT id FROM expired)
                         RETURNING cluster_id
                     )
-                    SELECT (SELECT count(*) FROM expired) AS expired,
+                    SELECT (SELECT count(*) FROM expired
+                            WHERE category = 'recent') AS expired_recent,
+                           (SELECT count(*) FROM expired
+                            WHERE category = 'commitment') AS expired_commitment,
                            (SELECT count(*) FROM cleaned) AS cleaned
                     """,
                     recent_expire_days,
+                    commitment_expire_days,
                 )
                 await conn.execute(
                     f"""
@@ -1593,7 +1637,8 @@ class MemoryDatabase(MemoryBackend):
                     pending_dead_days,
                 )
         return {
-            "expired_recent": recent["expired"],
+            "expired_recent": recent["expired_recent"],
+            "expired_commitment": recent["expired_commitment"],
             "demoted": demoted["demoted"],
             "profile_rows_deleted": recent["cleaned"] + demoted["cleaned"],
             "deaded": int(deaded.rsplit(" ", 1)[-1]),
@@ -1748,6 +1793,33 @@ class MemoryDatabase(MemoryBackend):
             )
         return [dict(r) for r in rows]
 
+    async def fetch_fact_code_sources(self) -> list:
+        """(platform, canonical_statement, last_seen) rows of live fact
+        clusters — source stream for the fact-code alias backfill pass.
+
+        last_seen = GREATEST(COALESCE(last_evidence_at, occurred_at),
+        occurred_at); the table is bounded (thousands of rows), full
+        streaming cost is millisecond-level.
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT platform, canonical_statement,
+                       GREATEST(COALESCE(last_evidence_at, occurred_at),
+                                occurred_at) AS last_seen
+                FROM memory_fact_cluster
+                WHERE status IN ('active', 'profiled')
+                """
+            )
+        return [
+            (r["platform"], r["canonical_statement"],
+             # None 仅在两时间列双 NULL 时出现（当前 schema occurred_at NOT
+             # NULL 不可达）；兜底最旧防 None 流入 alias_upsert 抛错毒化整
+             # 批——与 sqlite 版 fetch_fact_code_sources 口径一致
+             r["last_seen"] or datetime.min.replace(tzinfo=timezone.utc))
+            for r in rows
+        ]
+
     async def fetch_alias_names_by_owner(
         self, owners: list[tuple[str, str]] | None = None
     ) -> dict[tuple[str, str], str]:
@@ -1769,7 +1841,8 @@ class MemoryDatabase(MemoryBackend):
                 for graph write-side directory builds etc.).
         """
         async with self.pool.acquire() as conn:
-            if owners:
+            # None=全表(原语义);空列表/过滤后空=无待解析 owner 返回 {}
+            if owners is not None:
                 pairs = [(str(p or ""), str(u or "")) for p, u in owners if u]
                 if not pairs:
                     return {}
@@ -1798,6 +1871,35 @@ class MemoryDatabase(MemoryBackend):
             if not name or is_placeholder_name(name):
                 continue
             out.setdefault((r["platform"], str(r["user_id"])), name)
+        return out
+
+    async def fetch_alias_variants(
+        self, platforms: list[str], uids: list[str]
+    ) -> dict[tuple[str, str], list[str]]:
+        """Per-owner non-placeholder name variants (last_seen DESC).
+
+        Data source for the profile "other names" section: the historical
+        snapshot stream of the three name columns. Current-name exclusion
+        and capping are done by the caller (persona_service assembly);
+        this layer only applies the placeholder-name guard.
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT platform, user_id, name
+                FROM memory_entity_alias
+                WHERE platform = ANY($1::text[]) AND user_id = ANY($2::text[])
+                ORDER BY last_seen DESC
+                """,
+                list(platforms),
+                list(uids),
+            )
+        out: dict[tuple[str, str], list[str]] = {}
+        for r in rows:
+            name = str(r["name"] or "").strip()
+            if not name or is_placeholder_name(name):
+                continue
+            out.setdefault((r["platform"], str(r["user_id"])), []).append(name)
         return out
 
     # ------------------------------------------------------------------
@@ -1882,6 +1984,10 @@ class MemoryDatabase(MemoryBackend):
             )
         if not rows:
             return
+        # Echo pre-check and the write must share one connection (fix
+        # batch 2026-09-12): two acquires open a window where a mirrored
+        # edge interleaves between the check and the executemany, and the
+        # reverse-echo skip then misses the dual-active pair it exists for.
         async with self.pool.acquire() as conn:
             existing_keys = await self._fetch_existing_edge_keys(conn, rows)
             rows, skipped = split_reverse_echo_rows(rows, existing_keys)
@@ -1889,34 +1995,33 @@ class MemoryDatabase(MemoryBackend):
                 logger.info(
                     "关系边反向回声跳过 %d 条（镜像方向已在库/同批先到）", skipped
                 )
-        if not rows:
-            return
-        payload = [
-            (
-                r["platform"],
-                r["subject_uid"],
-                r["object_uid"],
-                r["subject_name"],
-                r["object_name"],
-                r["relation_label"],
-                r["statement"],
+            if not rows:
+                return
+            payload = [
                 (
-                    "pending"
-                    if r["is_bot_edge"] and int(r["min_evidence"]) > 1
-                    else "active"
-                ),
-                r["confidence"],
-                _ensure_tz(r["occurred_at"]),
-                r["evidence_key"],
-                bool(r["is_bot_edge"]),
-                int(r["min_evidence"]),
-                bool(r.get("count_on_conflict", True)),
-            )
-            for r in rows
-        ]
-        # Placeholder-name pattern is the single-source constant from
-        # alias_store (the Python predicate and both SQL copies must not drift).
-        async with self.pool.acquire() as conn:
+                    r["platform"],
+                    r["subject_uid"],
+                    r["object_uid"],
+                    r["subject_name"],
+                    r["object_name"],
+                    r["relation_label"],
+                    r["statement"],
+                    (
+                        "pending"
+                        if r["is_bot_edge"] and int(r["min_evidence"]) > 1
+                        else "active"
+                    ),
+                    r["confidence"],
+                    _ensure_tz(r["occurred_at"]),
+                    r["evidence_key"],
+                    bool(r["is_bot_edge"]),
+                    int(r["min_evidence"]),
+                    bool(r.get("count_on_conflict", True)),
+                )
+                for r in rows
+            ]
+            # Placeholder-name pattern is the single-source constant from
+            # alias_store (the Python predicate and both SQL copies must not drift).
             await conn.executemany(
                 f"""
                 INSERT INTO memory_entity_edge (
@@ -2058,6 +2163,16 @@ class MemoryDatabase(MemoryBackend):
             Edge rows (id/platform/endpoints/names/label/statement/
             evidence_count/last_seen/occurred_at).
         """
+        # 字符串/字节串会被逐元素迭代成 ['q','q',':',...] 静默空结果——
+        # 静默 miss 正是本函数要根除的形态，故 fail fast 而非归一兼容
+        # （空串 falsy 天然迭代为空，保持旧容忍）
+        if (isinstance(node_keys, (str, bytes)) and node_keys) or (
+            isinstance(bot_keys, (str, bytes)) and bot_keys
+        ):
+            raise TypeError(
+                "fetch_active_edges 收 \"platform:uid\" 复合键列表，"
+                "不接受单值字符串"
+            )
         keys = [str(k or "") for k in (node_keys or []) if k]
         bots = sorted(str(k or "") for k in (bot_keys or []) if k)
         async with self.pool.acquire() as conn:
@@ -2420,9 +2535,11 @@ class MemoryDatabase(MemoryBackend):
 
     async def fetch_profile_sections(
         self, platform: str, user_id: str, per_section_limit: int
-    ) -> dict[str, list[str]]:
+    ) -> dict[str, list[tuple[str, object]]]:
         """Per-section profile rows (data source for the first five
-        sections).
+        sections), statement + occurred_at (via cluster_id join; None
+        when the cluster row is missing — the assembler then omits the
+        time label).
 
         Ownership matching is owner-only (related ids do not join —
         relation-fact statements are written from the owner's viewpoint, so
@@ -2439,21 +2556,23 @@ class MemoryDatabase(MemoryBackend):
             per_section_limit: per-section cap.
 
         Returns:
-            category -> statement list (ordered within a section); empty
-            dict when the user has no profile rows.
+            category -> (statement, occurred_at) list (ordered within a
+            section); empty dict when the user has no profile rows.
         """
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT category, statement FROM (
-                    SELECT category, statement,
+                SELECT category, statement, occurred_at FROM (
+                    SELECT m.category, m.statement,
+                           c.occurred_at AS occurred_at,
                            row_number() OVER (
-                               PARTITION BY category
-                               ORDER BY score DESC, updated_at DESC, id ASC
+                               PARTITION BY m.category
+                               ORDER BY m.score DESC, m.updated_at DESC, m.id ASC
                            ) AS rn
-                    FROM memory_user_profile
-                    WHERE platform = $1
-                      AND user_id = $2
+                    FROM memory_user_profile m
+                    LEFT JOIN memory_fact_cluster c ON c.id = m.cluster_id
+                    WHERE m.platform = $1
+                      AND m.user_id = $2
                 ) t
                 WHERE rn <= $3
                 ORDER BY category, rn
@@ -2462,16 +2581,19 @@ class MemoryDatabase(MemoryBackend):
                 user_id,
                 per_section_limit,
             )
-        sections: dict[str, list[str]] = {}
+        sections: dict[str, list[tuple[str, object]]] = {}
         for r in rows:
-            sections.setdefault(r["category"], []).append(r["statement"])
+            sections.setdefault(r["category"], []).append(
+                (r["statement"], r["occurred_at"])
+            )
         return sections
 
     async def fetch_uncertain_statements(
         self, platform: str, user_id: str, limit: int
-    ) -> list[str]:
+    ) -> list[tuple[str, object]]:
         """Uncertain-info section source: pending_uncertain and replaced
-        (halved-score) clusters.
+        (halved-score) clusters, with occurred_at (NOT NULL column) for
+        the time label.
 
         Ownership matching is owner-only (same as the profile sections;
         related ids do not join injection).
@@ -2482,13 +2604,13 @@ class MemoryDatabase(MemoryBackend):
             limit: cap.
 
         Returns:
-            Canonical statement list (score DESC -> updated_at DESC ->
-            id ASC).
+            (canonical statement, occurred_at) list (score DESC ->
+            updated_at DESC -> id ASC).
         """
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT canonical_statement
+                SELECT canonical_statement, occurred_at
                 FROM memory_fact_cluster
                 WHERE platform = $1
                   AND user_id = $2
@@ -2500,20 +2622,22 @@ class MemoryDatabase(MemoryBackend):
                 user_id,
                 limit,
             )
-        return [r["canonical_statement"] for r in rows]
+        return [(r["canonical_statement"], r["occurred_at"]) for r in rows]
 
     async def fetch_profile_sections_multi(
         self, platforms: list[str], user_ids: list[str], per_section_limit: int
-    ) -> dict[str, list[str]]:
+    ) -> dict[str, list[tuple[str, object]]]:
         """Per-section profile rows with multi-account keys merged
-        (identity-linked reads, e.g. the same person on qq/web).
+        (identity-linked reads, e.g. the same person on qq/web), statement
+        + occurred_at (via cluster_id join).
 
         Keys pair up as parallel arrays (platforms[i], user_ids[i]);
         ownership matching is owner-only (same as the single-key version;
         related ids do not join injection); ordering and per-section caps
         match the single-key version (global score DESC -> updated_at DESC
         -> id ASC ordering, then per-section caps), and identical statement
-        texts across keys dedup order-preservingly.
+        texts across keys dedup order-preservingly with non-null
+        occurred_at preferred.
 
         Args:
             platforms: platform tag array (paired 1:1 with user_ids).
@@ -2521,19 +2645,21 @@ class MemoryDatabase(MemoryBackend):
             per_section_limit: per-section cap.
 
         Returns:
-            category -> statement list (ordered within a section); empty
-            dict when no profile rows exist.
+            category -> (statement, occurred_at) list (ordered within a
+            section); empty dict when no profile rows exist.
         """
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT category, statement FROM (
+                SELECT category, statement, occurred_at FROM (
                     SELECT m.category, m.statement,
+                           c.occurred_at AS occurred_at,
                            row_number() OVER (
                                PARTITION BY m.category
                                ORDER BY m.score DESC, m.updated_at DESC, m.id ASC
                            ) AS rn
                     FROM memory_user_profile m
+                    LEFT JOIN memory_fact_cluster c ON c.id = m.cluster_id
                     JOIN unnest($1::text[], $2::text[]) AS k(platform, user_id)
                       ON m.platform = k.platform
                      AND m.user_id = k.user_id
@@ -2545,18 +2671,18 @@ class MemoryDatabase(MemoryBackend):
                 user_ids,
                 per_section_limit,
             )
-        sections: dict[str, list[str]] = {}
+        sections: dict[str, list[tuple[str, object]]] = {}
         for r in rows:
             items = sections.setdefault(r["category"], [])
-            if r["statement"] not in items:  # order-preserving dedup across keys
-                items.append(r["statement"])
+            _dedupe_keep_time(items, r["statement"], r["occurred_at"])
         return sections
 
     async def fetch_uncertain_statements_multi(
         self, platforms: list[str], user_ids: list[str], limit: int
-    ) -> list[str]:
+    ) -> list[tuple[str, object]]:
         """Uncertain-info rows with multi-account keys merged (ordering/
-        dedup/ownership semantics identical to the single-key version).
+        dedup/ownership semantics identical to the single-key version);
+        dedup prefers non-null occurred_at across same-text entries.
 
         Args:
             platforms: platform tag array (paired 1:1 with user_ids).
@@ -2564,13 +2690,13 @@ class MemoryDatabase(MemoryBackend):
             limit: cap.
 
         Returns:
-            Canonical statement list (score DESC -> updated_at DESC ->
-            id ASC, deduplicated across keys).
+            (canonical statement, occurred_at) list (score DESC ->
+            updated_at DESC -> id ASC, deduplicated across keys).
         """
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT m.canonical_statement
+                SELECT m.canonical_statement, m.occurred_at
                 FROM memory_fact_cluster m
                 JOIN unnest($1::text[], $2::text[]) AS k(platform, user_id)
                   ON m.platform = k.platform
@@ -2583,10 +2709,9 @@ class MemoryDatabase(MemoryBackend):
                 user_ids,
                 limit,
             )
-        statements: list[str] = []
+        statements: list[tuple[str, object]] = []
         for r in rows:
-            if r["canonical_statement"] not in statements:
-                statements.append(r["canonical_statement"])
+            _dedupe_keep_time(statements, r["canonical_statement"], r["occurred_at"])
         return statements
 
     async def fetch_latest_display_name_multi(
@@ -2684,3 +2809,331 @@ class MemoryDatabase(MemoryBackend):
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(sql, *params)
         return row is not None
+
+    # ------------------------------------------------------------------
+    #  memory tools (search/write/correct) + summary lifecycle
+    # ------------------------------------------------------------------
+
+    async def upsert_persona_fact_raw_for_apply(
+        self,
+        *,
+        document_id: str,
+        platform: str,
+        user_id: str,
+        related_user_ids: list[str],
+        display_name: str,
+        category: str,
+        statement: str,
+        confidence: str,
+        session_id: str,
+        group_id: str,
+        evidence_key: str,
+        occurred_at: datetime,
+        embedding: list[float] | None,
+    ) -> int | None:
+        """插入原始事实并返回行 id（memory_write 确定性直写前置）。
+
+        与 insert_persona_fact_raw 的差异：幂等冲突时 DO UPDATE 刷新
+        display_name 并 RETURNING id——工具路径随后要对该行执行
+        apply_fact_merge（消费 extracted_flag），必须拿到行 id。空串
+        不覆盖既有名字（工具路径恒传 ""，而编码路径可能已解析出真名，
+        裸 SET 会把名字刷空）。冲突行已被合并 agent 消费（flag=1）时，
+        apply 的乐观锁翻 flag 失败返回 {"action": "skipped"}，工具层
+        据此报告「已记录」。
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO memory_persona_fact_raw
+                    (document_id, platform, user_id, related_user_ids,
+                     display_name, category, statement, confidence,
+                     session_id, group_id, evidence_key, occurred_at,
+                     written_at, embedding)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                        now(), $13::vector)
+                ON CONFLICT (document_id)
+                DO UPDATE SET display_name = COALESCE(
+                    NULLIF(EXCLUDED.display_name, ''),
+                    memory_persona_fact_raw.display_name)
+                RETURNING id
+                """,
+                document_id, platform, user_id,
+                related_user_ids, display_name, category, statement,
+                confidence, session_id, group_id, evidence_key,
+                _ensure_tz(occurred_at), vector_literal(embedding),
+            )
+        return int(row["id"]) if row else None
+
+    async def search_fact_clusters(
+        self,
+        *,
+        query_vec: list[float],
+        limit: int,
+        platform: str = "",
+        user_ids: list[str] | None = None,
+        category: str = "",
+        include_inactive: bool = False,
+        only_inactive: bool = False,
+    ) -> list[dict]:
+        """簇表语义检索（主动记忆工具 target=fact / memory_lookup 取数面）。
+
+        与 search_cluster_candidates 的差异：面向结论级消费（工具/维护），
+        非合并 agent 的候选形态——默认只返回生效簇（active/profiled），
+        include_inactive 时放开墓碑/待定并携带状态标注。
+        """
+        # only_inactive (memory_lookup deep-dig path) narrows to
+        # non-active statuses in SQL — active/profiled clusters never enter
+        # the similarity-ordered candidate window (see search_chat_summaries
+        # only_archived for the same crowd-out rationale).
+        if only_inactive:
+            statuses = ("replaced", "dead", "pending_uncertain")
+        elif include_inactive:
+            statuses = (
+                ("active", "profiled", "replaced", "dead", "pending_uncertain")
+            )
+        else:
+            statuses = ("active", "profiled")
+        p = _Params(vector_literal(query_vec))
+        vec_ph = "$1"
+        conds = [f"status = ANY({p.add(list(statuses))})"]
+        if platform:
+            conds.append(f"platform = {p.add(platform)}")
+        if user_ids:
+            conds.append(f"user_id = ANY({p.add([u for u in user_ids if u])})")
+        if category:
+            conds.append(f"category = {p.add(category)}")
+        limit_ph = p.add(limit)
+        sql = (
+            f"SELECT id, platform, user_id, category, canonical_statement, "
+            f"score, status, evidence_count, contradicted_at, occurred_at, "
+            f"replaced_by, "
+            f"1 - (embedding <=> {vec_ph}::vector) AS relevance "
+            f"FROM {FACT_CLUSTER_TABLE} "
+            f"WHERE embedding IS NOT NULL AND ({' AND '.join(conds)}) "
+            f"ORDER BY embedding <=> {vec_ph}::vector LIMIT {limit_ph}"
+        )
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(sql, *p.values)
+        return [dict(r) for r in rows]
+
+    async def fetch_cluster_owner(
+        self, cluster_id: int
+    ) -> tuple[str, str] | None:
+        """查簇归属（memory_write 的 replace 目标校验用，工具层作用域锁定）。"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT platform, user_id FROM {FACT_CLUSTER_TABLE} "
+                "WHERE id = $1",
+                cluster_id,
+            )
+        return (row["platform"], row["user_id"]) if row else None
+
+    async def cluster_status_op(
+        self,
+        cluster_id: int,
+        action: str,
+        *,
+        platform: str = "",
+        user_id: str = "",
+    ) -> dict:
+        """簇状态维护操作（memory_correct 的 db 落点，单事务）。
+
+        三种确定性状态调整（不动 canonical_statement/score 主语义）：
+        - drop：→dead 并清画像投影行（立即出画像；簇体保留可复活）；
+        - dispute：打矛盾标记 contradicted_at（不动 updated_at——画像
+          投影/排序不受影响；衰减遍的证据地板豁免带标记的簇）；
+        - reactivate：dead/pending_uncertain → active（replaced 不在此列
+          ——有继任簇，直接复活会与继任并存矛盾，调用方应提示对继任
+          簇 dispute）。归属不符与不存在同款输出（不向调用方泄露他人
+          簇的存在性）。
+        """
+        owner_conds: list[str] = []
+        owner_args: list[str] = []
+        if platform:
+            owner_conds.append(f"platform = ${len(owner_args) + 2}")
+            owner_args.append(platform)
+        if user_id:
+            owner_conds.append(f"user_id = ${len(owner_args) + 2}")
+            owner_args.append(user_id)
+        owner_clause = (
+            " AND " + " AND ".join(owner_conds) if owner_conds else ""
+        )
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                if action == "drop":
+                    row = await conn.fetchrow(
+                        f"""
+                        UPDATE {FACT_CLUSTER_TABLE}
+                        SET status = 'dead', updated_at = now()
+                        WHERE id = $1
+                          AND status IN ('active', 'profiled', 'pending_uncertain'){owner_clause}
+                        RETURNING status
+                        """,
+                        cluster_id,
+                        *owner_args,
+                    )
+                    if row is not None:
+                        await conn.execute(
+                            "DELETE FROM memory_user_profile WHERE cluster_id = $1",
+                            cluster_id,
+                        )
+                        return {"changed": True, "status": "dead", "replaced_by": None}
+                    return await self._cluster_current_status(
+                        conn, cluster_id, owner_clause, owner_args
+                    )
+                if action == "dispute":
+                    row = await conn.fetchrow(
+                        f"""
+                        UPDATE {FACT_CLUSTER_TABLE}
+                        SET contradicted_at = now()
+                        WHERE id = $1
+                          AND status IN ('active', 'profiled')
+                          AND contradicted_at IS NULL{owner_clause}
+                        RETURNING status
+                        """,
+                        cluster_id,
+                        *owner_args,
+                    )
+                    if row is not None:
+                        return {
+                            "changed": True,
+                            "status": row["status"],
+                            "replaced_by": None,
+                        }
+                    return await self._cluster_current_status(
+                        conn, cluster_id, owner_clause, owner_args
+                    )
+                if action == "reactivate":
+                    row = await conn.fetchrow(
+                        f"""
+                        UPDATE {FACT_CLUSTER_TABLE}
+                        SET status = 'active', demoted_at = NULL,
+                            updated_at = now()
+                        WHERE id = $1
+                          AND status IN ('dead', 'pending_uncertain'){owner_clause}
+                        RETURNING status
+                        """,
+                        cluster_id,
+                        *owner_args,
+                    )
+                    if row is not None:
+                        return {
+                            "changed": True,
+                            "status": "active",
+                            "replaced_by": None,
+                        }
+                    return await self._cluster_current_status(
+                        conn, cluster_id, owner_clause, owner_args
+                    )
+        raise ValueError(f"不支持的簇状态操作: {action}")
+
+    @staticmethod
+    async def _cluster_current_status(
+        conn, cluster_id: int, owner_clause: str = "", owner_args=()
+    ) -> dict:
+        """回读簇现态（状态操作的未变更分支：给调用方精确提示用）。"""
+        row = await conn.fetchrow(
+            f"SELECT status, replaced_by FROM {FACT_CLUSTER_TABLE} "
+            f"WHERE id = $1{owner_clause}",
+            cluster_id,
+            *owner_args,
+        )
+        if row is None:
+            return {"changed": False, "status": "", "replaced_by": None}
+        return {
+            "changed": False,
+            "status": row["status"],
+            "replaced_by": row["replaced_by"],
+        }
+
+    async def restore_summary(
+        self, summary_id: int, session_id: str = ""
+    ) -> bool:
+        """恢复归档摘要（memory_correct reactivate / 维护页操作）。"""
+        session_cond = " AND session_id = $2" if session_id else ""
+        async with self.pool.acquire() as conn:
+            status = await conn.execute(
+                f"""
+                UPDATE {CHAT_SUMMARY_TABLE}
+                SET archived = false, archived_at = NULL,
+                    last_recall_at = now()
+                WHERE id = $1 AND archived{session_cond}
+                """,
+                summary_id,
+                *(((session_id,) if session_id else ())),
+            )
+        return str(status).endswith("1")
+
+    async def archive_stale_summaries(
+        self,
+        *,
+        archive_after_days: int,
+        reinforce_window_days: int,
+        batch_size: int,
+    ) -> int:
+        """归档遍：超龄且强化窗口内无召回命中的行置 archived（keyset 分页）。
+
+        两段式（先 SELECT 候选快照、后 UPDATE 复查判据）+ keyset 分页：
+        满批判定取候选数而非 UPDATE 影响行数——复查剔除会使影响行数偏小，
+        提前返回会滞留剩余合格行到下周期。SELECT 以 id > last_id 按主键
+        推进，已处理段不重扫；UPDATE 复查强化判据收敛召回并发竞态
+        （「刚被想起的记忆被误归档」且归档后双侧排除无法自愈）。
+        """
+        total = 0
+        last_id = 0
+        async with self.pool.acquire() as conn:
+            while True:
+                rows = await conn.fetch(
+                    f"""
+                    SELECT id FROM {CHAT_SUMMARY_TABLE}
+                    WHERE id > $1
+                      AND NOT archived
+                      AND written_at < now() - make_interval(days => $2)
+                      AND (last_recall_at IS NULL
+                           OR last_recall_at < now()
+                              - make_interval(days => $3))
+                    ORDER BY id
+                    LIMIT $4
+                    """,
+                    last_id,
+                    archive_after_days,
+                    reinforce_window_days,
+                    batch_size,
+                )
+                if not rows:
+                    return total
+                ids = [int(r["id"]) for r in rows]
+                status = await conn.execute(
+                    f"""
+                    UPDATE {CHAT_SUMMARY_TABLE}
+                    SET archived = true,
+                        archived_at = now()
+                    WHERE id = ANY($1::int[])
+                      AND NOT archived
+                      AND written_at < now() - make_interval(days => $2)
+                      AND (last_recall_at IS NULL
+                           OR last_recall_at < now()
+                              - make_interval(days => $3))
+                    """,
+                    ids,
+                    archive_after_days,
+                    reinforce_window_days,
+                )
+                total += int(str(status).split()[-1])
+                if len(ids) < batch_size:
+                    return total
+                last_id = ids[-1]
+
+    async def reinforce_summaries(self, document_ids: list[str]) -> None:
+        """召回访问强化：刷新 last_recall_at 与 recall_count（归档豁免判据）。"""
+        if not document_ids:
+            return
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                f"""
+                UPDATE {CHAT_SUMMARY_TABLE}
+                SET last_recall_at = now(), recall_count = recall_count + 1
+                WHERE document_id = ANY($1::text[]) AND NOT archived
+                """,
+                document_ids,
+            )

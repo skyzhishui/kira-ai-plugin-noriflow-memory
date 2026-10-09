@@ -9,98 +9,44 @@ WebUI 可视化维护页。
 配了 dsn 用 postgres，否则 sqlite）；同一套 kernel / 合并 agent / 提示词 /
 WebUI 逻辑跑在两个后端上（双后端方案见 `docs/plans/`）。
 
-## 功能
+## 功能简介
 
-- **自动写入（retain）**：维护每会话滚动行缓存，在每轮对话（含工具循环、
-  多段回复）全部发送完成后由核心回合完成信号触发一次，按消息水位线取增量
-  批次，把「历史窗口 + 本轮增量 + bot 回复」交由 fast 档 LLM 端侧编码为
-  **保真摘要 + 人物事实**（摘要全文不超过 300 字），双通道写入 PG（摘要可召回，事实进入合并 agent；facts 先行、summary 殿后——任一通道失败即上抛并回滚水位线，下轮从零重编码，无半提交残留，内容不丢）；编码失败自动降级为原文单通道并回滚水位线待下轮重编码；DB 熔断
-  拒绝期 retain 直接失败并回滚水位线（本批留给下轮信号重编码，不白烧编码
-  LLM 与向量化调用；超长故障下受会话滚动行缓存上限约束——每会话最多
-  保 30 行待重编码）。事实幂等键粒度 = 归属集合 + 会话 +
-  日期——同批重复提取去重，跨会话/跨日逐字复现作为独立证据入库计分。
-  写入侧近重去重——retain 编码摘要落库前与同会话最近
-  `write_dedup_window` 批摘要比对，cosine ≥ `write_dedup_threshold` 的
-  跳过写入（抑制历史上下文泄漏进摘要导致的同事件重复行；窗口限制同会话
-  近期，久远相似事件不误杀；查询失败 fail-open 继续写入，
-  facts/relations 通道不受影响）；
-- **合并 agent**：启动缓冲后先跑一轮，此后周期性对原始事实做四遍扫描
-  （归一化 → LLM 四分类裁定 → 衰减/晋档 → 补编码），按评分状态机维护
-  事实簇，达阈值自动进入画像；replaced 墓碑簇不复活（重申旧说法转为对
-  继任簇打矛盾标记）。画像保留三机制：缺席冻结（衰减/降级仅作用于本周期
-  活跃用户）、证据地板（≥4 次确认的簇不因话题不再复现跌出画像，被裁定
-  更正/演变的簇豁免）、矛盾标记豁免。
-- **自动召回（recall）**：每轮对话前以批次文本为 query 做**向量 + BM25
-  双路检索**（候选池 max(rerank_candidates, top_k×4)；rerank 关闭时
-  top_k×4，RRF 融合）→ 重排序 → 相关度阈值
-  → 时间衰减重排 → 近重复去重 → 截断 top_k；支持「会话隔离」开关
-  （仅召回本会话 / 跨会话）。
-- **召回质量优化**：
-  - 扩选——最近 N 批摘要的参与者并入用户过滤，「问及未在场成员」可命中
-    其参与过的同会话摘要；扩展命中在 SQL 侧恒钉死当前会话，
-    与会话隔离开关无关（结构性防跨会话泄漏）；
-  - 问及他人召回——query 命中实体（窗口词典/持久别名层）的
-    (platform, uid) 键组并入主路检索：跨会话开放
-    （`summary_recall_session_scoped=false`）时并入主键组（问及者任何
-    会话的摘要，含其与 bot 的私聊，均可被召回——隐私口径由此开关决定，
-    摘要表无会话类型列，无法按 DM/群细分）；会话隔离时与扩选组同构钉死
-    当前会话（仅实体本会话摘要）。注入路径、memory_search 工具与
-    planner 兜底三路同语义（`recall_hint_enabled` 总开关）。
-  - 近时排除（块数锚定）——宿主 LLM 可见历史窗口按「块」截断
-    （max_memory_length，窗口内容不带时间戳），而 retain 每轮恰好一批
-    摘要，故「最近 K 批摘要」即「窗口内已可见内容」的等价物，这些行
-    不参与召回（不占召回名额；K 活读宿主配置，热改即时生效）；
-  - 近重复去重——最终序贪心扫描，与已保留条目 embedding cosine ≥
-    `dedup_similarity_threshold` 的丢弃（相邻轮次摘要高度重叠，
-    不去重时 top_k 会被同一事件的连续快照占满）；
-  - 相对时间标注——注入记忆尾部追加（今天/昨天/N天前/约N个月前），
-    时区链 = 插件 `timezone` > 宿主 `locale.TZ` > 服务器本地；
-  - recall_log——评估日志开关，启用后每次检索/注入各落一条 JSONL
-    （query/候选数/各过滤器丢弃数/最终注入集），供离线质量度量。
-- **混合检索**：写入侧 bigram 预分词列（search_text）
-  + tsvector GIN，与向量路 RRF 融合候选池——稀有条目（人名/游戏名/黑话）
-  经 BM25 路进入；存量行由补算任务新增分词回填遍周期补齐；
-- **滚动补回**：llm_request 时注入最近 N 批滚动出宿主可见窗口的同会话
-  摘要（跳过窗口内 K 批，与近时排除同源；非 query 驱动，notice 触发的
-  回合同样注入）；recall 同轮经行排除跳过这些行防重复注入。
-- **用户画像**：簇表确定性拼装（六栏：基本信息/称呼偏好/已知事实/互动偏好/
-  近期动态/待定信息），无 LLM 参与，注入内容与表内容逐字一致；群聊支持
-  多参与者画像。归属匹配为 owner-only（关系语句以 owner 视角写成，注入
-  related 方画像会丢失主语；related 参与方由其视角对其提取的事实覆盖），
-  owner OR related 匹配仅用于合并候选检索（防关系簇按归属人分裂）。
-- **主动工具**：`memory_search`（主动召回）、`memory_write`（写入记忆）、
-  `memory_remove`（删除记忆），可通过配置选择启用哪些；并有 `allowed_users`
-  用户白名单与 `allowed_sessions` 会话白名单做**代码级拦截**：按触发用户
-  或触发会话匹配，**任一命中即放行**（会话命中 = 该会话内任何成员可调用，
-  适合整个群开通）。用户条目支持 user_id 或 `平台:user_id`；会话条目支持
-  session_id、`平台:session_id`（覆盖该对端 dm 与 gm）或完整 sid
-  `平台:类型:session_id`。两名单均留空 = 全部拒绝（fail-closed）。
-  **信任边界**：白名单只约束「谁能触发」；默认开启 `tool_scope_locked`
-  作用域锁定（工具钉死为触发会话/触发者，忽略 AI 显式传入的
-  session_id/user_id，memory_remove 只能删触发作用域内的行）——关闭该
-  开关后显式参数恢复生效，此时群聊白名单命中者可让 AI 检索/写入/删除
-  其他用户与其他会话的记忆，请知悉后再关闭。
-  `memory_search` 的 session_id 参数为**裸会话 ID**（如群号），非
-  `平台:类型:id` 完整格式。
-- **维护页**：WebUI 侧边栏「长期记忆」页——概览 KPI、事实簇修正（陈述/
-  分数/状态）、原始事实清理、画像预览（所见即注入）、摘要语料修正与删除、
-  设置（全部记忆运行参数可视化编辑：dsn 等敏感键掩码显示；保存写入宿主
-  插件配置存储并即时热生效，连接池/embedding 客户端等装配期展开字段标注
-  「重启生效」，保存后弹窗列出）。
-- **Kira 记忆数据迁入**：维护页设置栏一键把 KiraAI 宿主
-  的存量记忆无损迁入本插件（设置页「Kira 记忆数据迁入」卡片，弹窗二次确认）：
-  - 会话历史（`chat_memory.json`）按批次以「待提炼原文」入摘要表
-    （summarized=false），由合并 agent 补编码遍逐步 LLM 提炼为摘要 +
-    事实 + 关系边（与管线降级原文同路）；
-  - 事实/洞察（TOML 真相源）入原始事实表走归一化遍去重入簇；画像
-    `profile.json` 的 name/nickname/aliases 入别名表；`archive/`（已遗忘）
-    与技能文件按语义不迁入；
-  - **幂等可重跑**：全部写入复用现网管线幂等键（摘要
-    `{session_id}-{md5}` / 事实 `fact_document_id` 同式 / 别名唯一键），
-    重复执行自动去重不产生重复行；源数据全程只读不改不删；
-  - 命名空间自动对齐：KiraAI 会话/实体 ID 的 adapter 前缀即宿主
-    platform（如 `seki:dm:10086` → platform=seki + session_id=10086），
-    与现网数据同键，召回/画像无缝衔接。
+- **自动记忆**：聊天自动沉淀为长期记忆——每轮对话结束后，后台自动把对话
+  提炼为保真摘要与人物事实入库，全程无需手动操作；
+- **智能召回**：每轮对话前自动检索相关历史记忆（向量 + BM25 混合检索 +
+  重排序），把「记得的事」连同时间标注注入上下文，bot 自然接得上从前的
+  话题；
+- **用户画像**：为每位成员自动维护 8 维画像（基本信息 / 称呼偏好 /
+  已知事实 / 喜好偏好 / 约定承诺 / 互动偏好 / 近期动态 / 待定信息，
+  另附历史名变体的「其他名称」栏），群聊支持多人画像；
+- **关系图谱**：从聊天中提取成员间关系（「A 的姐姐是 B」式陈述），话题
+  涉及时自动在上下文带出相关人物关系（默认关，配置或维护页开启）；
+- **AI 记忆工具**：bot 可主动查证、写入、更正、深查记忆
+  （memory_search / write / profile / lookup / correct 等），并注入
+  记忆工具准则——查到的记忆当亲历自然叙述，不播报操作过程；
+- **记忆新陈代谢**：长期未被召回的记忆自动归档并退出召回范围
+  （原文保留、可恢复），被召回的记忆自动续期（默认关，配置或维护页开启）；
+- **WebUI 维护页**：KiraAI 侧边栏「长期记忆」页——概览 KPI、事实簇修正、
+  摘要语料管理、画像预览（所见即注入）、全部运行参数可视化编辑；
+- **存量迁入**：维护页一键把 KiraAI 宿主的存量记忆（会话历史 / 事实 /
+  别名）无损迁入，幂等可重跑，源数据只读。
+
+## 特点
+
+- **双后端二选一**：PostgreSQL + pgvector 或 SQLite（零外部服务），同一套
+  kernel / 合并 agent / WebUI 跑在两个后端上；个人部署推荐 SQLite，
+  启用即用；
+- **确定性画像**：画像由事实簇表确定性拼装，无 LLM 参与——注入内容与库中
+  内容逐字一致，可审计、可在维护页直接修正；
+- **结构性隐私边界**：会话隔离召回、工具作用域锁定（默认钉死触发会话 /
+  触发者）、用户 / 会话双白名单（留空全拒，fail-closed）——防跨会话 /
+  跨用户泄漏是结构保证，不依赖提示词约定；
+- **全链路不丢数据**：编码失败自动降级、写入失败回滚水位线下轮重编码、
+  幂等键去重、DB 熔断保护，无半提交残留；
+- **召回质量工程**：扩选、问及他人召回、近时排除、近重复去重、时间衰减、
+  相对 / 绝对时间标注等十余项可调机制，默认即合理；
+- **对齐 nori 生态**：记忆工具语义与 nori 侧五件套同源，生命周期、时间
+  标注、关系边等机制持续对齐上游。
 
 ## 工作原理
 
@@ -171,7 +117,14 @@ flowchart TD
 | storage_backend | string | auto | 存储后端：postgres \| sqlite \| auto（auto=配置了 dsn 用 postgres，否则 sqlite）；启动期只读，运行中不可切换（切后端=换库，须走迁移工具） |
 | sqlite_path | string | 空 | SQLite 库文件路径（sqlite 后端生效）；空 = 插件数据目录/memory.sqlite3 |
 | dsn | sensitive | 空 | PostgreSQL 连接串（需 pgvector）；storage_backend=auto 时留空即选 sqlite 后端 |
-| enabled_tools | multi_select | 全部 | 提供给 AI 的记忆工具（memory_search/write/remove） |
+| enabled_tools | multi_select | 全部 | 提供给 AI 的记忆工具（memory_search/write/remove + memory_profile/lookup/correct） |
+| memory_tools_enabled | bool | true | 新三件（profile/lookup/correct）总开关；关闭则不注册（search/write/remove 由 enabled_tools 管理） |
+| summary_lifecycle_enabled | bool | false | 摘要生命周期总开关：归档遍（超龄且强化窗口内无召回命中的行置 archived，结构性退出召回；原文保留可恢复） |
+| summary_lifecycle_grace_days | integer | 30 | 最低保留期（天）：written_at 距今不足此值永不归档 |
+| summary_lifecycle_half_life_days | float | 90 | 生命周期半衰期：归档时限 = 最低保留期 + 3×半衰期 |
+| summary_lifecycle_reinforce_window_days | integer | 90 | 访问强化窗口：最近一次被召回命中在窗口内的行豁免归档（一次召回续命一个窗口） |
+| summary_lifecycle_interval_days | integer | 7 | 归档遍周期（天）：kv 持久化重启不丢；首遍延后至强化窗口后 |
+| summary_lifecycle_reinforce_on_recall | bool | true | 召回访问强化：最终注入集异步刷新 last_recall_at/recall_count（不受总开关门控——预累积信号防首遍误判） |
 | allowed_users | list | 空 | 主动工具用户白名单（代码级拦截）：条目为 user_id 或 `平台:user_id`；与 allowed_sessions 任一命中即放行，**两者均留空 = 全部拒绝** |
 | allowed_sessions | list | 空 | 主动工具会话白名单：条目为 session_id、`平台:session_id`（覆盖该对端 dm+gm）或完整 sid `平台:类型:session_id`；命中会话内任何成员可调用 |
 | pool_min / pool_max | integer | 2 / 8 | 连接池范围 |
@@ -189,6 +142,7 @@ flowchart TD
 | score_cap / promote_threshold / demote_threshold | float | 10 / 10 / 3 | 分数封顶 / 进画像阈值 / 降级迟滞下界 |
 | decay_factor / decay_interval_days | float / integer | 0.8 / 14 | 每周期衰减系数与周期天数（interval 兼缺席冻结窗口粒度；pending 死亡窗口由 pending_dead_days 独立控制） |
 | recent_expire_days / recent_promote_threshold | integer / float | 30 / 4 | 近期维度过期天数与进画像阈值 |
+| commitment_expire_days | integer | 60 | 约定维度过期天数：最近一次被确认后超此天数无新证据，降待定出画像（簇体保留可复活；持续被提起的约定自动续期） |
 | decay_requires_activity | bool | true | 缺席冻结（衰减/降级仅作用于本周期活跃用户） |
 | sticky_evidence_count | integer | 4 | 证据地板阈值（0=禁用；被裁定更正/演变的簇豁免） |
 | pending_dead_days | integer | 90 | 待定事实死亡窗口（天）：降级/过期后无新证据超此天数才判 dead，与衰减周期解耦 |
@@ -219,7 +173,8 @@ flowchart TD
 | write_dedup_enabled | bool | true | 写入侧近重去重：编码摘要与同会话最近 write_dedup_window 批 cosine ≥ write_dedup_threshold 的跳过写入 |
 | write_dedup_window | int | 8 | 写入去重比对窗口（同会话最近批次数） |
 | write_dedup_threshold | float | 0.85 | 写入去重阈值（0=关闭） |
-| recall_time_label_enabled | bool | true | 相对时间标注 |
+| recall_time_label_enabled | bool | true | 时间标注（recall 主路与滚动补回共用，按本地时区换算） |
+| recall_time_label_mode | string | both | 标注形态：relative（今天/N天前）/ absolute（9月28日 14:30，跨年带年份）/ both（相对+绝对并列）。绝对部分分层精度：7 天内带时分，更久只到日期 |
 | timezone | string | 空 | 时区（空=宿主 locale.TZ > 服务器本地） |
 | recall_log_enabled | bool | false | 召回评估日志（JSONL） |
 | recall_log_path | string | 空 | 日志路径（空=插件数据目录） |
@@ -272,6 +227,7 @@ python tests/test_relation_backfill.py      # 存量关系回填 + 关系图谱�
 python tests/test_config_web.py             # 维护页设置栏（schema/掩码/落盘/热更新）
 python tests/test_kira_memory_import.py          # Kira 记忆迁入工具真文件 harness
 python tests/test_sqlite_backend.py         # SQLite 后端真库集成（收敛管线/recall/alias/edge/WebUI）
+python tests/test_memory_tools_sqlite.py    # 记忆工具五件套 + 生命周期真 SQLite 集成（直写链/状态机/归档判据）
 ```
 
 测试桩基建（宿主桩/装载器）收敛在 `tests/_harness.py`；主套件

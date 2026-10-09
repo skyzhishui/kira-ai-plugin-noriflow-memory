@@ -39,9 +39,13 @@ if TYPE_CHECKING:
 
 logger = get_logger("noriflow_memory.encoder", "cyan")
 
-# category 值域（固定对应画像 6 维度：identity/stable/interaction/naming/recent/uncertain）
+# category 值域（画像 8 维度：主动 6（identity/stable/preference/commitment/
+# interaction/naming）+ 系统 2（recent/uncertain，编码器按证据强度/时间性落））
 _VALID_CATEGORIES = frozenset(
-    {"identity", "stable", "interaction", "naming", "recent", "uncertain"}
+    {
+        "identity", "stable", "preference", "commitment",
+        "interaction", "naming", "recent", "uncertain",
+    }
 )
 # confidence 值域
 _VALID_CONFIDENCES = frozenset({"high", "medium"})
@@ -73,7 +77,10 @@ _ENCODE_RESULT_SCHEMA = {
                     "display_name": {"type": "string", "description": "显示名"},
                     "category": {
                         "type": "string",
-                        "enum": ["identity", "stable", "interaction", "naming", "recent", "uncertain"],
+                        "enum": [
+                            "identity", "stable", "preference", "commitment",
+                            "interaction", "naming", "recent", "uncertain",
+                        ],
                     },
                     "statement": {"type": "string", "description": "简短中文陈述句"},
                     "confidence": {"type": "string", "enum": ["high", "medium"]},

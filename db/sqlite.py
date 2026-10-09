@@ -56,6 +56,7 @@ from .base import (
     MemoryBackend,
     _MIGRATION_NAME_RE,
     _Params,
+    _dedupe_keep_time,
     _ensure_tz,
     _like_contains_pattern,
     _rrf_fuse,
@@ -570,6 +571,8 @@ class SQLiteMemoryDatabase(MemoryBackend):
         exclude_document_ids: list[str] | None = None,
         with_embedding: bool = True,
         with_participants: bool = False,
+        include_archived: bool = False,
+        only_archived: bool = False,
     ) -> list[dict]:
         """Vector(+BM25) search over the summary table (condition-assembly
         semantics aligned verbatim with the PG version — see its docstring).
@@ -721,13 +724,31 @@ class SQLiteMemoryDatabase(MemoryBackend):
                 scope,
                 session_id or "",
             )
-        where = (
-            " AND ".join(conds) if conds else "(summarized OR kind = 'bot_self')"
-        )
+        # Lifecycle structural exclusion (011 migration): archived rows
+        # never enter recall candidates — appended after the degenerate-
+        # recall warning so the constant condition doesn't suppress it,
+        # and applied to BOTH branches so it can never mask the fallback
+        # summarized filter by keeping conds non-empty.
+        # include_archived (memory_lookup maintenance path) opens the
+        # tombstones and returns the flag column for status annotation.
+        # only_archived (memory_lookup deep-dig path) narrows further
+        # to tombstones only — pushed into SQL so active rows never
+        # crowd the similarity-ordered candidate window (a fixed
+        # oversized pool + caller-side filtering false-negatives once
+        # active rows outnumber the pool).
+        if only_archived:
+            arch_cond = " AND archived"
+        else:
+            arch_cond = "" if include_archived else " AND NOT archived"
+        if conds:
+            where = " AND ".join(conds) + arch_cond
+        else:
+            where = "(summarized OR kind = 'bot_self')" + arch_cond
         select_cols = (
             "id, document_id, kind, session_id, user_id, content, "
             "occurred_at"
             + (", participants" if with_participants else "")
+            + ", archived"
             + ", embedding"
         )
 
@@ -975,17 +996,20 @@ class SQLiteMemoryDatabase(MemoryBackend):
         connection session — consistent under the single-writer model).
         """
         async with self.pool.acquire() as conn:
+            # 占位符编号固定：session=$1、skip=$2、platform 恒占最高槽
+            # $3（缺席不挤占）——_translate 按 $n 显式下标绑定，若条件
+            # 分支收缩 params 而 LIMIT 槽位写死会越界（IndexError）
             count_sql = (
                 "SELECT count(*) FROM ("
                 f"SELECT kind FROM {CHAT_SUMMARY_TABLE} "  # noqa: S608
                 "WHERE session_id = $1 "
-                + ("AND platform = $2 " if platform else "")
-                + "AND summarized ORDER BY occurred_at DESC, id DESC LIMIT $3"
+                + ("AND platform = $3 " if platform else "")
+                + "AND summarized ORDER BY occurred_at DESC, id DESC LIMIT $2"
                 ") w WHERE w.kind = 'bot_self'"
             )
-            count_params = [session_id] + (
+            count_params = [session_id, int(skip_batches)] + (
                 [platform] if platform else []
-            ) + [int(skip_batches)]
+            )
             bot_in_window = int(
                 await conn.fetchval(count_sql, *count_params) or 0
             )
@@ -1370,6 +1394,7 @@ class SQLiteMemoryDatabase(MemoryBackend):
         demote_threshold: float,
         pending_dead_days: int,
         recent_expire_days: int,
+        commitment_expire_days: int = 60,
         activity_since: datetime | None = None,
         sticky_evidence_count: int = 0,
         anchor_profile_size: int = 0,
@@ -1380,7 +1405,8 @@ class SQLiteMemoryDatabase(MemoryBackend):
         The PG version's data-modifying CTEs are rewritten as an
         in-transaction "collect id set first -> UPDATE/DELETE" flow; the
         split_part semantics (splitting participants into platform/uid)
-        happen on the Python side.
+        happen on the Python side. Commitment expiry counts from
+        COALESCE(last_evidence_at, occurred_at), same as PG.
         """
         now = _now_ts()
         async with self.pool.acquire() as conn:
@@ -1468,21 +1494,33 @@ class SQLiteMemoryDatabase(MemoryBackend):
                         "AND x.cluster_id = memory_fact_cluster.id)"
                     )
 
-                # 1) Recent-dimension expiry demotion (calendar semantics,
-                # ungated) + profile-row cascade
+                # 1) Recent/commitment-dimension expiry demotion (calendar
+                # semantics, ungated) + profile-row cascade; commitment
+                # counted from COALESCE(last_evidence_at, occurred_at) —
+                # same semantics as the PG version
+                now_dt = datetime.now(timezone.utc)
                 recent_cutoff = sqlite_format_ts(
-                    datetime.now(timezone.utc) - timedelta(days=recent_expire_days)
+                    now_dt - timedelta(days=recent_expire_days)
                 )
-                expired_ids = [
-                    int(r["id"])
-                    for r in await conn.fetch(
-                        f"SELECT id FROM {FACT_CLUSTER_TABLE} "  # noqa: S608
-                        "WHERE category = 'recent' "
-                        "AND status IN ('active', 'profiled') "
-                        "AND occurred_at < $1",
-                        recent_cutoff,
-                    )
-                ]
+                commitment_cutoff = sqlite_format_ts(
+                    now_dt - timedelta(days=commitment_expire_days)
+                )
+                expired_rows = await conn.fetch(
+                    f"SELECT id, category FROM {FACT_CLUSTER_TABLE} "  # noqa: S608
+                    "WHERE status IN ('active', 'profiled') "
+                    "AND ((category = 'recent' AND occurred_at < $1) "
+                    "OR (category = 'commitment' "
+                    "AND COALESCE(last_evidence_at, occurred_at) < $2))",
+                    recent_cutoff,
+                    commitment_cutoff,
+                )
+                expired_ids = [int(r["id"]) for r in expired_rows]
+                expired_recent = sum(
+                    1 for r in expired_rows if r["category"] == "recent"
+                )
+                expired_commitment = sum(
+                    1 for r in expired_rows if r["category"] == "commitment"
+                )
                 expired_cleaned = 0
                 if expired_ids:
                     phs = ", ".join(f"${i + 2}" for i in range(len(expired_ids)))
@@ -1492,13 +1530,16 @@ class SQLiteMemoryDatabase(MemoryBackend):
                         f"updated_at = $1 WHERE id IN ({phs})",
                         now, *expired_ids,
                     )
-                    expired_cleaned = int(
-                        await conn.execute(
-                            "DELETE FROM memory_user_profile WHERE cluster_id "
-                            f"IN ({phs})",
-                            *expired_ids,
-                        ).rsplit(" ", 1)[-1]
+                    # DELETE 无 $1（now）前缀参——占位符自成 $1..$n，不能
+                    # 复用为 UPDATE 准备的 $2..$n+1（错位绑定/越界）
+                    del_phs = ", ".join(f"${i + 1}" for i in range(len(expired_ids)))
+                    del_status = await conn.execute(
+                        "DELETE FROM memory_user_profile WHERE cluster_id "
+                        f"IN ({del_phs})",
+                        *expired_ids,
                     )
+                    # 先 await 再切分：await 直链 .rsplit 会作用于协程对象
+                    expired_cleaned = int(del_status.rsplit(" ", 1)[-1])
 
                 # 2) Non-recent score decay (evidence floor inside the SQL
                 # CASE, same shape as PG)
@@ -1542,13 +1583,14 @@ class SQLiteMemoryDatabase(MemoryBackend):
                         f"updated_at = $1 WHERE id IN ({phs})",
                         now, *demoted_ids,
                     )
-                    demoted_cleaned = int(
-                        await conn.execute(
-                            "DELETE FROM memory_user_profile WHERE cluster_id "
-                            f"IN ({phs})",
-                            *demoted_ids,
-                        ).rsplit(" ", 1)[-1]
+                    # 同上：DELETE 占位符自成 $1..$n
+                    del_phs = ", ".join(f"${i + 1}" for i in range(len(demoted_ids)))
+                    del_status = await conn.execute(
+                        "DELETE FROM memory_user_profile WHERE cluster_id "
+                        f"IN ({del_phs})",
+                        *demoted_ids,
                     )
+                    demoted_cleaned = int(del_status.rsplit(" ", 1)[-1])
 
                 # 4) pending_uncertain death after pending_dead_days
                 # (gated)
@@ -1567,7 +1609,8 @@ class SQLiteMemoryDatabase(MemoryBackend):
                 await conn.execute("DROP TABLE IF EXISTS temp._decay_active_pairs")
 
         return {
-            "expired_recent": len(expired_ids),
+            "expired_recent": expired_recent,
+            "expired_commitment": expired_commitment,
             "demoted": len(demoted_ids),
             "profile_rows_deleted": expired_cleaned + demoted_cleaned,
             "deaded": int(dead_rowcount.rsplit(" ", 1)[-1]),
@@ -1705,13 +1748,38 @@ class SQLiteMemoryDatabase(MemoryBackend):
             )
         return out
 
+    async def fetch_fact_code_sources(self) -> list:
+        """(platform, canonical_statement, last_seen) rows of live fact
+        clusters — source stream for the fact-code alias backfill pass
+        (SQLite scalar MAX in place of PostgreSQL GREATEST)."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT platform, canonical_statement, "
+                "MAX(COALESCE(last_evidence_at, occurred_at), occurred_at) "
+                "AS last_seen FROM memory_fact_cluster "
+                "WHERE status IN ('active', 'profiled') "
+                "GROUP BY id"
+            )
+        out = []
+        for r in rows:
+            # 解析失败（旧格式/手工编辑）视作最旧——None 流入别名行会让
+            # alias_upsert 的 _ensure_tz 抛错毒化整批，绑定也随之丢失；
+            # 远古占位时间在 last_seen 单调（MAX）语义下不覆盖真实观测
+            seen = sqlite_parse_ts(r["last_seen"]) or datetime.min.replace(
+                tzinfo=timezone.utc
+            )
+            out.append((r["platform"], r["canonical_statement"], seen))
+        return out
+
     async def fetch_alias_names_by_owner(
         self, owners: list[tuple[str, str]] | None = None
     ) -> dict[tuple[str, str], str]:
         """(platform, uid) -> latest non-placeholder alias (canonical-name
         resolution source for the graph read side)."""
         async with self.pool.acquire() as conn:
-            if owners:
+
+            # None=全表(原语义);空列表/过滤后空=无待解析 owner 返回 {}
+            if owners is not None:
                 pairs = [(str(p or ""), str(u or "")) for p, u in owners if u]
                 if not pairs:
                     return {}
@@ -1739,6 +1807,39 @@ class SQLiteMemoryDatabase(MemoryBackend):
             out.setdefault((r["platform"], str(r["user_id"])), name)
         return out
 
+    async def fetch_alias_variants(
+        self, platforms: list[str], uids: list[str]
+    ) -> dict[tuple[str, str], list[str]]:
+        """(platform, uid) -> non-placeholder name variants (last_seen
+        DESC).
+
+        Data source for the profile "other names" section; placeholder
+        filtering happens here, current-name exclusion and capping in the
+        caller (persona_service). Semantics identical to the PG version
+        (ANY x ANY cross-product over the two id lists).
+        """
+        plats = [str(p or "") for p in platforms]
+        uids = [str(u or "") for u in uids if u]
+        if not plats or not uids:
+            return {}
+        async with self.pool.acquire() as conn:
+            p = _Params(None)
+            plat_sql = ", ".join(f"{p.add(v)}" for v in plats)
+            uid_sql = ", ".join(f"{p.add(v)}" for v in uids)
+            rows = await conn.fetch(
+                "SELECT platform, user_id, name FROM memory_entity_alias "
+                f"WHERE platform IN ({plat_sql}) AND user_id IN ({uid_sql}) "
+                "ORDER BY last_seen DESC",
+                *p.values,
+            )
+        out: dict[tuple[str, str], list[str]] = {}
+        for r in rows:
+            name = str(r["name"] or "").strip()
+            if not name or is_placeholder_name(name):
+                continue
+            out.setdefault((r["platform"], str(r["user_id"])), []).append(name)
+        return out
+
     # ------------------------------------------------------------------
     #  entity relation edges (P2 write / P3 inject)
     # ------------------------------------------------------------------
@@ -1764,6 +1865,9 @@ class SQLiteMemoryDatabase(MemoryBackend):
             )
         if not rows:
             return
+        # Echo pre-check and the write must share one connection (same
+        # contract as the PG version): two acquires open a window where a
+        # mirrored edge interleaves between the check and the executemany.
         async with self.pool.acquire() as conn:
             existing_keys = await self._fetch_existing_edge_keys(conn, rows)
             rows, skipped = split_reverse_echo_rows(rows, existing_keys)
@@ -1771,31 +1875,30 @@ class SQLiteMemoryDatabase(MemoryBackend):
                 logger.info(
                     "关系边反向回声跳过 %d 条（镜像方向已在库/同批先到）", skipped
                 )
-        if not rows:
-            return
-        now = _now_ts()
-        payload = [
-            (
-                r["platform"],
-                r["subject_uid"],
-                r["object_uid"],
-                r["subject_name"],
-                r["object_name"],
-                r["relation_label"],
-                r["statement"],
-                "pending" if r["is_bot_edge"] and int(r["min_evidence"]) > 1
-                else "active",
-                r["confidence"],
-                sqlite_format_ts(_ensure_tz(r["occurred_at"])),
-                r["evidence_key"],
-                1 if r["is_bot_edge"] else 0,
-                int(r["min_evidence"]),
-                1 if r.get("count_on_conflict", True) else 0,
-                now,
-            )
-            for r in rows
-        ]
-        async with self.pool.acquire() as conn:
+            if not rows:
+                return
+            now = _now_ts()
+            payload = [
+                (
+                    r["platform"],
+                    r["subject_uid"],
+                    r["object_uid"],
+                    r["subject_name"],
+                    r["object_name"],
+                    r["relation_label"],
+                    r["statement"],
+                    "pending" if r["is_bot_edge"] and int(r["min_evidence"]) > 1
+                    else "active",
+                    r["confidence"],
+                    sqlite_format_ts(_ensure_tz(r["occurred_at"])),
+                    r["evidence_key"],
+                    1 if r["is_bot_edge"] else 0,
+                    int(r["min_evidence"]),
+                    1 if r.get("count_on_conflict", True) else 0,
+                    now,
+                )
+                for r in rows
+            ]
             await conn.executemany(
                 f"""
                 INSERT INTO memory_entity_edge (
@@ -1903,6 +2006,16 @@ class SQLiteMemoryDatabase(MemoryBackend):
     ) -> list[dict]:
         """Injection candidate edges: active with an endpoint hitting the
         node set (bot-endpoint edges included when bot_keys is non-empty)."""
+        # 字符串/字节串会被逐元素迭代成 ['q','q',':',...] 静默空结果——
+        # 静默 miss 正是本函数要根除的形态，故 fail fast 而非归一兼容
+        # （空串 falsy 天然迭代为空，保持旧容忍）
+        if (isinstance(node_keys, (str, bytes)) and node_keys) or (
+            isinstance(bot_keys, (str, bytes)) and bot_keys
+        ):
+            raise TypeError(
+                "fetch_active_edges 收 \"platform:uid\" 复合键列表，"
+                "不接受单值字符串"
+            )
         keys = [str(k or "") for k in (node_keys or []) if k]
         bots = sorted(str(k or "") for k in (bot_keys or []) if k)
         if not keys and not bots:
@@ -2226,20 +2339,24 @@ class SQLiteMemoryDatabase(MemoryBackend):
 
     async def fetch_profile_sections(
         self, platform: str, user_id: str, per_section_limit: int
-    ) -> dict[str, list[str]]:
+    ) -> dict[str, list[tuple[str, object]]]:
         """Per-section profile rows (data source for the first five
-        sections; owner-only, ordering identical to the PG version)."""
+        sections), statement + occurred_at (via cluster_id join; None
+        when the cluster row is missing — the assembler then omits the
+        time label). Ownership and ordering identical to the PG version."""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT category, statement FROM (
-                    SELECT category, statement,
+                SELECT category, statement, occurred_at FROM (
+                    SELECT m.category, m.statement,
+                           c.occurred_at AS occurred_at,
                            row_number() OVER (
-                               PARTITION BY category
-                               ORDER BY score DESC, updated_at DESC, id ASC
+                               PARTITION BY m.category
+                               ORDER BY m.score DESC, m.updated_at DESC, m.id ASC
                            ) AS rn
-                    FROM memory_user_profile
-                    WHERE platform = $1 AND user_id = $2
+                    FROM memory_user_profile m
+                    LEFT JOIN memory_fact_cluster c ON c.id = m.cluster_id
+                    WHERE m.platform = $1 AND m.user_id = $2
                 ) t
                 WHERE rn <= $3
                 ORDER BY category, rn
@@ -2248,19 +2365,22 @@ class SQLiteMemoryDatabase(MemoryBackend):
                 user_id,
                 per_section_limit,
             )
-        sections: dict[str, list[str]] = {}
+        sections: dict[str, list[tuple[str, object]]] = {}
         for r in rows:
-            sections.setdefault(r["category"], []).append(r["statement"])
+            sections.setdefault(r["category"], []).append(
+                (r["statement"], sqlite_parse_ts(r["occurred_at"]))
+            )
         return sections
 
     async def fetch_uncertain_statements(
         self, platform: str, user_id: str, limit: int
-    ) -> list[str]:
+    ) -> list[tuple[str, object]]:
         """Uncertain-info section source: pending_uncertain and replaced
-        (halved-score) clusters."""
+        (halved-score) clusters, with occurred_at (NOT NULL column) for
+        the time label."""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                f"SELECT canonical_statement FROM {FACT_CLUSTER_TABLE} "  # noqa: S608
+                f"SELECT canonical_statement, occurred_at FROM {FACT_CLUSTER_TABLE} "  # noqa: S608
                 "WHERE platform = $1 AND user_id = $2 "
                 "AND status IN ('pending_uncertain', 'replaced') "
                 "ORDER BY score DESC, updated_at DESC, id ASC LIMIT $3",
@@ -2268,13 +2388,17 @@ class SQLiteMemoryDatabase(MemoryBackend):
                 user_id,
                 limit,
             )
-        return [r["canonical_statement"] for r in rows]
+        return [
+            (r["canonical_statement"], sqlite_parse_ts(r["occurred_at"]))
+            for r in rows
+        ]
 
     async def fetch_profile_sections_multi(
         self, platforms: list[str], user_ids: list[str], per_section_limit: int
-    ) -> dict[str, list[str]]:
+    ) -> dict[str, list[tuple[str, object]]]:
         """Per-section profile rows with multi-account keys merged (key
-        semantics/ordering/dedup identical to the PG version)."""
+        semantics/ordering/dedup identical to the PG version); dedup
+        prefers non-null occurred_at across same-text entries."""
         pairs = list(zip(platforms, user_ids))
         async with self.pool.acquire() as conn:
             if not pairs:
@@ -2285,13 +2409,15 @@ class SQLiteMemoryDatabase(MemoryBackend):
             )
             rows = await conn.fetch(
                 f"""
-                SELECT category, statement FROM (
+                SELECT category, statement, occurred_at FROM (
                     SELECT m.category, m.statement,
+                           c.occurred_at AS occurred_at,
                            row_number() OVER (
                                PARTITION BY m.category
                                ORDER BY m.score DESC, m.updated_at DESC, m.id ASC
                            ) AS rn
                     FROM memory_user_profile m
+                    LEFT JOIN memory_fact_cluster c ON c.id = m.cluster_id
                     WHERE (m.platform, m.user_id) IN ({pair_sql})
                 ) t
                 WHERE rn <= {p.add(per_section_limit)}
@@ -2299,18 +2425,18 @@ class SQLiteMemoryDatabase(MemoryBackend):
                 """,
                 *p.values,
             )
-        sections: dict[str, list[str]] = {}
+        sections: dict[str, list[tuple[str, object]]] = {}
         for r in rows:
             items = sections.setdefault(r["category"], [])
-            if r["statement"] not in items:  # order-preserving dedup across keys
-                items.append(r["statement"])
+            _dedupe_keep_time(items, r["statement"], sqlite_parse_ts(r["occurred_at"]))
         return sections
 
     async def fetch_uncertain_statements_multi(
         self, platforms: list[str], user_ids: list[str], limit: int
-    ) -> list[str]:
+    ) -> list[tuple[str, object]]:
         """Uncertain-info rows with multi-account keys merged (ordering/
-        dedup/ownership semantics as in the single-key version)."""
+        dedup/ownership semantics as in the single-key version); dedup
+        prefers non-null occurred_at across same-text entries."""
         pairs = list(zip(platforms, user_ids))
         async with self.pool.acquire() as conn:
             if not pairs:
@@ -2321,7 +2447,7 @@ class SQLiteMemoryDatabase(MemoryBackend):
             )
             rows = await conn.fetch(
                 f"""
-                SELECT m.canonical_statement
+                SELECT m.canonical_statement, m.occurred_at
                 FROM {FACT_CLUSTER_TABLE} m
                 WHERE (m.platform, m.user_id) IN ({pair_sql})
                   AND m.status IN ('pending_uncertain', 'replaced')
@@ -2330,10 +2456,11 @@ class SQLiteMemoryDatabase(MemoryBackend):
                 """,  # noqa: S608
                 *p.values,
             )
-        statements: list[str] = []
+        statements: list[tuple[str, object]] = []
         for r in rows:
-            if r["canonical_statement"] not in statements:
-                statements.append(r["canonical_statement"])
+            _dedupe_keep_time(
+                statements, r["canonical_statement"], sqlite_parse_ts(r["occurred_at"])
+            )
         return statements
 
     async def fetch_latest_display_name_multi(
@@ -2403,3 +2530,327 @@ class SQLiteMemoryDatabase(MemoryBackend):
                         int(row["id"]),
                     )
         return row is not None
+
+    # ------------------------------------------------------------------
+    #  memory tools (search/write/correct) + summary lifecycle
+    # ------------------------------------------------------------------
+
+    async def upsert_persona_fact_raw_for_apply(
+        self,
+        *,
+        document_id: str,
+        platform: str,
+        user_id: str,
+        related_user_ids: list[str],
+        display_name: str,
+        category: str,
+        statement: str,
+        confidence: str,
+        session_id: str,
+        group_id: str,
+        evidence_key: str,
+        occurred_at: datetime,
+        embedding: list[float] | None,
+    ) -> int | None:
+        """Insert a raw fact and RETURNING id (memory_write write-in).
+
+        Idempotent conflict refreshes display_name, but an empty incoming
+        name never blanks an existing one (tool path always passes ""; the
+        encoder path may have resolved a real name on the same key) —
+        same COALESCE guard as the PG version.
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO memory_persona_fact_raw
+                    (document_id, platform, user_id, related_user_ids,
+                     display_name, category, statement, confidence,
+                     session_id, group_id, evidence_key, occurred_at,
+                     written_at, embedding)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                        $13, $14)
+                ON CONFLICT (document_id)
+                DO UPDATE SET display_name = COALESCE(
+                    NULLIF(EXCLUDED.display_name, ''),
+                    display_name)
+                RETURNING id
+                """,
+                document_id, platform, user_id,
+                _json_list(related_user_ids), display_name, category,
+                statement, confidence, session_id, group_id, evidence_key,
+                sqlite_format_ts(_ensure_tz(occurred_at)), _now_ts(),
+                _pack_vector(embedding, self._embedding_dims),
+            )
+        return int(row["id"]) if row else None
+
+    async def search_fact_clusters(
+        self,
+        *,
+        query_vec: list[float],
+        limit: int,
+        platform: str = "",
+        user_ids: list[str] | None = None,
+        category: str = "",
+        include_inactive: bool = False,
+        only_inactive: bool = False,
+    ) -> list[dict]:
+        """Cluster-table semantic search (tools target=fact/lookup).
+
+        SQLite leg mirrors search_chat_summaries' vector leg: SQL binds the
+        row set (status/owner/category), Python cosine sorts and truncates.
+        """
+        # only_inactive (memory_lookup deep-dig path) narrows to
+        # non-active statuses in SQL — active/profiled clusters never enter
+        # the similarity-ordered candidate window (see search_chat_summaries
+        # only_archived for the same crowd-out rationale).
+        if only_inactive:
+            statuses = ("replaced", "dead", "pending_uncertain")
+        elif include_inactive:
+            statuses = (
+                ("active", "profiled", "replaced", "dead", "pending_uncertain")
+            )
+        else:
+            statuses = ("active", "profiled")
+        p = _Params(None)
+        conds = [
+            "status IN (" + ", ".join(p.add(s) for s in statuses) + ")",
+            "embedding IS NOT NULL",
+        ]
+        if platform:
+            conds.append(f"platform = {p.add(platform)}")
+        uids = [u for u in (user_ids or []) if u]
+        if uids:
+            cond = _in_cond(p, "user_id", uids)
+            if cond:
+                conds.append(cond)
+        if category:
+            conds.append(f"category = {p.add(category)}")
+        async with self.pool.acquire() as conn:
+            rows = _decode_rows(
+                await conn.fetch(
+                    "SELECT id, platform, user_id, category, "
+                    "canonical_statement, score, status, evidence_count, "
+                    "contradicted_at, occurred_at, replaced_by, embedding "
+                    f"FROM {FACT_CLUSTER_TABLE} WHERE "
+                    + " AND ".join(conds),
+                    *p.values,
+                )
+            )
+        scored: list[dict] = []
+        for row in rows:
+            sim = _cosine(row.get("embedding"), query_vec)
+            if sim is None:
+                continue
+            row.pop("embedding", None)
+            row["relevance"] = sim
+            scored.append(row)
+        scored.sort(key=lambda r: r["relevance"], reverse=True)
+        return scored[:limit]
+
+    async def fetch_cluster_owner(
+        self, cluster_id: int
+    ) -> tuple[str, str] | None:
+        """Owner of a cluster (memory_write replace-target scope check)."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT platform, user_id FROM {FACT_CLUSTER_TABLE} "
+                "WHERE id = $1",
+                cluster_id,
+            )
+        return (row["platform"], row["user_id"]) if row else None
+
+    async def cluster_status_op(
+        self,
+        cluster_id: int,
+        action: str,
+        *,
+        platform: str = "",
+        user_id: str = "",
+    ) -> dict:
+        """Cluster status op (memory_correct db landing).
+
+        Read-modify-write under BEGIN IMMEDIATE (same serialization
+        argument as apply_fact_merge): SQLite cannot do conditional
+        multi-statement updates with side effects in one statement, and
+        drop must additionally clear the profile projection row.
+        """
+        if action not in ("drop", "dispute", "reactivate"):
+            raise ValueError(f"不支持的簇状态操作: {action}")
+        now = _now_ts()
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"SELECT platform, user_id, status, replaced_by, "
+                    f"contradicted_at "
+                    f"FROM {FACT_CLUSTER_TABLE} WHERE id = $1",
+                    cluster_id,
+                )
+                if row is None:
+                    return {"changed": False, "status": "", "replaced_by": None}
+                status = row["status"]
+                # Owner mismatch reads identically to "not found" (never
+                # leak the existence of another user's cluster)
+                if platform and row["platform"] != platform:
+                    return {"changed": False, "status": "", "replaced_by": None}
+                if user_id and row["user_id"] != user_id:
+                    return {"changed": False, "status": "", "replaced_by": None}
+
+                def _unchanged() -> dict:
+                    return {
+                        "changed": False,
+                        "status": status,
+                        "replaced_by": row["replaced_by"],
+                    }
+
+                if action == "drop":
+                    if status not in ("active", "profiled", "pending_uncertain"):
+                        return _unchanged()
+                    await conn.execute(
+                        f"UPDATE {FACT_CLUSTER_TABLE} SET status = 'dead', "
+                        "updated_at = $2 WHERE id = $1",
+                        cluster_id, now,
+                    )
+                    await conn.execute(
+                        "DELETE FROM memory_user_profile WHERE cluster_id = $1",
+                        cluster_id,
+                    )
+                    return {"changed": True, "status": "dead", "replaced_by": None}
+                if action == "dispute":
+                    if status not in ("active", "profiled"):
+                        return _unchanged()
+                    if row["contradicted_at"] is not None:
+                        # 已打过矛盾标记：与 PG 版 RETURNING 未命中分支
+                        # 同款——回读现态报 changed=False（BEGIN IMMEDIATE
+                        # 下本读即最新，重复 dispute 不假报状态变化）
+                        return _unchanged()
+                    await conn.execute(
+                        f"UPDATE {FACT_CLUSTER_TABLE} SET contradicted_at = $2 "
+                        "WHERE id = $1 AND contradicted_at IS NULL",
+                        cluster_id, now,
+                    )
+                    return {
+                        "changed": True,
+                        "status": status,
+                        "replaced_by": None,
+                    }
+                # reactivate: dead/pending_uncertain only (replaced has a
+                # successor — reviving it would contradict the successor;
+                # caller points the model at dispute on the successor)
+                if status not in ("dead", "pending_uncertain"):
+                    return _unchanged()
+                await conn.execute(
+                    f"UPDATE {FACT_CLUSTER_TABLE} SET status = 'active', "
+                    "demoted_at = NULL, updated_at = $2 WHERE id = $1",
+                    cluster_id, now,
+                )
+                return {"changed": True, "status": "active", "replaced_by": None}
+
+    async def restore_summary(
+        self, summary_id: int, session_id: str = ""
+    ) -> bool:
+        """Restore an archived summary (clear archived, keep reinforcement)."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT session_id, archived FROM memory_chat_summary "
+                "WHERE id = $1",
+                summary_id,
+            )
+            if row is None or not row["archived"]:
+                return False
+            if session_id and row["session_id"] != session_id:
+                # Owner mismatch reads identically to "not found"
+                return False
+            await conn.execute(
+                "UPDATE memory_chat_summary SET archived = 0, "
+                "archived_at = NULL, last_recall_at = $2 WHERE id = $1",
+                summary_id, _now_ts(),
+            )
+        return True
+
+    async def archive_stale_summaries(
+        self,
+        *,
+        archive_after_days: int,
+        reinforce_window_days: int,
+        batch_size: int,
+    ) -> int:
+        """Archive pass: stale un-recalled rows flip to archived.
+
+        Keyset pagination (id > last_id) with per-batch commits; the triple
+        predicate (NOT archived + over-age + reinforce window) is pushed
+        down into the candidate SELECT — aligned with the PG side and the
+        idx_mcs_lifecycle partial index, so a pass scans only stale rows
+        instead of paging through every unarchived row. Each batch still
+        re-checks the predicate at UPDATE time so a row recalled mid-pass
+        (racing the candidate snapshot) is skipped and survives —
+        "freshly remembered memory wrongly archived" cannot self-heal once
+        both sides exclude it. Full-batch detection counts the candidate
+        snapshot, not the UPDATE rowcount: the re-check removes rows from
+        the update, and using the rowcount would return early and strand
+        remaining eligible rows until the next cycle.
+        """
+        total = 0
+        last_id = 0
+        async with self.pool.acquire() as conn:
+            while True:
+                rows = await conn.fetch(
+                    "SELECT id FROM memory_chat_summary "
+                    "WHERE id > $1 AND NOT archived "
+                    "AND written_at < $2 "
+                    "AND (last_recall_at IS NULL OR last_recall_at < $3) "
+                    "ORDER BY id LIMIT $4",
+                    last_id,
+                    self._lifecycle_cutoff(archive_after_days),
+                    self._lifecycle_cutoff(reinforce_window_days),
+                    batch_size,
+                )
+                if not rows:
+                    return total
+                ids = [int(r["id"]) for r in rows]
+                if ids:
+                    # $1=archived_at, $2=written_at cutoff, $3=reinforce
+                    # cutoff, $4..=ids（编号不与 SET 子句撞号——shim 按首
+                    # 次出现顺序绑定参数）
+                    phs = ", ".join(f"${i + 4}" for i in range(len(ids)))
+                    # UPDATE-time re-check: the candidate snapshot may be
+                    # stale by the time the UPDATE lands (concurrent
+                    # reinforcement / re-encode rewriting written_at); the
+                    # predicate runs again in SQL, same triple condition as
+                    # the PG side (NOT archived + over-age + reinforce
+                    # window) so both backends archive identically
+                    status = await conn.execute(
+                        "UPDATE memory_chat_summary SET archived = 1, "
+                        f"archived_at = $1 WHERE id IN ({phs}) AND NOT archived "
+                        "AND written_at < $2 "
+                        "AND (last_recall_at IS NULL OR last_recall_at < $3)",
+                        _now_ts(),
+                        self._lifecycle_cutoff(archive_after_days),
+                        self._lifecycle_cutoff(reinforce_window_days),
+                        *ids,
+                    )
+                    total += int(str(status).split()[-1])
+                if len(rows) < batch_size:
+                    return total
+                last_id = ids[-1]
+
+    @staticmethod
+    def _lifecycle_cutoff(reinforce_window_days: int) -> str:
+        """Reinforcement-window cutoff as canonical SQLite TEXT (UTC)."""
+        boundary = datetime.now(timezone.utc) - timedelta(
+            days=reinforce_window_days
+        )
+        return sqlite_format_ts(boundary)
+
+    async def reinforce_summaries(self, document_ids: list[str]) -> None:
+        """Refresh last_recall_at/recall_count for the recalled rows."""
+        if not document_ids:
+            return
+        phs = ", ".join(f"${i + 1}" for i in range(len(document_ids)))
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE memory_chat_summary SET last_recall_at = $"
+                f"{len(document_ids) + 1}, "
+                "recall_count = recall_count + 1 "
+                f"WHERE document_id IN ({phs}) AND NOT archived",
+                *document_ids, _now_ts(),
+            )

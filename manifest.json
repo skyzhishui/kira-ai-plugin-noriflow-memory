@@ -1,7 +1,7 @@
 {
   "display_name": "NoriFlow 长期记忆",
   "plugin_id": "kira-ai-plugin-noriflow-memory",
-  "version": "1.16.1",
+  "version": "1.17.0",
   "core_version": ">=2.31.0",
   "author": "skyzhishui",
   "license": "AGPL-3.0",

@@ -209,6 +209,7 @@ def select_relation_edges(
     edges: list[dict],
     node_keys: list[str],
     bot_uid: object,
+    session_platform: str,
     bot_addressed: bool,
     stopwords: Optional[list[str]],
     max_neighbors: int,
@@ -225,19 +226,24 @@ def select_relation_edges(
     - bot 端点边：对端复合键 ∈ node_keys 且 label ∈ text -> 场景 A
       （锚 = 对端；真名锚定的 bot 关系问题安全，不受 C 门槛约束）；
       对端未命中节点时须 bot_addressed 才 -> 场景 C（锚 = 该边的 bot
-      端点 uid，"@bot 你姐姐是谁"无任何名字锚点，bot 端点自身即锚）；
+      端点复合键，"@bot 你姐姐是谁"无任何名字锚点，bot 端点自身即锚）；
     - 停用 label 两场景均跳过；按边 id 去重；每锚点邻居 ≤
       max_neighbors；总行数 ≤ max_lines。
 
     bot_uid 接受单 uid 或集合（bot_uid_set 语义：会话标识/平台 uid
-    双形态任一命中即 bot 端点边——端点是否 bot 按裸 uid 判定，复合键
-    匹配在 db 层已完成）。
+    双形态任一命中即 bot 端点边）。bot 端点判定为复合键：形态 ×
+    session_platform 拼键后与边端点复合键比对——跨平台同号者的边
+    不会因裸 uid 撞号被误判为 bot 边（db 层不再按平台过滤后，这是
+    python 层的平台校验位）。session_platform 必填：漏传即 TypeError，
+    不允许静默退回裸 uid 判定。
 
     Returns:
         选中边行（原 dict 副本 + _scenario/_anchor 标注），可能为空。
     """
     node_set = {k for k in (node_keys or []) if k}
-    bots = bot_uid_set(bot_uid)
+    bot_keys = {
+        f"{session_platform}:{u}" for u in bot_uid_set(bot_uid)
+    }
     stopped = {w for w in (stopwords or []) if w}
     selected: list[dict] = []
     seen_ids: set = set()
@@ -256,16 +262,17 @@ def select_relation_edges(
         object_ = str(edge.get("object_uid") or "")
         subject_key = f"{platform}:{subject}"
         object_key = f"{platform}:{object_}"
-        bot_hits = bots & {subject, object_}
-        if bot_hits:
-            if subject in bot_hits and object_ in bot_hits:
+        subject_bot = subject_key in bot_keys
+        object_bot = object_key in bot_keys
+        if subject_bot or object_bot:
+            if subject_bot and object_bot:
                 continue  # 两端都是 bot 形态：无对端，无意义
-            other_key = object_key if subject in bot_hits else subject_key
+            other_key = object_key if subject_bot else subject_key
             if other_key in node_set:
                 scenario, anchor = "A", other_key
             elif bot_addressed:
                 scenario = "C"
-                anchor = subject if subject in bot_hits else object_
+                anchor = subject_key if subject_bot else object_key
             else:
                 continue
         elif subject_key in node_set:
@@ -287,25 +294,30 @@ def select_relation_edges(
 
 
 def relation_statement_line(
-    edge: dict, bot_uid: object, bot_nickname: str, time_qualifier: str
+    edge: dict, bot_uid: object, session_platform: str,
+    bot_nickname: str, time_qualifier: str,
 ) -> str:
     """陈述行：`小张(u1001)的姐姐是小李(u2002)（截至9月7日）`。
 
     端点名取边表冗余名（每次证据刷新为最新），缺省回退 uid；bot 端点
-    回退 bot_nickname（bot_uid 为 bot_uid_set 语义集合，双形态任一
-    命中即用昵称渲染）。时间限定由调用方按 last_seen 本地时区生成——
-    label 存在多值语义（决策 8：不做自动互斥），LLM 依据时间自行裁决
-    新旧。
+    回退 bot_nickname——bot 判定为复合键（bot_uid 形态 ×
+    session_platform，与 select_relation_edges / neighbor_profile_uids
+    同口径，跨平台同号真人不渲染成 bot 昵称）。时间限定由调用方按
+    last_seen 本地时区生成——label 存在多值语义（决策 8：不做自动
+    互斥），LLM 依据时间自行裁决新旧。
     """
     subject = str(edge.get("subject_uid") or "")
     object_ = str(edge.get("object_uid") or "")
     label = str(edge.get("relation_label") or "")
     sname = str(edge.get("subject_name") or "").strip()
     oname = str(edge.get("object_name") or "").strip()
-    bots = bot_uid_set(bot_uid)
-    if subject and subject in bots and bot_nickname:
+    platform = str(edge.get("platform") or "")
+    bot_keys = {
+        f"{session_platform}:{u}" for u in bot_uid_set(bot_uid)
+    }
+    if subject and f"{platform}:{subject}" in bot_keys and bot_nickname:
         sname = bot_nickname
-    if object_ and object_ in bots and bot_nickname:
+    if object_ and f"{platform}:{object_}" in bot_keys and bot_nickname:
         oname = bot_nickname
     s = f"{sname or subject}({subject})" if subject else (sname or "?")
     o = f"{oname or object_}({object_})" if object_ else (oname or "?")
@@ -317,17 +329,22 @@ def neighbor_profile_uids(
     selected: list[dict],
     node_keys: list[str],
     bot_uid: object,
+    session_platform: str,
     max_profiles: int,
 ) -> list[tuple[str, str, str]]:
     """需要画像补注的对端 (platform, uid, name) 列表（独立预算）。
 
     只取「未命中节点的对端」——命中节点的成员已走实体候选路进画像
-    注入；bot 端点跳过（bot 无画像；bot_uid 为 bot_uid_set 语义集合）。
-    platform 取该边自己的平台（跨平台别名命中的对端经其所在边平台
-    查画像，而非会话平台）。按 (platform, uid) 去重，保边选择序。
+    注入；bot 端点跳过（bot 无画像；bot 端点判定为复合键：bot_uid
+    形态 × session_platform，与 select_relation_edges 同口径——跨
+    平台同号真人不因裸 uid 撞号被误排除）。platform 取该边自己的
+    平台（跨平台别名命中的对端经其所在边平台查画像，而非会话平台）。
+    按 (platform, uid) 去重，保边选择序。
     """
     node_set = {k for k in (node_keys or []) if k}
-    bots = bot_uid_set(bot_uid)
+    bot_keys = {
+        f"{session_platform}:{u}" for u in bot_uid_set(bot_uid)
+    }
     seen: set[tuple[str, str]] = set()
     out: list[tuple[str, str, str]] = []
     for edge in selected or []:
@@ -336,7 +353,11 @@ def neighbor_profile_uids(
             (str(edge.get("subject_uid") or ""), str(edge.get("subject_name") or "")),
             (str(edge.get("object_uid") or ""), str(edge.get("object_name") or "")),
         ):
-            if not uid or uid in bots or (platform, uid) in seen:
+            if (
+                not uid
+                or f"{platform}:{uid}" in bot_keys
+                or (platform, uid) in seen
+            ):
                 continue
             if f"{platform}:{uid}" in node_set:
                 continue

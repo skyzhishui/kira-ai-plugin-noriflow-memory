@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .clients import FastLlmExit
-from .alias_store import is_placeholder_name
+from .alias_store import AliasStore, build_fact_code_alias_rows, is_placeholder_name
 from .config import LocalMemoryConfig
 from .db import MemoryDatabase, fact_document_id
 from .entity_edge import EncodedRelation, edge_has_bot_endpoint
@@ -141,6 +141,8 @@ _PENDING_STALE_DAYS = 14
 
 # 衰减遍上次执行时间的 kv 键
 _DECAY_KV_KEY = "last_decay_at"
+# 摘要归档遍上次执行时间的 kv 键（011 生命周期；与衰减遍独立周期）
+_SUMMARY_LIFECYCLE_KV_KEY = "last_summary_lifecycle_at"
 # 补编码遍连续失败熔断阈值（视为 LLM 整体不可用，提前结束本遍）
 _REENCODE_FAIL_LIMIT = 3
 # 毒丸行重试上限（差分计数：仅当同一周期/遍内存在其他成功处理时才累计
@@ -393,6 +395,7 @@ class FactMergeAgent:
         tz_provider: Optional[Callable[[], tzinfo]] = None,
         bot_forms_provider: Optional[Callable[[], list[str]]] = None,
         alias_name_resolver: Optional[Callable[[str, str], str]] = None,
+        alias_store: Optional[AliasStore] = None,
     ) -> None:
         """初始化（不启动任务）。
 
@@ -417,6 +420,8 @@ class FactMergeAgent:
             alias_name_resolver: (platform, uid) -> 最新非占位别名（写侧
                 占位名守卫的顶替源，与 kernel._endpoint_name 同源；
                 None 时空名留给 upsert 保旧名）。
+            alias_store: 持久别名内存视图（事实代号别名回填遍的 apply_rows
+                同步口；None 时该遍跳过——别名层被禁用的降级形态）。
         """
         self._db = db
         self._adjudicator = FactAdjudicator(llm, prompt_dir)
@@ -430,9 +435,11 @@ class FactMergeAgent:
         self._tz_provider = tz_provider
         self._bot_forms_provider = bot_forms_provider
         self._alias_name_resolver = alias_name_resolver
+        self._alias_store = alias_store
         # 周期参数运行时读 self._config（维护页保存配置后热生效，无需重启）
         self._task: Optional[asyncio.Task] = None
         self._last_decay_at: Optional[datetime] = None
+        self._last_summary_lifecycle_at: Optional[datetime] = None
         # WebUI manual-trigger state: the inter-cycle wait doubles as a
         # kickable event so a manual request short-circuits the interval.
         # The loop stays the only runner — a kicked cycle can never
@@ -627,6 +634,12 @@ class FactMergeAgent:
         ][: cfg.merge_batch_size]
         llm_seen_ok = False
         for fact in facts:
+            # 预算耗尽在候选检索前短路：省掉无谓的 HNSW 候选查询；同时
+            # 不得走无裁定的建簇路径——本条可能存在候选簇，跳过检索直接
+            # create 等于盲目建簇，违反模块契约（顺延下周期重审）
+            if budget <= 0:
+                stats["deferred"] += 1
+                continue
             candidates = await self._db.search_cluster_candidates(
                 platform=fact["platform"],
                 user_id=fact["user_id"],
@@ -637,9 +650,6 @@ class FactMergeAgent:
             )
             verdicts: Optional[list[tuple[int, str]]] = None
             if candidates:
-                if budget <= 0:
-                    stats["deferred"] += 1
-                    continue
                 budget -= 1
                 stats["llm_calls"] += 1
                 result = await self._adjudicator.adjudicate(fact, candidates)
@@ -732,6 +742,16 @@ class FactMergeAgent:
             recent_promote_threshold=cfg.recent_promote_threshold,
         )
 
+        # ---- 摘要归档遍（011 生命周期；周期/开关门控见方法内）----
+        # fail-open（与 _fact_code_alias_pass 同款）：归档遍是可选功能且
+        # 默认关闭，其异常不应中断本周期后续各遍（补编码/关系自检/语义
+        # 审计/别名回填）——失败仅告警，下周期重试
+        try:
+            stats["summaries_archived"] = await self._maybe_summary_lifecycle()
+        except Exception:
+            logger.warning("摘要归档遍失败（跳过，下周期重试）", exc_info=True)
+            stats["summaries_archived"] = 0
+
         # ---- 补编码遍（剩余预算 + 保留份额内处理降级原文行）----
         stats["reencoded"] = await self._reencode_pass(budget + reserve)
         await self._save_skip_state(_ADJUD_SKIP_KV_KEY, skip_state)
@@ -741,7 +761,43 @@ class FactMergeAgent:
         audited, superseded = await self._relation_audit_pass()
         stats["edges_audited"] = audited
         stats["edges_superseded"] = superseded
+
+        # ---- 事实代号别名回填遍（零 LLM；retain 通道的周期兜底）----
+        stats["fact_alias"] = await self._fact_code_alias_pass()
         return stats
+
+    async def _fact_code_alias_pass(self) -> int:
+        """生效事实簇的「用户<uid>（<代号>）」登记为 uid 别名。
+
+        消息流别名 upsert 只能学到名片形态的名字，群聊真实称呼（代号/
+        缩写）与名片不同形时（名片 undefined𝕩𝕩𝕪 vs 群称 xxy）永远
+        学不到——事实陈述里 LLM 写出的「用户3429924750（xxy）」才是
+        代号与 uid 的显式绑定。retain 通道实时登记增量（kernel.
+        _register_fact_code_aliases），本遍全量兜底：存量簇（含部署前
+        历史）下周期即补齐，upsert 幂等可重入。别名层被禁用时整遍跳过。
+        """
+        if self._alias_store is None:
+            return 0
+        try:
+            sources = await self._db.fetch_fact_code_sources()
+        except Exception:
+            logger.warning("事实代号别名回填读取失败（下周期重试）", exc_info=True)
+            return 0
+        try:
+            rows = build_fact_code_alias_rows(sources)
+        except Exception:
+            logger.warning("事实代号别名回填构建失败（下周期重试）", exc_info=True)
+            return 0
+        if not rows:
+            return 0
+        try:
+            await self._db.alias_upsert(rows)
+            self._alias_store.apply_rows(rows)
+        except Exception:
+            logger.warning("事实代号别名回填写入失败（下周期重试）", exc_info=True)
+            return 0
+        logger.info("事实代号别名回填完成: %d 行（source=fact）", len(rows))
+        return len(rows)
 
     async def _reencode_pass(self, budget: int) -> int:
         """补编码遍：对编码降级写入的对话原文行重跑端侧编码。
@@ -1362,6 +1418,7 @@ class FactMergeAgent:
             demote_threshold=cfg.demote_threshold,
             pending_dead_days=cfg.pending_dead_days,
             recent_expire_days=cfg.recent_expire_days,
+            commitment_expire_days=cfg.commitment_expire_days,
             activity_since=(
                 self._last_decay_at if cfg.decay_requires_activity else None
             ),
@@ -1371,3 +1428,76 @@ class FactMergeAgent:
         self._last_decay_at = now
         await self._db.set_kv(_DECAY_KV_KEY, now.isoformat())
         logger.info("衰减遍完成: %s", stats)
+
+    async def _maybe_summary_lifecycle(self) -> int:
+        """摘要归档遍触发判定（011 生命周期）：周期门控 + 判据下发 db。
+
+        与衰减遍同款保真语义：上次执行时间 kv 持久化。首遍延后至强化
+        窗口之后——存量行部署前无强化记录（last_recall_at 恒 NULL，判据
+        按「从未召回」处理），若按常规 interval 触发首遍，升级前一个窗口
+        内被召回过的高龄行会被误归档——初始时间戳前推（首跑打点后
+        max(window, interval) 天才实际执行），窗口内被召回的行届时已获
+        强化记录豁免。归档时限 = 最低保留期 + 3×半衰期（衰减权重降至
+        12.5% 以下），强化窗口内被召回过的行豁免（判据实现见 db 层）。
+
+        关闭 summary_lifecycle_enabled 时本遍整体跳过（已归档行不回流，
+        强化计数仍由召回侧独立累积）。
+
+        Returns:
+            本次归档行数（未到周期/未开启/首跑打点返回 0）。
+        """
+        if not self._config.summary_lifecycle_enabled:
+            return 0
+
+        now = datetime.now().astimezone()
+        if self._last_summary_lifecycle_at is None:
+            stored = await self._db.get_kv(_SUMMARY_LIFECYCLE_KV_KEY)
+            if stored:
+                try:
+                    self._last_summary_lifecycle_at = datetime.fromisoformat(
+                        stored
+                    )
+                except ValueError:
+                    logger.warning(
+                        "摘要归档遍时间戳损坏（忽略并重置）: %r", stored
+                    )
+            if self._last_summary_lifecycle_at is None:
+                # 首遍延后：初始时间戳前推，首跑打点后 max(window, interval)
+                # - interval 天才实际执行（见 docstring）
+                first_delay_days = max(
+                    self._config.summary_lifecycle_reinforce_window_days,
+                    self._config.summary_lifecycle_interval_days,
+                )
+                first_at = now + timedelta(
+                    days=first_delay_days
+                    - self._config.summary_lifecycle_interval_days
+                )
+                await self._db.set_kv(
+                    _SUMMARY_LIFECYCLE_KV_KEY, first_at.isoformat()
+                )
+                self._last_summary_lifecycle_at = first_at
+                logger.info(
+                    "摘要归档遍首次运行：初始化时间戳（首遍延后 %d 天，"
+                    "存量行强化预积累），本周期不归档",
+                    first_delay_days,
+                )
+                return 0
+
+        interval = timedelta(days=self._config.summary_lifecycle_interval_days)
+        if now - self._last_summary_lifecycle_at < interval:
+            return 0
+
+        cfg = self._config
+        archive_after = int(
+            cfg.summary_lifecycle_grace_days
+            + 3.0 * cfg.summary_lifecycle_half_life_days
+        )
+        total = await self._db.archive_stale_summaries(
+            archive_after_days=archive_after,
+            reinforce_window_days=cfg.summary_lifecycle_reinforce_window_days,
+            batch_size=200,
+        )
+        self._last_summary_lifecycle_at = now
+        await self._db.set_kv(_SUMMARY_LIFECYCLE_KV_KEY, now.isoformat())
+        logger.info("摘要归档遍完成: 归档 %d 行", total)
+        return total

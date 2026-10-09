@@ -12,9 +12,16 @@ concurrency:
 permissions:
   contents: read
 
+# 双平台 CI：同一份文件在 GitHub 与内网 gitea 各自跑各自的执行链路。
+# GitHub = 托管 runner + actions/checkout/setup-python；
+# gitea = runner 侧 python 镜像标签 + GITHUB_TOKEN 内网 clone（runner
+# 环境对 github.com 不可达，actions/* 克隆必超时）。job 级 if 以
+# github.server_url 区分平台，非目标平台的 job 直接 skip。
+
 jobs:
-  tests:
-    name: tests (Python ${{ matrix.python-version }})
+  tests-github:
+    name: tests-github (Python ${{ matrix.python-version }})
+    if: github.server_url == 'https://github.com'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -41,6 +48,62 @@ jobs:
 
       # Suites are self-contained direct-run scripts (python tests/test_x.py),
       # not pytest collections; each exits non-zero on the first failed check.
+      - name: Run test suites
+        run: |
+          for f in tests/test_*.py; do
+            echo "::group::python $f"
+            python "$f"
+            echo "::endgroup::"
+          done
+
+  tests-gitea:
+    name: tests-gitea (${{ matrix.tag }})
+    if: github.server_url != 'https://github.com'
+    runs-on: ${{ matrix.tag }}
+    strategy:
+      matrix:
+        tag: [python-3.10, python-3.11, python-3.12]
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+    steps:
+      - name: Checkout (内网 gitea)
+        env:
+          # 内网 clone 基址走仓库级 Actions 变量（只存在于内网实例配置，
+          # 本文件会公开到 GitHub，不落内网地址）；未配置的实例回退
+          # runner 自带的 GITHUB_SERVER_URL，保证文件可移植
+          CI_GITEA_URL: ${{ vars.CI_GITEA_URL }}
+          # gitea 内置令牌名为 GITEA_TOKEN（secrets 命名空间），且 runner
+          # 不自动注入 GITHUB_TOKEN 环境变量——credential helper 引用的
+          # ${GITHUB_TOKEN} 必须在这里显式落地，私有仓库 clone 才有凭据
+          GITHUB_TOKEN: ${{ secrets.GITEA_TOKEN }}
+        run: |
+          base="${CI_GITEA_URL:-$GITHUB_SERVER_URL}"
+          # credential helper 注入：token 不进命令行/URL（run 命令会回显
+          # 进日志）也不落 .git/config。链路为明文 HTTP 属实例侧已知限制：
+          # 该 gitea 未终止 TLS 且未暴露 git SSH 端口，token 为 job 级
+          # 只读短时效、仅内网可达；实例侧启用 TLS 后把 CI_GITEA_URL
+          # 变量值改成 https 即可，无需再动本文件
+          git config --global credential.helper \
+            '!f() { echo "username=x-access-token"; echo "password=${GITHUB_TOKEN}"; }; f'
+          git clone "${base}/${GITHUB_REPOSITORY}.git" .
+          # fork PR 的提交不在目标仓库任何分支上：普通 clone 拿不到该
+          # SHA，须先显式获取 PR head ref 再 checkout（仅 pull_request
+          # 事件——其 GITHUB_REF 形如 refs/pull/<n>/head；push 事件跳过）
+          pr=""
+          case "$GITHUB_REF" in
+            refs/pull/*) pr="${GITHUB_REF#refs/pull/}"; pr="${pr%%/*}" ;;
+          esac
+          if [ -n "$pr" ]; then
+            git fetch origin "+refs/pull/${pr}/head"
+          fi
+          git checkout "$GITHUB_SHA"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
       - name: Run test suites
         run: |
           for f in tests/test_*.py; do

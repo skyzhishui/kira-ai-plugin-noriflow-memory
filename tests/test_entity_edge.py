@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+
 from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +32,16 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _harness import load_module  # noqa: E402
+
+
+async def await_raises(exc: type[BaseException], awaitable) -> None:
+    """Direct-run stand-in for ``pytest.raises`` (suite must stay
+    pytest-free per CI design; the file docstring promises the same)."""
+    try:
+        await awaitable
+    except exc:
+        return
+    raise AssertionError(f"expected {exc.__name__} to be raised")
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 
@@ -171,12 +182,13 @@ _STOP = ["朋友", "认识", "熟人", "网友"]
 
 
 def _select(edges, text, nodes, *, bot=BOT, addressed=False, neighbors=2,
-            lines=3, stopwords=None):
+            lines=3, stopwords=None, session_platform="qq"):
     # 节点匹配为复合键（"platform:uid"）：裸 uid 入参由助手按 _edge 的
     # platform（qq）补前缀，调用侧保持简洁
     node_keys = [n if ":" in n else f"qq:{n}" for n in nodes]
     return select_relation_edges(
         text=text, edges=edges, node_keys=node_keys, bot_uid=bot,
+        session_platform=session_platform,
         bot_addressed=addressed, stopwords=stopwords or _STOP,
         max_neighbors=neighbors, max_lines=lines,
     )
@@ -221,16 +233,33 @@ def test_select_budgets_and_stopwords() -> None:
 
 def test_statement_line_and_neighbors() -> None:
     edge = _edge(1, "u1", BOT, "姐姐", sname="小张")
-    line = relation_statement_line(edge, bot_uid=BOT, bot_nickname="Kira",
+    line = relation_statement_line(edge, bot_uid=BOT, session_platform="qq",
+                                   bot_nickname="Kira",
                                    time_qualifier="截至9月7日")
     assert line == f"小张(u1)的姐姐是Kira({BOT})（截至9月7日）"
     edge2 = _edge(2, "u1", "u2", "室友")
-    assert relation_statement_line(edge2, bot_uid=BOT, bot_nickname="Kira",
+    assert relation_statement_line(edge2, bot_uid=BOT, session_platform="qq",
+                                   bot_nickname="Kira",
                                    time_qualifier="") == "u1(u1)的室友是u2(u2)"
+    # 跨平台撞号：web 边端点裸 uid 恰等 bot uid 的真人不渲染成 bot 昵称
+    web_edge = dict(_edge(3, "u1", BOT, "姐姐", sname="小张"))
+    web_edge["platform"] = "web"
+    line3 = relation_statement_line(web_edge, bot_uid=BOT, session_platform="qq",
+                                    bot_nickname="Kira", time_qualifier="")
+    assert line3 == f"小张(u1)的姐姐是{BOT}({BOT})"
     hit = _select([edge, edge2], "小张的姐姐和室友", ["u1"])
-    assert neighbor_profile_uids(hit, ["qq:u1"], BOT, 2) == [("qq", "u2", "")]
+    assert neighbor_profile_uids(
+        hit, ["qq:u1"], BOT, session_platform="qq", max_profiles=2,
+    ) == [("qq", "u2", "")]
     hit_bot = _select([edge], "@Kira 你姐姐是谁", [], addressed=True)
-    assert neighbor_profile_uids(hit_bot, [], BOT, 2) == [("qq", "u1", "小张")]
+    assert neighbor_profile_uids(
+        hit_bot, [], BOT, session_platform="qq", max_profiles=2,
+    ) == [("qq", "u1", "小张")]
+    # 跨平台撞号：web 边端点裸 uid 撞号 bot uid 的真人照常进邻居画像
+    hit_web = _select([web_edge], "小张的姐姐", ["web:u1"])
+    assert neighbor_profile_uids(
+        hit_web, ["web:u1"], BOT, session_platform="qq", max_profiles=2,
+    ) == [("web", BOT, "")]
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +372,44 @@ async def test_fetch_active_edges_params() -> None:
     # 双形态集合：任一形态复合键命中 bot 端点边
     await db.fetch_active_edges([], ["qq:9900000004", "qq:bot-1"])
     assert pool.queries[2][1] == [[], ["qq:9900000004", "qq:bot-1"]]
+    # 非空字符串入参 fail fast（空串 falsy 保持旧容忍，上文已覆盖）
+    await await_raises(TypeError, db.fetch_active_edges("qq:123"))
+    await await_raises(TypeError, db.fetch_active_edges([], "qq:bot-1"))
+    # bytes 迭代出 int 同样静默落空，一并 fail fast
+    await await_raises(TypeError, db.fetch_active_edges(b"qq:123"))
+
+
+async def test_fetch_alias_names_by_owner_owners_contract() -> None:
+    """owners 三态契约（真实 MemoryDatabase 层，非桩）。
+
+    None = 全表 SQL（原语义）；空列表/过滤后空 = 短路不发查询返回 {}；
+    含非空 uid 条目 = 照常发起参数化过滤查询——短路与过滤分支须直接
+    对 db 层断言，桩测兜不住。
+    """
+    pool = FakeConnPool(fetch_rows=[
+        {"platform": "qq", "user_id": "u1", "name": "新昵称"},
+    ])
+    db = _make_db(pool)
+
+    # None = 全表：无参数、无复合键过滤
+    assert await db.fetch_alias_names_by_owner(None) == {("qq", "u1"): "新昵称"}
+    assert len(pool.queries) == 1
+    sql, args = pool.queries[0]
+    assert not args and "memory_entity_alias" in sql
+
+    # 空列表 = 短路，不发任何查询
+    pool.queries.clear()
+    assert await db.fetch_alias_names_by_owner([]) == {}
+    assert pool.queries == []
+
+    # 全空 uid 过滤后为空 = 短路
+    assert await db.fetch_alias_names_by_owner([("qq", ""), ("", "")]) == {}
+    assert pool.queries == []
+
+    # 命中行按 (platform, uid) 归位
+    assert await db.fetch_alias_names_by_owner([("qq", "u1")]) == {
+        ("qq", "u1"): "新昵称"
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -509,7 +576,9 @@ class FakeRecallDB:
         return self.edges
 
     async def fetch_alias_names_by_owner(self, owners=None) -> dict:
-        if owners:
+        if owners is not None:
+            if not owners:
+                return {}
             return {k: v for k, v in self.canonical.items() if k in set(owners)}
         return self.canonical
 
@@ -603,9 +672,24 @@ def test_select_relation_edges_dual_bot_forms() -> None:
     # 双形态集合：平台 uid 端点边照常走场景 C
     hit = _select([plat_edge], "你姐姐是谁", [], bot=[BOT, "9900000004"], addressed=True)
     assert [e["_scenario"] for e in hit] == ["C"]
-    assert hit[0]["_anchor"] == "9900000004"
+    assert hit[0]["_anchor"] == "qq:9900000004"
     # 仅会话标识（旧单形态）：平台 uid 端点边不认 -> 不注入
     assert _select([plat_edge], "你姐姐是谁", [], bot=BOT, addressed=True) == []
+
+
+def test_select_relation_edges_cross_platform_bot_collision() -> None:
+    """跨平台 bot 撞号：他平台真人边裸 uid 恰等 bot uid 不误判为 bot 边。
+
+    bot 端点判定为复合键（形态 × session_platform）——web 平台 uid=BOT
+    的边端点键 web:BOT ∉ qq:BOT，走普通节点匹配路（未命中 node_keys
+    即不注入），不误入场景 C 把真人端点渲染成 bot 昵称。
+    """
+    web_edge = dict(_edge(30, "u1", BOT, "姐姐", sname="小张"))
+    web_edge["platform"] = "web"
+    assert _select([web_edge], "你姐姐是谁", [], addressed=True) == []
+    hit = _select([web_edge], "你姐姐是谁", [], addressed=True, session_platform="web")
+    assert [e["_scenario"] for e in hit] == ["C"]
+    assert hit[0]["_anchor"] == f"web:{BOT}"
 
 
 async def test_injection_scenario_c_platform_uid_form() -> None:
@@ -758,6 +842,8 @@ async def main() -> None:
     test_statement_line_and_neighbors()
     await test_upsert_entity_edge_sql_and_params()
     await test_fetch_active_edges_params()
+    await test_fetch_alias_names_by_owner_owners_contract()
+    test_select_relation_edges_cross_platform_bot_collision()
     await test_retain_relations_channel_and_gating()
     await test_retain_relations_failure_no_half_commit()
     await test_encoder_relations_prompt_and_schema()

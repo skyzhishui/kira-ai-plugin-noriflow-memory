@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, get_args, get_origin
 
 from pydantic_core import PydanticUndefined
 
@@ -63,6 +63,7 @@ _CONFIG_GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
         "score_start_high", "score_start_medium", "score_cap",
         "promote_threshold", "demote_threshold", "decay_factor",
         "decay_interval_days", "recent_expire_days", "recent_promote_threshold",
+        "commitment_expire_days",
         "decay_requires_activity", "sticky_evidence_count", "pending_dead_days",
         "anchor_profile_size",
     )),
@@ -77,7 +78,7 @@ _CONFIG_GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
         "recall_expansion_recent_batches", "recall_exclude_history_window",
         "dedup_similarity_threshold", "write_dedup_enabled",
         "write_dedup_window", "write_dedup_threshold",
-        "recall_time_label_enabled", "timezone",
+        "recall_time_label_enabled", "recall_time_label_mode", "timezone",
         "max_persona_profiles", "recall_log_enabled", "recall_log_path",
     )),
     ("alias", "实体别名", (
@@ -95,8 +96,15 @@ _CONFIG_GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
         "recent_rollout_enabled", "recent_rollout_batches",
         "recent_rollout_max_chars",
     )),
+    ("lifecycle", "摘要生命周期", (
+        "summary_lifecycle_enabled", "summary_lifecycle_grace_days",
+        "summary_lifecycle_half_life_days",
+        "summary_lifecycle_reinforce_window_days",
+        "summary_lifecycle_interval_days",
+        "summary_lifecycle_reinforce_on_recall",
+    )),
     ("breaker", "DB 熔断", ("failure_threshold", "recovery_seconds")),
-    ("tools", "主动工具", ("tool_scope_locked",)),
+    ("tools", "主动工具", ("tool_scope_locked", "memory_tools_enabled")),
 ]
 
 
@@ -110,7 +118,18 @@ def _field_type(annotation) -> str:
         return "float"
     if annotation is str:
         return "str"
+    if get_origin(annotation) is Literal:
+        # Literal["a", "b"] 是枚举字符串，不是列表——按 str 控件渲染，
+        # 可选值经 config_schema 的 options 透出（见 _literal_options）
+        return "str"
     return "list"
+
+
+def _literal_options(annotation) -> list[str] | None:
+    """Literal 注解的可选值列表（非 Literal 注解返回 None）。"""
+    if get_origin(annotation) is Literal:
+        return [str(v) for v in get_args(annotation)]
+    return None
 
 
 def _numeric_bounds(field) -> tuple[Any, Any]:
@@ -162,6 +181,9 @@ def config_schema() -> dict:
             "restart": name in _RESTART_FIELDS,
             "sensitive": bool(_SENSITIVE_KEY_RE.search(name)),
         }
+        literal_options = _literal_options(f.annotation)
+        if literal_options is not None:
+            entry["options"] = literal_options
         if entry["type"] in ("int", "float"):
             lo, hi = _numeric_bounds(f)
             if lo is not None:

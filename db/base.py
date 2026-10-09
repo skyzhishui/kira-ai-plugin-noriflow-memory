@@ -286,6 +286,21 @@ def sqlite_parse_ts(value) -> datetime | None:
         return None
 
 
+def _dedupe_keep_time(
+    items: list, statement: str, occurred_at
+) -> None:
+    """Cross-key identical-statement dedup: position stays at first
+    occurrence, occurred_at prefers non-null — backfills when the first
+    row's cluster join missed but a later same-text row has a timestamp
+    (prevents silent time-anchor loss on merged entries)."""
+    for idx, (s, ts) in enumerate(items):
+        if s == statement:
+            if ts is None and occurred_at is not None:
+                items[idx] = (s, occurred_at)
+            return
+    items.append((statement, occurred_at))
+
+
 class _Params:
     """asyncpg numbered-placeholder collector: add appends a param value
     and returns its $n placeholder.
@@ -397,6 +412,41 @@ class MemoryBackend(ABC):
         """Dispose of one raw fact in a single transaction (join/create/replace cluster) and flip extracted_flag."""
 
     @abstractmethod
+    async def upsert_persona_fact_raw_for_apply(self, **kwargs) -> int | None:
+        """Insert a raw fact and return its row id (memory_write deterministic
+        write-in; DO UPDATE on document_id conflict so the tool path always
+        gets the id to feed apply_fact_merge)."""
+
+    @abstractmethod
+    async def search_fact_clusters(self, **kwargs) -> list[dict]:
+        """Cluster-table semantic search (tools target=fact data plane;
+        active/profiled by default, include_inactive opens tombstones)."""
+
+    @abstractmethod
+    async def fetch_cluster_owner(self, cluster_id: int) -> tuple[str, str] | None:
+        """Owner of a cluster (memory_write replace-target scope check)."""
+
+    @abstractmethod
+    async def cluster_status_op(self, cluster_id: int, action: str, **kwargs) -> dict:
+        """Cluster status maintenance op (memory_correct db landing, single
+        transaction: drop/dispute/reactivate + owner scope)."""
+
+    @abstractmethod
+    async def restore_summary(self, summary_id: int, session_id: str = "") -> bool:
+        """Restore an archived summary (clear archived, keep reinforcement)."""
+
+    @abstractmethod
+    async def archive_stale_summaries(
+        self, *, archive_after_days: int, reinforce_window_days: int, batch_size: int
+    ) -> int:
+        """Archive pass: stale un-recalled rows flip to archived (keyset
+        paged, batch-committed; returns total archived)."""
+
+    @abstractmethod
+    async def reinforce_summaries(self, document_ids: list[str]) -> None:
+        """Refresh last_recall_at/recall_count for the recalled rows."""
+
+    @abstractmethod
     async def decay_pass(self, **kwargs) -> dict:
         """Decay pass (single transaction)."""
 
@@ -421,8 +471,17 @@ class MemoryBackend(ABC):
         """All alias rows (full in-memory view reload)."""
 
     @abstractmethod
+    async def fetch_fact_code_sources(self) -> list:
+        """(platform, canonical_statement, last_seen) rows of live fact
+        clusters (source stream for fact-code alias backfill)."""
+
+    @abstractmethod
     async def fetch_alias_names_by_owner(self, owners=None) -> dict:
         """(platform, uid) -> latest non-placeholder alias."""
+
+    @abstractmethod
+    async def fetch_alias_variants(self, platforms: list, uids: list) -> dict:
+        """(platform, uid) -> non-placeholder name variants (last_seen DESC)."""
 
     @abstractmethod
     async def upsert_entity_edge(self, rows: list[dict], **kwargs) -> None:
@@ -474,25 +533,30 @@ class MemoryBackend(ABC):
     async def fetch_profile_sections(
         self, platform: str, user_id: str, per_section_limit: int
     ) -> dict:
-        """Per-section profile rows (data source for the first five sections)."""
+        """Per-section profile rows (first five sections), statement +
+        occurred_at (via cluster_id join; None when the cluster row is
+        missing)."""
 
     @abstractmethod
     async def fetch_uncertain_statements(
         self, platform: str, user_id: str, limit: int
-    ) -> list[str]:
-        """Data source for the uncertain-info section."""
+    ) -> list:
+        """Data source for the uncertain-info section: (statement,
+        occurred_at) pairs (cluster-table column, NOT NULL)."""
 
     @abstractmethod
     async def fetch_profile_sections_multi(
         self, platforms: list, user_ids: list, per_section_limit: int
     ) -> dict:
-        """Per-section profile rows, multi-account keys merged."""
+        """Per-section profile rows, multi-account keys merged
+        (statement + occurred_at)."""
 
     @abstractmethod
     async def fetch_uncertain_statements_multi(
         self, platforms: list, user_ids: list, limit: int
-    ) -> list[str]:
-        """Uncertain-info rows, multi-account keys merged."""
+    ) -> list:
+        """Uncertain-info rows, multi-account keys merged
+        ((statement, occurred_at) pairs)."""
 
     @abstractmethod
     async def fetch_latest_display_name_multi(
