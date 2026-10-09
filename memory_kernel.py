@@ -39,9 +39,14 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, Optional, TypeVar
-from zoneinfo import ZoneInfo
 
-from .alias_store import AliasStore, is_placeholder_name
+from . import time_labels
+from .alias_store import (
+    AliasStore,
+    build_fact_code_alias_rows,
+    is_placeholder_name,
+    normalize_alias_text,
+)
 from .circuit_breaker import MemoryDBCircuitBreaker
 from .clients import KiraRerankClient
 from .config import LocalMemoryConfig
@@ -129,7 +134,7 @@ class _EntityDirectory:
 
     def __init__(self, source: Optional[Callable[[str], Awaitable[list[tuple[str, str, str]]]]]):
         self._source = source
-        self._cache: OrderedDict[str, tuple[float, dict[str, list[tuple[str, str]]]]] = OrderedDict()
+        self._cache: OrderedDict[str, tuple[float, dict[str, dict[tuple[str, str], str]]]] = OrderedDict()
 
     async def match(self, session_id: str, text: str) -> list[tuple[str, str, str]]:
         """返回文本命中条目 [(名字, platform, uid)]（去重保序，含重名多键）。
@@ -150,15 +155,17 @@ class _EntityDirectory:
                     exc_info=True,
                 )
                 return []
-            names: dict[str, list[tuple[str, str]]] = {}
+            # 键 -> {pair: 该 pair 自己的观测原名}——同归一化键多 uid 时
+            # 命中条目各带各的称呼，不串贴他人原名（与 AliasStore.
+            # _display_by_pair 同款口径）
+            names: dict[str, dict[tuple[str, str], str]] = {}
             for raw_name, platform, uid in pairs or []:
                 name = (raw_name or "").strip()
-                if len(name) < self._MIN_NAME_LEN or not uid:
+                key = normalize_alias_text(name)
+                if len(key) < self._MIN_NAME_LEN or not uid:
                     continue
                 pair = (platform or "", str(uid))
-                bucket = names.setdefault(name, [])
-                if pair not in bucket:
-                    bucket.append(pair)
+                names.setdefault(key, {}).setdefault(pair, name)
             entry = (now, names)
             self._cache[session_id] = entry
             self._cache.move_to_end(session_id)
@@ -166,13 +173,14 @@ class _EntityDirectory:
                 self._cache.popitem(last=False)
         matched: list[tuple[str, str, str]] = []
         seen_pairs: set[tuple[str, str]] = set()
-        for name, pairs in entry[1].items():
-            if name not in text:
+        norm_text = normalize_alias_text(text)
+        for key, pair_displays in entry[1].items():
+            if key not in norm_text:
                 continue
-            for platform, uid in pairs:
+            for (platform, uid), display in pair_displays.items():
                 if (platform, uid) not in seen_pairs:
                     seen_pairs.add((platform, uid))
-                    matched.append((name, platform, uid))
+                    matched.append((display, platform, uid))
         return matched[: self._MAX_HINT_ENTRIES]
 
 
@@ -184,7 +192,9 @@ class LocalMemoryKernel:
     - retain_encoded: 端侧编码后双通道写入（chat_summary 表 + fact 原始表），
       encoder 未装配或编码降级时退化为单通道 ingest（原文走摘要表标记
       summarized=false，不参与召回，由合并 agent 补编码遍重编码）
-    - search / build_injection_text: M3 占位（返回空，不阻断注入链路）
+    - search / build_injection_text: M3 召回管线（向量+BM25 双路 ->
+      RRF 融合 -> 重排序 -> 相关度阈值 -> 时间衰减 -> 近重复去重 ->
+      截断；P3 关系小节独立拼装）
     """
 
     def __init__(
@@ -253,6 +263,9 @@ class LocalMemoryKernel:
         # 陈述行、不拼画像——画像预算独立于宿主画像注入）
         self.persona_service = None
         self._local_tz_cache = None
+        # 召回访问强化在飞任务（011 生命周期）：持引用防 GC 中途取消；
+        # 正常路径任务自清，_drain_reinforcement 供测试等待落定
+        self._reinforce_tasks: set = set()
         # 滚动补回去重 memo：{session_id: (已注入 document_id 列表, monotonic 时间)}
         # 同轮 recall/主动检索据此排除已注入行；TTL 覆盖单轮 pipeline 时长
         self._rollout_memo: dict[str, tuple[list[str], float]] = {}
@@ -563,6 +576,130 @@ class LocalMemoryKernel:
         ))
         return doc_ids
 
+    async def write_fact(
+        self,
+        *,
+        statement: str,
+        category: str,
+        confidence: str = "high",
+        platform: str,
+        session_id: str,
+        group_id: str,
+        user_id: str,
+        display_name: str = "",
+        replaces_cluster_id: Optional[int] = None,
+        occurred_at: Optional[datetime] = None,
+    ) -> dict:
+        """主动事实写入（memory_write 工具的确定性直写簇路径）。
+
+        与 retain 的编码提取路径互补：不走编码 LLM、不等合并 agent 周期
+        ——插入 raw 行后立即 apply_fact_merge 成簇（create 或 replace 替代
+        旧簇），显式指令即最高档证据。幂等闭环：document_id 粒度 = 归属
+        uid + 会话 + 日期 + 语句哈希，同日重复写入落同一 raw 行；行已被
+        消费（flag=1）时 apply 乐观锁拒绝返回 {"action": "skipped"}。
+        同轮 retain 对同一事实的编码提取经合并裁定 same 入簇，
+        evidence_key 同键去重不双计分。
+
+        语义约束（调用方保证）：category 限主动六维（系统维度
+        recent/uncertain 不经此通道）；归属钉死为参数 user_id（工具层
+        作用域锁定触发者，防越权代写）。
+
+        Raises:
+            MemoryDBUnavailable: 熔断拒绝或任一步失败（工具层转错误文本）。
+        """
+        if not await self.circuit_breaker.peek_available():
+            raise MemoryDBUnavailable("记忆库熔断拒绝期，主动事实写入被拒绝")
+        occurred = self._to_local(occurred_at or datetime.now())
+        evidence_key = self._build_evidence_key(session_id, occurred)
+        embedding = await self.embedding_service.embed_one(statement)
+        base_prefix = fact_document_id([user_id], session_id, occurred)
+        content_hash = hashlib.md5(statement.encode()).hexdigest()[:12]
+        document_id = f"{base_prefix}-{content_hash}"
+        if embedding is None:
+            # fail-open 落库等补算回填（与 retain 编码路径同哲学：主动
+            # 写入因向量故障被拒 = 对话滑走后内容永丢）；embedded 标志让
+            # 工具层如实告知「稍后才可检索」，不静默违约立即生效承诺
+            logger.warning(
+                "主动事实写入向量化失败（embedding 不可用），"
+                "置 NULL 落库等补算回填: %s", document_id
+            )
+
+        cfg = self.config
+        start_score = (
+            cfg.score_start_high
+            if confidence == "high"
+            else cfg.score_start_medium
+        )
+
+        async def _write(doc_id: str) -> dict:
+            """按给定幂等键落 raw 行并执行成簇/替换，返回 merge 摘要。"""
+            row_id: Optional[int] = None
+
+            async def _insert() -> None:
+                nonlocal row_id
+                row_id = await self.db.upsert_persona_fact_raw_for_apply(
+                    document_id=doc_id,
+                    platform=platform,
+                    user_id=user_id,
+                    related_user_ids=[],
+                    display_name=display_name,
+                    category=category,
+                    statement=statement,
+                    confidence=confidence,
+                    session_id=session_id,
+                    group_id=group_id,
+                    evidence_key=evidence_key,
+                    occurred_at=occurred,
+                    embedding=embedding,
+                )
+
+            if not await self._guarded(
+                _insert, description=f"主动事实写入 {doc_id}"
+            ) or row_id is None:
+                raise MemoryDBUnavailable(f"主动事实写入失败: {doc_id}")
+
+            summary: dict = {}
+
+            async def _apply() -> None:
+                nonlocal summary
+                summary = await self.db.apply_fact_merge(
+                    fact_id=row_id,
+                    action=(
+                        "replace" if replaces_cluster_id is not None
+                        else "create"
+                    ),
+                    cluster_id=replaces_cluster_id,
+                    evidence_key=evidence_key,
+                    occurred_at=occurred,
+                    start_score=start_score,
+                    score_cap=cfg.score_cap,
+                    promote_threshold=cfg.promote_threshold,
+                    recent_promote_threshold=cfg.recent_promote_threshold,
+                )
+
+            if not await self._guarded(
+                _apply, description=f"主动事实成簇 {doc_id}"
+            ) or not summary:
+                raise MemoryDBUnavailable(f"主动事实成簇失败: {doc_id}")
+            return summary
+
+        summary = await _write(document_id)
+        if (
+            summary.get("action") == "skipped"
+            and replaces_cluster_id is not None
+        ):
+            # 同日改回旧说法：原语句当日已写入且行已消费，乐观锁拒绝
+            # 再次成簇——更正语义优先于同日重复去重。换更正作用域的
+            # 幂等键（语句+目标簇）重落一行完成替换；该键也已消费
+            # （同一更正当日重复执行）时维持 skipped，工具层如实报告
+            correct_hash = hashlib.md5(
+                f"{statement}#r{replaces_cluster_id}".encode()
+            ).hexdigest()[:12]
+            summary = await _write(f"{base_prefix}-{correct_hash}")
+        summary["embedded"] = embedding is not None
+        await self._register_fact_code_aliases([statement], platform, occurred)
+        return summary
+
     async def _ingest_facts(
         self,
         facts: list[EncodedFact],
@@ -631,7 +768,38 @@ class LocalMemoryKernel:
                 # 重试无半提交、无重复；旧语义在熔断期会永久丢失整批事实
                 raise MemoryDBUnavailable(f"事实写入失败: {document_id}")
             doc_ids.append(document_id)
+        await self._register_fact_code_aliases(
+            [fact.statement for fact in facts], platform, occurred_at
+        )
         return doc_ids
+
+    async def _register_fact_code_aliases(
+        self, statements: list[str], platform: str, last_seen: datetime
+    ) -> None:
+        """事实陈述「用户<uid>（<代号>）」登记为该 uid 别名（旁路增益）。
+
+        群聊对某成员的称呼常与名片完全不同形（名片 undefined𝕩𝕩𝕪 vs
+        群称 xxy），消息流别名 upsert 永远学不到这种代号——只有事实陈述
+        里 LLM 写出的「用户3429924750（xxy）」把它与 uid 显式绑定。登记
+        后实体命中（画像候选/问及他人召回/记忆工具名字解析）即刻可用。
+
+        旁路定位：失败只记 warning 不上抛——别名是增益不是契约，主写入
+        （raw/summary）失败重试语义不受影响；存量簇由合并 agent 周期
+        兜底（run_cycle 的别名回填遍），本方法只管实时增量。
+        """
+        if self._alias_store is None or not statements:
+            return
+        try:
+            rows = build_fact_code_alias_rows(
+                [(platform, s, last_seen) for s in statements]
+            )
+            if not rows:
+                return
+            await self.db.alias_upsert(rows)
+            self._alias_store.apply_rows(rows)
+            logger.debug("事实代号别名登记: %d 行（source=fact）", len(rows))
+        except Exception:
+            logger.warning("事实代号别名登记失败（下轮事实继续）", exc_info=True)
 
     async def _ingest_relations(
         self,
@@ -1004,6 +1172,12 @@ class LocalMemoryKernel:
         else:
             rows = rows[:top_k]
 
+        # 访问强化（011 生命周期，对齐 iris batch_update_access 语义）：
+        # 只对最终注入集（截断后）刷新——这一批是真正喂给模型的记忆，
+        # 被截掉的候选行不算"被想起"。fire-and-forget：写库挂后台任务，
+        # 失败仅告警，绝不拖慢/阻断召回返回。
+        self._fire_reinforcement(rows)
+
         self._log_search(
             session_id=session_id, query=query, scope=scope, top_k=top_k,
             candidates_n=candidates_n, exclude_batches=window_batches,
@@ -1128,14 +1302,23 @@ class LocalMemoryKernel:
     ) -> str:
         """构建注入 LLM 的记忆文本。
 
-        返回格式（对齐 hindsight 版，时间标注为本插件扩展）：
-            # 相关长期记忆（仅供背景参考，不要提及记忆来源，不要逐字复述）
+        返回格式（时间标注与归因/时态导语为本插件扩展）：
+            # 相关长期记忆（仅供背景参考；文中"{bot_nickname}"即你自己）
+            以下均为过去某时的群聊记录：各条目中发言者的言行都发生在条目
+            末尾标注的时间，与当前消息的发言者无关，不要把记忆中他人的言行
+            当成眼前正在发生的事。
+            提及旧事时请概括转述、带时效感（如"之前""8月那会儿"），
+            不要提及"记忆/检索"等来源，也不要逐字复述。
             - {memory_text_1}（约2周前）
             - {memory_text_2}（今天）
             ...
 
+        导语全部前置（不用尾注）——planner 主动检索会向既有 memory_context
+        末尾追加 bullet，规则置尾会被追加行截断错位。
+
         recall_time_label_enabled 开启时每条尾部追加相对时间标注
-        （本地时区按日粒度）；关闭时与 hindsight 逐字一致。
+        （本地时区按日粒度）；关闭时条目行不带标注，导语中的时间指代
+        同步改为"更早发生的事"（不再称"条目末尾标注"）。
 
         无记忆时返回空字符串。exclude_person_facts 为 hindsight 存量数据
         防御参数：本地事实表结构性不参与 recall，无需等价操作（接受并忽略）。
@@ -1240,17 +1423,24 @@ class LocalMemoryKernel:
         # token 预算截断：按字符数保守估算（CJK 近似 1 字符=1 token）；
         # 首条允许超预算（避免单条超长时返回全空），其后累加超限即止
         budget = self.config.recall_max_tokens
-        # bot 名自指锚定：记忆以第三人称记录 bot 言行（query 端亦恒为第三人称，
-        # 库内保留 bot 名原文保字面检索命中），注入时显式告知 LLM 该名即自己，
-        # 防把记忆中 bot 的言行当成第三方成员的事
-        identity_note = (
-            f"；文中“{self.bot_nickname}”即你自己" if self.bot_nickname else ""
+        # 归因/时态导语全部前置（不用尾注）：planner 主动检索会向既有
+        # memory_context 末尾追加 bullet，规则若置尾会被追加行截断错位；
+        # 前置保证追加后规则恒在列表上方、结构不破。
+        # 时间指代按标注开关动态选措辞：关闭时条目行无尾部时间标注，
+        # 导语若仍称"条目末尾标注的时间"会指挥模型找不存在的标注。
+        time_phrase = (
+            "各条目中发言者的言行都发生在条目末尾标注的时间，"
+            if self.config.recall_time_label_enabled
+            else "各条目都是更早发生的事，"
         )
         lines = [
-            "# 相关长期记忆（仅供背景参考，不要提及记忆来源，不要逐字复述"
-            f"{identity_note}）"
+            f"# 相关长期记忆（仅供背景参考{self._identity_note()}）",
+            "以下均为过去某时的群聊记录：" + time_phrase
+            + "与当前消息的发言者无关，不要把记忆中他人的言行当成眼前正在发生的事。",
+            "提及旧事时请概括转述、带时效感（如“之前”“8月那会儿”），"
+            "不要提及“记忆/检索”等来源，也不要逐字复述。",
         ]
-        used = 0
+        used = len("\n".join(lines))
         appended = 0
         injected: list[dict] = []
         previews: list[str] = []
@@ -1340,6 +1530,7 @@ class LocalMemoryKernel:
             edges=edges,
             node_keys=node_keys,
             bot_uid=bot_uids,
+            session_platform=session_platform,
             bot_addressed=hints.bot_addressed,
             stopwords=cfg.relation_label_stopwords,
             max_neighbors=cfg.relation_inject_max_neighbors,
@@ -1378,6 +1569,7 @@ class LocalMemoryKernel:
                 + relation_statement_line(
                     edge,
                     bot_uid=bot_uids,
+                    session_platform=session_platform,
                     bot_nickname=self.bot_nickname,
                     time_qualifier=self._edge_time_qualifier(edge.get("last_seen")),
                 )
@@ -1388,6 +1580,7 @@ class LocalMemoryKernel:
                 selected,
                 node_keys=node_keys,
                 bot_uid=bot_uids,
+                session_platform=session_platform,
                 max_profiles=cfg.relation_inject_max_profiles,
             )
             if neighbors:
@@ -1435,13 +1628,15 @@ class LocalMemoryKernel:
         """边时间限定：截至M月D日（last_seen 本地时区）。
 
         label 存在多值语义（决策 8：不做自动互斥），注入带时间限定让
-        LLM 可自行裁决新旧；naive 时间戳按本地时区补齐。
+        LLM 可自行裁决新旧；naive 时间戳视为已是本地口径（与 _to_local
+        同语义）补配置时区，不走服务器本地时区——配置 timezone 与服务器
+        时区不同时不产生偏差。
         """
         if ts is None:
             return ""
-        if ts.tzinfo is None:
-            ts = ts.astimezone()
         try:
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=self._local_tz())
             local = ts.astimezone(self._local_tz())
         except (ValueError, OSError, OverflowError):
             return ""
@@ -1624,7 +1819,8 @@ class LocalMemoryKernel:
 
         lines = [
             "# 更早对话摘要（已滚动出当前可见历史，仅供背景参考，"
-            "不要提及记忆来源，不要逐字复述）"
+            "不要提及记忆来源，不要逐字复述"
+            f"{self._identity_note()}）"
         ]
         injected_ids: list[str] = []
         for row in reversed(kept_rows):
@@ -1656,18 +1852,21 @@ class LocalMemoryKernel:
     def _local_tz(self):
         """本地时区（插件配置 timezone > 宿主 locale.TZ > 服务器本地）。"""
         if self._local_tz_cache is None:
-            name = (self.config.timezone or "").strip()
-            if name:
-                try:
-                    self._local_tz_cache = ZoneInfo(name)
-                except Exception:
-                    logger.warning(
-                        "timezone 配置无法解析（%s），回退宿主/服务器本地时区", name
-                    )
-                    self._local_tz_cache = self._host_tz_or_local()
-            else:
-                self._local_tz_cache = self._host_tz_or_local()
+            self._local_tz_cache = time_labels.resolve_local_tz(
+                (self.config.timezone or "").strip(), self._host_tz_provider
+            )
         return self._local_tz_cache
+
+    def _identity_note(self) -> str:
+        """bot 名自指锚（recall 块与滚动补回块共用，防两处措辞漂移）。
+
+        记忆以第三人称记录 bot 言行（库内保留 bot 名原文保字面检索命中），
+        注入时显式告知 LLM 该名即自己，防把记忆中 bot 的言行当成第三方
+        成员的事。
+        """
+        return (
+            f"；文中“{self.bot_nickname}”即你自己" if self.bot_nickname else ""
+        )
 
     def reset_local_tz_cache(self) -> None:
         """Invalidate the cached local timezone (maintenance-page save path).
@@ -1677,18 +1876,6 @@ class LocalMemoryKernel:
         pick up the new zone on the next call instead of after a restart.
         """
         self._local_tz_cache = None
-
-    def _host_tz_or_local(self):
-        """宿主 locale.TZ（provider 活读；不可用回退服务器本地时区）。"""
-        if self._host_tz_provider is not None:
-            try:
-                tz = self._host_tz_provider()
-            except Exception:
-                logger.warning("宿主时区读取失败，回退服务器本地时区", exc_info=True)
-                tz = None
-            if tz is not None:
-                return tz
-        return datetime.now().astimezone().tzinfo
 
     def _to_local(self, dt: datetime) -> datetime:
         """幂等键日期口径归一：aware 入参转本地时区，naive 视为已是本地口径。
@@ -1705,33 +1892,74 @@ class LocalMemoryKernel:
         return dt.astimezone(self._local_tz())
 
     def _relative_time_label(self, ts: datetime | None) -> str:
-        """相对时间标注（本地时区按日粒度）：今天/昨天/N天前/约N周前/…。
+        """注入时间标注（本地时区）：形态由 recall_time_label_mode 决定。
+
+        实现委托共享模块 time_labels.memory_time_label——画像档案
+        （persona_service）的时效栏需要与 recall 记忆块逐字一致的标注，
+        单点实现防两处漂移。口径详见 time_labels 模块 docstring。
 
         Args:
-            ts: 记忆发生时间（aware；None 返回空串）。
+            ts: 记忆发生时间（aware；None 或将来时间戳返回空串）。
 
         Returns:
             标注文本（空串表示不加标注）。
         """
-        if ts is None:
-            return ""
+        return time_labels.memory_time_label(
+            ts,
+            now=self._now(),
+            local_tz=self._local_tz(),
+            mode=self.config.recall_time_label_mode,
+        )
+
+    def _relative_part(self, days: int) -> str:
+        """相对时距（按日粒度）：委托共享实现（口径见 time_labels）。"""
+        return time_labels.relative_time_part(days)
+
+    def _absolute_part(self, local: datetime, days: int, now_local: datetime) -> str:
+        """绝对时间锚（分层精度）：委托共享实现（口径见 time_labels）。"""
+        return time_labels.absolute_time_part(local, days, now_local)
+
+    def _fire_reinforcement(self, rows: list) -> None:
+        """召回访问强化派发（011 生命周期）：最终注入集异步刷新强化时间戳。
+
+        语义对齐 iris 的 batch_update_access，但收敛为只刷最终注入集——
+        被 top_k 截掉的候选行不算「被想起」。fire-and-forget：后台任务
+        执行，任何异常仅告警（不走 _guarded_call——强化失败不该计熔断，
+        它不是召回主路的一部分）。任务句柄挂实例集合（事件循环对 task
+        只持弱引用，不持引用可能被 GC 中途取消）。
+
+        关闭 summary_lifecycle_reinforce_on_recall 时不派发；生命周期
+        总开关不控制本钩子（强化计数独立累积，供开启后首遍判据使用）。
+        """
+        if not self.config.summary_lifecycle_reinforce_on_recall or not rows:
+            return
+        doc_ids = [str(r["document_id"]) for r in rows if r.get("document_id")]
+        if not doc_ids:
+            return
+
+        async def _reinforce() -> None:
+            task = asyncio.current_task()
+            try:
+                await self.db.reinforce_summaries(doc_ids)
+            except Exception:
+                logger.warning("召回访问强化写入失败（不影响召回结果）", exc_info=True)
+            finally:
+                if task is not None:
+                    self._reinforce_tasks.discard(task)
+
         try:
-            local = ts.astimezone(self._local_tz())
-            now_local = self._now().astimezone(self._local_tz())
-        except (ValueError, OSError, OverflowError):
-            return ""
-        days = (now_local.date() - local.date()).days
-        if days <= 0:
-            return "今天"
-        if days == 1:
-            return "昨天"
-        if days < 7:
-            return f"{days}天前"
-        if days < 30:
-            return f"约{max(days // 7, 1)}周前"
-        if days < 365:
-            return f"约{max(days // 30, 1)}个月前"
-        return f"约{max(days // 365, 1)}年前"
+            task = asyncio.get_running_loop().create_task(_reinforce())
+        except RuntimeError:
+            # 无运行中的事件循环（同步上下文直接调 search 的场景）：
+            # 放弃异步派发，强化是尽力而为语义
+            return
+        self._reinforce_tasks.add(task)
+
+    async def _drain_reinforcement(self) -> None:
+        """等待在飞的强化任务落定（测试钩子：保证断言前写入已发生）。"""
+        pending = [t for t in self._reinforce_tasks if not t.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     def _log_search(
         self,

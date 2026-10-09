@@ -122,7 +122,7 @@ async def main_async() -> None:
     db = SQLiteMemoryDatabase(config)
     await db.connect()
     applied = await db.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
-    check("migrations_applied", applied == [1], str(applied))
+    check("migrations_applied", applied == [1, 11, 12], str(applied))
     applied_again = await db.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
     check("migrations_idempotent", applied_again == [])
 
@@ -462,7 +462,8 @@ async def main_async() -> None:
     check(
         "decay_pass_stats",
         set(stats) == {
-            "expired_recent", "demoted", "profile_rows_deleted", "deaded",
+            "expired_recent", "expired_commitment", "demoted",
+            "profile_rows_deleted", "deaded",
         }, str(stats),
     )
 
@@ -885,6 +886,124 @@ async def main_async() -> None:
         kept == valid_ambiguous, str(kept),
     )
 
+    # ---- 评审回归：SQLite LIKE 元字符字面匹配 ----
+    # SQLite 的 LIKE 无默认转义符，反斜杠转义模式（\_ \%）不声明
+    # ESCAPE 会被解析成「字面反斜杠 + 通配」，含 _/% 的关键字假阴性
+    await db.insert_chat_summary(
+        document_id="10086-dddd4444",
+        kind="chat_summary", platform="qq", session_id="10086",
+        group_id="10086", user_id="u1", participants=["qq:u1"],
+        content="群号 a_b 讨论串归档", occurred_at=now + timedelta(minutes=7),
+        embedding=None, summarized=True,
+    )
+    await db.insert_persona_fact_raw(
+        document_id="u1@10086|2026-09-12-d3",
+        platform="qq", user_id="u1", related_user_ids=[],
+        display_name="小明", category="stable", statement="联系人 qq_123 的偏好",
+        confidence="high", session_id="10086", group_id="10086",
+        evidence_key="10086|2026-09-16", occurred_at=now, embedding=None,
+    )
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO memory_fact_cluster (platform, user_id, category,"
+            " canonical_statement, score, occurred_at)"
+            " VALUES ('qq', 'u_9', 'stable', '簇陈述引用 qq_123', 1.0,"
+            " '2026-08-03T12:00:00Z')"
+        )
+    check(
+        "regress_like_facts_underscore",
+        (await webui.fetch_facts(db, 1, 10, q="qq_123"))["total"] == 1,
+    )
+    check(
+        "regress_like_summaries_underscore",
+        (await webui.fetch_summaries(db, 1, 10, q="a_b"))["total"] == 1,
+    )
+    check(
+        "regress_like_users_underscore",
+        (await webui.fetch_users(db, keyword="u_9", page=1, size=10))["total"] == 1,
+    )
+    check(
+        "regress_like_clusters_underscore",
+        (await webui.fetch_clusters(db, 1, 10, q="qq_123"))["total"] == 1,
+    )
+
+    # ---- 评审回归：decay 画像级联 DELETE 的行数解析 ----
+    # `await conn.execute(...).rsplit(...)` 的 await 直链会先对协程对象
+    # 取 .rsplit 抛 AttributeError，整个衰减事务回滚——recent 过期与
+    # profiled 降级两条画像级联路径必须有非空命中时仍能走通
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO memory_fact_cluster (platform, user_id, category,"
+            " canonical_statement, score, occurred_at)"
+            " VALUES ('qq', 'u1', 'recent', '过期 recent 簇', 5.0,"
+            " '2026-08-01T00:00:00Z')"
+        )
+        exp_id = await conn.fetchval(
+            "SELECT id FROM memory_fact_cluster"
+            " WHERE canonical_statement = '过期 recent 簇'"
+        )
+        await conn.execute(
+            "INSERT INTO memory_user_profile (platform, user_id, category,"
+            " cluster_id, statement, score)"
+            " VALUES ('qq', 'u1', 'recent', $1, '过期 recent 画像', 5.0)",
+            exp_id,
+        )
+        await conn.execute(
+            "INSERT INTO memory_fact_cluster (platform, user_id, category,"
+            " canonical_statement, score, status, occurred_at)"
+            " VALUES ('qq', 'u1', 'stable', '低分 profiled 簇', 1.0,"
+            " 'profiled', '2026-08-01T00:00:00Z')"
+        )
+        dem_id = await conn.fetchval(
+            "SELECT id FROM memory_fact_cluster"
+            " WHERE canonical_statement = '低分 profiled 簇'"
+        )
+        await conn.execute(
+            "INSERT INTO memory_user_profile (platform, user_id, category,"
+            " cluster_id, statement, score)"
+            " VALUES ('qq', 'u1', 'stable', $1, '低分 profiled 画像', 1.0)",
+            dem_id,
+        )
+    stats = await db.decay_pass(
+        decay_factor=0.8, demote_threshold=3.0, pending_dead_days=90,
+        recent_expire_days=30,
+    )
+    check(
+        "regress_decay_profile_cascade",
+        stats["expired_recent"] == 1 and stats["demoted"] == 1
+        and stats["profile_rows_deleted"] == 2, str(stats),
+    )
+    async with db.pool.acquire() as conn:
+        left = await conn.fetchval(
+            "SELECT count(*) FROM memory_user_profile"
+            " WHERE cluster_id IN ($1, $2)",
+            exp_id, dem_id,
+        )
+    check(
+        "regress_decay_profile_rows_gone", int(left) == 0, str(left),
+    )
+
+    # ---- 评审回归：滚动补回 count_sql 占位符编号 ----
+    # _translate 按 $n 显式下标绑定；platform 为空（默认值）时 params
+    # 收缩为 2 个但 LIMIT 槽位写死 $3 → IndexError，且 kernel 侧
+    # _guarded_call 会吞掉异常——默认路径上滚动补回整个静默失效。
+    # 回归点会话 10086 只剩 cccc/dddd 两批（早段已删 aaaa/bbbb）：
+    # skip=1 → 窗口顶 1 批 dddd，bot=0 → offset=1 → 应得次新 cccc
+    rollout = await db.fetch_recent_rollout_summaries(
+        session_id="10086", skip_batches=1, limit=5
+    )
+    check(
+        "regress_rollout_default_platform",
+        [r["document_id"] for r in rollout] == ["10086-cccc3333"],
+        str([r["document_id"] for r in rollout]),
+    )
+    rollout = await db.fetch_recent_rollout_summaries(
+        session_id="10086", skip_batches=2, limit=5, platform="wx"
+    )
+    check(
+        "regress_rollout_platform_nomatch", rollout == [], str(rollout),
+    )
+
     await db.close()
 
     # ---- 持久化：close 后重开数据仍在 ----
@@ -894,6 +1013,47 @@ async def main_async() -> None:
     left = await db2.get_kv("decay_last_run")
     check("reopen_persists", left == "2026-09-12T12:00:00.000000Z")
     await db2.close()
+
+    # commitment 维度过期（对齐 nori 8 维画像）：起算点
+    # COALESCE(last_evidence_at, occurred_at)，超窗降 pending_uncertain
+    # 出画像（簇体保留可复活）——置尾执行：改簇状态不影响前序断言
+    old_ts = db_pkg.sqlite_format_ts(now - timedelta(days=100))
+    db3 = SQLiteMemoryDatabase(config)
+    await db3.connect()
+    async with db3.pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE memory_fact_cluster SET category = 'commitment', "
+            "status = 'profiled', last_evidence_at = $1 WHERE id = $2",
+            old_ts, new_cluster,
+        )
+        await conn.execute(
+            "INSERT OR REPLACE INTO memory_user_profile "
+            "(platform, user_id, category, cluster_id, statement, score) "
+            "VALUES ('qq', 'u1', 'commitment', $1, "
+            "'9月12日和小林去爬山', 8.0)",
+            new_cluster,
+        )
+    cstats = await db3.decay_pass(
+        decay_factor=0.8, demote_threshold=3.0, pending_dead_days=90,
+        recent_expire_days=30, commitment_expire_days=60,
+    )
+    check(
+        "commitment_expiry_demotes",
+        cstats["expired_commitment"] == 1
+        and "commitment" not in await db3.fetch_profile_sections("qq", "u1", 5),
+        str(cstats),
+    )
+    async with db3.pool.acquire() as conn:
+        crow = await conn.fetchrow(
+            "SELECT status FROM memory_fact_cluster WHERE id = $1",
+            new_cluster,
+        )
+    check(
+        "commitment_expiry_body_survives",
+        crow is not None and crow["status"] == "pending_uncertain",
+        str(dict(crow) if crow else None),
+    )
+    await db3.close()
 
     # ---- migrate_backend: --force unique-key skip + dim verification ----
     await _migrate_backend_checks()

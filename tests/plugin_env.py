@@ -1,50 +1,38 @@
-"""Shared direct-run test infrastructure (host stubs + module loader).
+"""共享测试引导：core.* 宿主桩 + 插件包装载（pytest 与 python 直跑两用）。
 
-2026-09-12 review cleanup: every direct-run test file used to carry its own
-copy of the core.* host stubs and the importlib loader (7 near-identical
-copies, ~600 lines of boilerplate); they are now consolidated here.
+此前 7 个测试文件各自复制 ~100-140 行桩设施（review 2026-09-12 冗余项 1），
+本模块统一为单一实现：
 
-- install_core_stubs(): core.* / fastapi host stubs (a superset of the
-  historical per-file variants — includes register.tag and the fastapi
-  fallback; harmless for files that never touch those surfaces);
-- load_module(name): loader handling both the db package directory and
-  single-file modules (stubs installed first, always).
+- install_host_stubs(): 幂等注入 core.* 桩（logging/plugin/chat/prompt/
+  provider；fastapi 未安装时的兜底桩）。core.plugin 的 on/register 桩
+  记录装饰调用（test_noriflow_memory 的生命周期/订阅断言依赖；其余文件
+  不消费记录，仅无害）。
+- load_modules(*names): 确保 noriflow_memory_pkg 就绪后按名 import，
+  返回模块元组——依赖模块经 pkg.__path__ 由常规导入机制解析，
+  sys.modules 去重保证跨文件单实例。
 
-Convention: test files load the plugin submodules they need through
-load_module before use; main.py is always loaded last (its import chain
-pulls in the other submodules via the package stub).
-
-Note: test_noriflow_memory.py (the unittest main suite) stays
-self-contained — it is spec-exec'd under a separate module name by
-test_config_web.py and does not import this module.
+导入本模块依赖 tests/ 在 sys.path：pytest（非包测试目录自动插入）与
+直跑（脚本目录即 sys.path[0]）均满足；各测试文件显式 insert 兜底。
 """
 
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import sys
 import types
 from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
+PKG_NAME = "noriflow_memory_pkg"
 
 
-def install_core_stubs() -> None:
-    """Install the core.* host stubs (idempotent: skipped when the package
-    stub already exists)."""
-    if "noriflow_memory_pkg" in sys.modules:
+def install_host_stubs() -> None:
+    """幂等注入 core.* 宿主桩（已安装时跳过）。"""
+    if "core.plugin" in sys.modules:
         return
 
-    def get_logger(*args, **kwargs):
-        import logging
-
-        return logging.getLogger("stub")
-
     core = types.ModuleType("core")
-    logging_mod = types.ModuleType("core.logging_manager")
-    logging_mod.get_logger = get_logger
     sys.modules["core"] = core
-    sys.modules["core.logging_manager"] = logging_mod
 
     plugin_mod = types.ModuleType("core.plugin")
 
@@ -59,9 +47,13 @@ def install_core_stubs() -> None:
             self.plugin_cfg = cfg
 
     class _On:
+        def __init__(self):
+            self.calls = []
+
         def __getattr__(self, name):
             def deco(*args, **kwargs):
                 def wrap(func):
+                    self.calls.append((name, args, kwargs, func.__name__))
                     return func
 
                 return wrap
@@ -83,15 +75,8 @@ def install_core_stubs() -> None:
 
             return wrap
 
-        def tag(self, *args, **kwargs):
-            def wrap(func):
-                return func
-
-            return wrap
-
         def page(self, route, menu=None):
             def wrap(func):
-                # 宿主 route 注册为键控（重复加载主模块不重复记账）
                 if not any(p["route"] == route for p in self.pages):
                     self.pages.append({"route": route, "menu": menu,
                                        "func": func.__name__})
@@ -117,8 +102,18 @@ def install_core_stubs() -> None:
         "PluginPage", (), {"from_folder": staticmethod(lambda path: ("folder", path))}
     )
     plugin_mod.PageMenu = type("PageMenu", (), {"__init__": lambda self, **kw: None})
+
+    def get_logger(*args, **kwargs):
+        import logging
+
+        return logging.getLogger("stub")
+
     plugin_mod.logger = get_logger()
     sys.modules["core.plugin"] = plugin_mod
+
+    logging_mgr = types.ModuleType("core.logging_manager")
+    logging_mgr.get_logger = get_logger
+    sys.modules["core.logging_manager"] = logging_mgr
 
     chat_mod = types.ModuleType("core.chat")
     elements_mod = types.ModuleType("core.chat.message_elements")
@@ -147,6 +142,7 @@ def install_core_stubs() -> None:
     prompt_mod = types.ModuleType("core.prompt_manager")
 
     class Prompt:
+        # 对齐宿主签名：persist/end 是注入与持久化断言的依据
         def __init__(self, content="", name="", source="", persist=True,
                      end=None, **kwargs):
             self.content = content
@@ -158,46 +154,49 @@ def install_core_stubs() -> None:
     prompt_mod.Prompt = Prompt
     sys.modules["core.prompt_manager"] = prompt_mod
 
-    if sys.modules.get("fastapi") is None:
-        # Leave the real package alone if it is already imported; otherwise
-        # install a stub (this shadows an installed-but-unimported fastapi
-        # for the rest of the process — the plugin only needs
-        # HTTPException/Body, so that is fine for tests)
-        fastapi_stub = types.ModuleType("fastapi")
+    provider_mod = types.ModuleType("core.provider")
 
-        class HTTPException(Exception):
-            def __init__(self, status_code=400, detail=""):
-                self.status_code = status_code
-                self.detail = detail
-                super().__init__(detail)
+    class LLMRequest:
+        # 桩：仅承接 clients.FastLlmExit 用到的构造参数与 tool_choice 推导
+        def __init__(self, messages=None, tools=None, tool_funcs=None,
+                     tool_set=None, tool_choice=None):
+            self.messages = messages or []
+            self.tools = tools
+            self.tool_choice = tool_choice or ("auto" if tools else "none")
 
-        def Body(*args, **kwargs):
-            return None
+    provider_mod.LLMRequest = LLMRequest
+    sys.modules["core.provider"] = provider_mod
 
-        fastapi_stub.HTTPException = HTTPException
-        fastapi_stub.Body = Body
-        sys.modules["fastapi"] = fastapi_stub
+    if "fastapi" not in sys.modules:
+        try:
+            import fastapi  # noqa: F401  真包优先（HTTPException 断言语义一致）
+        except ImportError:
+            fastapi_stub = types.ModuleType("fastapi")
 
-    pkg = types.ModuleType("noriflow_memory_pkg")
-    pkg.__path__ = [str(PLUGIN_DIR)]
-    sys.modules["noriflow_memory_pkg"] = pkg
+            class HTTPException(Exception):
+                def __init__(self, status_code=400, detail=""):
+                    self.status_code = status_code
+                    self.detail = detail
+                    super().__init__(detail)
+
+            def Body(*args, **kwargs):
+                return None
+
+            fastapi_stub.HTTPException = HTTPException
+            fastapi_stub.Body = Body
+            sys.modules["fastapi"] = fastapi_stub
 
 
-def load_module(mod_name: str):
-    """Load a plugin submodule (db is a package directory, everything else a
-    single file; host stubs installed first)."""
-    install_core_stubs()
-    target = PLUGIN_DIR / mod_name
-    if target.is_dir():
-        path = target / "__init__.py"
-        kwargs = {"submodule_search_locations": [str(target)]}
-    else:
-        path = PLUGIN_DIR / f"{mod_name}.py"
-        kwargs = {}
-    spec = importlib.util.spec_from_file_location(
-        f"noriflow_memory_pkg.{mod_name}", path, **kwargs
-    )
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[f"noriflow_memory_pkg.{mod_name}"] = mod
-    spec.loader.exec_module(mod)
-    return mod
+def load_modules(*names: str):
+    """按名加载插件模块（返回元组；重复加载经 sys.modules 去重）。"""
+    install_host_stubs()
+    if PKG_NAME not in sys.modules:
+        pkg = types.ModuleType(PKG_NAME)
+        pkg.__path__ = [str(PLUGIN_DIR)]
+        sys.modules[PKG_NAME] = pkg
+    return tuple(importlib.import_module(f"{PKG_NAME}.{n}") for n in names)
+
+
+def load_plugin_module():
+    """加载插件主模块（连带全依赖；幂等，返回同一实例）。"""
+    return load_modules("main")[0]

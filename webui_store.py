@@ -85,6 +85,12 @@ def _like_op(backend) -> str:
     return "LIKE" if _dialect(backend) == "sqlite" else "ILIKE"
 
 
+def _like_suffix(backend) -> str:
+    """LIKE 匹配后缀：SQLite 无默认转义符，反斜杠转义模式须显式
+    ESCAPE（PG 的 LIKE/ILIKE 默认转义符即反斜杠，无需子句）。"""
+    return " ESCAPE '\\'" if _dialect(backend) == "sqlite" else ""
+
+
 def _escape_like(keyword: str) -> str:
     """LIKE 模式元字符转义（\\ % _ → 字面量；默认转义符为 \\）。"""
     return keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -190,7 +196,7 @@ async def fetch_facts(
     if extracted.strip() in ("0", "1"):
         add("extracted_flag = ${n}", int(extracted.strip()))
     if q.strip():
-        add(f"statement {like_op} ${{n}}", _ilike(q.strip()))
+        add(f"statement {like_op} ${{n}}{_like_suffix(backend)}", _ilike(q.strip()))
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     async with _pool(backend).acquire() as conn:
@@ -476,13 +482,27 @@ async def fetch_profile_preview(
     display_name = (
         await db.fetch_latest_display_name(platform, user_id) or user_id
     )
+
+    def _entry(statement: str, occurred_at) -> dict:
+        return {"statement": statement, "occurred_at": _dt(occurred_at)}
+
     return {
         "platform": platform,
         "user_id": user_id,
         "display_name": display_name,
         "injection_text": injection_text,
-        "sections": sections,
-        "uncertain": uncertain,
+        # sections/uncertain 维持既有字符串结构（消费方兼容）；
+        # 发生时间经 *_meta 附加，不破坏旧契约
+        "sections": {
+            category: [s for s, _ in items]
+            for category, items in sections.items()
+        },
+        "sections_meta": {
+            category: [_entry(s, ts) for s, ts in items]
+            for category, items in sections.items()
+        },
+        "uncertain": [s for s, _ in uncertain],
+        "uncertain_meta": [_entry(s, ts) for s, ts in uncertain],
     }
 
 
@@ -512,7 +532,7 @@ async def fetch_summaries(
     if kind.strip() in ("chat_summary", "bot_self"):
         add("kind = ${n}", kind.strip())
     if q.strip():
-        add(f"content {like_op} ${{n}}", _ilike(q.strip()))
+        add(f"content {like_op} ${{n}}{_like_suffix(backend)}", _ilike(q.strip()))
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     async with _pool(backend).acquire() as conn:

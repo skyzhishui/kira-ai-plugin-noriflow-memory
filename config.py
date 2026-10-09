@@ -5,6 +5,8 @@ M2（写入链路）只消费连接池 / embedding / 补算 / 熔断字段；
 recall、合并 agent、评分状态机字段随 M3-M5 里程碑接入。
 """
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -80,6 +82,13 @@ class LocalMemoryConfig(BaseModel):
     decay_interval_days: int = Field(default=14, ge=1, description="衰减周期（天），兼缺席冻结窗口粒度")
     recent_expire_days: int = Field(default=30, ge=1, description="recent 维度过期天数")
     recent_promote_threshold: float = Field(default=4.0, description="recent 维度进画像阈值")
+    commitment_expire_days: int = Field(
+        default=60,
+        ge=1,
+        description="commitment 维度过期天数：最近一次被确认后超过此天数无新证据，"
+        "降 pending_uncertain 出画像（簇体保留可复活；起算点取 "
+        "COALESCE(last_evidence_at, occurred_at)——持续被提起的约定可持续续期）",
+    )
     decay_requires_activity: bool = Field(
         default=True,
         description="衰减门控：仅衰减/降级/死亡本周期内出现过的用户的簇（缺席冻结画像）",
@@ -127,6 +136,53 @@ class LocalMemoryConfig(BaseModel):
     summary_recall_session_scoped: bool = Field(
         default=True,
         description="摘要记忆 recall 是否会话隔离（true 仅召回本会话，默认隔离）",
+    )
+    # ---- 摘要生命周期（归档态 + 访问强化；对齐 nori 侧 011 同名配置组）----
+    summary_lifecycle_enabled: bool = Field(
+        default=False,
+        description="摘要生命周期总开关：开启后合并 agent 周期执行归档遍"
+        "（written_at 超过归档时限且强化窗口内无召回命中的行置 archived，"
+        "结构性退出召回；原文保留、按 id 可读，memory_lookup 可查、"
+        "memory_correct(reactivate) 可恢复）。关闭后已归档行保持归档态"
+        "（不回流）",
+    )
+    summary_lifecycle_grace_days: int = Field(
+        default=30,
+        ge=0,
+        description="最低保留期（天）：written_at 距今不足此值的行永不归档",
+    )
+    summary_lifecycle_half_life_days: float = Field(
+        default=90.0,
+        gt=0,
+        description="生命周期半衰期（天）：归档时限 = 最低保留期 + 3×半衰期"
+        "（衰减权重降至 12.5% 以下，即『陈年且长期无人问津』）",
+    )
+    summary_lifecycle_reinforce_window_days: int = Field(
+        default=90,
+        ge=1,
+        description="访问强化窗口（天）：最近一次被召回命中在窗口内的行豁免归档"
+        "（一次召回续命一个窗口）",
+    )
+    summary_lifecycle_interval_days: int = Field(
+        default=7,
+        ge=1,
+        description="归档遍执行周期（天）：上次执行时间 kv 持久化，重启不丢；"
+        "首次运行只打时间戳不归档（首遍延后至强化窗口后）",
+    )
+    summary_lifecycle_reinforce_on_recall: bool = Field(
+        default=True,
+        description="召回访问强化：召回最终注入集的行异步刷新 last_recall_at "
+        "与 recall_count（fire-and-forget，失败仅告警）。默认开启且不受"
+        " summary_lifecycle_enabled 门控——预累积强化信号，避免开启生命"
+        "周期后首遍判据因无 last_recall_at 把存量高频记忆误归档",
+    )
+    # ---- 主动记忆工具（对齐 nori 侧五件套）----
+    memory_tools_enabled: bool = Field(
+        default=True,
+        description="主动记忆维护工具总开关：memory_profile / "
+        "memory_lookup / memory_correct 新三件（关闭则三件不注册）；"
+        "既有 memory_search/write/remove 不受本开关管理，"
+        "细粒度禁用走 enabled_tools",
     )
     max_persona_profiles: int = Field(
         default=3, ge=1, description="群聊单轮注入画像人数上限",
@@ -269,7 +325,15 @@ class LocalMemoryConfig(BaseModel):
     )
     recall_time_label_enabled: bool = Field(
         default=True,
-        description="注入记忆追加相对时间标注（今天/昨天/N天前/约N周前/约N个月前，按本地时区换算）",
+        description="注入记忆追加时间标注（recall 主路与滚动补回共用，按本地时区换算）",
+    )
+    recall_time_label_mode: Literal["relative", "absolute", "both"] = Field(
+        default="both",
+        description="时间标注形态：relative=仅相对（今天/N天前）；"
+        "absolute=仅绝对（9月28日 14:30，跨年带年份）；"
+        "both=相对+绝对并列（3天前 · 9月28日 14:30）。绝对部分分层精度："
+        "7 天内带时分，更久只到日期——occurred_at 是批次落库时间，"
+        "远期事件时刻本就近似，精确到分钟反而误导时序推理",
     )
     timezone: str = Field(
         default="",

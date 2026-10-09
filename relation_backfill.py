@@ -271,7 +271,8 @@ class RelationBackfill:
         （簇陈述修正后想重新提取时用；数据侧 count_on_conflict=False
         保证重跑只刷新不计分）。源查询按 batch_size 窗口分页推进（大库
         全量不再一次性载入内存）。复活簇待办（merge/维护页复活、水位
-        之下的簇）在每轮开头取走并按 id 精取，置于增量批次之前补提取。
+        之下的簇）在每轮开头取走并按 id 精取，置于增量批次之前补提取；
+        精取/批处理失败时未成功的簇重新登记回待办（下轮增量重试）。
 
         Args:
             progress: 每批一次的进度回调（收 {done,total,relations}）。
@@ -291,18 +292,24 @@ class RelationBackfill:
             except Exception:
                 logger.warning("回填水位读取失败（退化为全量）", exc_info=True)
                 after_id, mode = 0, "full"
-        # 复活簇待办：水位之下的复活簇（merge/手工复活）按 id 精取
+        # 复活簇待办：水位之下的复活簇（merge/手工复活）按 id 精取。
+        # take 即清空——失败面（精取失败/批处理失败）须重新登记回待办，
+        # 否则水位之下的簇在增量模式永远失去重试机会（只能全量重跑）
         revived_pending = await take_backfill_pending(self._db)
         revived = []
+        revived_retry: set[int] = set()
         if revived_pending:
             try:
                 revived = await self._db.fetch_confirmed_relation_sources_by_ids(
                     revived_pending
                 )
             except Exception:
-                logger.warning("复活簇待办精取失败（待办已清，可全量重跑补）",
+                logger.warning("复活簇待办精取失败（本批重新登记待办）",
                                exc_info=True)
+                await self._requeue_backfill_pending(revived_pending)
                 revived = []
+            else:
+                revived_retry = {int(c["id"]) for c in revived}
         bot = self._bot_user_id
         try:
             remaining = await self._db.count_confirmed_relation_sources(
@@ -370,6 +377,10 @@ class RelationBackfill:
             except Exception:
                 stopped = True
                 break
+            revived_retry -= {int(c["id"]) for c in batch}
+        if revived_retry:
+            # 中途失败的复活批：重新登记待办，下轮增量重试
+            await self._requeue_backfill_pending(sorted(revived_retry))
         # 增量/全量批：id 窗口分页，每批成功即推水位
         if not stopped:
             while True:
@@ -408,6 +419,17 @@ class RelationBackfill:
         return summary
 
     # ------------------------------------------------------------------
+
+    async def _requeue_backfill_pending(self, cluster_ids: list[int]) -> None:
+        """复活簇待办失败重登记（fail-open：登记失败只记日志，可全量重跑补）。"""
+        try:
+            await mark_backfill_pending(self._db, cluster_ids)
+        except Exception:
+            logger.warning(
+                "复活簇待办重登记失败（cluster_ids=%s，可全量重跑补）",
+                cluster_ids[:10],
+                exc_info=True,
+            )
 
     async def _run_batch(
         self,

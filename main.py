@@ -81,7 +81,46 @@ PLUGIN_ID = "kira-ai-plugin-noriflow-memory"
 # 内置文件型记忆插件（官方描述：使用第三方记忆插件前请先禁用）
 SIMPLE_MEMORY_PLUGIN_ID = "kira_plugin_simple_memory"
 
-ALL_TOOLS = ["memory_search", "memory_write", "memory_remove"]
+# 旧三件（enabled_tools 管理；search/write 已升级为 nori 双语义）
+_LEGACY_TOOLS = ["memory_search", "memory_write", "memory_remove"]
+# 对齐 nori 五件套新增的三件（memory_tools_enabled 总开关管理）
+_PARITY_TOOLS = ["memory_profile", "memory_lookup", "memory_correct"]
+ALL_TOOLS = _LEGACY_TOOLS + _PARITY_TOOLS
+
+# 主动维度（memory_write 可写；系统维度 recent/uncertain 仅编码器落）
+# ——与 nori 侧 tools.py 同值域（模块级：类体 genexpr 查找跳过类作用域）
+_ACTIVE_CATEGORIES = (
+    "identity", "stable", "preference", "commitment", "interaction", "naming",
+)
+_SEARCH_CATEGORIES = _ACTIVE_CATEGORIES + ("relation",)
+_CATEGORY_HINTS = {
+    "identity": "他是谁（职业/身份/自我定位）",
+    "stable": "既成事实（住址、宠物、经历、习惯）",
+    "preference": "喜好厌恶（饮食禁忌、口味、喜欢或反感的事物）",
+    "commitment": "带日期的约定（答应的事、约好的活动）",
+    "interaction": "怎么和他相处（节奏、边界、忌讳）",
+    "naming": "称呼偏好（想被怎么叫、反感什么称呼）",
+    "relation": "此人的人际关系（谁—关系→谁）",
+}
+_MAX_TOP_K = 10
+_MAX_STATEMENT_CHARS = 200
+
+_MEMORY_TOOLS_GUIDANCE = (
+    "## 记忆工具使用准则\n"
+    "上下文已注入的记忆简报与画像块中的内容不要重复检索。缺上下文"
+    "先检索再答，不得假装记得，没查到就坦诚说记不清。本次真正检"
+    "索到的内容当作自己亲身记得的经历自然讲出来，不要说「翻了翻"
+    "记忆」「查了下记录」这类话，也不要提及工具名或检索过程。"
+    "跨会话记忆注意时间与当事人：别人的经历不等于当前用户的，同"
+    "名不等于同一人。被问到某个具体人物（含群友代号/昵称）时，用 "
+    "memory_search(target=\"fact\", name=称呼) 查该成员的事实结论，"
+    "用 memory_profile 查完整画像。memory_search 查对话与事实结论，"
+    "memory_lookup 查归档/失效的记忆，memory_profile 按名字查"
+    "成员画像，memory_write 仅在用户明确要求记住时调用，答应记"
+    "住就自然应下、顺接当前话题，不要说「写进记忆里啦」「已经记"
+    "录」这类话，也不要提及写入操作或工具名，"
+    "memory_correct 调整记忆状态（必须给 reason）。"
+)
 
 # 编码输入中历史窗口行数（与上游 nori 版一致）
 _HISTORY_WINDOW_LINES = 10
@@ -161,6 +200,20 @@ def _cfg_bool(raw: dict, key: str, default: bool) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+_TIME_LABEL_MODES = ("relative", "absolute", "both")
+
+
+def _cfg_time_label_mode(raw: dict) -> str:
+    """recall_time_label_mode 接线：Literal 白名单外的宿主配置值回落
+    默认 both 并告警——手改宿主 json 拼错形态不应炸掉整个插件装配
+    （与 _cfg_int/_cfg_float 的容错口径一致）。"""
+    value = _cfg_str(raw, "recall_time_label_mode", "both")
+    if value not in _TIME_LABEL_MODES:
+        logger.warning("配置项 recall_time_label_mode=%r 非法，使用默认 both", value)
+        return "both"
+    return value
+
+
 def _cfg_strlist(raw: dict, key: str, default: Optional[list[str]] = None) -> list[str]:
     value = raw.get(key)
     if not value:
@@ -199,6 +252,7 @@ def _build_config(raw: dict) -> LocalMemoryConfig:
         decay_interval_days=_cfg_int(raw, "decay_interval_days", 14),
         recent_expire_days=_cfg_int(raw, "recent_expire_days", 30),
         recent_promote_threshold=_cfg_float(raw, "recent_promote_threshold", 4.0),
+        commitment_expire_days=_cfg_int(raw, "commitment_expire_days", 60),
         decay_requires_activity=_cfg_bool(raw, "decay_requires_activity", True),
         sticky_evidence_count=_cfg_int(raw, "sticky_evidence_count", 4),
         pending_dead_days=_cfg_int(raw, "pending_dead_days", 90),
@@ -252,6 +306,7 @@ def _build_config(raw: dict) -> LocalMemoryConfig:
         write_dedup_window=_cfg_int(raw, "write_dedup_window", 8),
         write_dedup_threshold=_cfg_float(raw, "write_dedup_threshold", 0.85),
         recall_time_label_enabled=_cfg_bool(raw, "recall_time_label_enabled", True),
+        recall_time_label_mode=_cfg_time_label_mode(raw),
         timezone=_cfg_str(raw, "timezone"),
         recall_log_enabled=_cfg_bool(raw, "recall_log_enabled", False),
         recall_log_path=_cfg_str(raw, "recall_log_path"),
@@ -263,6 +318,25 @@ def _build_config(raw: dict) -> LocalMemoryConfig:
         failure_threshold=_cfg_int(raw, "failure_threshold", 5),
         recovery_seconds=_cfg_float(raw, "recovery_seconds", 60.0),
         tool_scope_locked=_cfg_bool(raw, "tool_scope_locked", True),
+        summary_lifecycle_enabled=_cfg_bool(
+            raw, "summary_lifecycle_enabled", False
+        ),
+        summary_lifecycle_grace_days=_cfg_int(
+            raw, "summary_lifecycle_grace_days", 30
+        ),
+        summary_lifecycle_half_life_days=_cfg_float(
+            raw, "summary_lifecycle_half_life_days", 90.0
+        ),
+        summary_lifecycle_reinforce_window_days=_cfg_int(
+            raw, "summary_lifecycle_reinforce_window_days", 90
+        ),
+        summary_lifecycle_interval_days=_cfg_int(
+            raw, "summary_lifecycle_interval_days", 7
+        ),
+        summary_lifecycle_reinforce_on_recall=_cfg_bool(
+            raw, "summary_lifecycle_reinforce_on_recall", True
+        ),
+        memory_tools_enabled=_cfg_bool(raw, "memory_tools_enabled", True),
     )
 
 
@@ -488,6 +562,11 @@ class NoriflowMemoryPlugin(BasePlugin):
                     and self._memory_kernel.alias_store is not None
                     else ""
                 ),
+                alias_store=(
+                    self._memory_kernel.alias_store
+                    if self._memory_kernel is not None
+                    else None
+                ),
             )
         else:
             logger.warning(
@@ -535,6 +614,8 @@ class NoriflowMemoryPlugin(BasePlugin):
             config=config,
             bot_nickname=self._bot_nickname,
             identity_resolver=None,  # KiraAI 无跨渠道身份合并，单键路径
+            # 与 kernel 同源宿主时区链：画像尾注与 recall 标注同一时区口径
+            host_tz_provider=getattr(self.ctx, "get_timezone", None),
         )
         # P3 边注入的邻居画像句柄（kernel 内消费，独立预算；未回填时只出陈述行）
         self._memory_kernel.persona_service = self._persona_service
@@ -858,6 +939,10 @@ class NoriflowMemoryPlugin(BasePlugin):
           构建以让其 memo 就位，recall 同轮排除这些行防重复注入）。
         - 画像：批次发言者候选 -> 簇表确定性拼装（群聊多人 / 私聊
           触发者+实体命中扩员，v1.7.1 起私聊提及他人也注入其画像）。
+        - 注入位置：动态块（滚动补回/召回/画像）写入 user prompt 头部，
+          宿主 assemble_prompt 会将其排到最新一条 user 消息内、紧邻用户
+          输入之前——system prompt 与历史消息因此构成稳定前缀、可命中
+          提示词缓存；persist=False，仅本轮生效不写回历史。
         """
         # enabled_tools 显式空列表 = 全部禁用（与 schema "取消选择即禁用"
         # 语义一致）；键缺失/None 才回退全启用
@@ -865,6 +950,13 @@ class NoriflowMemoryPlugin(BasePlugin):
         if configured is None:
             configured = ALL_TOOLS
         disabled = set(ALL_TOOLS) - set(configured)
+        if (
+            self._config is None
+            or not self._config.memory_tools_enabled
+        ):
+            # 新三件（profile/lookup/correct）由 memory_tools_enabled 总
+            # 开关管理；旧三件不受其管辖
+            disabled |= set(_PARITY_TOOLS)
         if not self._ready:
             disabled = set(ALL_TOOLS)
         elif self._proactive_tools_denied(event):
@@ -969,27 +1061,54 @@ class NoriflowMemoryPlugin(BasePlugin):
         except Exception:
             logger.warning("用户画像获取失败（不阻断本轮）", exc_info=True)
 
+        # 动态块注入 user prompt 头部（宿主 assemble_prompt 将其排进最新一条
+        # user 消息、紧邻用户输入）：system prompt 与历史消息由此构成稳定
+        # 前缀可命中提示词缓存，随轮次变化的召回/画像块落在尾部不再打断
+        # 前缀缓存。persist=False：仅本轮生效，不写回会话历史。
+        inject_prompts: list[Prompt] = []
         if rollout_text:
-            req.system_prompt.append(
+            inject_prompts.append(
                 Prompt(
                     content=rollout_text,
                     name=f"{PLUGIN_ID}:rollout",
                     source=PLUGIN_ID,
+                    persist=False,
                 )
             )
         if memory_text:
-            req.system_prompt.append(
+            inject_prompts.append(
                 Prompt(
                     content=memory_text,
                     name=f"{PLUGIN_ID}:recall",
                     source=PLUGIN_ID,
+                    persist=False,
                 )
             )
         if profile_text:
-            req.system_prompt.append(
+            inject_prompts.append(
                 Prompt(
                     content=profile_text,
                     name=f"{PLUGIN_ID}:profile",
+                    source=PLUGIN_ID,
+                    persist=False,
+                )
+            )
+        if inject_prompts:
+            user_prompt = getattr(req, "user_prompt", None)
+            if isinstance(user_prompt, list):
+                user_prompt[:0] = inject_prompts
+            else:
+                # 旧宿主无 user_prompt（或类型不可变）时回退 system prompt，
+                # 注入不丢
+                req.system_prompt.extend(inject_prompts)
+        # 记忆工具准则：本轮至少一件记忆工具可用时注入（工具全被门控摘除
+        # 时不占 prompt 预算）。静态内容留在 system prompt 尾部——不随轮次
+        # 变化，仍是可缓存前缀的一部分，故不随动态块下移。
+        if set(ALL_TOOLS) - disabled:
+            req.system_prompt.append(
+                Prompt(
+                    content=_MEMORY_TOOLS_GUIDANCE,
+                    name=f"{PLUGIN_ID}:tools",
                     source=PLUGIN_ID,
                 )
             )
@@ -1210,8 +1329,18 @@ class NoriflowMemoryPlugin(BasePlugin):
 
         bot 行跳过（bot 名字会命中全部会话摘要，候选爆炸）；重启后
         缓存从零积累，词典随之自愈（TTL 兜底）。
+
+        裸 session_id 兼容：缓存以复合 sid（platform:type:id）为键，而
+        build_injection_text 的兜底自匹配等调用方传裸 id——按尾段反查。
+        跨适配器同号会话取最久活跃者：名字仅作候选源，误配由重排与
+        画像空栏兜底。
         """
         bucket = self._history.get(sid)
+        if bucket is None and sid and ":" not in sid:
+            for key, candidate in self._history.items():
+                if key.rsplit(":", 1)[-1] == sid:
+                    bucket = candidate
+                    break
         if not bucket:
             return []
         pairs: list[tuple[str, str, str]] = []
@@ -1590,8 +1719,47 @@ class NoriflowMemoryPlugin(BasePlugin):
         return db
 
     # ------------------------------------------------------------------
-    #  主动记忆工具（enabled_tools 门控见 inject_memory）
+    #  主动记忆工具（enabled_tools 门控见 inject_memory；search/write 为
+    #  nori 双语义版，profile/lookup/correct 由 memory_tools_enabled 管；
+    #  常量与准则文本在模块级）
     # ------------------------------------------------------------------
+
+    async def _resolve_tool_name(
+        self, session_id: str, name: str
+    ) -> tuple[Optional[tuple[str, str]], str]:
+        """名字 → 唯一 (platform, uid)（复用实体命中的 match 机制）。
+
+        歧义/未命中时第二项为给模型的提示文本；与画像候选/P3 关系
+        节点同一套解析（窗口词典 + 持久别名层）。
+        """
+        kernel = self._memory_kernel
+        if kernel is None:
+            return None, "名字解析暂时不可用，请稍后再试。"
+        try:
+            entries = await kernel.entity_hint_entries(session_id, name)
+        except Exception:
+            logger.warning("记忆工具名字解析失败", exc_info=True)
+            return None, "名字解析暂时不可用，请稍后再试。"
+        pairs: list[tuple[str, str]] = []
+        labels: dict[tuple[str, str], str] = {}
+        for entry_name, plat, uid in entries:
+            if (plat, uid) not in pairs:
+                pairs.append((plat, uid))
+                labels[(plat, uid)] = entry_name
+        if not pairs:
+            return None, (
+                f"没有找到叫「{name}」的成员。名字需要与他在对话中出现过"
+                "的称呼一致（支持历史昵称变体）。"
+            )
+        if len(pairs) > 1:
+            candidates = "、".join(
+                f"{labels[(p, u)]}[{p}:{u}]" for p, u in pairs[:6]
+            )
+            return None, (
+                f"「{name}」命中多位成员：{candidates}。"
+                "请用更完整的名字或加上平台区分后重试。"
+            )
+        return pairs[0], ""
 
     @staticmethod
     def _event_scope(event) -> tuple[str, str, str]:
@@ -1753,13 +1921,56 @@ class NoriflowMemoryPlugin(BasePlugin):
 
     @register.tool(
         name="memory_search",
-        description="搜索长期记忆库中的历史记忆（对话摘要）。当需要回忆过去聊过的内容、用户提到「之前说过/上次聊过」时调用。",
+        description=(
+            "检索长期记忆。两种目标：summary=对话摘要（每轮对话压缩为"
+            "一段保真记录，带时间与参与者，是「当时聊了什么」的证据级"
+            "材料，陈年记录会归档不再出现在此检索）；fact=事实簇（从"
+            "多轮对话合并计分出的人物结论，score 为确信度，仅返回生效"
+            "中的簇，是「这个人怎样」的结论级材料）。查「我们聊过/发生"
+            "过什么」用 summary；查「某人有什么特点/偏好/约定」用 fact。"
+            "query 用简洁关键词，不要复述整句用户消息；第一次不够就换"
+            "关键词再查。"
+        ),
         params={
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "检索内容（自然语言）"},
-                "top_k": {"type": "number", "description": "返回条数上限，默认 5"},
-                "session_id": {"type": "string", "description": "会话 ID（裸会话 ID，非 platform:type:id 完整格式；提供则按会话检索；不填默认当前会话）"},
+                "query": {
+                    "type": "string",
+                    "description": "检索关键词（简洁短语或实体名）",
+                },
+                "target": {
+                    "type": "string",
+                    "enum": ["summary", "fact"],
+                    "description": (
+                        "检索目标，默认 summary。查某个具体人物"
+                        "的特点/偏好/约定/身份等结论时必须选 "
+                        "fact，并同时传 name（成员称呼）——"
+                        "不传 name 时 fact 只查触发者本人"
+                    ),
+                },
+                "category": {
+                    "type": "string",
+                    "enum": list(_SEARCH_CATEGORIES),
+                    "description": (
+                        "仅 target=fact：按维度过滤。"
+                        + "；".join(
+                            f"{k}={v}"
+                            for k, v in _CATEGORY_HINTS.items()
+                        )
+                        + "。不传则全维度"
+                    ),
+                },
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "仅 target=fact：成员称呼（支持历史昵称与"
+                        "群内代号，如 xxy）。查某人的事实结论必传"
+                        "；category=relation 时必填（返回该成员的"
+                        "关系边）"
+                    ),
+                },
+                "top_k": {"type": "number", "description": "返回条数上限，默认 5，最大 10"},
+                "session_id": {"type": "string", "description": "会话 ID（裸会话 ID；提供则按会话检索；不填默认当前会话）"},
                 "user_id": {"type": "string", "description": "用户 ID（提供则按用户跨会话检索）"},
             },
             "required": ["query"],
@@ -1767,7 +1978,18 @@ class NoriflowMemoryPlugin(BasePlugin):
     )
     # The framework invokes tools as func(event, **args): the first parameter
     # after self receives the message event, tool params arrive by keyword.
-    async def memory_search(self, event, *_, query: str, top_k: int = 5, session_id: str = "", user_id: str = "") -> str:
+    async def memory_search(
+        self,
+        event,
+        *_,
+        query: str,
+        target: str = "summary",
+        category: str = "",
+        name: str = "",
+        top_k: int = 5,
+        session_id: str = "",
+        user_id: str = "",
+    ) -> str:
         denial = self._whitelist_denial(event, "memory_search")
         if denial:
             return denial
@@ -1775,7 +1997,14 @@ class NoriflowMemoryPlugin(BasePlugin):
         if kernel is None or not self._ready:
             return "记忆功能未启用"
         query = (query or "").strip()
-        if not query:
+        target = (target or "summary").strip()
+        category = (category or "").strip()
+        name = (name or "").strip()
+        if target not in ("summary", "fact"):
+            return "错误：target 只能是 summary 或 fact。"
+        if category and category not in _SEARCH_CATEGORIES:
+            return f"错误：category 只能是 {'/'.join(_SEARCH_CATEGORIES)}。"
+        if not query and not (category == "relation" and name):
             return "query 不能为空"
         sid = (session_id or "").strip()
         uid = (user_id or "").strip()
@@ -1791,18 +2020,28 @@ class NoriflowMemoryPlugin(BasePlugin):
             # (platform then unknown——裸 id 检索不限平台，兼容旧行为).
             sid, uid, plat = self._event_scope(event)
         try:
-            top_k = max(1, min(int(top_k or 5), 10))
+            top_k = max(1, min(int(top_k or 5), _MAX_TOP_K))
         except (TypeError, ValueError):
             top_k = 5
+        if target == "fact" or (target == "summary" and category == "relation"):
+            return await self._tool_search_facts(
+                kernel, query, top_k, category, name, sid, uid, plat
+            )
         # Asking-about-others recall: match the query against the entity
         # dictionary + persistent aliases; the keys then join the main search
         # path. Isolation posture follows summary_recall_session_scoped via
         # cross_session below (session-pinned entity keys when isolated).
+        # 实体词典路用复合 sid：历史行缓存/窗口词典以 session.sid（复合键）
+        # 为键，_event_scope 返回的裸 session_id 在词典路恒 miss——与
+        # inject_memory 同源口径；无会话对象（手工调用）时回退原值
+        entity_sid = str(
+            getattr(getattr(event, "session", None), "sid", "") or ""
+        ) or sid
         entity_keys: list[str] = []
         entity_uids: list[str] = []
         if sid and self._config.recall_hint_enabled:
             try:
-                entries = await kernel.entity_hint_entries(sid, query)
+                entries = await kernel.entity_hint_entries(entity_sid, query)
                 entity_keys = [f"{p}:{u}" if p else u for _, p, u in entries]
                 entity_uids = [u for _, _, u in entries]
             except Exception:
@@ -1831,37 +2070,229 @@ class NoriflowMemoryPlugin(BasePlugin):
             f"- [{it.id}] ({it.score:.2f}) {it.content}" for it in items
         )
 
+    def _owner_label(self, platform: str, uid: str) -> str:
+        """归属标注：最新非占位别名（uid），动态取名避免昵称漂移写死。"""
+        name = ""
+        kernel = self._memory_kernel
+        alias_store = getattr(kernel, "alias_store", None) if kernel is not None else None
+        if alias_store is not None:
+            try:
+                name = str(alias_store.name_for(platform, uid) or "").strip()
+            except Exception:
+                logger.warning("归属别名查询失败（回退 uid）", exc_info=True)
+                name = ""
+        if len(name) > 24:
+            name = name[:23] + "…"
+        return f"{name}（{uid}）" if name else f"（{uid}）"
+
+    async def _tool_search_facts(
+        self,
+        kernel,
+        query: str,
+        top_k: int,
+        category: str,
+        name: str,
+        sid: str,
+        uid: str,
+        plat: str,
+    ) -> str:
+        """memory_search 的 fact/relation 通道（对齐 nori _search_facts）。
+
+        作用域锁定：有 name 经实体解析收窄到该成员；无 name 锚定触发者，
+        缺用户定位拒绝检索（防跨会话事实泄漏）。
+        """
+        db = self._db
+        if db is None:
+            return "记忆功能未启用"
+        resolved: Optional[tuple[str, str]] = None
+        if name:
+            if not sid:
+                return "错误：缺少会话定位，无法解析名字。"
+            resolved, hint = await self._resolve_tool_name(sid, name)
+            if resolved is None:
+                return hint
+        elif not uid:
+            return "错误：缺少用户定位，拒绝检索（作用域锁定）。"
+        if category == "relation":
+            if not name:
+                return "错误：category=relation 需要提供 name（成员名字）。"
+            if resolved is None:
+                return "错误：名字解析失败。"
+            r_plat, r_uid = resolved
+            try:
+                # fetch_active_edges 收 "platform:uid" 复合键列表——传裸值
+                # 会被逐字符展开、条件恒不命中（按成员查关系永远空）
+                edges = await db.fetch_active_edges([f"{r_plat}:{r_uid}"])
+            except Exception:
+                logger.warning("关系边检索失败", exc_info=True)
+                return "记忆检索暂时不可用，请稍后再试"
+            if query:
+                needle = query.strip()
+                edges = [
+                    e for e in edges
+                    if needle in str(e.get("relation_label") or "")
+                    or needle in str(e.get("statement") or "")
+                ]
+            if not edges:
+                return f"没有查到「{name}」的关系记录。"
+            lines = []
+            for e in edges[:top_k]:
+                lines.append(
+                    f"- {str(e.get('statement') or '')[:400]}"
+                    f"（{e.get('evidence_count')} 次证据）"
+                )
+            return "\n".join(lines)
+        try:
+            query_vec = await kernel.embedding_service.embed_one(query or name)
+        except Exception:
+            logger.warning("检索向量化失败", exc_info=True)
+            return "检索向量化暂不可用，请稍后再试。"
+        if not query_vec:
+            return "检索向量化暂不可用，请稍后再试。"
+        try:
+            rows = await db.search_fact_clusters(
+                query_vec=query_vec,
+                limit=top_k,
+                platform=resolved[0] if resolved else plat,
+                user_ids=[resolved[1]] if resolved else [uid],
+                category=category if category else "",
+            )
+        except Exception:
+            logger.warning("事实簇检索失败", exc_info=True)
+            return "记忆检索暂时不可用，请稍后再试"
+        if not rows:
+            return "没有找到相关事实。"
+        lines = []
+        for r in rows:
+            # user_id 与 platform 同口径 .get 兜底（防缺列行 KeyError 带走
+            # 整次检索）；缺 uid 不输出归属段（（空）占位无信息量）
+            uid = r.get("user_id") or ""
+            owner = (
+                f"{self._owner_label(r.get('platform') or plat, uid)} "
+                if uid
+                else ""
+            )
+            lines.append(
+                f"- [簇{r['id']}] ({float(r['score']):.1f}分) "
+                f"{owner}"
+                f"{str(r['canonical_statement'] or '')[:400]}"
+                f"（{r['category']}，{r['status']}，证据{r['evidence_count']}次）"
+            )
+        return "\n".join(lines)
+
     @register.tool(
         name="memory_write",
-        description="把一条信息写入长期记忆库。仅当用户明确要求记住某事时调用。",
+        description=(
+            "把一条用户明确要求记住的人物事实直接写入事实库并立即"
+            "生效（无需等待后台合并）。仅当用户明确说「记住/记下」时"
+            "调用；对话中自然流露的信息不要用此工具（后台会自动提取）。"
+            "text 必须是绑定主体的第三人称完整陈述句。仅当用户更正一条"
+            "既有记忆时传 replaces_cluster_id（来自 memory_search 的 "
+            "fact 检索结果，新旧说法在单次调用内原子替换）。写入归属"
+            "锁定为当前用户，不可代他人写入。"
+        ),
         params={
             "type": "object",
             "properties": {
-                "text": {"type": "string", "description": "要记住的内容（完整陈述句）"},
-                "session_id": {"type": "string", "description": "归属会话 ID（不填默认当前会话）"},
-                "user_id": {"type": "string", "description": "归属用户 ID（不填默认当前会话用户）"},
-                "platform": {"type": "string", "description": "平台标识（如 napcat；不填自动从当前会话推断）"},
+                "text": {
+                    "type": "string",
+                    "description": (
+                        "完整陈述句（第三人称绑定主体，如「小周不吃辣」；"
+                        "commitment 须含具体日期，如「9 月 12 日和小林去爬山」）"
+                    ),
+                },
+                "category": {
+                    "type": "string",
+                    "enum": list(_ACTIVE_CATEGORIES),
+                    "description": (
+                        "六选一："
+                        + "；".join(
+                            f"{k}={v}"
+                            for k, v in _CATEGORY_HINTS.items()
+                            if k in _ACTIVE_CATEGORIES
+                        )
+                        + "。拿不准归 stable"
+                        + "。relation 不在值域：人际关系类内容"
+                        "（谁是谁的什么人）不支持此参数，勿传入"
+                    ),
+                },
+                "confidence": {
+                    "type": "string",
+                    "enum": ["high", "medium"],
+                    "description": "置信度（默认 high：用户明确指令）",
+                },
+                "replaces_cluster_id": {
+                    "type": "integer",
+                    "description": (
+                        "被更正的旧簇 id（仅更正场景传；新簇继承旧簇"
+                        "分数，旧说法转为已替代）"
+                    ),
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": (
+                        "归属会话 ID（裸会话 ID；仅宿主关闭 "
+                        "tool_scope_locked 时生效，默认钉死为当前"
+                        "会话，通常不填）"
+                    ),
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": (
+                        "归属用户 ID（仅宿主关闭 tool_scope_locked 时"
+                        "生效，默认钉死为触发者，通常不填）"
+                    ),
+                },
+                "platform": {
+                    "type": "string",
+                    "description": (
+                        "归属平台（与 user_id 配套；仅宿主关闭 "
+                        "tool_scope_locked 时生效）"
+                    ),
+                },
             },
-            "required": ["text"],
+            "required": ["text", "category"],
         },
     )
-    async def memory_write(self, event, *_, text: str, session_id: str = "", user_id: str = "", platform: str = "") -> str:
+    async def memory_write(
+        self,
+        event,
+        *_,
+        text: str,
+        category: str = "",
+        confidence: str = "high",
+        replaces_cluster_id=None,
+        session_id: str = "",
+        user_id: str = "",
+        platform: str = "",
+    ) -> str:
         denial = self._whitelist_denial(event, "memory_write")
         if denial:
             return denial
         kernel = self._memory_kernel
-        if kernel is None or not self._ready:
+        db = self._db
+        if kernel is None or db is None or not self._ready:
             return "记忆功能未启用"
         text = (text or "").strip()
+        category = (category or "").strip()
+        confidence = (confidence or "high").strip()
         if not text:
             return "text 不能为空"
+        if len(text) > _MAX_STATEMENT_CHARS:
+            return f"错误：text 超过 {_MAX_STATEMENT_CHARS} 字，请精简为一句陈述。"
+        if category not in _ACTIVE_CATEGORIES:
+            return (
+                "错误：category 六选一（identity/stable/preference/"
+                "commitment/interaction/naming）。"
+            )
+        if confidence not in ("high", "medium"):
+            return "错误：confidence 只能是 high 或 medium。"
         sid = (session_id or "").strip()
         uid = (user_id or "").strip()
         plat = (platform or "").strip()
         if self._tool_scope_lock_enabled():
             # 作用域锁定：写入归属钉死为触发会话/触发者（防越权写入
-            # 他人会话名下伪造记忆）；作用域派生失败时与 memory_remove
-            # 同口径显式拒绝，不静默落一行空归属记忆
+            # 他人名下伪造记忆）；作用域派生失败时显式拒绝
             sid, uid, plat = self._event_scope(event)
             if not (sid or uid):
                 return "作用域锁定开启且无法识别当前会话/用户，拒绝写入"
@@ -1870,21 +2301,73 @@ class NoriflowMemoryPlugin(BasePlugin):
             sid = sid or ev_sid
             uid = uid or ev_uid
             plat = plat or ev_plat
-        pairs = [(plat, uid)] if plat and uid else None
+        if not (plat and uid):
+            return "错误：缺少用户定位，拒绝写入（作用域锁定）。"
+        replaces: Optional[int] = None
+        raw_replaces: Optional[int] = None
+        if (
+            replaces_cluster_id is not None
+            and str(replaces_cluster_id).strip() != ""
+        ):
+            try:
+                raw_replaces = int(str(replaces_cluster_id).strip())
+            except (TypeError, ValueError):
+                return "错误：replaces_cluster_id 必须是整数（memory_search 结果里的簇 id）。"
+        if raw_replaces is not None:
+            replaces = raw_replaces
+            # 作用域锁定（replace 目标校验，对齐 nori PR#4 安全修复）：
+            # 模型可能把 memory_search(name=他人) 拿到的簇 id 误作更正
+            # 目标——跨用户 replace 会把他人簇置 replaced 并删其画像
+            # 投影。目标簇必须属于触发者
+            try:
+                owner = await db.fetch_cluster_owner(replaces)
+            except Exception:
+                logger.warning("replace 目标归属校验失败", exc_info=True)
+                return "写入失败，请稍后再试。"
+            # 不存在与属于他人同款输出：簇 id 自增可枚举，双文案即存在性
+            # 预言机（cluster_status_op / restore_summary 均已同款化，此处
+            # 对齐；引导语义并入同一条文本）
+            if owner is None or owner != (plat, uid):
+                return (
+                    "错误：更正目标不存在或不属于当前用户（作用域锁定）；"
+                    "他人的说法变化请作为新观察记录，不要替代其原有簇，"
+                    "自己的簇请先用 memory_lookup 确认 id。"
+                )
         try:
-            doc_id = await kernel.ingest(
-                content=text,
-                session_id=sid,
-                user_id=uid,
+            summary = await kernel.write_fact(
+                statement=text,
+                category=category,
+                confidence=confidence,
                 platform=plat,
-                kind="chat_summary",
-                timestamp=datetime.now(),
-                participant_user_ids=pairs,
+                session_id=sid,
+                group_id="",
+                user_id=uid,
+                display_name="",
+                replaces_cluster_id=replaces,
             )
         except Exception:
             logger.warning("memory_write 工具失败", exc_info=True)
             return "写入失败：记忆库暂时不可用，请稍后再试"
-        return f"已写入长期记忆（id={doc_id}）"
+        if summary.get("action") == "skipped":
+            if replaces is not None:
+                # 更正路径换幂等键重试后仍 skipped = 同一更正当日已执行过
+                return "这条更正今天已经执行过了（幂等跳过，未重复执行）。"
+            return "这条事实今天已经记录过了（幂等跳过，未重复计分）。"
+        cluster_id = summary.get("cluster_id")
+        embedded_note = (
+            ""
+            if summary.get("embedded", True)
+            else "（向量服务暂不可用，数分钟内自动补算后才能被检索到）"
+        )
+        if summary.get("action") == "replace":
+            return (
+                f"已更正：新记忆已生效（簇 {cluster_id}，替代旧簇 "
+                f"{replaces}，分数继承 {summary.get('score')}）。{embedded_note}"
+            )
+        return (
+            f"已记住（簇 {cluster_id}，当前状态 {summary.get('status')}）。"
+            f"{embedded_note}"
+        )
 
     @register.tool(
         name="memory_remove",
@@ -1926,6 +2409,281 @@ class NoriflowMemoryPlugin(BasePlugin):
         if scope_sid or scope_uid:
             return "记忆条目不存在或不属于当前会话/用户"
         return "记忆条目不存在"
+
+    @register.tool(
+        name="memory_profile",
+        description=(
+            "按名字查询一位成员的画像（基本信息/称呼/事实/喜好/约定/"
+            "互动偏好/近期动态/待定信息）。上下文画像块中已出现的人"
+            "不要再查；仅当想了解的人不在画像块中时使用（名字需与他在"
+            "对话中出现过的称呼一致，支持历史昵称变体）。"
+        ),
+        params={
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "成员名字（对话中出现过的称呼）",
+                },
+            },
+            "required": ["name"],
+        },
+    )
+    async def memory_profile(self, event, *_, name: str) -> str:
+        denial = self._whitelist_denial(event, "memory_profile")
+        if denial:
+            return denial
+        kernel = self._memory_kernel
+        persona = self._persona_service
+        if kernel is None or persona is None or not self._ready:
+            return "记忆功能未启用"
+        name = (name or "").strip()
+        if not name:
+            return "错误：name 不能为空。"
+        sid, _uid, _plat = self._event_scope(event)
+        if not sid:
+            return "错误：缺少会话定位，无法解析名字。"
+        resolved, hint = await self._resolve_tool_name(sid, name)
+        if resolved is None:
+            return hint
+        platform, uid = resolved
+        try:
+            text = await persona.build_profile_text(
+                uid, session_id=sid, platform=platform
+            )
+        except Exception:
+            logger.warning("memory_profile 工具失败", exc_info=True)
+            return "画像查询失败，请稍后再试。"
+        if not text:
+            return f"「{name}」暂无画像内容（还没有足够的对话事实沉淀）。"
+        return text
+
+    @register.tool(
+        name="memory_lookup",
+        description=(
+            "维护性深查：检索**非激活状态**的记忆——已归档的对话摘要"
+            "与已失效/被替代/待定的事实簇（memory_search 查不到它们）。"
+            "结果带状态标注与 id；用户提起「很久以前的事」而常规检索"
+            "为空、或想恢复某条被淡忘的记忆时使用，随后可用 "
+            "memory_correct(reactivate) 重新激活。"
+        ),
+        params={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "检索关键词"},
+                "target": {
+                    "type": "string",
+                    "enum": ["summary", "fact"],
+                    "description": "检索目标，默认 summary",
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "返回条数上限，默认 5，最大 10",
+                },
+            },
+            "required": ["query"],
+        },
+    )
+    async def memory_lookup(
+        self, event, *_, query: str, target: str = "summary", top_k: int = 5
+    ) -> str:
+        denial = self._whitelist_denial(event, "memory_lookup")
+        if denial:
+            return denial
+        kernel = self._memory_kernel
+        db = self._db
+        if kernel is None or db is None or not self._ready:
+            return "记忆功能未启用"
+        query = (query or "").strip()
+        if not query:
+            return "错误：query 不能为空。"
+        target = (target or "summary").strip()
+        if target not in ("summary", "fact"):
+            return "错误：target 只能是 summary 或 fact。"
+        try:
+            top_k = max(1, min(int(top_k or 5), _MAX_TOP_K))
+        except (TypeError, ValueError):
+            top_k = 5
+        sid, uid, plat = self._event_scope(event)
+        try:
+            query_vec = await kernel.embedding_service.embed_one(query)
+            if not query_vec:
+                return "检索向量化暂不可用，请稍后再试。"
+            if target == "summary":
+                if not sid:
+                    # 防止 db 侧退化全库召回（与 search 同款拒绝）
+                    return "错误：缺少会话定位，拒绝检索（作用域锁定）。"
+                rows = await db.search_chat_summaries(
+                    query_vec=query_vec,
+                    limit=top_k,
+                    scope="session",
+                    session_id=sid,
+                    only_archived=True,
+                    query_text=query,
+                    hybrid=self._config.hybrid_search_enabled,
+                    with_embedding=False,
+                )
+                # 契约：工具描述承诺只检索非激活记忆——only_archived 把
+                # 过滤下推进 SQL，生效行不进相似度候选窗，数量再多也挤
+                # 不出归档行（固定倍数池 + 调用方过滤会在生效行超池时
+                # 假阴性）；db 侧行序即相似度序
+                if not rows:
+                    return "没有找到已归档的相关记忆。"
+                lines = []
+                for r in rows:
+                    lines.append(
+                        f"- [id:{r['id']}][{r['document_id']}][已归档] "
+                        f"({float(r['relevance']):.2f}) · "
+                        f"{str(r['content'] or '')[:400]}"
+                    )
+                return "\n".join(lines)
+            if not uid:
+                # 作用域锁定：维护检索钉死触发者，防翻出其他用户事实簇
+                return "错误：缺少用户定位，拒绝检索（作用域锁定）。"
+            rows = await db.search_fact_clusters(
+                query_vec=query_vec,
+                limit=top_k,
+                platform=plat,
+                user_ids=[uid],
+                only_inactive=True,
+            )
+            # 契约同上：only_inactive 在 SQL 侧只留 replaced/dead/
+            # pending_uncertain，active/profiled 的生效簇走 memory_search
+            # 的既有通道，不进此处候选窗
+            if not rows:
+                return "没有找到已失效/被替代/待定的相关事实簇。"
+            markers = {
+                "replaced": "[已替代]",
+                "dead": "[已失效]",
+                "pending_uncertain": "[待定]",
+            }
+            lines = []
+            for r in rows:
+                marker = markers.get(str(r["status"]), "")
+                # user_id 与 platform 同口径 .get 兜底（见 memory_search）
+                uid = r.get("user_id") or ""
+                owner = (
+                    f"{self._owner_label(r.get('platform') or plat, uid)} "
+                    if uid
+                    else ""
+                )
+                lines.append(
+                    f"- [簇{r['id']}]{marker} {owner}"
+                    f"{str(r['canonical_statement'] or '')[:400]}"
+                    f"（{r['category']}，证据{r['evidence_count']}次）"
+                )
+            return "\n".join(lines)
+        except Exception:
+            logger.warning("memory_lookup 工具失败", exc_info=True)
+            return "维护检索失败，请稍后再试。"
+
+    @register.tool(
+        name="memory_correct",
+        description=(
+            "调整记忆状态（不修改内容本身）。action：drop=彻底否定"
+            "（簇转失效并退出画像）；dispute=存疑降权（打矛盾标记，"
+            "自然衰减淡出，适合拿不准或部分过时）；reactivate=重新"
+            "激活（归档摘要恢复召回 / 失效簇复活，与 memory_lookup "
+            "配合）。更正内容本身请用 memory_write(replaces_cluster_id)"
+            " 原子替换。id 来自 memory_search / memory_lookup 的结果。"
+        ),
+        params={
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "enum": ["summary", "fact"],
+                    "description": "操作对象：对话摘要 / 事实簇",
+                },
+                "id": {
+                    "type": "integer",
+                    "description": (
+                        "行 id（fact=簇 id；summary 为摘要行 id——"
+                        "取 memory_lookup 结果行的 [id:N] 前缀，"
+                        "非 document_id）"
+                    ),
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["drop", "dispute", "reactivate"],
+                    "description": "drop/dispute 仅 fact；reactivate 两者皆可",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "操作原因（用户原话或语境，审计留痕）",
+                },
+            },
+            "required": ["target", "id", "action", "reason"],
+        },
+    )
+    async def memory_correct(
+        self, event, *_, target: str, id: int, action: str, reason: str
+    ) -> str:
+        denial = self._whitelist_denial(event, "memory_correct")
+        if denial:
+            return denial
+        db = self._db
+        if db is None or not self._ready:
+            return "记忆功能未启用"
+        target = (target or "").strip()
+        action = (action or "").strip()
+        reason = (reason or "").strip()
+        if not reason:
+            return "错误：reason 必填（审计留痕）。"
+        try:
+            row_id = int(id)
+        except (TypeError, ValueError):
+            return "错误：id 必须是整数。"
+        if target not in ("summary", "fact"):
+            return "错误：target 只能是 summary 或 fact。"
+        sid, uid, plat = self._event_scope(event)
+        try:
+            if target == "summary":
+                # 作用域锁定：恢复归属钉死当前会话（自增 id 可被诱导
+                # 传入他人行 id，db 侧 session 校验拦截跨用户篡改）
+                if action != "reactivate":
+                    return "错误：摘要只支持 reactivate（删除请走 memory_remove）。"
+                if not sid:
+                    return "错误：缺少会话定位，拒绝调整（作用域锁定）。"
+                restored = await db.restore_summary(row_id, sid)
+                if not restored:
+                    return "未变更：本会话没有该归档摘要。"
+                logger.info(
+                    "[记忆工具] 归档摘要已恢复: id=%s reason=%s", row_id, reason
+                )
+                return "已恢复：该摘要重新进入召回。"
+            if action not in ("drop", "dispute", "reactivate"):
+                return "错误：fact 支持 drop / dispute / reactivate。"
+            if not (plat and uid):
+                return "错误：缺少用户定位，拒绝调整（作用域锁定）。"
+            result = await db.cluster_status_op(
+                row_id, action, platform=plat, user_id=uid
+            )
+            if result.get("changed"):
+                logger.info(
+                    "[记忆工具] 簇状态调整: id=%s action=%s reason=%s",
+                    row_id, action, reason,
+                )
+                verb = {
+                    "drop": "已否定（转失效并退出画像，可再激活）",
+                    "dispute": "已标记存疑（降权淡出，再被提及时自动恢复确信）",
+                    "reactivate": "已重新激活",
+                }[action]
+                return verb + "。"
+            status = str(result.get("status") or "")
+            if not status:
+                return "未变更：簇不存在。"
+            if action == "reactivate" and status == "replaced":
+                successor = result.get("replaced_by")
+                return (
+                    f"该说法已有更正版本（簇 {successor}）。如更正本身有误，"
+                    f"请对继任簇 {successor} 执行 dispute，或用 memory_write 带 "
+                    f"replaces_cluster_id={successor} 重新更正。"
+                )
+            return f"未变更：簇当前状态为 {status}，不适用 {action}。"
+        except Exception:
+            logger.warning("memory_correct 工具失败", exc_info=True)
+            return "记忆状态调整失败，请稍后再试。"
 
     # ------------------------------------------------------------------
     #  维护页 + API（数据层见 webui_store.py）
@@ -2270,10 +3028,14 @@ class NoriflowMemoryPlugin(BasePlugin):
         #    validated 已通过模型校验，赋值安全）
         for name in config_web.config_schema():
             setattr(self._config, name, getattr(result["validated"], name))
-        # timezone 变更后使内核时区缓存失效：_local_tz_cache 首次解析后不再
-        # 失效（相对时间标注/幂等键日期口径共用），不重置则继续用旧时区
-        if "timezone" in changed and self._memory_kernel is not None:
-            self._memory_kernel.reset_local_tz_cache()
+        # timezone 变更后使 kernel 与 persona 两处时区缓存失效：缓存首次
+        # 解析后不再失效（相对时间标注/幂等键日期口径/画像尾注共用），
+        # 不重置则继续用旧时区
+        if "timezone" in changed:
+            if self._memory_kernel is not None:
+                self._memory_kernel.reset_local_tz_cache()
+            if self._persona_service is not None:
+                self._persona_service.reset_local_tz_cache()
 
         # 2) 宿主真相源同步：内存 dict（宿主配置页/下次 init_plugin 读）+ 磁盘
         merged_host = dict(host_values)

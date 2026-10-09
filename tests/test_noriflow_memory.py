@@ -30,183 +30,33 @@ import sys
 import tempfile
 import types
 import unittest
+import unittest.mock
+from typing import Literal, get_args, get_origin
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# 桩设施统一入口（review 2026-09-12 冗余项 1）
+from plugin_env import install_host_stubs, load_plugin_module  # noqa: E402
 
 # ---------------------------------------------------------------------------
 #  core.* 桩模块（先于加载插件主模块注入）
 # ---------------------------------------------------------------------------
+#  core.* 桩与插件主模块加载（已统一至 tests/plugin_env，review 冗余项 1）
+# ---------------------------------------------------------------------------
 
 
 def _install_core_stubs() -> None:
-    core = types.ModuleType("core")
-    sys.modules["core"] = core
-
-    plugin_mod = types.ModuleType("core.plugin")
-
-    class Priority:
-        LOW = -50
-        MEDIUM = 0
-        HIGH = 50
-
-    class BasePlugin:
-        def __init__(self, ctx, cfg):
-            self.ctx = ctx
-            self.plugin_cfg = cfg
-
-    class _On:
-        def __init__(self):
-            self.calls = []
-
-        def __getattr__(self, name):
-            def deco(*args, **kwargs):
-                def wrap(func):
-                    self.calls.append((name, args, kwargs, func.__name__))
-                    return func
-
-                return wrap
-
-            return deco
-
-    class _Register:
-        def __init__(self):
-            self.tools = []
-            self.pages = []
-            self.apis = []
-
-        def tool(self, name, description, params):
-            def wrap(func):
-                self.tools.append({"name": name, "description": description, "params": params, "func": func.__name__})
-                return func
-
-            return wrap
-
-        def page(self, route, menu=None):
-            def wrap(func):
-                self.pages.append({"route": route, "menu": menu, "func": func.__name__})
-                return func
-
-            return wrap
-
-        def api(self, method, path, auth=True, **kwargs):
-            def wrap(func):
-                self.apis.append({"method": method, "path": path, "auth": auth, "func": func.__name__})
-                return func
-
-            return wrap
-
-    on_inst = _On()
-    register_inst = _Register()
-
-    class PluginPage:
-        @staticmethod
-        def from_folder(path):
-            return ("folder", path)
-
-    class PageMenu:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-
-    def get_logger(*args, **kwargs):
-        import logging
-
-        return logging.getLogger("stub")
-
-    plugin_mod.BasePlugin = BasePlugin
-    plugin_mod.Priority = Priority
-    plugin_mod.on = on_inst
-    plugin_mod.register = register_inst
-    plugin_mod.PluginPage = PluginPage
-    plugin_mod.PageMenu = PageMenu
-    plugin_mod.logger = get_logger()
-    sys.modules["core.plugin"] = plugin_mod
-
-    logging_mgr = types.ModuleType("core.logging_manager")
-    logging_mgr.get_logger = get_logger
-    sys.modules["core.logging_manager"] = logging_mgr
-
-    chat_mod = types.ModuleType("core.chat")
-    elements_mod = types.ModuleType("core.chat.message_elements")
-
-    class Text:
-        def __init__(self, text=""):
-            self.text = text
-
-    class At:
-        def __init__(self, pid="", nickname=None):
-            self.pid = str(pid)
-            self.nickname = nickname
-
-    class Reply:
-        def __init__(self, message_id="", message_content=None, chain=None):
-            self.message_id = str(message_id)
-            self.message_content = message_content
-            self.chain = chain
-
-    elements_mod.Text = Text
-    elements_mod.At = At
-    elements_mod.Reply = Reply
-    sys.modules["core.chat"] = chat_mod
-    sys.modules["core.chat.message_elements"] = elements_mod
-
-    prompt_mod = types.ModuleType("core.prompt_manager")
-
-    class Prompt:
-        def __init__(self, content="", name="", source="", **kwargs):
-            self.content = content
-            self.name = name
-            self.source = source
-
-    prompt_mod.Prompt = Prompt
-    sys.modules["core.prompt_manager"] = prompt_mod
-
-    provider_mod = types.ModuleType("core.provider")
-
-    class LLMRequest:
-        # 桩：仅承接 clients.FastLlmExit 用到的构造参数与 tool_choice 推导
-        def __init__(self, messages=None, tools=None, tool_funcs=None,
-                     tool_set=None, tool_choice=None):
-            self.messages = messages or []
-            self.tools = tools
-            self.tool_choice = tool_choice or ("auto" if tools else "none")
-
-    provider_mod.LLMRequest = LLMRequest
-    sys.modules["core.provider"] = provider_mod
-
-    fastapi_stub = sys.modules.get("fastapi")
-    if fastapi_stub is None:
-        # 真包已安装；若缺失则兜底桩件
-        fastapi_stub = types.ModuleType("fastapi")
-
-        class HTTPException(Exception):
-            def __init__(self, status_code=400, detail=""):
-                self.status_code = status_code
-                self.detail = detail
-                super().__init__(detail)
-
-        def Body(*args, **kwargs):
-            return None
-
-        fastapi_stub.HTTPException = HTTPException
-        fastapi_stub.Body = Body
-        sys.modules["fastapi"] = fastapi_stub
+    """兼容别名：桩安装实现迁至 plugin_env（直跑入口保持可用）。"""
+    install_host_stubs()
 
 
 def _load_plugin_module():
-    _install_core_stubs()
-    pkg = types.ModuleType("noriflow_memory_pkg")
-    pkg.__path__ = [str(PLUGIN_DIR)]
-    sys.modules["noriflow_memory_pkg"] = pkg
-    spec = importlib.util.spec_from_file_location(
-        "noriflow_memory_pkg.main", PLUGIN_DIR / "main.py"
-    )
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["noriflow_memory_pkg.main"] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    """加载插件主模块（幂等；pytest 收集与 python 直跑共用同一实例）。"""
+    return load_plugin_module()
 
 
 # ---------------------------------------------------------------------------
@@ -274,12 +124,19 @@ class FakeDB:
         self.pool = FakePool()
         self.inserted_summaries = []
         self.inserted_facts = []
+        self.applied_merges = []     # memory_write 直写路径的 apply 调用记录
         self.deleted_ids = []
         self.connect_calls = 0
         self.migrations = None
         self.closed = False
         self.unsummarized_rows = []   # 补编码遍预设行
         self.encoded_updates = []     # update_chat_summary_encoded 调用记录
+        self.cluster_owner_result = None  # fetch_cluster_owner 可配置返回
+        self.merge_outcomes = []         # apply_fact_merge 可配置结果队列
+        self.summary_search_rows = []     # memory_lookup summary 检索桩
+        self.summary_search_kwargs = None
+        self.fact_search_rows = []        # memory_lookup fact 检索桩
+        self.fact_search_kwargs = None
 
     async def connect(self):
         self.connect_calls += 1
@@ -299,6 +156,45 @@ class FakeDB:
 
     async def insert_persona_fact_raw(self, **kwargs):
         self.inserted_facts.append(kwargs)
+
+    async def upsert_persona_fact_raw_for_apply(self, **kwargs):
+        self.inserted_facts.append(kwargs)
+        return 9000 + len(self.inserted_facts)
+
+    async def fetch_cluster_owner(self, cluster_id):
+        return self.cluster_owner_result
+
+    async def search_chat_summaries(self, **kwargs):
+        self.summary_search_kwargs = kwargs
+        rows = list(self.summary_search_rows)
+        if kwargs.get("only_archived"):
+            # 模拟 db 侧 only_archived 下推（真库在 SQL WHERE 过滤）
+            rows = [r for r in rows if r.get("archived")]
+        return rows
+
+    async def search_fact_clusters(self, **kwargs):
+        self.fact_search_kwargs = kwargs
+        rows = list(self.fact_search_rows)
+        if kwargs.get("only_inactive"):
+            # 模拟 db 侧 only_inactive 下推（真库在 SQL 状态集过滤）
+            rows = [
+                r for r in rows
+                if str(r["status"]) in
+                ("replaced", "dead", "pending_uncertain")
+            ]
+        return rows
+
+    async def apply_fact_merge(self, **kwargs):
+        self.applied_merges.append(kwargs)
+        if self.merge_outcomes:
+            # 可配置出队：模拟乐观锁 skipped / 正常 create|replace 序列
+            return self.merge_outcomes.pop(0)
+        return {
+            "action": kwargs.get("action"),
+            "cluster_id": 555,
+            "score": 3,
+            "status": "active",
+        }
 
     async def delete_chat_summary(self, document_id, **scope_kwargs):
         self.deleted_ids.append((document_id, scope_kwargs))
@@ -323,6 +219,7 @@ class FakeToolSet:
 class FakeReq:
     def __init__(self):
         self.system_prompt = []
+        self.user_prompt = []
         self.tool_set = FakeToolSet()
 
 
@@ -1020,15 +917,23 @@ class TestPersonaService(unittest.TestCase):
         class StubDB:
             async def fetch_profile_sections(self, platform, user_id, limit):
                 return {
-                    "identity": ["住在杭州"],
-                    "stable": [f"喜欢{user_id}猫"],
+                    "identity": [("住在杭州", None)],
+                    "stable": [(f"喜欢{user_id}猫", None)],
+                    "preference": [("不吃辣", None)],
+                    "commitment": [("9月12日和小林去爬山", None)],
+                    "interaction": [("喜欢被叫大神", None)],
+                    "naming": [("叫他明明哥", None)],
+                    "recent": [("在准备考试", None)],
                 }
 
             async def fetch_uncertain_statements(self, platform, user_id, limit):
-                return ["可能在减肥"]
+                return [("可能在减肥", None)]
 
             async def fetch_latest_display_name(self, platform, user_id):
                 return "小明"
+
+            async def fetch_alias_variants(self, platforms, uids):
+                return {("napcat", "u1"): ["明明", "小明"]}
 
         return mod.LocalPersonaService(
             db=StubDB(), config=mod._build_config({"dsn": "x", "topic_blacklist": blacklist or []}),
@@ -1042,6 +947,23 @@ class TestPersonaService(unittest.TestCase):
         self.assertIn("小明：", text)
         self.assertIn("## 基本信息", text)
         self.assertIn("可能在减肥", text)
+
+    def test_29b_profile_sections_and_alias_row(self):
+        # 画像 8 维度（对齐 nori 侧）：preference/commitment 栏位落位 +
+        # "其他名称"栏（alias 层变体，排除当前称呼，置于基本信息之后）
+        svc = self._svc()
+        text = asyncio.run(svc.build_profile_text(user_id="u1", platform="napcat"))
+        self.assertIn("## 喜好偏好\n- 不吃辣", text)
+        self.assertIn("## 约定承诺\n- 9月12日和小林去爬山", text)
+        self.assertIn("## 其他名称\n- 明明", text)
+        self.assertNotIn("- 小明\n", text)  # 当前称呼仅作抬头，不进其他名称栏
+        order = [
+            "## 基本信息", "## 其他名称", "## 称呼偏好", "## 已知事实",
+            "## 喜好偏好", "## 约定承诺", "## 互动偏好", "## 近期动态",
+            "## 待定信息",
+        ]
+        positions = [text.index(t) for t in order]
+        self.assertEqual(positions, sorted(positions))
 
     def test_30_blacklist_filters(self):
         svc = self._svc(blacklist=["猫"])
@@ -1069,6 +991,112 @@ class TestPersonaService(unittest.TestCase):
         self.assertEqual(len(sqls), 2)
         for sql in sqls:
             self.assertNotIn("ANY(related_user_ids)", sql)
+
+    def test_29c_recent_and_uncertain_time_labels(self):
+        # 时效栏（近期动态/待定信息）条目带发生时间尾注（与 recall 记忆块
+        # 逐字同款）；长期栏不加——过期事实冒充近况的时序幻觉修复
+        fixed_now = datetime(2026, 10, 8, 4, 0, tzinfo=timezone.utc)
+        aug24 = datetime(2026, 8, 24, 1, 40, 16, tzinfo=timezone.utc)
+
+        class TimedStubDB:
+            async def fetch_profile_sections(self, platform, user_id, limit):
+                return {
+                    "identity": [("住在杭州", None)],
+                    "commitment": [("答应陪看电影（10月5日）", None)],
+                    "recent": [("最近在学滑雪", aug24)],
+                }
+
+            async def fetch_uncertain_statements(self, platform, user_id, limit):
+                return [("疑似早起困难", aug24), ("常喝咖啡（已被更正）", None)]
+
+            async def fetch_latest_display_name(self, platform, user_id):
+                return "小明"
+
+            async def fetch_alias_variants(self, platforms, uids):
+                return {}
+
+        svc = mod.LocalPersonaService(
+            db=TimedStubDB(),
+            config=mod._build_config({"dsn": "x", "timezone": "Asia/Shanghai"}),
+        )
+        with unittest.mock.patch.object(
+            mod.LocalPersonaService, "_now", staticmethod(lambda: fixed_now)
+        ):
+            text = asyncio.run(
+                svc.build_profile_text(user_id="u1", platform="napcat")
+            )
+        self.assertIn("## 近期动态\n- 最近在学滑雪（约1个月前 · 8月24日）", text)
+        self.assertIn(
+            "## 待定信息\n- 疑似早起困难（约1个月前 · 8月24日）\n- 常喝咖啡（已被更正）",
+            text,
+        )
+        # 长期栏：无尾注；commitment 按编码要求自带的日期原样保留
+        self.assertIn("## 约定承诺\n- 答应陪看电影（10月5日）\n", text)
+
+    def test_29d_parse_profile_keeps_time_suffix(self):
+        # get_profile 解析零剥离：日期/相对时距形态与陈述自带内容不可
+        # 区分，剥离零收益换误删敞口——尾注原样保留（时距锚本身是信息）
+        markdown = (
+            "## 近期动态\n"
+            "- 最近在学滑雪（约1个月前 · 8月24日）\n"
+            "- 买了新电脑（10月5日）\n\n"
+            "## 待定信息\n"
+            "- 疑似早起困难（3天前 · 10月5日 14:30）\n\n"
+            "## 约定承诺\n"
+            "- 答应陪用户看电影（10月5日）"
+        )
+        profile = mod.LocalPersonaService._parse_profile("90001", markdown)
+        self.assertEqual(
+            profile.recent_updates,
+            ["最近在学滑雪（约1个月前 · 8月24日）", "买了新电脑（10月5日）"],
+        )
+        self.assertEqual(
+            profile.unverified_notes,
+            ["疑似早起困难（3天前 · 10月5日 14:30）"],
+        )
+        self.assertEqual(
+            profile.memory_points, ["答应陪用户看电影（10月5日）"]
+        )
+
+    def test_29e_persona_local_tz_cached(self):
+        # persona 时区懒解析缓存：非法 timezone 只解析一次（防每次注入
+        # 重复落 warning），reset 后按新配置重解析
+        svc = mod.LocalPersonaService(
+            db=None,
+            config=mod._build_config({"dsn": "x", "timezone": "Asia/Shanghai"}),
+        )
+        self.assertIsNone(svc._tz_cache)
+        tz1 = svc._local_tz()
+        tz2 = svc._local_tz()
+        self.assertIs(tz1, tz2)
+        self.assertIsNotNone(svc._tz_cache)
+        svc.reset_local_tz_cache()
+        self.assertIsNone(svc._tz_cache)
+
+    def test_29f_dedupe_keep_time_prefers_nonnull(self):
+        # 跨键同文去重：首条 None 后条非空补上时间锚，非空不被 None 覆盖
+        # 经插件模块树取共享 helper（mod 是插件包的 main 模块，db 是兄弟包）
+        pkg = mod.__name__.rsplit(".", 1)[0]
+        _dedupe_keep_time = sys.modules[f"{pkg}.db.base"]._dedupe_keep_time
+
+        items = []
+        _dedupe_keep_time(items, "喜欢猫", None)
+        _dedupe_keep_time(
+            items, "喜欢猫", datetime(2026, 8, 24, 9, 40, tzinfo=timezone.utc)
+        )
+        _dedupe_keep_time(
+            items, "在学钢琴", datetime(2026, 9, 1, tzinfo=timezone.utc)
+        )
+        _dedupe_keep_time(items, "在学钢琴", None)
+        _dedupe_keep_time(items, "新条目", None)
+        self.assertEqual(
+            items,
+            [
+                ("喜欢猫", datetime(2026, 8, 24, 9, 40, tzinfo=timezone.utc)),
+                ("在学钢琴", datetime(2026, 9, 1, tzinfo=timezone.utc)),
+                ("新条目", None),
+            ],
+        )
 
 
 class TestMergeAgentCycle(unittest.TestCase):
@@ -1707,7 +1735,7 @@ class TestPluginRetain(unittest.TestCase):
 
 
 class TestPluginInjection(unittest.TestCase):
-    def _inject(self, cfg=None, with_msgs=True, uid="u1"):
+    def _inject(self, cfg=None, with_msgs=True, uid="u1", user_prompt=True):
         # whitelist the trigger uid by default (fail-closed gate, see 51c/51d)
         base = {"dsn": "postgres://u:p@127.0.0.1:5432/db", "allowed_users": [uid]}
         if cfg:
@@ -1734,6 +1762,10 @@ class TestPluginInjection(unittest.TestCase):
         inst._memory_kernel = self._stub_kernel
         inst._persona_service = StubPersona()
         req = FakeReq()
+        if user_prompt is None:
+            del req.user_prompt
+        elif user_prompt is not True:
+            req.user_prompt = user_prompt
         req.tool_set.names = set(mod.ALL_TOOLS)
         event = types.SimpleNamespace(
             session=FakeSession(),
@@ -1744,11 +1776,24 @@ class TestPluginInjection(unittest.TestCase):
 
     def test_50_inject_appends_prompts(self):
         inst, req = self._inject()
-        names = [p.name for p in req.system_prompt]
+        names = [p.name for p in req.user_prompt]
         self.assertIn(f"{mod.PLUGIN_ID}:recall", names)
         self.assertIn(f"{mod.PLUGIN_ID}:profile", names)
-        recall = next(p for p in req.system_prompt if p.name.endswith(":recall"))
+        recall = next(p for p in req.user_prompt if p.name.endswith(":recall"))
         self.assertIn("# 相关长期记忆", recall.content)
+        # 动态记忆块注入 user prompt（紧邻用户输入前，保 system+历史稳定
+        # 前缀命中缓存），且仅本轮生效不写回历史
+        self.assertTrue(all(p.persist is False for p in req.user_prompt))
+        for suffix in (":rollout", ":recall", ":profile"):
+            self.assertNotIn(
+                f"{mod.PLUGIN_ID}{suffix}",
+                [p.name for p in req.system_prompt],
+            )
+        # 静态工具准则仍留在可缓存前缀（system prompt）内
+        self.assertIn(
+            f"{mod.PLUGIN_ID}:tools",
+            [p.name for p in req.system_prompt],
+        )
         # cross_session 与隔离开关联动（默认会话隔离——开关联动断言在
         # 默认翻转后改为显式关隔离构造，见本类后续用例）
         self.assertFalse(self._stub_kernel.kwargs["cross_session"])
@@ -1788,6 +1833,7 @@ class TestPluginInjection(unittest.TestCase):
 
     def test_52_no_messages_no_prompts(self):
         inst, req = self._inject(with_msgs=False)
+        self.assertEqual(req.user_prompt, [])
         self.assertEqual(req.system_prompt, [])
         # identity-less batch -> whitelist fail-closed removes the tools
         # (the "ready keeps all tools enabled" assertion moved to test_50)
@@ -1805,7 +1851,7 @@ class TestPluginInjection(unittest.TestCase):
     def test_52c_rollout_prompt_prepended_before_recall(self):
         # 滚动补回块注入为独立 Prompt，且时间线先于 recall 块
         inst, req = self._inject()
-        names = [p.name for p in req.system_prompt]
+        names = [p.name for p in req.user_prompt]
         self.assertIn(f"{mod.PLUGIN_ID}:rollout", names)
         self.assertLess(
             names.index(f"{mod.PLUGIN_ID}:rollout"),
@@ -1813,7 +1859,7 @@ class TestPluginInjection(unittest.TestCase):
             "滚动补回块应先于 recall 块（时间线旧→新）",
         )
         rollout = next(
-            p for p in req.system_prompt if p.name.endswith(":rollout")
+            p for p in req.user_prompt if p.name.endswith(":rollout")
         )
         self.assertIn("# 更早对话摘要", rollout.content)
         self.assertEqual(self._stub_kernel.rollout_session, "10086")
@@ -1823,9 +1869,25 @@ class TestPluginInjection(unittest.TestCase):
             "dsn": "postgres://u:p@127.0.0.1:5432/db",
             "recent_rollout_enabled": False,
         })
-        names = [p.name for p in req.system_prompt]
+        names = [p.name for p in req.user_prompt]
         self.assertNotIn(f"{mod.PLUGIN_ID}:rollout", names)
         self.assertFalse(hasattr(self._stub_kernel, "rollout_session"))
+
+    def test_52e_fallback_to_system_without_user_prompt(self):
+        # 旧宿主无 user_prompt 属性：回退 system prompt，注入不丢
+        inst, req = self._inject(user_prompt=None)
+        names = [p.name for p in req.system_prompt]
+        self.assertIn(f"{mod.PLUGIN_ID}:rollout", names)
+        self.assertIn(f"{mod.PLUGIN_ID}:recall", names)
+        self.assertIn(f"{mod.PLUGIN_ID}:profile", names)
+        self.assertFalse(hasattr(req, "user_prompt"))
+
+    def test_52f_fallback_to_system_when_user_prompt_immutable(self):
+        # user_prompt 非 list（不可变类型）：同样回退，不抛 TypeError
+        inst, req = self._inject(user_prompt=())
+        names = [p.name for p in req.system_prompt]
+        self.assertIn(f"{mod.PLUGIN_ID}:recall", names)
+        self.assertIn(f"{mod.PLUGIN_ID}:profile", names)
 
 
 class TestPluginTools(unittest.TestCase):
@@ -2126,10 +2188,16 @@ class TestPluginTools(unittest.TestCase):
         inst = self._inst()
         # tool-scope lock pins ownership to the triggering event; the event
         # must carry a session (bare events are rejected symmetrically with
-        # memory_remove — see test_55e)
-        out = asyncio.run(inst.memory_write(self._tool_event(), text="记住我爱猫", session_id="s", user_id="u1", platform="napcat"))
-        self.assertIn("已写入长期记忆", out)
-        self.assertEqual(len(inst._db.inserted_summaries), 1)
+        # memory_remove — see test_55e). v2 语义：确定性事实直写（nori 对齐）
+        out = asyncio.run(inst.memory_write(
+            self._tool_event(), text="他最爱猫", category="preference",
+            session_id="s", user_id="u1", platform="napcat",
+        ))
+        self.assertIn("已记住（簇 555", out)
+        self.assertEqual(len(inst._db.inserted_facts), 1)
+        self.assertEqual(
+            inst._db.applied_merges[0].get("action"), "create"
+        )
 
     def test_55d_write_reports_failure_during_breaker(self):
         # P2-2 连带：熔断拒绝期 memory_write 回报写入失败（旧契约假成功）
@@ -2137,38 +2205,190 @@ class TestPluginTools(unittest.TestCase):
         for _ in range(5):
             asyncio.run(inst._memory_kernel.circuit_breaker.record_failure())
         out = asyncio.run(inst.memory_write(
-            self._tool_event(), text="记住我爱猫",
+            self._tool_event(), text="他最爱猫", category="preference",
             session_id="s", user_id="u1", platform="napcat",
         ))
         self.assertTrue(out.startswith("写入失败"), out)
-        self.assertEqual(inst._db.inserted_summaries, [])
+        self.assertEqual(inst._db.inserted_facts, [])
 
     def test_55e_write_rejects_when_scope_undervable(self):
         # P3 对称性：作用域锁定 + 触发事件派生不出会话/用户 → 显式拒绝
         # （旧行为是静默写一行空归属记忆，与 memory_remove 不对称）
         inst = self._inst()
         out = asyncio.run(inst.memory_write(
-            self._bare_event(), text="记住我爱猫",
+            self._bare_event(), text="他最爱猫", category="preference",
             session_id="s", user_id="u1", platform="napcat",
         ))
         self.assertIn("拒绝写入", out)
-        self.assertEqual(inst._db.inserted_summaries, [])
+        self.assertEqual(inst._db.inserted_facts, [])
+
+    def test_55f_write_rejects_non_integer_replaces(self):
+        # LLM 把簇 id 传成非数字串（schema 是 integer 也拦不住）：
+        # 必须返回可读错误而非 ValueError 炸穿 handler
+        inst = self._inst()
+        out = asyncio.run(inst.memory_write(
+            self._tool_event(), text="他最爱猫", category="preference",
+            replaces_cluster_id="旧簇",
+        ))
+        self.assertIn("必须是整数", out)
+        self.assertEqual(inst._db.inserted_facts, [])
+
+    def test_55g_write_replace_owner_opaque(self):
+        # 存在性泄露回归锁：replace 目标「不存在」与「属于他人」必须
+        # 同款输出——簇 id 自增可枚举，双文案即存在性预言机
+        inst = self._inst()
+        inst._db.cluster_owner_result = None
+        out_a = asyncio.run(inst.memory_write(
+            self._tool_event(), text="他最爱猫", category="preference",
+            replaces_cluster_id=123,
+        ))
+        inst._db.cluster_owner_result = ("napcat", "someone-else")
+        out_b = asyncio.run(inst.memory_write(
+            self._tool_event(), text="他最爱猫", category="preference",
+            replaces_cluster_id=123,
+        ))
+        self.assertEqual(out_a, out_b)
+        self.assertIn("不存在或不属于当前用户", out_a)
+        self.assertEqual(inst._db.inserted_facts, [])
 
     def test_55b_write_scope_falls_back_to_event(self):
         # LLM 只传 text：session/user/platform 从触发事件补齐
         inst = self._inst()
-        out = asyncio.run(inst.memory_write(self._tool_event(), text="记住我爱猫"))
-        self.assertIn("已写入长期记忆", out)
-        row = inst._db.inserted_summaries[0]
+        out = asyncio.run(inst.memory_write(
+            self._tool_event(), text="他最爱猫", category="preference",
+        ))
+        self.assertIn("已记住（簇 555", out)
+        row = inst._db.inserted_facts[0]
         self.assertEqual(row.get("session_id"), "napcat:dm:9900000002")
         self.assertEqual(row.get("platform"), "napcat")
 
     def test_55c_write_denied_for_non_whitelisted_user(self):
         # a denied call must not write anything
         inst = self._inst()
-        out = asyncio.run(inst.memory_write(self._tool_event(uid="999"), text="记住我爱猫"))
+        out = asyncio.run(inst.memory_write(
+            self._tool_event(uid="999"), text="他最爱猫", category="preference",
+        ))
         self.assertIn("权限不足", out)
-        self.assertEqual(inst._db.inserted_summaries, [])
+        # 写路径已改为 raw upsert + apply_fact_merge，inserted_summaries
+        # 恒空（旧断言失效）；双空断言与 55d/55e 的 inserted_facts 口径对齐
+        self.assertEqual(inst._db.inserted_facts, [])
+        self.assertEqual(inst._db.applied_merges, [])
+
+    def _embed_kernel(self):
+        # memory_lookup 只用到 kernel.embedding_service.embed_one
+        class EmbSvc:
+            async def embed_one(self, text):
+                return [1.0]
+
+        class Kernel:
+            embedding_service = EmbSvc()
+
+        return Kernel()
+
+    def test_55h_write_replaces_same_day_revert(self):
+        # 同日改回旧说法回归锁：原语句当日已写入（行已消费，乐观锁
+        # skipped）时，带 replaces 的更正必须换幂等键重落一行完成替换，
+        # 不得把「更正没执行」报成「已记录」——库里生效的仍是错误说法
+        inst = self._inst()
+        inst._db.cluster_owner_result = ("napcat", self.ALLOWED_UID)
+        inst._db.merge_outcomes = [
+            {"action": "skipped"},
+            {"action": "replace", "cluster_id": 777, "score": 3,
+             "status": "active"},
+        ]
+        out = asyncio.run(inst.memory_write(
+            self._tool_event(), text="他最爱猫", category="preference",
+            replaces_cluster_id=123,
+        ))
+        self.assertIn("已更正", out)
+        # 两次落行（原幂等键 + 更正作用域键），键不同、merge 均为 replace
+        self.assertEqual(len(inst._db.inserted_facts), 2)
+        doc_ids = [r["document_id"] for r in inst._db.inserted_facts]
+        self.assertNotEqual(doc_ids[0], doc_ids[1])
+        self.assertTrue(
+            all(m["action"] == "replace" for m in inst._db.applied_merges)
+        )
+
+    def test_55i_write_replaces_repeat_correction_idempotent(self):
+        # 同一更正当日重复执行：换键重试后仍 skipped → 如实报「更正
+        # 已执行过」；纯重复写入（无 replaces）维持「已记录」口径
+        inst = self._inst()
+        inst._db.cluster_owner_result = ("napcat", self.ALLOWED_UID)
+        inst._db.merge_outcomes = [{"action": "skipped"}, {"action": "skipped"}]
+        out = asyncio.run(inst.memory_write(
+            self._tool_event(), text="他最爱猫", category="preference",
+            replaces_cluster_id=123,
+        ))
+        self.assertIn("更正今天已经执行过", out)
+        self.assertEqual(len(inst._db.inserted_facts), 2)
+        self.assertEqual(len(inst._db.applied_merges), 2)
+        inst2 = self._inst()
+        inst2._db.merge_outcomes = [{"action": "skipped"}]
+        out = asyncio.run(inst2.memory_write(
+            self._tool_event(), text="他最爱猫", category="preference",
+        ))
+        self.assertIn("已经记录过", out)
+        self.assertNotIn("更正", out)
+        self.assertEqual(len(inst2._db.inserted_facts), 1)
+
+    def test_56_lookup_summary_only_archived(self):
+        # 契约回归锁：工具描述承诺只检索非激活记忆——生效摘要不得混入
+        # 结果（无标注的生效行会被模型按「失效检索」语义误读）。过滤由
+        # only_archived 下推 db 侧完成，工具层直取 top_k 不再放大池
+        inst = self._inst()
+        inst._memory_kernel = self._embed_kernel()
+        inst._db.summary_search_rows = [
+            {"id": 1, "document_id": "d1", "archived": False,
+             "relevance": 0.9, "content": "生效摘要"},
+            {"id": 2, "document_id": "d2", "archived": True,
+             "relevance": 0.5, "content": "归档摘要"},
+        ]
+        out = asyncio.run(inst.memory_lookup(self._tool_event(), query="猫"))
+        self.assertIn("[id:2]", out)
+        self.assertIn("[已归档]", out)
+        self.assertNotIn("[id:1]", out)
+        self.assertNotIn("生效摘要", out)
+        # 下推断言：真库在 SQL 侧过滤 + limit 直取 top_k（默认 5）
+        self.assertTrue(inst._db.summary_search_kwargs["only_archived"])
+        self.assertEqual(inst._db.summary_search_kwargs["limit"], 5)
+        # 只有生效行时按契约报「没找到」
+        inst._db.summary_search_rows = [
+            {"id": 1, "document_id": "d1", "archived": False,
+             "relevance": 0.9, "content": "生效摘要"},
+        ]
+        out = asyncio.run(inst.memory_lookup(self._tool_event(), query="猫"))
+        self.assertIn("没有找到已归档", out)
+
+    def test_56b_lookup_fact_only_inactive(self):
+        # 契约回归锁：fact 分支由 only_inactive 在 SQL 侧只留 replaced/
+        # dead/pending_uncertain，active/profiled 生效簇不进候选窗——
+        # 固定倍数池 + 调用方过滤会在生效簇超池时把目标行挤出（假阴性）
+        inst = self._inst()
+        inst._memory_kernel = self._embed_kernel()
+        inst._db.fact_search_rows = [
+            {"id": 11, "platform": "qq", "user_id": "9900000002",
+             "status": "active", "canonical_statement": "生效簇",
+             "category": "preference", "evidence_count": 2},
+            {"id": 12, "platform": "qq", "user_id": "9900000002",
+             "status": "dead", "canonical_statement": "失效簇",
+             "category": "preference", "evidence_count": 1},
+            {"id": 13, "platform": "qq", "user_id": "9900000002",
+             "status": "pending_uncertain",
+             "canonical_statement": "待定簇", "category": "preference",
+             "evidence_count": 1},
+        ]
+        out = asyncio.run(
+            inst.memory_lookup(self._tool_event(), query="猫", target="fact")
+        )
+        self.assertIn("[簇12][已失效]", out)
+        self.assertIn("[簇13][待定]", out)
+        # 归属标注：消费行必须携带 owner uid（防 fact 无主语漂移）
+        self.assertIn("（9900000002）", out)
+        self.assertNotIn("[簇11]", out)
+        self.assertNotIn("生效簇", out)
+        # 下推断言：SQL 侧过滤 + limit 直取 top_k
+        self.assertTrue(inst._db.fact_search_kwargs["only_inactive"])
+        self.assertEqual(inst._db.fact_search_kwargs["limit"], 5)
 
     def test_56_remove(self):
         # 锁开启（默认）：删除下推触发会话/用户归属限定
@@ -3057,6 +3277,15 @@ class TestBuildConfigReflection(unittest.TestCase):
                     value = float(value)
             elif ann is str or ann == "str":
                 value = f"probe-{name}"
+            elif get_origin(ann) is Literal:
+                # Literal 白名单字段：取首个非默认合法值验证接线透传——
+                # 探测值若与默认相同（recall_time_label_mode 默认 both
+                # 恰为白名单末位），_build_config 漏接时 pydantic 回落
+                # 同一默认，raw/expected/实际三方相等，断言失效；白名单
+                # 外的串会在装配期被 _cfg_time_label_mode 归一回落，故
+                # 只从白名单内取
+                non_default = [a for a in get_args(ann) if a != default]
+                value = (non_default or list(get_args(ann)))[0]
             else:  # list[str]
                 value = ["probe"]
             raw[name] = value
@@ -3588,6 +3817,10 @@ def _setup() -> None:
         _HTTP_EXCEPTION = HTTPException
     except ImportError:
         _HTTP_EXCEPTION = Exception
+
+
+# 模块导入即装配（pytest 收集路径）；直跑 main() 重复调用幂等
+_setup()
 
 
 def main() -> int:

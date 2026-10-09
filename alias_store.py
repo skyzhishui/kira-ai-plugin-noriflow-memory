@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 import time
+import unicodedata
 from datetime import datetime, timezone
 from typing import Iterable, Optional
 
@@ -37,6 +38,103 @@ except ImportError:  # kira 宿主（模块与上游 nori 版保持同构）
 _BRACKETS_OPEN = "（(【〔[《<"
 _BRACKETS_CLOSE = "）)】〕]》>"
 _FALLBACK_NAME_RE = re.compile(r"^用户\d+$")
+
+
+def normalize_alias_text(text: str) -> str:
+    """匹配视图归一化：NFKC + casefold。
+
+    群名片常见 Unicode 数学字母（"undefined𝕩𝕩𝕪" 的 𝕩=U+1D569）与全角
+    形态，聊天文本里打的往往是 ASCII/半角（"xxy"）——码点不同则子串
+    匹配恒败。NFKC 把 𝕩→x、全角→半角，casefold 统一大小写；两侧
+    （词典键与匹配文本）都过本函数，字节级歧义在匹配面前消失。
+
+    DB 存储保留原名（规范名/画像标题展示原样），归一化仅发生在内存
+    匹配视图（加载与匹配两口），语义与 alias_upsert 写入口无关。
+    """
+    return unicodedata.normalize("NFKC", text or "").casefold()
+
+
+# 事实陈述中的「用户<uid>（<代号>）」模式（原文直接匹配，括号全角/
+# 半角通吃；uid 4 位起防误伤泛指；代号不含括号、长度有界防 LLM 长句
+# 误裹）。典型来源：编码提示词要求关系陈述写
+# 「用户3429924750（xxy）关系亲密」——括号内代号是群聊真实称呼，
+# 与名片可能完全不同形（名片 undefined𝕩𝕩𝕪 vs 群称 xxy）。
+_FACT_CODE_RE = re.compile(r"用户(\d{4,})\s*[（(]\s*([^()（）]{1,24}?)\s*[）)]")
+
+
+def extract_uid_code_names(statement: str) -> list[tuple[str, str]]:
+    """从事实陈述提取「用户<uid>（<代号>）」模式的 (uid, 代号) 列表。
+
+    原文直接提取（括号全角/半角通吃），代号保留原文形态——DB 存储
+    与展示用原名（normalize_alias_text 的存储约定），归一化只用于
+    uid（NFKC 统一半角数字）与匹配键。同形多现去重保序。原始形态
+    不作校验——清洗与占位名裁决由 build_fact_code_alias_rows 统一把关。
+    """
+    pairs: list[tuple[str, str]] = []
+    for uid, code in _FACT_CODE_RE.findall(statement or ""):
+        uid = normalize_alias_text(uid)
+        if (uid, code) not in pairs:
+            pairs.append((uid, code))
+    return pairs
+
+
+def _later_ts(a: Optional[datetime], b: Optional[datetime]) -> bool:
+    """None 安全的时间先后比较：None 视作最旧。
+
+    时间值缺失/不可解析不得让比较抛 TypeError——SQLite 标量 MAX 任一
+    参数为 NULL 即返回 NULL（与 PG GREATEST 忽略 NULL 语义不同），
+    TEXT 旧数据格式漂移经 sqlite_parse_ts 也流入 None。
+    """
+    if a is None:
+        return False
+    if b is None:
+        return True
+    return a > b
+
+
+def build_fact_code_alias_rows(
+    sources: Iterable[tuple[str, str, datetime]],
+    *,
+    source: str = "fact",
+) -> list[dict]:
+    """事实陈述代号 -> 别名行（（platform, 陈述, last_seen) 流）。
+
+    提取的代号过 clean_alias_name（清洗）与 is_placeholder_name
+    （unknown/undefined/纯数字等 LLM 毒输出拦截，在归一化形上裁决）
+    双重守卫；同 (platform, uid, 归一化名) 去重——行 name 保留首个
+    观测原文（大小写/全角形态，展示原样），last_seen 取更晚
+    （None 视作最旧，见 _later_ts）。
+
+    Returns:
+        别名行列表（platform/user_id/name/last_seen/source），供
+        db.alias_upsert 落库 + AliasStore.apply_rows 同步内存。
+    """
+    by_key: dict[tuple[str, str, str], tuple[str, Optional[datetime]]] = {}
+    for platform, statement, last_seen in sources:
+        if not platform or not statement:
+            continue
+        for uid, code in extract_uid_code_names(statement):
+            name = clean_alias_name(code)
+            if not name:
+                continue
+            key = (platform, uid, normalize_alias_text(name))
+            if is_placeholder_name(key[2]):
+                continue
+            prev = by_key.get(key)
+            if prev is None:
+                by_key[key] = (name, last_seen)
+            elif _later_ts(last_seen, prev[1]):
+                by_key[key] = (prev[0], last_seen)
+    return [
+        {
+            "platform": platform,
+            "user_id": uid,
+            "name": name,
+            "last_seen": last_seen,
+            "source": source,
+        }
+        for (platform, uid, _), (name, last_seen) in by_key.items()
+    ]
 
 
 def _word_chars(name: str) -> int:
@@ -207,9 +305,18 @@ class AliasStore:
         """Args: db 为 None 时仅 apply_rows 驱动的内存视图可用（测试用）。"""
         self._db = db
         self._variant_cap = variant_cap
-        self._stopwords = {w for w in (stopwords or []) if w}
-        # name -> [(platform, uid, last_seen epoch)]
+        # 停用词同样以归一化形态比对（视图键是归一化名，口径一致）
+        self._stopwords = {normalize_alias_text(w) for w in (stopwords or []) if w}
+        # 归一化名 -> [(platform, uid, last_seen epoch)]（匹配键 = NFKC +
+        # casefold；DB 与展示保留原名，见 normalize_alias_text）
         self._names: dict[str, list[tuple[str, str, float]]] = {}
+        # 归一化名 -> 首个观测原名（命中条目的展示名，画像标题与聊天
+        # 称呼一致；同键多原名时保最先入视图者）
+        self._display: dict[str, str] = {}
+        # (归一化名, platform, uid) -> 该 uid 自己的观测原名——同键多 uid
+        # 时命中条目各带各的称呼，不串贴他人原名（_display 仅作键级兜底
+        # 与歧义跳过名单展示）
+        self._display_by_pair: dict[tuple[str, str, str], str] = {}
         # (platform, uid) -> (最新非占位名, epoch)——写侧守卫/读侧规范名
         # 解析的反向视图，与 _names 同源同步（refresh/apply 两口）
         self._by_owner: dict[tuple[str, str], tuple[str, float]] = {}
@@ -234,22 +341,33 @@ class AliasStore:
             return
         rows = await self._db.alias_fetch_all()
         names: dict[str, list[tuple[str, str, float]]] = {}
+        display: dict[str, str] = {}
+        display_by_pair: dict[tuple[str, str, str], str] = {}
         by_owner: dict[tuple[str, str], tuple[str, float]] = {}
         for row in rows:
             name = row["name"]
-            if not name or name in self._stopwords:
+            if not name:
+                continue
+            key = normalize_alias_text(name)
+            if not key or key in self._stopwords:
                 continue
             epoch = _to_epoch(row.get("last_seen_epoch"))
-            names.setdefault(name, []).append(
-                (row["platform"], row["user_id"], epoch)
-            )
+            # uid 统一 str（与 apply_rows/_by_owner 及 _display_by_pair 键同
+            # 口径）——DB 返回非 str uid（整数列）时 match 以 _names 原值查
+            # _display_by_pair 会落空回退键级兜底，串贴复发
             pair = (row["platform"], str(row["user_id"]))
+            names.setdefault(key, []).append((pair[0], pair[1], epoch))
+            if key not in display:
+                display[key] = name
+            display_by_pair.setdefault((key, pair[0], pair[1]), name)
             if is_placeholder_name(name):
                 continue
             prev = by_owner.get(pair)
             if prev is None or epoch > prev[1]:
                 by_owner[pair] = (name, epoch)
         self._names = names
+        self._display = display
+        self._display_by_pair = display_by_pair
         self._by_owner = by_owner
         self._loaded_at = now
         logger.info("持久别名视图已加载: %d 名", len(names))
@@ -258,13 +376,16 @@ class AliasStore:
         """写入侧落库后同步内存（增量，免整表重载）。"""
         for row in rows:
             name = row.get("name") or ""
-            if not name or name in self._stopwords:
+            if not name:
+                continue
+            key = normalize_alias_text(name)
+            if not key or key in self._stopwords:
                 continue
             pair = (row.get("platform") or "", str(row.get("user_id") or ""))
             if not pair[1]:
                 continue
             epoch = _to_epoch(row.get("last_seen"))
-            bucket = self._names.setdefault(name, [])
+            bucket = self._names.setdefault(key, [])
             for idx, (p, u, ts) in enumerate(bucket):
                 if (p, u) == pair:
                     if epoch > ts:
@@ -272,6 +393,8 @@ class AliasStore:
                     break
             else:
                 bucket.append((pair[0], pair[1], epoch))
+            self._display.setdefault(key, name)
+            self._display_by_pair.setdefault((key, pair[0], pair[1]), name)
             if is_placeholder_name(name):
                 continue
             prev = self._by_owner.get(pair)
@@ -291,7 +414,12 @@ class AliasStore:
     def match(
         self, text: str, window_pairs: set[tuple[str, str]]
     ) -> tuple[list[tuple[str, str, str]], list[str]]:
-        """子串包含匹配（name in text）。
+        """子串包含匹配（归一化 name in 归一化 text）。
+
+        两侧都过 normalize_alias_text（NFKC + casefold）：名片里的
+        Unicode 数学字母/全角形态与聊天文本的 ASCII/半角写法在字节级
+        不同、语义上是同一称呼——归一化后子串匹配才能命中（DB 原名
+        不动，仅内存匹配视图归一化，见 normalize_alias_text）。
 
         歧义裁决：名字对应多个 (platform, uid) 时——窗口词典（会话内
         权威）命中者优先；无窗口背书且仍多义则跳过并记入返回值第二项
@@ -303,14 +431,19 @@ class AliasStore:
 
         Returns:
             (命中条目 [(名字, platform, uid)], 歧义跳过的名字列表)。
+            名字为该键的展示原名（非归一化形）。
         """
         if not text:
             return [], []
+        norm_text = normalize_alias_text(text)
+        if not norm_text:
+            return [], []
         hits: list[tuple[str, str, str]] = []
         skipped: list[str] = []
-        for name, entries in self._names.items():
-            if name in self._stopwords or name not in text:
+        for key, entries in self._names.items():
+            if key in self._stopwords or key not in norm_text:
                 continue
+            display = self._display.get(key, key)
             pairs: list[tuple[str, str]] = []
             for platform, uid, _ in entries:
                 if (platform, uid) not in pairs:
@@ -321,8 +454,11 @@ class AliasStore:
             elif len(pairs) == 1:
                 chosen = pairs
             else:
-                skipped.append(name)
+                skipped.append(display)
                 continue
             for platform, uid in chosen:
-                hits.append((name, platform, uid))
+                pair_display = self._display_by_pair.get(
+                    (key, platform, uid), display
+                )
+                hits.append((pair_display, platform, uid))
         return hits, skipped

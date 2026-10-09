@@ -61,8 +61,9 @@ class EncodedFact:
     由记忆编码器（端侧 LLM 一次调用）从对话批次提取：
     - 归属明确的长期事实才允许产出（宁缺毋滥）；
     - user_id 为平台用户 ID（从编码输入的 uid 属性引用）；
-    - category 值域对应画像 6 维度：identity(基本信息)/stable(已知事实)/
-      interaction(互动偏好)/naming(称呼偏好)/recent(近期动态)/uncertain(待定信息)；
+    - category 值域对应画像 8 维度：identity(基本信息)/stable(已知事实)/
+      preference(喜好偏好)/commitment(约定承诺)/interaction(互动偏好)/
+      naming(称呼偏好)/recent(近期动态)/uncertain(待定信息)；
     - confidence 取值 high/medium。
     """
 
@@ -76,18 +77,18 @@ class EncodedFact:
 
 @dataclass
 class PersonProfile:
-    """人物画像数据（六栏 + 扩展栏，persona_service 拼装/解析消费）。"""
+    """人物画像数据（8 维度栏位 + 待定栏，persona_service 拼装/解析消费）。"""
 
     user_id: str
     primary_name: str = ""
     aliases: list[str] = field(default_factory=list)
     persona_backdrop: list[str] = field(default_factory=list)  # 基本信息
     addressing_style: list[str] = field(default_factory=list)  # 称呼偏好
-    established_notes: list[str] = field(default_factory=list)  # 已知事实
+    established_notes: list[str] = field(default_factory=list)  # 已知事实（preference 并入）
+    memory_points: list[str] = field(default_factory=list)  # 记忆要点（commitment 并入）
     rapport_rules: list[str] = field(default_factory=list)  # 互动偏好
     recent_updates: list[str] = field(default_factory=list)  # 近期动态
     unverified_notes: list[str] = field(default_factory=list)  # 待定信息
-    memory_points: list[str] = field(default_factory=list)  # 记忆要点
 
 
 @dataclass

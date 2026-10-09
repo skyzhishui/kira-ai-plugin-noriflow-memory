@@ -3,3 +3,6 @@ asyncpg>=0.30
 json_repair>=0.30.0
 aiosqlite>=0.19
 tomli>=2.0; python_version < "3.11"
+# Windows 宿主无系统 tz 数据库：zoneinfo 解析 timezone 配置（如 Asia/Shanghai）
+# 必需，缺失时静默回退服务器本地时区
+tzdata>=2024.1; sys_platform == "win32"
