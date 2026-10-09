@@ -93,7 +93,9 @@ def memory_time_label(
     """注入时间标注（本地时区）：形态由 recall_time_label_mode 决定。
 
     Args:
-        ts: 记忆/事实发生时间（aware；None 或将来时间戳返回空串）。
+    Args:
+        ts: 记忆/事实发生时间（aware；naive 视为 local_tz 本地时间——
+            SQLite 后端/宿主可能传来 naive 值；None 或将来时间戳返回空串）。
         now: 当前时间锚（aware）。
         local_tz: 本地时区（resolve_local_tz 产物）。
         mode: 标注形态（relative/absolute/both）。
@@ -104,6 +106,11 @@ def memory_time_label(
     if ts is None:
         return ""
     try:
+        if ts.tzinfo is None:
+            # naive 约定为配置时区的本地时间（SQLite 后端/宿主可能传来）：
+            # 直接 astimezone 会按服务器本地时区解释，配置时区不一致时
+            # 日期与"今天/昨天"判定漂移——转换前先钉上 local_tz
+            ts = ts.replace(tzinfo=local_tz)  # type: ignore[arg-type]
         local = ts.astimezone(local_tz)  # type: ignore[arg-type]
         now_local = now.astimezone(local_tz)  # type: ignore[arg-type]
     except (ValueError, OSError, OverflowError):

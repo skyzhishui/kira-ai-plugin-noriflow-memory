@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, get_args, get_origin
 
 from pydantic_core import PydanticUndefined
 
@@ -118,7 +118,18 @@ def _field_type(annotation) -> str:
         return "float"
     if annotation is str:
         return "str"
+    if get_origin(annotation) is Literal:
+        # Literal["a", "b"] 是枚举字符串，不是列表——按 str 控件渲染，
+        # 可选值经 config_schema 的 options 透出（见 _literal_options）
+        return "str"
     return "list"
+
+
+def _literal_options(annotation) -> list[str] | None:
+    """Literal 注解的可选值列表（非 Literal 注解返回 None）。"""
+    if get_origin(annotation) is Literal:
+        return [str(v) for v in get_args(annotation)]
+    return None
 
 
 def _numeric_bounds(field) -> tuple[Any, Any]:
@@ -170,6 +181,9 @@ def config_schema() -> dict:
             "restart": name in _RESTART_FIELDS,
             "sensitive": bool(_SENSITIVE_KEY_RE.search(name)),
         }
+        literal_options = _literal_options(f.annotation)
+        if literal_options is not None:
+            entry["options"] = literal_options
         if entry["type"] in ("int", "float"):
             lo, hi = _numeric_bounds(f)
             if lo is not None:

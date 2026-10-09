@@ -842,6 +842,8 @@ async def main() -> None:
     test_statement_line_and_neighbors()
     await test_upsert_entity_edge_sql_and_params()
     await test_fetch_active_edges_params()
+    await test_fetch_alias_names_by_owner_owners_contract()
+    test_select_relation_edges_cross_platform_bot_collision()
     await test_retain_relations_channel_and_gating()
     await test_retain_relations_failure_no_half_commit()
     await test_encoder_relations_prompt_and_schema()

@@ -145,7 +145,7 @@ confidence 取值：
     {{
       "user_id": "u3003",
       "display_name": "小周",
-      "category": "stable",
+      "category": "preference",
       "statement": "不吃辣（饮食禁忌）",
       "confidence": "high",
       "related_user_ids": []

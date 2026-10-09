@@ -73,6 +73,10 @@ jobs:
           # 本文件会公开到 GitHub，不落内网地址）；未配置的实例回退
           # runner 自带的 GITHUB_SERVER_URL，保证文件可移植
           CI_GITEA_URL: ${{ vars.CI_GITEA_URL }}
+          # gitea 内置令牌名为 GITEA_TOKEN（secrets 命名空间），且 runner
+          # 不自动注入 GITHUB_TOKEN 环境变量——credential helper 引用的
+          # ${GITHUB_TOKEN} 必须在这里显式落地，私有仓库 clone 才有凭据
+          GITHUB_TOKEN: ${{ secrets.GITEA_TOKEN }}
         run: |
           base="${CI_GITEA_URL:-$GITHUB_SERVER_URL}"
           # credential helper 注入：token 不进命令行/URL（run 命令会回显
@@ -83,6 +87,16 @@ jobs:
           git config --global credential.helper \
             '!f() { echo "username=x-access-token"; echo "password=${GITHUB_TOKEN}"; }; f'
           git clone "${base}/${GITHUB_REPOSITORY}.git" .
+          # fork PR 的提交不在目标仓库任何分支上：普通 clone 拿不到该
+          # SHA，须先显式获取 PR head ref 再 checkout（仅 pull_request
+          # 事件——其 GITHUB_REF 形如 refs/pull/<n>/head；push 事件跳过）
+          pr=""
+          case "$GITHUB_REF" in
+            refs/pull/*) pr="${GITHUB_REF#refs/pull/}"; pr="${pr%%/*}" ;;
+          esac
+          if [ -n "$pr" ]; then
+            git fetch origin "+refs/pull/${pr}/head"
+          fi
           git checkout "$GITHUB_SHA"
 
       - name: Install dependencies

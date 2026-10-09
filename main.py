@@ -562,11 +562,9 @@ class NoriflowMemoryPlugin(BasePlugin):
                     and self._memory_kernel.alias_store is not None
                     else ""
                 ),
-                alias_store=(
-                    self._memory_kernel.alias_store
-                    if self._memory_kernel is not None
-                    else None
-                ),
+                # alias_store 不在此传值：kernel 尚未构造，此刻取值恒为
+                # None（事实代号别名回填遍将永久空转）——kernel 就绪后
+                # 在下方统一补设
             )
         else:
             logger.warning(
@@ -619,6 +617,10 @@ class NoriflowMemoryPlugin(BasePlugin):
         )
         # P3 边注入的邻居画像句柄（kernel 内消费，独立预算；未回填时只出陈述行）
         self._memory_kernel.persona_service = self._persona_service
+        # 事实代号别名回填遍的别名句柄：FactMergeAgent 构造先于 kernel，
+        # 只能在 kernel 就绪后补设（None 当别名层被禁用时保持跳过语义）
+        if merge_agent is not None:
+            merge_agent._alias_store = self._memory_kernel.alias_store  # noqa: SL001
         self._merge_agent = merge_agent
         self._backfill_task = EmbeddingBackfillTask(db, embedding_service, config)
         # 存量关系回填控制器（维护页关系图谱栏手动触发；LLM 出口缺失时
@@ -2024,6 +2026,11 @@ class NoriflowMemoryPlugin(BasePlugin):
         except (TypeError, ValueError):
             top_k = 5
         if target == "fact" or (target == "summary" and category == "relation"):
+            # 批次事件（框架工具分发形态）_event_scope 取不到 uid；fact
+            # 通道要求触发者锚定，回退 _trigger_user（与召回同款约定）。
+            # 仅作用于事实路——summary 会话检索的 user_id 传参口径不变
+            if not uid:
+                uid, _ = self._trigger_user(event)
             return await self._tool_search_facts(
                 kernel, query, top_k, category, name, sid, uid, plat
             )
@@ -2294,6 +2301,10 @@ class NoriflowMemoryPlugin(BasePlugin):
             # 作用域锁定：写入归属钉死为触发会话/触发者（防越权写入
             # 他人名下伪造记忆）；作用域派生失败时显式拒绝
             sid, uid, plat = self._event_scope(event)
+            # 批次事件（框架工具分发形态）无 message 属性，_event_scope
+            # 取不到 uid——回退 _trigger_user（与召回同款触发者约定）
+            if not uid:
+                uid, _ = self._trigger_user(event)
             if not (sid or uid):
                 return "作用域锁定开启且无法识别当前会话/用户，拒绝写入"
         elif not (sid and uid and plat):
@@ -2505,6 +2516,11 @@ class NoriflowMemoryPlugin(BasePlugin):
         except (TypeError, ValueError):
             top_k = 5
         sid, uid, plat = self._event_scope(event)
+        # 批次事件（框架工具分发形态）无 message 属性，_event_scope 取不到
+        # uid——回退 _trigger_user（与召回同款触发者约定）；uid 仅 fact
+        # 通道消费，summary 通道只看 sid，此处统一回退无副作用
+        if not uid:
+            uid, _ = self._trigger_user(event)
         try:
             query_vec = await kernel.embedding_service.embed_one(query)
             if not query_vec:
@@ -2518,6 +2534,10 @@ class NoriflowMemoryPlugin(BasePlugin):
                     limit=top_k,
                     scope="session",
                     session_id=sid,
+                    # session_id 存的是裸 id：不带平台过滤时其他适配器上的
+                    # 同号会话归档摘要会漏进来（跨平台泄漏），与
+                    # memory_search 会话路口径对齐
+                    platform=plat,
                     only_archived=True,
                     query_text=query,
                     hybrid=self._config.hybrid_search_enabled,
@@ -2637,6 +2657,11 @@ class NoriflowMemoryPlugin(BasePlugin):
         if target not in ("summary", "fact"):
             return "错误：target 只能是 summary 或 fact。"
         sid, uid, plat = self._event_scope(event)
+        # 批次事件（框架工具分发形态）无 message 属性，_event_scope 取不到
+        # uid——回退 _trigger_user（与召回同款触发者约定）；uid 仅 fact
+        # 通道消费，summary 通道只看 sid，此处统一回退无副作用
+        if not uid:
+            uid, _ = self._trigger_user(event)
         try:
             if target == "summary":
                 # 作用域锁定：恢复归属钉死当前会话（自增 id 可被诱导

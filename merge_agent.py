@@ -743,7 +743,14 @@ class FactMergeAgent:
         )
 
         # ---- 摘要归档遍（011 生命周期；周期/开关门控见方法内）----
-        stats["summaries_archived"] = await self._maybe_summary_lifecycle()
+        # fail-open（与 _fact_code_alias_pass 同款）：归档遍是可选功能且
+        # 默认关闭，其异常不应中断本周期后续各遍（补编码/关系自检/语义
+        # 审计/别名回填）——失败仅告警，下周期重试
+        try:
+            stats["summaries_archived"] = await self._maybe_summary_lifecycle()
+        except Exception:
+            logger.warning("摘要归档遍失败（跳过，下周期重试）", exc_info=True)
+            stats["summaries_archived"] = 0
 
         # ---- 补编码遍（剩余预算 + 保留份额内处理降级原文行）----
         stats["reencoded"] = await self._reencode_pass(budget + reserve)
