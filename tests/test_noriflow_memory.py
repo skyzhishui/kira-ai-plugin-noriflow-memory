@@ -2127,6 +2127,36 @@ class TestPluginTools(unittest.TestCase):
         asyncio.run(inst.inject_memory(event, req, None))
         self.assertEqual(req.tool_set.names, set())
 
+    def test_53r_name_tools_resolve_against_composite_session_sid(self):
+        # EntityDirectory is keyed by Session.sid (platform:type:id), while
+        # _event_scope exposes the host's bare session_id. Name-based tools
+        # must pass the composite key or every profile/fact lookup misses.
+        inst = self._inst()
+        calls = []
+
+        class NameKernel:
+            async def entity_hint_entries(self, sid, text):
+                calls.append((sid, text))
+                if sid == "napcat:gm:10086":
+                    return [("小李", "napcat", "u9")]
+                return []
+
+        class Persona:
+            async def build_profile_text(self, uid, *, session_id, platform):
+                return f"profile:{platform}:{uid}:{session_id}"
+
+        inst._memory_kernel = NameKernel()
+        inst._persona_service = Persona()
+        event = types.SimpleNamespace(
+            session=FakeSession(sid="10086", stype="gm"),
+            message=make_msg(self.ALLOWED_UID, "小李是谁"),
+        )
+
+        out = asyncio.run(inst.memory_profile(event, name="小李"))
+
+        self.assertEqual(out, "profile:napcat:u9:10086")
+        self.assertEqual(calls, [("napcat:gm:10086", "小李")])
+
     def test_54_search_with_session(self):
         inst = self._inst()
         # 桩 db 无检索方法：kernel.search 会走 db.search_chat_summaries（FakeDB 无此方法 → 异常）

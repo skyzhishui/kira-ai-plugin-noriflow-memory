@@ -2025,6 +2025,13 @@ class NoriflowMemoryPlugin(BasePlugin):
             top_k = max(1, min(int(top_k or 5), _MAX_TOP_K))
         except (TypeError, ValueError):
             top_k = 5
+        # EntityDirectory is keyed by the composite session.sid, while the
+        # tool scope intentionally uses the bare session_id for DB queries.
+        # Keep both forms so name-based fact lookup uses the same key as the
+        # recall/entity-hint path.
+        entity_sid = str(
+            getattr(getattr(event, "session", None), "sid", "") or ""
+        ) or sid
         if target == "fact" or (target == "summary" and category == "relation"):
             # 批次事件（框架工具分发形态）_event_scope 取不到 uid；fact
             # 通道要求触发者锚定，回退 _trigger_user（与召回同款约定）。
@@ -2032,7 +2039,8 @@ class NoriflowMemoryPlugin(BasePlugin):
             if not uid:
                 uid, _ = self._trigger_user(event)
             return await self._tool_search_facts(
-                kernel, query, top_k, category, name, sid, uid, plat
+                kernel, query, top_k, category, name, sid, uid, plat,
+                entity_sid=entity_sid,
             )
         # Asking-about-others recall: match the query against the entity
         # dictionary + persistent aliases; the keys then join the main search
@@ -2041,9 +2049,6 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 实体词典路用复合 sid：历史行缓存/窗口词典以 session.sid（复合键）
         # 为键，_event_scope 返回的裸 session_id 在词典路恒 miss——与
         # inject_memory 同源口径；无会话对象（手工调用）时回退原值
-        entity_sid = str(
-            getattr(getattr(event, "session", None), "sid", "") or ""
-        ) or sid
         entity_keys: list[str] = []
         entity_uids: list[str] = []
         if sid and self._config.recall_hint_enabled:
@@ -2102,6 +2107,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         sid: str,
         uid: str,
         plat: str,
+        entity_sid: str = "",
     ) -> str:
         """memory_search 的 fact/relation 通道（对齐 nori _search_facts）。
 
@@ -2115,7 +2121,9 @@ class NoriflowMemoryPlugin(BasePlugin):
         if name:
             if not sid:
                 return "错误：缺少会话定位，无法解析名字。"
-            resolved, hint = await self._resolve_tool_name(sid, name)
+            resolved, hint = await self._resolve_tool_name(
+                entity_sid or sid, name
+            )
             if resolved is None:
                 return hint
         elif not uid:
@@ -2454,7 +2462,10 @@ class NoriflowMemoryPlugin(BasePlugin):
         sid, _uid, _plat = self._event_scope(event)
         if not sid:
             return "错误：缺少会话定位，无法解析名字。"
-        resolved, hint = await self._resolve_tool_name(sid, name)
+        entity_sid = str(
+            getattr(getattr(event, "session", None), "sid", "") or ""
+        ) or sid
+        resolved, hint = await self._resolve_tool_name(entity_sid, name)
         if resolved is None:
             return hint
         platform, uid = resolved
