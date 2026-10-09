@@ -1,17 +1,23 @@
-"""LocalPersonaService：簇表 + 画像表的确定性画像拼装（M5，开发方案 §9.3）。
+"""LocalPersonaService: deterministic persona assembly from cluster table + profile table (M5, dev plan section 9.3).
 
-设计（与 hindsight 的本质差异）：
-- 画像 = 表内容的**确定性投影**：栏位模板（8 维度 + 条件性"其他
-  名称"栏）+ 固定排序（score DESC ->
-  updated_at DESC -> id ASC）+ 每栏上限，同样的表内容产出逐字节相同的
-  画像文本；无 LLM 参与、无全量重写，画像变化 ⇔ 簇状态变化；
-- 数据源：前五栏取画像表（profiled 簇的投影行），待定信息栏取簇表
-  （pending_uncertain 与 replaced 减半分簇，摇摆/降级内容对 bot 仍可见）；
-- 注入三件套（标题/免责声明/尾句）逐字对齐 hindsight_persona，消费侧
-  （MemoryStage -> planner/replyer）无感切换；
-- 写接口语义适配：update_profile / update_name / ensure_profile_* 均为
-  no-op（画像唯一变更通道是评分状态机，杜绝外部直接改写破坏确定性）；
-  ensure_profile_model 返回 None（本地后端无实体可建，表即画像）。
+Design (essential difference from hindsight):
+- persona == a **deterministic projection** of table content: field
+  template (8 dimensions + conditional "other names" slot) + fixed ordering
+  (score DESC -> updated_at DESC -> id ASC) + per-slot cap; identical table
+  content produces byte-identical persona text; no LLM involvement, no
+  full rewrite, persona change iff cluster state changes;
+- data source: the first five slots come from the profile table (projection
+  rows of profiled clusters); the pending-info slot from the cluster table
+  (pending_uncertain plus halved replaced scores, so swaying/degraded
+  content stays visible to the bot);
+- injection triple (header/disclaimer/footer) is verbatim-aligned with
+  hindsight_persona; consuming side (MemoryStage -> planner/replyer) switches
+  without noticing;
+- write-interface semantics adaptation: update_profile / update_name /
+  ensure_profile_* are all no-ops (the scoring state machine is the only
+  persona change channel, external direct writes would break determinism);
+  ensure_profile_model returns None (the local backend has no entity to
+  create; the table is the persona).
 """
 
 from __future__ import annotations
@@ -60,7 +66,7 @@ _ALIAS_NAMES_LIMIT = 5
 
 
 class LocalPersonaService:
-    """本地记忆后端的用户画像服务（确定性拼装）。"""
+    """User persona service for the local memory backend (deterministic assembly)."""
 
     def __init__(
         self,
@@ -70,19 +76,21 @@ class LocalPersonaService:
         identity_resolver: object | None = None,
         host_tz_provider: object | None = None,
     ) -> None:
-        """初始化。
+        """Initialize.
 
         Args:
-            db: 记忆库访问层。
-            config: 插件运行时配置（话题黑名单等）。
-            bot_nickname: Bot 昵称（保留对齐基类构造习惯，拼装不使用——
-                画像语句由编码器产出，无需运行时再代入称呼）。
-            identity_resolver: 可选身份映射解析器——多渠道同一人
-                （accounts 关联 qq/web 账号）时读侧按身份合并画像；
-                画像写入仍按来源账号键独立落库，仅读取时合并注入。
-            host_tz_provider: 宿主时区活读回调（与 kernel 同源传入）——
-                时区解析链"配置名 > 宿主 > 服务器本地"与 recall 注入
-                保持同一口径。
+            db: Memory store access layer.
+            config: Plugin runtime config (topic blacklist etc.).
+            bot_nickname: Bot nickname (kept for base-class constructor
+                compatibility; not used in assembly, persona statements are
+                produced by the encoder and need no runtime name substitution).
+            identity_resolver: Optional identity-mapping resolver; when the
+                same person has multiple channels (accounts linking qq/web
+                accounts), reads merge personas by identity; persona writes
+                still land per source account, merging only happens for read-side injection.
+            host_tz_provider: Host timezone live-read callback (passed from
+                kernel with the same source), keeping the resolution chain
+                "config name > host > server local" aligned with recall injection.
         """
         self._db = db
         self._config = config
@@ -92,9 +100,9 @@ class LocalPersonaService:
         self._tz_cache: object | None = None
 
     def _local_tz(self) -> object:
-        """本地时区（懒解析缓存，解析链与 kernel 同款：配置名 > 宿主
-        provider > 服务器本地）——防非法 timezone 配置在每次画像注入时
-        重复落 warning。"""
+        """Local timezone (lazy-resolved cache; resolution chain same as kernel: config name > host
+        provider > server local), preventing an illegal timezone config from
+        logging a warning on every persona injection."""
         if self._tz_cache is None:
             self._tz_cache = resolve_local_tz(
                 (self._config.timezone or "").strip(), self._host_tz_provider
@@ -102,7 +110,7 @@ class LocalPersonaService:
         return self._tz_cache
 
     def reset_local_tz_cache(self) -> None:
-        """时区配置变更后失效缓存（维护页保存路径，与 kernel 同款）。"""
+        """Invalidate the cache after timezone config changes (maintenance-page save path, same as kernel)."""
         self._tz_cache = None
 
     # ------------------------------------------------------------------
@@ -116,29 +124,30 @@ class LocalPersonaService:
         display_name: str,
         nickname: str = "",
     ) -> Optional[str]:
-        """本地后端无画像实体可建：表即画像，返回 None（基类语义适配）。
+        """The local backend has no persona entity to create: the table is the persona, returns None (base-class semantics adaptation).
 
         Args:
-            platform: 平台标识。
-            user_id: 用户 ID。
-            display_name: 显示名（忽略——显示名按 raw 表最近登记动态取）。
-            nickname: 用户昵称（忽略）。
+            platform: Platform identifier.
+            user_id: User ID.
+            display_name: Display name (ignored, the display name is taken
+                dynamically from the most recent entry in the raw table).
+            nickname: User nickname (ignored).
 
         Returns:
-            恒 None。
+            Always None.
         """
         return None
 
     async def ensure_profile_exists(
         self, user_id: str, platform: str = "", nickname: str = ""
     ) -> None:
-        """无实体可建：空画像自然返回空文本，无需预创建。"""
+        """No entity to create: an empty persona naturally returns empty text, no pre-creation needed."""
         return None
 
     async def update_profile(
         self, user_id: str, profile: PersonProfile, platform: str = ""
     ) -> None:
-        """画像为簇表投影，不接受直接写入（外部改写会破坏确定性）。"""
+        """The persona is a cluster-table projection and does not accept direct writes (external rewrites would break determinism)."""
         logger.info(
             "update_profile 被忽略：画像由评分状态机驱动（user_id=%s）", user_id
         )
@@ -146,7 +155,7 @@ class LocalPersonaService:
     async def update_name(
         self, user_id: str, new_name: str, reason: str = "", platform: str = ""
     ) -> None:
-        """称呼变更走事实提取 -> naming 簇 -> 画像投影链路，不直接改写。"""
+        """Name changes go through the fact-extraction -> naming cluster -> persona-projection path, not direct rewrites."""
         logger.info(
             "update_name 被忽略：称呼经 naming 簇投影（user_id=%s, new_name=%s）",
             user_id,
@@ -160,15 +169,15 @@ class LocalPersonaService:
     async def get_profile(
         self, user_id: str, session_id: str = "", platform: str = ""
     ) -> Optional[PersonProfile]:
-        """获取用户画像（表内容拼装后解析为 PersonProfile 结构）。
+        """Fetch the user persona (assembled from table content, then parsed into PersonProfile).
 
         Args:
-            user_id: 用户 ID。
-            session_id: 会话 ID（拼装不使用，保留契约兼容）。
-            platform: 平台标识（空时返回 None——无归属可查）。
+            user_id: User ID.
+            session_id: Session ID (not used in assembly; kept for contract compatibility).
+            platform: Platform identifier (None returned when empty, nothing to look up).
 
         Returns:
-            PersonProfile；无画像内容或 platform 缺失时 None。
+            PersonProfile; None when there is no persona content or platform is missing.
         """
         if not platform:
             logger.warning("get_profile 需要 platform 参数")
@@ -181,15 +190,16 @@ class LocalPersonaService:
     async def build_profile_text(
         self, user_id: str, session_id: str = "", platform: str = ""
     ) -> str:
-        """构建单用户画像注入文本（三件套格式，逐字对齐 hindsight）。
+        """Build single-user persona injection text (triple format, verbatim-aligned with hindsight).
 
         Args:
-            user_id: 用户 ID。
-            session_id: 会话 ID（拼装不使用）。
-            platform: 平台标识。
+            user_id: User ID.
+            session_id: Session ID (not used in assembly).
+            platform: Platform identifier.
 
         Returns:
-            注入文本；无画像内容（或全被黑名单过滤）时空字符串。
+            Injection text; empty string when there is no persona content
+            (or everything was filtered by the blacklist).
         """
         if not platform:
             return ""
@@ -230,18 +240,19 @@ class LocalPersonaService:
         candidates: list[PersonaCandidate],
         session_id: str,
     ) -> str:
-        """批量构建多参与者画像注入文本（群聊场景）。
+        """Build multi-participant persona injection text for group chat.
 
-        逐候选拼装 "{display_name}：\n{档案}" 块后合并；(platform, user_id)
-        去重防重复注入；候选数量上限由调用方（MemoryStage 的
-        max_persona_profiles）控制。无任何有效块时返回空字符串。
+        Assembles "{display_name}:\n{profile}" blocks per candidate and
+        merges them; (platform, user_id) dedup prevents repeated injection;
+        the candidate count cap is controlled by the caller (MemoryStage's
+        max_persona_profiles). Returns an empty string when no block is valid.
 
         Args:
-            candidates: 多参与者画像候选列表。
-            session_id: 会话 ID（拼装不使用）。
+            candidates: Multi-participant persona candidate list.
+            session_id: Session ID (not used in assembly).
 
         Returns:
-            合并后的画像文本；无内容时空字符串。
+            Merged persona text; empty string when there is no content.
         """
         if not candidates:
             return ""
@@ -292,11 +303,12 @@ class LocalPersonaService:
     # ------------------------------------------------------------------
 
     def _linked_keys(self, platform: str, user_id: str) -> list[tuple[str, str]] | None:
-        """展开身份关联账号键；无映射/无 resolver 时返回 None（单键路径）。
+        """Expand identity-linked account keys; None when there is no mapping/no resolver (single-key path).
 
-        多渠道同一人（如 qq 与 web 账号关联同一 identity）时读侧合并画像：
-        两个渠道的画像行共同注入同一份档案。单键路径完全保持原行为
-        （不触发 multi 查询，存量部署零差异）。
+        When the same person has multiple channels (e.g. qq and web accounts
+        linked to one identity), reads merge personas: profile rows from both
+        channels inject as one shared profile. The single-key path keeps the
+        exact original behavior (no multi query; zero difference for existing deployments).
         """
         if self._identity_resolver is None:
             return None
@@ -308,21 +320,26 @@ class LocalPersonaService:
     async def _assemble_profile_markdown(
         self, platform: str, user_id: str, current_name: str = ""
     ) -> str:
-        """按栏位固定顺序确定性拼装画像档案（空栏写"暂无"）。
+        """Deterministically assemble the persona profile in fixed slot order (empty slots write the "no data" placeholder).
 
-        完全无内容（无画像行、无待定簇且无名变体）时返回空字符串（调用
-        方据此判定"无画像"，不产出全空档案）。身份关联多键时走 multi
-        查询，跨键画像行合并为同一份档案（排序/去重见 db 层 multi 方法）。
-        "其他名称"栏内容为 alias 层采集的历史名变体（含历史昵称/名片，
-        排除当前称呼 current_name），跨键合并按 db 层 last_seen 降序。
+        Returns an empty string when there is no content at all (no profile
+        rows, no pending clusters, no name variants); the caller uses that to
+        conclude "no persona" instead of producing an all-empty profile. When
+        identity-linked multiple keys exist, the multi query path is used and
+        profile rows across keys merge into one profile (ordering/dedup per
+        the db-layer multi methods). The "other names" slot holds historical
+        name variants collected by the alias layer (historical nicknames and
+        cards, current address current_name excluded), merged across keys and
+        sorted by db-layer last_seen descending.
 
         Args:
-            platform: 平台标识。
-            user_id: 用户 ID。
-            current_name: 该用户当前称呼（块抬头名），其他名称栏排除项。
+            platform: Platform identifier.
+            user_id: User ID.
+            current_name: The user's current address (block header name),
+                exclusion for the other-names slot.
 
         Returns:
-            画像档案 markdown；无任何内容时空字符串。
+            Persona profile markdown; empty string with no content.
         """
         keys = self._linked_keys(platform, user_id)
         if keys is not None:
@@ -382,20 +399,21 @@ class LocalPersonaService:
 
     @staticmethod
     def _now() -> datetime:
-        """当前 UTC 时间（独立方法便于测试固定时钟）。"""
+        """Current UTC time (separate method so tests can pin the clock)."""
         return datetime.now(timezone.utc)
 
     def _filter_blacklist(self, markdown: str) -> str:
-        """按话题黑名单逐行过滤画像内容（与 recall 过滤对齐）。
+        """Filter persona content line by line against the topic blacklist (aligned with recall filtering).
 
-        包含黑名单关键词的行（"- xxx" 条目）被丢弃；"## 栏目"标题保留。
-        全部条目被过滤时返回空字符串。
+        Lines containing a blacklist keyword ("- xxx" entries) are dropped;
+        "## slot" titles are kept. Returns an empty string when all entries
+        are filtered out.
 
         Args:
-            markdown: 画像档案文本。
+            markdown: Persona profile text.
 
         Returns:
-            过滤后的文本（可能为空串）。
+            Filtered text (possibly empty).
         """
         blacklist = self._config.topic_blacklist
         if not blacklist:
@@ -421,16 +439,18 @@ class LocalPersonaService:
 
     @staticmethod
     def _parse_profile(user_id: str, markdown: str) -> PersonProfile:
-        """把拼装档案解析为 PersonProfile 结构（栏名 -> 字段映射）。
+        """Parse the assembled profile into a PersonProfile structure (slot name -> field mapping).
 
-        与 hindsight 版解析器行为一致：跳过空项与"暂无"占位行。
+        Behavior consistent with the hindsight parser: skips empty items and
+        "no data" placeholder lines.
 
         Args:
-            user_id: 用户 ID。
-            markdown: 栏位模板档案文本。
+            user_id: User ID.
+            markdown: Slot-template profile text.
 
         Returns:
-            PersonProfile（字段名是核心侧契约，见 _SECTION_ORDER 注释）。
+            PersonProfile (field names are the core-side contract, see the
+            _SECTION_ORDER comment).
         """
         profile = PersonProfile(user_id=user_id)
         section_map = {title: field for _, title, field in _SECTION_ORDER}

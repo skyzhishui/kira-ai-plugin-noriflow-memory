@@ -1,12 +1,16 @@
-"""自包含数据契约（自 nori-core 记忆/画像扩展模块 vendor）。
+"""Self-contained data contracts (vendored from the nori-core memory/persona extension modules).
 
-KiraAI 无对应的核心契约层，本插件把用到的数据结构自带：
-- KnowledgeType / MemoryItem：记忆条目分类与统一模型（kernel 检索返回值）；
-- EncodedFact：端侧编码产出的人物事实单元（编码器 -> kernel 双通道写入）；
-- PersonProfile / PersonaCandidate：画像结构与群聊多参与者候选
-  （persona_service 拼装消费）。
+KiraAI has no corresponding core contract layer; this plugin carries the
+data structures it uses:
+- KnowledgeType / MemoryItem: memory entry classification and unified model
+  (kernel retrieval return values);
+- EncodedFact: person-fact units produced by on-device encoding
+  (encoder -> kernel dual-channel write);
+- PersonProfile / PersonaCandidate: persona structure and group-chat
+  multi-participant candidates (assembled/consumed by persona_service).
 
-字段语义与上游 nori 版逐字一致，便于未来数据/经验互通。
+Field semantics are verbatim-consistent with the upstream nori version, so
+future data/experience interchange stays straightforward.
 """
 
 from __future__ import annotations
@@ -17,10 +21,11 @@ from enum import Enum
 
 
 class KnowledgeType(str, Enum):
-    """记忆条目分类（认知科学记忆类型学）。
+    """Memory entry classification (cognitive-science memory typology).
 
-    本插件实际只使用 EPISODIC（摘要/事实通道均为情景记忆），
-    其余值保留枚举完整性以对齐上游 nori 版语义。
+    This plugin only actually uses EPISODIC (summary/fact channels are both
+    episodic memory); the remaining values are kept for enum completeness to
+    align with the upstream nori version semantics.
     """
 
     EPISODIC = "episodic"
@@ -31,17 +36,17 @@ class KnowledgeType(str, Enum):
 
 @dataclass
 class MemoryItem:
-    """记忆条目统一模型。
+    """Unified model for memory entries.
 
     Attributes:
-        id: 记忆后端分配的唯一标识（document_id）。
-        content: 记忆正文。
-        memory_category: 记忆分类，默认情景记忆。
-        session_id: 归属会话 ID（空字符串表示无会话归属）。
-        user_id: 关联用户 ID。
-        timestamp: 记忆发生时间。
-        metadata: 扩展元数据（召回结果携带的 kind、相关度等）。
-        score: 检索相关性分数（召回后填充，0.0 表示未评分）。
+        id: Unique identifier assigned by the memory backend (document_id).
+        content: Memory body text.
+        memory_category: Memory category, defaults to episodic.
+        session_id: Owning session ID (empty string means no session).
+        user_id: Linked user ID.
+        timestamp: Time the memory occurred.
+        metadata: Extended metadata (kind, relevance carried by recall results).
+        score: Retrieval relevance score (filled after recall; 0.0 means unscored).
     """
 
     id: str
@@ -56,15 +61,19 @@ class MemoryItem:
 
 @dataclass
 class EncodedFact:
-    """编码产出的人物事实（retain 双通道写入的 persona_fact 单元）。
+    """Person fact produced by encoding (the persona_fact unit of the retain dual-channel write).
 
-    由记忆编码器（端侧 LLM 一次调用）从对话批次提取：
-    - 归属明确的长期事实才允许产出（宁缺毋滥）；
-    - user_id 为平台用户 ID（从编码输入的 uid 属性引用）；
-    - category 值域对应画像 8 维度：identity(基本信息)/stable(已知事实)/
-      preference(喜好偏好)/commitment(约定承诺)/interaction(互动偏好)/
-      naming(称呼偏好)/recent(近期动态)/uncertain(待定信息)；
-    - confidence 取值 high/medium。
+    Extracted by the memory encoder (a single on-device LLM call) from a
+    conversation batch:
+    - only long-term facts with clear attribution may be produced (rather
+      nothing than garbage);
+    - user_id is the platform user id (referenced from the uid attribute of
+      the encoding input);
+    - category values map to the persona 8 dimensions: identity (basic
+      info)/stable (established facts)/preference (preferences)/
+      commitment (promises)/interaction (interaction style)/naming (address
+      style)/recent (recent updates)/uncertain (pending info);
+    - confidence takes high/medium.
     """
 
     user_id: str
@@ -77,7 +86,7 @@ class EncodedFact:
 
 @dataclass
 class PersonProfile:
-    """人物画像数据（8 维度栏位 + 待定栏，persona_service 拼装/解析消费）。"""
+    """Person profile data (8 dimension slots + pending slot, assembled/parsed by persona_service)."""
 
     user_id: str
     primary_name: str = ""
@@ -93,14 +102,15 @@ class PersonProfile:
 
 @dataclass
 class PersonaCandidate:
-    """群聊多参与者画像候选。
+    """Group-chat multi-participant persona candidate.
 
     Attributes:
-        user_id: 用户 ID。
-        platform: 平台标识。
-        display_name: 显示名称（主称呼）。
-        source: 候选来源（自由字符串，仅作日志语境，画像后端不分支依赖）。
-        nickname: 用户昵称（取不到为空）。
+        user_id: User ID.
+        platform: Platform identifier.
+        display_name: Display name (primary address).
+        source: Candidate source (free-form string, log-context only; the
+            persona backend does not branch on it).
+        nickname: User nickname (empty when unavailable).
     """
 
     user_id: str

@@ -1,32 +1,45 @@
-"""NoriFlow 长期记忆插件（KiraAI 版，PostgreSQL + pgvector）。
+"""NoriFlow long-term memory plugin (KiraAI edition, PostgreSQL + pgvector).
 
-自 nori-core nori_plugin_noriflow_memory 移植。与工具/标签型插件的差异：
-本插件是服务型插件，核心价值在自动记忆链路——
+Ported from nori-core nori_plugin_noriflow_memory. Difference from tool/label
+plugins: this is a service plugin whose core value is the automatic memory
+pipeline:
 
-- 写入（retain）：监听 @on.im_message / @on.message_sent 维护每会话滚动行
-  缓存；订阅核心 session_memory_updated 事件（每对话回合——含工具循环——
-  全部发送完成后恰好发出一次）按消息水位线取增量批次组装编码输入（历史
-  窗口 + 分隔标记 + 本轮批次 + bot 回复，格式与 memory_encode.prompt 契约
-  逐字对齐），经 FastLlmExit（fast 档）端侧编码为「保真摘要 + 人物事实」
-  双通道写入；编码失败 fail-open 降级为原文单通道并回滚水位线，DB 熔断
-  拒绝期 retain 直接失败并回滚水位线（本批待下轮重编码，不白烧编码与
-  向量化调用），内容永不丢。
-- 召回（recall）：@on.llm_request 时以批次文本为 query 向量检索 + 重排序，
-  注入为独立 Prompt；用户画像由簇表确定性拼装（无 LLM），一并注入。
-- 主动工具：memory_search / memory_write / memory_remove（enabled_tools
-  多选配置控制启用哪些工具；allowed_users 用户白名单与 allowed_sessions
-  会话白名单做代码级拦截——按触发用户或触发会话匹配，任一命中即放行，
-  两者皆空 = 全部拒绝；用户条目支持 user_id 或 平台:user_id，会话条目
-  支持 session_id、平台:session_id 或完整 sid 平台:类型:session_id）。
-- 维护：@register.page 维护页 + 22 个 @register.api 端点（概览/用户/事实/
-  簇/画像/摘要/图谱/边编辑/回填/补编码/迁入/设置的浏览与修正），数据层见 webui_store.py。
+- Write (retain): listen on @on.im_message / @on.message_sent to maintain a
+  per-session rolling line cache; subscribe to the core session_memory_updated
+  event (emitted exactly once per conversation turn - including tool loops -
+  after all messages are sent) and take incremental batches by message
+  watermark to assemble encoding input (history window + separator markers +
+  current batch + bot reply, byte-aligned with the memory_encode.prompt
+  contract), encoded end-side via FastLlmExit (fast tier) and written through
+  the dual channel of "fidelity summary + persona facts"; on encoding failure,
+  fail-open degrades to the single original-text channel and rolls back the
+  watermark; while the DB circuit breaker rejects, retain fails directly and
+  rolls back the watermark (the batch waits for re-encoding on the next round,
+  without wasting encoding and vectorization calls); content is never lost.
+- Recall (recall): on @on.llm_request, vector-retrieve with the batch text as
+  the query + rerank, injected as an independent Prompt; the user persona is
+  deterministically assembled from the cluster table (no LLM) and injected too.
+- Active tools: memory_search / memory_write / memory_remove (enabled_tools
+  multi-select config controls which tools are enabled; the allowed_users user
+  whitelist and allowed_sessions session whitelist do code-level interception -
+  matched by trigger user or trigger session, any hit is allowed through, both
+  empty = all rejected; user entries support user_id or platform:user_id,
+  session entries support session_id, platform:session_id or a full sid
+  platform:type:session_id).
+- Maintenance: @register.page maintenance page + 22 @register.api endpoints
+  (overview/user/facts/cluster/persona/summary/graph/edge edit/backfill/re-
+  encoding/import/settings browse and fix), data layer in webui_store.py.
 
-graceful degradation：dsn 未配置 / DB 连接或迁移失败 / fast LLM 未配置，
-均跳过对应能力并记录日志，不阻断宿主启动；kernel 未就绪时自动摘除全部
-记忆工具。装配完全就绪后自动禁用内置 kira_plugin_simple_memory（官方
-要求使用第三方记忆插件前禁用；仅在本插件就绪后才禁用，避免记忆真空）。
+graceful degradation: dsn not configured / DB connection or migration failure
+/ fast LLM not configured - all skip the corresponding capability and log,
+without blocking host startup; when the kernel is not ready, all memory tools
+are removed automatically. Once assembly is fully ready, the built-in
+kira_plugin_simple_memory is disabled automatically (officially required
+before using third-party memory plugins; disabled only after this plugin is
+ready, to avoid a memory vacuum).
 
-配置默认值不含真实地址；dsn 请在部署侧 WebUI 插件配置中填写。
+Config defaults contain no real addresses; fill in dsn in the deployment-side
+WebUI plugin config.
 """
 
 from __future__ import annotations
@@ -204,9 +217,10 @@ _TIME_LABEL_MODES = ("relative", "absolute", "both")
 
 
 def _cfg_time_label_mode(raw: dict) -> str:
-    """recall_time_label_mode 接线：Literal 白名单外的宿主配置值回落
-    默认 both 并告警——手改宿主 json 拼错形态不应炸掉整个插件装配
-    （与 _cfg_int/_cfg_float 的容错口径一致）。"""
+    """recall_time_label_mode wiring: host config values outside the Literal
+    whitelist fall back to the default both and warn - a mistyped form in a
+    hand-edited host json should not blow up the whole plugin assembly
+    (consistent with the tolerant handling of _cfg_int/_cfg_float)."""
     value = _cfg_str(raw, "recall_time_label_mode", "both")
     if value not in _TIME_LABEL_MODES:
         logger.warning("配置项 recall_time_label_mode=%r 非法，使用默认 both", value)
@@ -226,7 +240,7 @@ def _cfg_strlist(raw: dict, key: str, default: Optional[list[str]] = None) -> li
 
 
 def _build_config(raw: dict) -> LocalMemoryConfig:
-    """插件配置 dict -> LocalMemoryConfig（逐字段容错，非法值落默认）。"""
+    """Plugin config dict -> LocalMemoryConfig (per-field tolerant, invalid values fall back to defaults)."""
     return LocalMemoryConfig(
         storage_backend=_cfg_str(raw, "storage_backend"),
         sqlite_path=_cfg_str(raw, "sqlite_path"),
@@ -341,9 +355,11 @@ def _build_config(raw: dict) -> LocalMemoryConfig:
 
 
 def _try_build_config(raw: dict) -> LocalMemoryConfig:
-    """_build_config 的兜底层：数值越界触发 pydantic 校验异常时回退默认
-    参数（仅保留 dsn），与模块"逐字段容错"承诺一致，避免单个配置项
-    （如 pool_min=0）让插件整体初始化失败。"""
+    """Fallback layer for _build_config: when out-of-range values trigger a
+    pydantic validation exception, fall back to default parameters (keeping
+    only dsn), consistent with the module's "per-field tolerant" promise, so a
+    single config item (e.g. pool_min=0) cannot fail the whole plugin
+    initialization."""
     try:
         return _build_config(raw)
     except Exception:
@@ -353,7 +369,7 @@ def _try_build_config(raw: dict) -> LocalMemoryConfig:
 
 @dataclass
 class _CachedLine:
-    """滚动行缓存的一行：信封行 + 归属元数据（供回合信号重建增量批次）。"""
+    """One line of the rolling line cache: envelope line + attribution metadata (used by the turn signal to rebuild incremental batches)."""
 
     line: str
     uid: str = ""          # 发言者裸 uid（bot 行为空）
@@ -367,7 +383,7 @@ class _CachedLine:
 
 @dataclass
 class _RetainState:
-    """一次对话轮次的 retain 快照（回合完成信号到达时按水位线定格）。"""
+    """Retain snapshot of one conversation turn (frozen at the watermark when the turn completion signal arrives)."""
 
     event_id: str
     session_id: str
@@ -382,7 +398,7 @@ class _RetainState:
 
 
 class NoriflowMemoryPlugin(BasePlugin):
-    """NoriFlow 长期记忆插件：自动 retain/recall + 主动工具 + 维护页。"""
+    """NoriFlow long-term memory plugin: automatic retain/recall + active tools + maintenance page."""
 
     def __init__(self, ctx, cfg: dict):
         super().__init__(ctx, cfg)
@@ -421,10 +437,11 @@ class NoriflowMemoryPlugin(BasePlugin):
     # ------------------------------------------------------------------
 
     async def initialize(self) -> None:
-        """装配：配置 -> DB 连接迁移 -> 客户端适配 -> 内核/服务 -> 后台任务。
+        """Assembly: config -> DB connect/migrate -> client adapters -> kernel/services -> background tasks.
 
-        任何一步失败均降级跳过（记录日志），不阻断宿主启动；只有完全
-        就绪才置 _ready 并自动禁用内置文件型记忆插件。
+        Any step failing degrades and skips (logged), without blocking host
+        startup; only when fully ready is _ready set and the built-in
+        file-based memory plugin disabled.
         """
         cfg = self.plugin_cfg or {}
         if _cfg_bool(cfg, "enabled", True) is False:
@@ -487,7 +504,7 @@ class NoriflowMemoryPlugin(BasePlugin):
     async def _initialize_services(
         self, db: MemoryDatabase, config: LocalMemoryConfig
     ) -> None:
-        """装配服务与后台任务（initialize 后半段；异常由调用方统一清理）。"""
+        """Assemble services and background tasks (second half of initialize; exceptions are cleaned up uniformly by the caller)."""
         # bot 身份：persona 名（先取，供 kernel/合并 agent 构造使用；
         # 消息 self_id 随首条消息回填）
         try:
@@ -682,7 +699,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         await self._disable_simple_memory()
 
     async def terminate(self) -> None:
-        """清理：退订回合信号 -> flush 在途 retain -> 停后台任务 -> 关池。"""
+        """Cleanup: unsubscribe turn signal -> flush in-flight retain -> stop background tasks -> close pools."""
         self._ready = False
         if self._mem_handler is not None:
             bus = getattr(self.ctx, "event_bus", None)
@@ -737,11 +754,12 @@ class NoriflowMemoryPlugin(BasePlugin):
     # ------------------------------------------------------------------
 
     def _build_embedding_client(self) -> Optional[KiraEmbeddingClient]:
-        """embedding_model 覆盖 -> default_embedding -> 插件内适配器。
+        """embedding_model override -> default_embedding -> in-plugin adapter.
 
-        embedding_model 格式 provider_id:model_id（与宿主 WebUI 模型标识
-        一致，经 get_embedding_client 解析）；解析失败回退 default_embedding
-        并告警（fail-open，不阻断装配）。两者均未配置返回 None。
+        embedding_model format is provider_id:model_id (consistent with the
+        host WebUI model identifier, resolved via get_embedding_client); on
+        resolve failure, fall back to default_embedding and warn (fail-open,
+        does not block assembly). Returns None if neither is configured.
         """
         config = self._config
         override = (
@@ -777,7 +795,7 @@ class NoriflowMemoryPlugin(BasePlugin):
     def _build_rerank_client(
         self, config: LocalMemoryConfig
     ) -> Optional[KiraRerankClient]:
-        """default_rerank -> 插件内适配器（未配置/未启用返回 None，纯向量序）。"""
+        """default_rerank -> in-plugin adapter (returns None when not configured/disabled; pure vector order)."""
         if not config.rerank_enabled:
             return None
         try:
@@ -790,11 +808,14 @@ class NoriflowMemoryPlugin(BasePlugin):
         return KiraRerankClient(rr)
 
     def _host_window_batches(self) -> int:
-        """宿主 LLM 可见历史窗口块数（bot.max_memory_length 活读）。
+        """Number of history window batches visible to the host LLM (live-read bot.max_memory_length).
 
-        与 session_manager 的窗口截断同键同源（热改即时生效）；读取失败
-        回退核心默认 10。retain 每轮恰好一批摘要，「最近 K 批」即窗口内
-        已可见内容的等价物（见 memory_kernel._derive_window_batches）。
+        Same key and source as the session_manager window truncation (hot
+        changes take effect immediately); on read failure, fall back to the
+        core default of 10. retain produces exactly one summary batch per
+        turn, so "the most recent K batches" is the equivalent of the content
+        already visible in the window (see
+        memory_kernel._derive_window_batches).
         """
         cfg = getattr(self.ctx, "config", None)
         if cfg is None:
@@ -806,7 +827,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         return max(value, 0)
 
     def _plugin_data_dir(self) -> Path:
-        """插件数据目录（宿主 plugin_data/<plugin_id>；不可得时回退 ./data）。"""
+        """Plugin data directory (host plugin_data/<plugin_id>; falls back to ./data when unavailable)."""
         try:
             d = self.ctx.get_plugin_data_dir()
             if d is not None:
@@ -816,14 +837,18 @@ class NoriflowMemoryPlugin(BasePlugin):
         return Path("data")
 
     async def _refresh_bot_nickname(self) -> None:
-        """活读宿主 persona 昵称并传播（TTL 限频）。
+        """Live-read the host persona nickname and propagate it (TTL rate-limited).
 
-        宿主 persona 每次请求从 DB 活读（支持运行期热切换），且没有
-        persona 变更事件可订阅——initialize 的一次性缓存会在切换后过期：
-        编码 prompt 的「bot 排除规则」仍指向旧名，新人格名下关于 bot
-        自身的信息可能被提取进用户画像（信封行靠 is_self 标记仍安全，
-        与 bot_id 传播同族的确定性防线）。消费方：编码/补编码 prompt
-        排除规则、bot 回复信封行。读取失败保持现值。
+        The host persona is live-read from the DB on every request (supports
+        hot switching at runtime), and there is no persona change event to
+        subscribe to - the one-shot cache in initialize goes stale after a
+        switch: the "bot exclusion rule" in the encoding prompt still points
+        to the old name, and under the new persona name, information about the
+        bot itself may be extracted into the user persona (the envelope line
+        is still safe via the is_self marker, a deterministic defense in the
+        same family as bot_id propagation). Consumers: the encoding /
+        re-encoding prompt exclusion rule and bot reply envelope lines. On
+        read failure, keep the current value.
         """
         now = time.monotonic()
         if (
@@ -849,12 +874,14 @@ class NoriflowMemoryPlugin(BasePlugin):
         logger.info("persona 昵称已热切换并传播: %s", name)
 
     def _propagate_bot_identity(self, bot_user_id: str) -> None:
-        """真实 bot 平台 ID 传播到 kernel / 合并 agent（构造期是占位符）。
+        """Propagate the real bot platform ID to the kernel / merge agent (the placeholder is used at construction time).
 
-        消费方：retain_encoded/_reingest_facts 的 bot 事实硬过滤、编码
-        prompt 的「平台 ID」渲染、召回扩选的 bot 剔除——占位符「kira」
-        与真实 uid 永不相等，传播前这层确定性防线是死代码。首见即定型
-        （KiraAI 单 bot 部署；跨适配器多账号不在当前范围）。
+        Consumers: the bot fact hard-filter in retain_encoded/_reingest_facts,
+        the "platform ID" rendering in the encoding prompt, and bot exclusion
+        in recall expansion - the "kira" placeholder never equals a real uid,
+        so this deterministic defense is dead code before propagation. Fixed
+        on first sight (KiraAI single-bot deployment; multi-account across
+        adapters is out of current scope).
         """
         if self._memory_kernel is not None:
             self._memory_kernel.bot_id = bot_user_id
@@ -863,7 +890,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         logger.info("bot 平台 ID 已学习并传播: %s", bot_user_id)
 
     def _probe_fast_llm(self) -> Optional[FastLlmExit]:
-        """探测 fast LLM 可用性；可用返回出口实例，不可用返回 None。"""
+        """Probe fast LLM availability; return the exit instance if available, None otherwise."""
         try:
             client = self.ctx.get_default_fast_llm_client()
         except Exception as exc:
@@ -874,7 +901,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         return FastLlmExit(self.ctx)
 
     def _make_relation_backfill(self) -> RelationBackfill:
-        """构造存量关系回填器（llm_call 闭包对齐共享模块两侧同构约定）。"""
+        """Construct the legacy relation backfiller (the llm_call closure aligns the isomorphic convention on both sides of the shared module)."""
         fast_llm = self._fast_llm
 
         async def _call(system_prompt: str, user_prompt: str) -> str:
@@ -902,7 +929,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         )
 
     async def _disable_simple_memory(self) -> None:
-        """自动禁用内置文件型记忆插件（仅在本插件完全就绪后调用）。"""
+        """Automatically disable the built-in file-based memory plugin (called only after this plugin is fully ready)."""
         pm = getattr(self.ctx, "plugin_mgr", None)
         if pm is None:
             logger.info(
@@ -930,21 +957,30 @@ class NoriflowMemoryPlugin(BasePlugin):
 
     @on.llm_request(priority=Priority.MEDIUM)
     async def inject_memory(self, event, req, tag_set, *args, **kwargs):
-        """召回注入 + 记忆工具门控。
+        """Recall injection + memory tool gating.
 
-        - 工具门控：enabled_tools 多选配置，kernel 未就绪时摘除全部记忆
-          工具（防调用报错）；allowed_users 用户白名单下，非白名单触发者
-          同样摘除（硬拦截仍在各工具入口）。
-        - 召回：批次文本为 query 向量检索（session 隔离开关控制跨会话）。
-        - 滚动补回：宿主可见窗口外的最近批次摘要注入为独立 Prompt（非
-          query 驱动——notice 触发的回合同样需要近期上下文；先于 recall
-          构建以让其 memo 就位，recall 同轮排除这些行防重复注入）。
-        - 画像：批次发言者候选 -> 簇表确定性拼装（群聊多人 / 私聊
-          触发者+实体命中扩员，v1.7.1 起私聊提及他人也注入其画像）。
-        - 注入位置：动态块（滚动补回/召回/画像）写入 user prompt 头部，
-          宿主 assemble_prompt 会将其排到最新一条 user 消息内、紧邻用户
-          输入之前——system prompt 与历史消息因此构成稳定前缀、可命中
-          提示词缓存；persist=False，仅本轮生效不写回历史。
+        - Tool gating: enabled_tools multi-select config; when the kernel is
+          not ready, all memory tools are removed (to prevent call errors);
+          under the allowed_users user whitelist, non-whitelisted trigger
+          users are also removed (hard interception still lives at each tool
+          entry point).
+        - Recall: vector retrieval with the batch text as the query (the
+          session isolation switch controls cross-session behavior).
+        - Rolling rollout: the recent batch summaries outside the host-visible
+          window are injected as an independent Prompt (not query-driven -
+          notice-triggered turns also need recent context; built before
+          recall so its memo is in place, and recall excludes these lines in
+          the same turn to avoid duplicate injection).
+        - Persona: batch speaker candidates -> deterministically assembled
+          from the cluster table (multi-user in group chat / trigger user +
+          entity hits in private chat; since v1.7.1, naming others in private
+          chat also injects their persona).
+        - Injection position: dynamic blocks (rolling rollout / recall /
+          persona) are written to the head of the user prompt, and the host's
+          assemble_prompt places them inside the latest user message, right
+          before the user input - so the system prompt and history messages
+          form a stable prefix and can hit the prompt cache; persist=False,
+          effective for this turn only, not written back to history.
         """
         # enabled_tools 显式空列表 = 全部禁用（与 schema "取消选择即禁用"
         # 语义一致）；键缺失/None 才回退全启用
@@ -1118,11 +1154,14 @@ class NoriflowMemoryPlugin(BasePlugin):
     async def _build_profile_text(
         self, event, session, messages, entity_entries: list | None = None
     ) -> str:
-        """构建画像注入文本（bot 自身排除；候选 = 发送者 + 实体命中）。
+        """Build the persona injection text (bot itself excluded; candidates = sender + entity hits).
 
-        v1.7.1 设计修订：私聊（一切非群会话）同样消费实体命中——批次
-        文本提及他人（别名/词典命中）时其画像并入候选（候选收集与群聊
-        同款）；无扩员时保持单用户路径（输出格式与既有私聊一致）。
+        v1.7.1 design revision: private chat (any non-group session) also
+        consumes entity hits - when the batch text mentions others (alias /
+        dictionary hit), their persona joins the candidates (candidate
+        collection same as group chat); with no expansion, keep the
+        single-user path (output format consistent with existing private
+        chat).
         """
         persona_service = self._persona_service
         if persona_service is None or not self._config:
@@ -1155,12 +1194,14 @@ class NoriflowMemoryPlugin(BasePlugin):
         platform: str,
         entity_entries: list | None = None,
     ) -> list[PersonaCandidate]:
-        """从批次消息收集画像候选（去重保序，bot 自身排除，上限配置）。
+        """Collect persona candidates from batch messages (dedup preserving order, bot itself excluded, capped by config).
 
-        候选优先级：批次发送者 > 实体词典命中（批次文本提及的成员；
-        与召回提示旁路共用同一命中结果，命中名直接作 display_name——
-        保证画像标题与聊天称呼一致。误命中由上限截断与空画像栏兜底，
-        被发送者级先收集的用户经 seen 去重跳过）。
+        Candidate priority: batch sender > entity dictionary hits (members
+        mentioned in the batch text; shares the same hit results as the recall
+        hint bypass, and the hit name is used directly as display_name -
+        ensuring the persona title matches the chat appellation. False hits
+        are guarded by cap truncation and empty persona slots; users already
+        collected at the sender level are skipped via the seen dedup).
         """
         seen: set[str] = set()
         candidates: list[PersonaCandidate] = []
@@ -1202,7 +1243,7 @@ class NoriflowMemoryPlugin(BasePlugin):
 
     @staticmethod
     def _build_recall_query(messages: list) -> str:
-        """批次文本拼接为 recall query（截断防向量请求过大）。"""
+        """Concatenate the batch text into the recall query (truncated to prevent oversized vector requests)."""
         texts: list[str] = []
         for msg in messages:
             if getattr(msg, "is_notice", False):
@@ -1215,11 +1256,12 @@ class NoriflowMemoryPlugin(BasePlugin):
 
     @staticmethod
     def _entity_match_text(messages: list) -> str:
-        """实体词典匹配文本：Text 元素 + At 元素昵称（单独构造，不动
-        retain 用的 _chain_text）。
+        """Entity dictionary match text: Text elements + At element nicknames (built separately, does not touch the _chain_text used by retain).
 
-        At 昵称进入匹配面是特性——AT 是最强提及信号，「@小王 你上次说的」
-        正应命中小王；Reply 元素只含消息 ID 不含名字，不进匹配面。
+        At nicknames being part of the match surface is a feature - AT is the
+        strongest mention signal, and "@XiaoWang, what you said last time"
+        should rightly match XiaoWang; Reply elements only carry the message
+        ID without a name, so they are not part of the match surface.
         """
         parts: list[str] = []
         for msg in messages:
@@ -1244,7 +1286,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         return " ".join(parts)
 
     def _track_bot_message_id(self, sid: str, message_id: str) -> None:
-        """bot 出站平台消息 ID 入会话追踪集（有界；会话数 LRU）。"""
+        """Track bot outbound platform message IDs in the per-session set (bounded; sessions LRU)."""
         bucket = self._bot_message_ids.get(sid)
         if bucket is None:
             bucket = deque(maxlen=_BOT_MESSAGE_ID_LIMIT)
@@ -1257,12 +1299,15 @@ class NoriflowMemoryPlugin(BasePlugin):
             self._bot_message_ids.popitem(last=False)
 
     def _bot_addressed(self, messages: list, sid: str) -> bool:
-        """P3 场景 C 硬门槛：本轮输入 AT bot 或引用 bot 消息。
+        """P3 scenario C hard gate: this turn's input ATs the bot or quotes a bot message.
 
-        AT 判定 = At 元素 pid 等于 bot uid（"all" 不算）；引用判定 =
-        Reply 目标命中本会话 bot 出站消息 ID 追踪集。裸代词"你"永不
-        构成 bot 命中——bot 名不进实体词典/别名表，名字匹配层结构性
-        不含 bot，群聊随便一句话不会误触发 bot 边注入。
+        AT determination = At element pid equals the bot uid ("all" does not
+        count); quote determination = the Reply target hits this session's bot
+        outbound message ID tracking set. A bare pronoun "you" never
+        constitutes a bot hit - the bot name is not in the entity
+        dictionary/alias table, the name matching layer structurally excludes
+        the bot, so a random group chat sentence cannot falsely trigger bot
+        edge injection.
         """
         bot_uid = self._bot_user_id
         if not bot_uid:
@@ -1289,15 +1334,19 @@ class NoriflowMemoryPlugin(BasePlugin):
         return False
 
     def _reply_quote_text(self, messages: list, sid: str) -> str:
-        """被引用消息原文（并入 recall query 的引用文本）。
+        """Original text of the quoted message (quote text merged into the recall query).
 
-        v1.7.1 设计修订：引用反查旁路（锚点时间窗摘要拉取）移除，改为
-        被引用消息原文并入 query 走主路语义召回——引用只能引用本会话
-        消息，会话隔离由主路开关统一管。覆盖 = 会话滚动缓存
-        （_SESSION_CACHE_LIMIT 行）；更早的引用目标不并入（缓存 miss
-        无害，无引用文本）。信封行整行截断使用（含时间/说话人前缀——
-        embedding 对前缀噪声不敏感，保留说话人反而有助召回）；
-        每条截 200 字、每轮至多 2 条。
+        v1.7.1 design revision: the quote reverse-lookup bypass (anchor
+        time-window summary pull) was removed; instead the quoted message
+        original text joins the query and goes through the main semantic
+        recall path - a quote can only reference messages in this session, and
+        session isolation is uniformly governed by the main-path switch.
+        Coverage = session rolling cache (_SESSION_CACHE_LIMIT lines); older
+        quote targets are not merged (a cache miss is harmless, no quote
+        text). The envelope line is used truncated in full (including the
+        time/speaker prefix - embedding is insensitive to prefix noise, and
+        keeping the speaker actually helps recall); each quote is truncated to
+        200 characters, at most 2 per turn.
         """
         target_ids: set[str] = set()
         for msg in messages:
@@ -1327,15 +1376,18 @@ class NoriflowMemoryPlugin(BasePlugin):
         return " ".join(texts[:2]).strip()
 
     async def _directory_names(self, sid: str) -> list[tuple[str, str, str]]:
-        """实体词典名字源：会话滚动缓存内观察到的发送者昵称/群名片。
+        """Entity dictionary name sources: sender nicknames / group cards observed in the session rolling cache.
 
-        bot 行跳过（bot 名字会命中全部会话摘要，候选爆炸）；重启后
-        缓存从零积累，词典随之自愈（TTL 兜底）。
+        Bot lines are skipped (the bot name would hit all session summaries
+        and explode candidates); after restart the cache accumulates from zero
+        and the dictionary heals itself (TTL fallback).
 
-        裸 session_id 兼容：缓存以复合 sid（platform:type:id）为键，而
-        build_injection_text 的兜底自匹配等调用方传裸 id——按尾段反查。
-        跨适配器同号会话取最久活跃者：名字仅作候选源，误配由重排与
-        画像空栏兜底。
+        Bare session_id compatibility: the cache is keyed by composite sid
+        (platform:type:id), while callers such as build_injection_text's
+        fallback self-match pass a bare id - looked up by trailing segment.
+        For same-number sessions across adapters, take the most recently
+        active one: names are only a candidate source, and mismatches are
+        guarded by reranking and empty persona slots.
         """
         bucket = self._history.get(sid)
         if bucket is None and sid and ":" not in sid:
@@ -1356,10 +1408,12 @@ class NoriflowMemoryPlugin(BasePlugin):
         return pairs
 
     async def _alias_upsert_batch(self, user_delta: list) -> None:
-        """回合批次 sender 名字 -> 持久别名层 upsert（kira 侧名字流唯一来源）。
+        """Upsert turn batch sender names into the persistent alias layer (the only name-stream source on the kira side).
 
-        kira 插件不读宿主用户表（两侧同构约定：消息流 -> 插件 alias 表）；
-        变体拆分与上限截断在 build_alias_rows 内完成。失败仅记日志。
+        The kira plugin does not read the host user table (isomorphic
+        convention on both sides: message stream -> plugin alias table);
+        variant splitting and the cap truncation happen inside
+        build_alias_rows. Failures are only logged.
         """
         kernel = self._memory_kernel
         if (
@@ -1391,10 +1445,11 @@ class NoriflowMemoryPlugin(BasePlugin):
 
     @staticmethod
     def _trigger_identity(messages: list) -> tuple[str, str]:
-        """取批次触发者 (user_id, "")——platform 由调用方按 session 补齐。
+        """Get the batch trigger user (user_id, "") - platform is filled in by the caller from the session.
 
         Returns:
-            (首个非 notice 消息的发送者 uid，占位空 platform)。
+            (uid of the first non-notice message sender, placeholder empty
+            platform).
         """
         for msg in messages:
             if getattr(msg, "is_notice", False):
@@ -1410,7 +1465,7 @@ class NoriflowMemoryPlugin(BasePlugin):
 
     @on.im_message(priority=Priority.LOW)
     async def observe_message(self, event, *args, **kwargs):
-        """入站消息入滚动行缓存（编码输入的历史窗口来源）。"""
+        """Add an inbound message to the rolling line cache (the history window source for encoding input)."""
         if not self._ready:
             return
         msg = getattr(event, "message", None)
@@ -1449,11 +1504,13 @@ class NoriflowMemoryPlugin(BasePlugin):
 
     @on.message_sent(priority=Priority.MEDIUM)
     async def observe_sent(self, event, action, result, *args, **kwargs):
-        """bot 发送观察：行入滚动缓存（retain 由回合完成信号触发）。
+        """Bot sent observation: line into the rolling cache (retain is triggered by the turn completion signal).
 
-        不在此处触发编码——按发送段触发会在段间隔超过合并窗口时把同一
-        批次重复编码（工具回合拆段/多段回复即中招）；核心的
-        session_memory_updated 信号保证每回合恰好编码一次。
+        Encoding is not triggered here - triggering per sent segment would
+        re-encode the same batch when the segment gap exceeds the merge window
+        (tool-turn splits / multi-segment replies hit this); the core
+        session_memory_updated signal guarantees exactly one encoding per
+        turn.
         """
         if not self._ready:
             return
@@ -1563,7 +1620,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         task.add_done_callback(self._retain_tasks.discard)
 
     def _prune_consumed(self, sid: str) -> None:
-        """水位线只保留仍在缓存里的键（消息键不复用，逐出的可安全丢弃）。"""
+        """The watermark keeps only keys still in the cache (message keys are never reused, evicted ones can be safely dropped)."""
         consumed = self._consumed.get(sid)
         bucket = self._history.get(sid)
         if consumed is None:
@@ -1574,7 +1631,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         self._consumed[sid] = {k for k in bucket if k in consumed}
 
     def _rollback_consumed(self, sid: str, delta_keys: set[str]) -> None:
-        """编码失败回滚水位线，让下一轮信号重新编码这批消息。"""
+        """On encoding failure, roll back the watermark so the next turn's signal re-encodes this batch of messages."""
         consumed = self._consumed.get(sid)
         if consumed is not None:
             consumed.difference_update(delta_keys)
@@ -1582,7 +1639,7 @@ class NoriflowMemoryPlugin(BasePlugin):
     async def _do_retain(
         self, state: _RetainState, sid: str = "", delta_keys: Optional[set[str]] = None
     ) -> None:
-        """组装编码输入并写入（Semaphore 限流；失败回滚水位线，异常只记录）。"""
+        """Assemble the encoding input and write (Semaphore rate-limited; on failure roll back the watermark, exceptions only logged)."""
         # persona 昵称活读（TTL 限频）：编码 prompt 的 bot 排除规则消费
         await self._refresh_bot_nickname()
         kernel = self._memory_kernel
@@ -1638,7 +1695,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         cardname: str = "",
         timestamp: Optional[datetime] = None,
     ) -> None:
-        """追加一行到会话滚动缓存（LRU 上限防膨胀；会话逐出时同步清水位线）。"""
+        """Append a line to the session rolling cache (LRU cap prevents bloat; watermarks are cleared in sync when a session is evicted)."""
         bucket = self._history.get(sid)
         if bucket is None:
             bucket = OrderedDict()
@@ -1664,7 +1721,7 @@ class NoriflowMemoryPlugin(BasePlugin):
             )
 
     def _history_snapshot(self, sid: str, exclude_ids: set[str]) -> list[str]:
-        """取会话最近 N 行（排除本轮增量消息），时间序（旧 -> 新）。"""
+        """Take the most recent N lines of a session (excluding this turn's incremental messages), in time order (old -> new)."""
         bucket = self._history.get(sid)
         if not bucket:
             return []
@@ -1675,7 +1732,7 @@ class NoriflowMemoryPlugin(BasePlugin):
 
     @staticmethod
     def _chain_text(chain: Any) -> str:
-        """从消息链提取纯文本（只取 Text 元素）。"""
+        """Extract plain text from a message chain (Text elements only)."""
         if chain is None:
             return ""
         parts: list[str] = []
@@ -1690,7 +1747,7 @@ class NoriflowMemoryPlugin(BasePlugin):
 
     @staticmethod
     def _to_datetime(ts: Any) -> Optional[datetime]:
-        """时间戳 -> datetime（秒/毫秒自适应；非法返回 None）。"""
+        """Timestamp -> datetime (seconds/milliseconds auto-detected; returns None for invalid input)."""
         if not ts:
             return None
         try:
@@ -1702,12 +1759,14 @@ class NoriflowMemoryPlugin(BasePlugin):
             return None
 
     def _pool_or_503(self):
-        """维护 API 公共守卫：kernel 未就绪时 503。
+        """Common guard for maintenance APIs: 503 when the kernel is not ready.
 
-        返回 backend 对象（而非裸池）——webui_store 双后端 SQL 派发按
-        ``backend.dialect`` 判定方言，裸池缺该属性会被兜底成 postgres，
-        在 SQLite 后端下把 PG 方言 SQL 打进 SQLite（::token 语法错误）。
-        webui_store 内部经 ``_pool(backend)`` 取池，调用点无需改动。
+        Returns the backend object (not the bare pool) - webui_store's
+        dual-backend SQL dispatch determines the dialect from
+        ``backend.dialect``; a bare pool lacks this attribute and would fall
+        back to postgres, pushing PG-dialect SQL into SQLite under the SQLite
+        backend (::token syntax errors). webui_store fetches the pool
+        internally via ``_pool(backend)``, so call sites need no changes.
         """
         db = self._db
         pool = None
@@ -1729,10 +1788,11 @@ class NoriflowMemoryPlugin(BasePlugin):
     async def _resolve_tool_name(
         self, session_id: str, name: str
     ) -> tuple[Optional[tuple[str, str]], str]:
-        """名字 → 唯一 (platform, uid)（复用实体命中的 match 机制）。
+        """Resolve a name to a unique (platform, uid) (reuses the entity-hit match mechanism).
 
-        歧义/未命中时第二项为给模型的提示文本；与画像候选/P3 关系
-        节点同一套解析（窗口词典 + 持久别名层）。
+        On ambiguity/miss, the second item is hint text for the model; the
+        same resolution used for persona candidates / P3 relation nodes
+        (window dictionary + persistent alias layer).
         """
         kernel = self._memory_kernel
         if kernel is None:
@@ -1917,7 +1977,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         return self._whitelist_denial(event) is not None
 
     def _tool_scope_lock_enabled(self) -> bool:
-        """工具作用域锁定开关（tool_scope_locked，默认开）。"""
+        """Tool scope lock switch (tool_scope_locked, on by default)."""
         config = self._config
         return bool(config is not None and config.tool_scope_locked)
 
@@ -2083,7 +2143,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         )
 
     def _owner_label(self, platform: str, uid: str) -> str:
-        """归属标注：最新非占位别名（uid），动态取名避免昵称漂移写死。"""
+        """Attribution label: the newest non-placeholder alias (uid); the dynamic name avoids hard-coding nickname drift."""
         name = ""
         kernel = self._memory_kernel
         alias_store = getattr(kernel, "alias_store", None) if kernel is not None else None
@@ -2109,10 +2169,11 @@ class NoriflowMemoryPlugin(BasePlugin):
         plat: str,
         entity_sid: str = "",
     ) -> str:
-        """memory_search 的 fact/relation 通道（对齐 nori _search_facts）。
+        """The fact/relation channel of memory_search (aligned with nori _search_facts).
 
-        作用域锁定：有 name 经实体解析收窄到该成员；无 name 锚定触发者，
-        缺用户定位拒绝检索（防跨会话事实泄漏）。
+        Scope lock: with a name, narrow to that member via entity resolution;
+        without a name, anchor to the trigger user, and refuse retrieval when
+        the user cannot be located (prevents cross-session fact leakage).
         """
         db = self._db
         if db is None:
@@ -2864,7 +2925,7 @@ class NoriflowMemoryPlugin(BasePlugin):
 
     @register.api(method="POST", path="/memory/relations/backfill")
     async def api_relations_backfill(self, full: bool = False):
-        """full=True 忽略水位全量重跑（默认增量：只回填上次进度之后的新簇）。"""
+        """full=True ignores the watermark and reruns in full (default incremental: only refills clusters newer than the last progress)."""
         ctl = self._relation_controller
         if ctl is None:
             raise HTTPException(status_code=503, detail="回填控制器未装配")
@@ -2941,7 +3002,7 @@ class NoriflowMemoryPlugin(BasePlugin):
     # ------------------------------------------------------------------
 
     def _kira_memory_bot_identity(self) -> tuple[str, str, str]:
-        """global 域事实的归属 bot（platform/uid/昵称；装配未就绪时空串）。"""
+        """The owning bot of global-scope facts (platform/uid/nickname; empty strings when assembly is not ready)."""
         platform = ""
         uid = ""
         nickname = ""
@@ -2954,7 +3015,7 @@ class NoriflowMemoryPlugin(BasePlugin):
 
     @register.api(method="GET", path="/memory/kira_memory/import")
     async def api_kira_memory_import_preview(self, source_path: str = ""):
-        """迁入预览：源扫描计数 + 最近一次迁入结果（不写任何数据）。"""
+        """Import preview: source scan counts + the most recent import result (writes no data)."""
         path = source_path.strip() or default_source_path(self._plugin_data_dir())
         preview = scan_source(path)
         backend = self._pool_or_503() if preview["exists"] else None
@@ -2968,9 +3029,10 @@ class NoriflowMemoryPlugin(BasePlugin):
 
     @register.api(method="POST", path="/memory/kira_memory/import")
     async def api_kira_memory_import_run(self, body: dict = Body(None)):
-        """执行迁入（源只读；目标端幂等，重复执行自动去重）。
+        """Run the import (source read-only; target idempotent, repeated runs are auto-deduped).
 
-        body 可选 {"source_path": "..."}；缺省用推断的宿主 data/memory。
+        body is optional {"source_path": "..."}; defaults to the inferred host
+        data/memory.
         """
         if getattr(self, "_kira_memory_import_running", False):
             raise HTTPException(status_code=409, detail="已有一次迁入在执行中")
@@ -3007,7 +3069,7 @@ class NoriflowMemoryPlugin(BasePlugin):
     # ------------------------------------------------------------------
 
     def _plugin_id(self) -> str:
-        """manifest.json 的 plugin_id（宿主配置存储键；启动后缓存）。"""
+        """The plugin_id from manifest.json (the host config storage key; cached after startup)."""
         if getattr(self, "_cached_plugin_id", None):
             return self._cached_plugin_id
         try:
@@ -3032,13 +3094,17 @@ class NoriflowMemoryPlugin(BasePlugin):
 
     @register.api(method="PUT", path="/memory/config")
     async def api_memory_config_put(self, body: dict = Body(...)):
-        """保存配置：校验 -> 就地热更新运行时实例 -> 同步宿主真相源。
+        """Save config: validate -> hot-update the runtime instance in place -> sync the host source of truth.
 
-        不走 pm.update_plugin_config（那会 init_plugin 整体重初始化、拆池
-        重建）——直接更新宿主内存 dict 并落盘 PLUGIN_CONFIG_DIR/<pid>.json，
-        与宿主配置页读内存的口径一致；kernel/merge_agent/encoder/熔断器
-        运行时按次读同一 LocalMemoryConfig 实例，保存即生效。装配期展开
-        的字段（restart_required）如实返回，需重初始化/重启进程生效。
+        Does not use pm.update_plugin_config (that would re-initialize the
+        whole plugin via init_plugin and tear down/recreate pools) - instead
+        it directly updates the host in-memory dict and persists
+        PLUGIN_CONFIG_DIR/<pid>.json, consistent with the host config page
+        reading from memory; kernel/merge_agent/encoder/circuit breaker read
+        the same LocalMemoryConfig instance at runtime, so the save takes
+        effect immediately. Fields expanded at assembly time
+        (restart_required) are returned as-is; they need a re-initialization
+        or process restart to take effect.
         """
         pm = self.ctx.plugin_mgr
         if pm is None or self._config is None:

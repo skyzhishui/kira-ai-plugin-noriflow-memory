@@ -1,29 +1,42 @@
-"""存量关系回填：已确认事实簇 -> memory_entity_edge（一次性维护任务）。
+"""Legacy relation backfill: confirmed fact clusters -> memory_entity_edge (one-off maintenance task).
 
-P2 关系提取只对增量编码批次生效——历史已确认事实（active/profiled 簇）
-里沉淀的关系需要一次回填才能进边表。本模块经维护页手动触发
-（关系图谱栏"从已确认事实回填"），不走常规管线。
+P2 relation extraction only applies to incremental encoding batches;
+relations sedimented in historical confirmed facts (active/profiled
+clusters) need a one-time backfill before entering the edge table. This
+module is manually triggered from the maintenance page ("backfill from
+confirmed facts" in the relation-graph section) and does not run on the
+regular pipeline.
 
-数据流（零 LLM 信任原则，逐条防御）：
-1. 源：fetch_confirmed_relation_sources（active+profiled 簇，id 升序）；
-2. 目录：fetch_alias_directory 全表 -> 纯函数 _build_directory 消歧
-   （同名多 uid 跳过，确定性优先）；bot 昵称显式入目录 (bot)；
-3. 批次：每批 cluster_batch_size 条；批内陈述子串命中目录名的名字
-   才进该批词典（提示词有界）；无可解析名字的批次跳过 LLM 直达 0 条；
-4. LLM：prompts/fact_relations.prompt 单次调用出 relations 数组；
-5. 校验：parse_relation（label 2-8 字/statement<=200/confidence 值域）
-   + cluster_id 必须引用输入行 + subject 必须等于该簇归属 uid +
-   object 必须在该批词典 uid 集 + label 词形必须出现在源陈述里；
-   端点占位名（未知/uid 兜底形）以目录规范名顶替；
-6. 落库：db.upsert_entity_edge，evidence_key = backfill|{cluster_id}
-   （重跑幂等不涨计数）；occurred_at 取簇 occurred_at；bot 边照常
-   pending + min_evidence 门槛（回填不算双证据，激活仍需线上复现）。
+Data flow (zero-LLM-trust principle, defended per entry):
+1. source: fetch_confirmed_relation_sources (active+profiled clusters, id ascending);
+2. directory: fetch_alias_directory full table -> pure function
+   _build_directory disambiguates (same-name multi-uid skipped,
+   determinism first); the bot nickname explicitly enters the directory (bot);
+3. batches: cluster_batch_size entries per batch; only names whose
+   substrings hit a batch's statement enter that batch's dictionary
+   (bounded prompt); batches with no resolvable name skip the LLM and
+   return 0 directly;
+4. LLM: one prompts/fact_relations.prompt call producing the relations array;
+5. validation: parse_relation (label 2-8 chars/statement<=200/confidence
+   domain) + cluster_id must reference an input row + subject must equal
+   that cluster's owning uid + object must be inside the batch-dictionary
+   uid set + the label form must appear in the source statement; endpoint
+   placeholder names (unknown/uid-fallback forms) replaced by the
+   directory canonical name;
+6. persist: db.upsert_entity_edge with evidence_key = backfill|{cluster_id}
+   (rerun idempotent, no count inflation); occurred_at taken from the
+   cluster occurred_at; bot edges still go pending + min_evidence threshold
+   (backfill does not count as double evidence; activation still needs
+   online reproduction).
 
-失败语义：单批失败（LLM 不可用/输出不可解析）计数并即停——失败批与
-其后的簇水位不推进，下次重跑自动补；全量重跑（force_full）忽略水位。
-计数语义：回填行 count_on_conflict=False——命中已有边的冲突路径只刷新
-不计分（防线上提取 +1 后回填回声再 +1、防回填回声凑满 bot 边双证据
-门槛），新行插入仍计 1；重跑数据侧零副作用。
+Failure semantics: a batch failure (LLM unavailable/unparseable output)
+counts and stops immediately; the failed batch and clusters after it keep
+the watermark unadvanced and are auto-recovered on the next rerun; full
+rerun (force_full) ignores the watermark. Counting semantics: backfill rows
+use count_on_conflict=False, a conflict path hitting an existing edge only
+refreshes without scoring (prevents online extraction +1 then backfill echo
++1, and backfill echo from reaching the bot-edge double-evidence threshold);
+new-row inserts still count 1; reruns have zero side effects on the data.
 """
 
 from __future__ import annotations
@@ -70,12 +83,12 @@ _BACKFILL_PENDING_MAX = 500
 
 
 def _kv_pool(db_or_pool):
-    """MemoryDatabase 或裸 pool -> 裸 pool（标记函数两侧调用方通吃）。"""
+    """MemoryDatabase or bare pool -> bare pool (works for callers on either side of the seam)."""
     return db_or_pool.pool if hasattr(db_or_pool, "pool") else db_or_pool
 
 
 async def _kv_get(db_or_pool, key: str):
-    """kv 读取：MemoryDatabase.get_kv 优先，裸 pool 走 SQL。"""
+    """kv read: MemoryDatabase.get_kv preferred, bare pool goes through SQL."""
     if hasattr(db_or_pool, "get_kv"):
         return await db_or_pool.get_kv(key)
     pool = _kv_pool(db_or_pool)
@@ -87,7 +100,7 @@ async def _kv_get(db_or_pool, key: str):
 
 
 async def _kv_set(db_or_pool, key: str, value: str) -> None:
-    """kv 写入：MemoryDatabase.set_kv 优先，裸 pool 走 SQL。"""
+    """kv write: MemoryDatabase.set_kv preferred, bare pool goes through SQL."""
     if hasattr(db_or_pool, "set_kv"):
         await db_or_pool.set_kv(key, value)
         return
@@ -103,14 +116,14 @@ async def _kv_set(db_or_pool, key: str, value: str) -> None:
 
 
 async def mark_backfill_pending(db_or_pool, cluster_ids: list[int]) -> int:
-    """登记复活簇的回填待办（append 语义，容量上限内保序去重）。
+    """Register revived clusters as backfill todos (append semantics; dedup, order-preserved within the capacity cap).
 
     Args:
-        db_or_pool: MemoryDatabase / asyncpg 连接池 / 具备 get_kv+set_kv 的桩。
-        cluster_ids: 复活簇 id 列表。
+        db_or_pool: MemoryDatabase / asyncpg pool / a stub with get_kv+set_kv.
+        cluster_ids: Revived cluster id list.
 
     Returns:
-        本次新登记的簇数。
+        Number of clusters newly registered this call.
     """
     ids = sorted({int(i) for i in cluster_ids or [] if int(i) > 0})
     if not ids:
@@ -134,10 +147,10 @@ async def mark_backfill_pending(db_or_pool, cluster_ids: list[int]) -> int:
 
 
 async def take_backfill_pending(db_or_pool) -> list[int]:
-    """取走回填待办（读后清空；失败保留待办下轮重试）。
+    """Take the backfill todos (read then clear; on failure keep them for the next round).
 
     Returns:
-        待办簇 id 列表（空列表 = 无待办或读取失败）。
+        Todo cluster id list (empty list = no todos or read failed).
     """
     try:
         raw = await _kv_get(db_or_pool, _BACKFILL_PENDING_KEY)
@@ -162,7 +175,7 @@ async def take_backfill_pending(db_or_pool) -> list[int]:
 
 @dataclass
 class _DirectoryEntry:
-    """目录条目：名字 -> (platform, uid)。platform 空串 = 通配（bot）。"""
+    """Directory entry: name -> (platform, uid). Empty platform = wildcard (bot)."""
 
     platform: str
     uid: str
@@ -178,15 +191,17 @@ def build_directory(
     bot_user_id: str = "",
     bot_nickname: str = "",
 ) -> dict[str, _DirectoryEntry]:
-    """名字 -> 目录条目（歧义名字整名跳过，与 alias_store.match 同裁决）。
+    """Build a name -> directory-entry map (ambiguous names dropped entirely, same ruling as alias_store.match).
 
     Args:
-        alias_rows: (platform, uid, name) 全表行。
-        bot_user_id: bot 平台 uid（非空时以通配 platform 入目录）。
-        bot_nickname: bot 昵称（目录键）。
+        alias_rows: Full-table (platform, uid, name) rows.
+        bot_user_id: Bot platform uid (enters the directory with a wildcard
+            platform when non-empty).
+        bot_nickname: Bot nickname (directory key).
 
     Returns:
-        name -> _DirectoryEntry；同名字多 uid 的名字不出现（确定性优先）。
+        name -> _DirectoryEntry; names resolving to multiple uids do not appear
+        (determinism first).
     """
     grouped: dict[str, list[tuple[str, str]]] = {}
     for platform, uid, name in alias_rows or []:
@@ -207,7 +222,7 @@ def build_directory(
 
 
 class RelationBackfill:
-    """存量关系回填任务（维护页手动触发，可重跑幂等）。"""
+    """Legacy relation backfill task (manually triggered from the maintenance page, rerunnable idempotently)."""
 
     def __init__(
         self,
@@ -221,22 +236,23 @@ class RelationBackfill:
         batch_size: int = DEFAULT_BATCH_SIZE,
         bot_forms_provider: Optional[Callable[[], list[str]]] = None,
     ) -> None:
-        """装配回填器。
+        """Assemble the backfiller.
 
         Args:
-            llm_call: LLM 出口 (system_prompt, user_prompt) -> 原始输出
-                文本——两侧宿主出口不同（上游 nori 版 / kira
-                run_structured），由装配层闭包包装，本模块保持两侧字节
-                级一致。
-            db: 记忆库连接池。
-            config: 插件配置（relation_bot_edge_min_evidence）。
-            bot_user_id: bot 平台 uid（bot 边判定 + 目录 bot 条目）。
-            bot_nickname: bot 昵称。
-            prompt_dir: 提示词目录；None 用本插件 prompts/。
-            batch_size: 每批簇数。
-            bot_forms_provider: bot uid 全形态集合读取器（kernel.
-                _bot_uid_forms_all 语义——bot 端点判定与 retain 通道
-                对齐；None 退化为单形态 bot_user_id）。
+            llm_call: LLM exit (system_prompt, user_prompt) -> raw output
+                text: the two hosts' exits differ (upstream nori / kira
+                run_structured), wrapped by the assembly-layer closure so this
+                module stays byte-identical across both sides.
+            db: Memory store connection pool.
+            config: Plugin config (relation_bot_edge_min_evidence).
+            bot_user_id: Bot platform uid (bot-edge ruling + directory bot entry).
+            bot_nickname: Bot nickname.
+            prompt_dir: Prompt directory; None uses this plugin's prompts/.
+            batch_size: Number of clusters per batch.
+            bot_forms_provider: Reader for the bot uid's full-form set
+                (kernel._bot_uid_forms_all semantics, bot-endpoint ruling
+                aligned with the retain channel; None degrades to the
+                single form bot_user_id).
         """
         self._llm_call = llm_call
         self._db = db
@@ -248,7 +264,7 @@ class RelationBackfill:
         self._batch_size = max(1, int(batch_size))
 
     def _bot_forms(self) -> list[str]:
-        """Bot uid 全形态集合（provider 优先；退化为单形态 uid）。"""
+        """Bot uid full-form set (provider preferred; degrades to single-form uid)."""
         if self._bot_forms_provider is not None:
             try:
                 forms = [f for f in (self._bot_forms_provider() or []) if f]
@@ -263,24 +279,30 @@ class RelationBackfill:
         progress: Optional[Callable[[dict], None]] = None,
         force_full: bool = False,
     ) -> dict:
-        """执行回填（id 窗口分页逐批；单批失败即停，余量顺延下次重跑）。
+        """Run the backfill (id-window paging per batch; a single-batch failure stops, the remainder defers to the next run).
 
-        水位增量：非全量模式从 kv 水位（relation_backfill_watermark）
-        之后的新簇开始；每批成功后水位推进到该批最大簇 id，失败即停——
-        失败批与其后的簇保持未推进，下次重跑自动补。全量模式忽略水位
-        （簇陈述修正后想重新提取时用；数据侧 count_on_conflict=False
-        保证重跑只刷新不计分）。源查询按 batch_size 窗口分页推进（大库
-        全量不再一次性载入内存）。复活簇待办（merge/维护页复活、水位
-        之下的簇）在每轮开头取走并按 id 精取，置于增量批次之前补提取；
-        精取/批处理失败时未成功的簇重新登记回待办（下轮增量重试）。
+        Watermark incremental: in non-full mode start from clusters after kv
+        watermark (relation_backfill_watermark); on each successful batch the
+        watermark advances to that batch's max cluster id; a failure stops
+        there, the failed batch and clusters after it stay unadvanced and are
+        auto-recovered on the next run. Full mode ignores the watermark (used
+        when cluster statements were corrected and re-extraction is wanted;
+        count_on_conflict=False guarantees a rerun only refreshes without
+        scoring). The source query pages by batch_size window (a large-table
+        full run no longer loads everything into memory). Revived-cluster
+        todos (merge/maintenance-page revival, clusters below the watermark)
+        are taken at the start of each round and fetched precisely by id,
+        placed before incremental batches for re-extraction; clusters that
+        fail precise-fetch/batch-processing are re-registered as todos
+        (incremental retry next round).
 
         Args:
-            progress: 每批一次的进度回调（收 {done,total,relations}）。
-            force_full: True 忽略水位全量重跑。
+            progress: Per-batch progress callback (receives {done,total,relations}).
+            force_full: True ignores the watermark for a full rerun.
 
         Returns:
-            汇总 dict：clusters_total/batches_total/batches_failed/
-            relations_written/relations_discarded/mode。
+            Summary dict: clusters_total/batches_total/batches_failed/
+            relations_written/relations_discarded/mode.
         """
         after_id = 0
         mode = "full"
@@ -421,7 +443,7 @@ class RelationBackfill:
     # ------------------------------------------------------------------
 
     async def _requeue_backfill_pending(self, cluster_ids: list[int]) -> None:
-        """复活簇待办失败重登记（fail-open：登记失败只记日志，可全量重跑补）。"""
+        """Re-register failed revived-cluster todos (fail-open: a registration failure only logs; a full rerun covers it)."""
         try:
             await mark_backfill_pending(self._db, cluster_ids)
         except Exception:
@@ -437,10 +459,10 @@ class RelationBackfill:
         directory: dict[str, _DirectoryEntry],
         names_by_owner: dict[tuple[str, str], str],
     ) -> tuple[int, int]:
-        """单批：名字预筛 -> LLM 提取 -> 校验 -> 落库。
+        """Single batch: name pre-filter -> LLM extraction -> validation -> persist.
 
         Returns:
-            (写入边数, 校验丢弃数)。
+            (edges written, validation-discarded count).
         """
         by_id = {int(c["id"]): c for c in batch}
         # 批内词典：陈述子串命中的目录名（含 bot）——提示词有界
@@ -490,7 +512,7 @@ class RelationBackfill:
     def _render_user_prompt(
         self, batch: list[dict], entries: dict[str, _DirectoryEntry]
     ) -> str:
-        """用户提示词：事实行 + 名字→uid 词典。"""
+        """User prompt: fact rows + name->uid dictionary."""
         lines = ["【用户事实（每行一条，#簇ID [platform] uid=归属uid：陈述）】"]
         for c in batch:
             stmt = str(c["canonical_statement"] or "").replace("\n", " ")
@@ -510,12 +532,14 @@ class RelationBackfill:
         entries: dict[str, _DirectoryEntry],
         names_by_owner: dict[tuple[str, str], str],
     ) -> Optional[dict]:
-        """LLM 元素 -> 边行；任一防御不通过返回 None。
+        """LLM element -> edge row; return None when any defense fails.
 
-        校验链：cluster_id 引用输入行 -> parse_relation 结构 ->
-        subject == 簇归属 uid -> object ∈ 批词典 uid -> 平台一致
-        （bot 通配）-> label 词形出现在源陈述。端点占位名（未知/
-        uid 兜底形）用目录规范名顶替，未命中留空（upsert 保旧名）。
+        Validation chain: cluster_id references an input row -> parse_relation
+        structure -> subject == the cluster's owning uid -> object inside the
+        batch-dictionary uid set -> platform consistent (bot wildcard), label
+        form appears in the source statement. Endpoint placeholder names
+        (unknown/uid-fallback forms) are replaced with the directory canonical
+        name; unmatched ones stay empty (upsert keeps the old name).
         """
         if not isinstance(item, dict):
             return None
@@ -582,19 +606,21 @@ class RelationBackfill:
 
 
 class BackfillController:
-    """回填任务控制器：状态挂长期对象（插件实例），非 per-request API 对象。
+    """Backfill task controller: state lives on a long-lived object (the plugin instance), not a per-request API object.
 
-    webui 插件按请求解析 get_web_ui（MemoryWebApi 每次新建），运行中的
-    asyncio 任务与进度状态必须驻留更外层——本控制器由 main.py 装配并
-    随插件生命周期存续，API 层只透传 start/status。
+    The webui plugin parses get_web_ui per request (MemoryWebApi is built
+    each time); running asyncio tasks and progress state must dwell at an
+    outer layer. This controller is assembled by main.py and lives with the
+    plugin lifecycle; the API layer only passes through start/status.
     """
 
     def __init__(self, factory: Callable[[], Optional[RelationBackfill]]) -> None:
-        """装配控制器。
+        """Assemble the controller.
 
         Args:
-            factory: 惰性构造 RelationBackfill（task_router 未装配时
-                返回 None——由插件装配层决定可用性）。
+            factory: Lazily constructs RelationBackfill (returns None when
+                task_router is not assembled, availability decided by the
+                plugin assembly layer).
         """
         self._factory = factory
         self._task: Optional[asyncio.Task] = None
@@ -615,7 +641,7 @@ class BackfillController:
         }
 
     def available(self) -> bool:
-        """回填是否可用（factory 产出的 runner 非 None）。"""
+        """Whether backfill is available (the runner produced by the factory is non-None)."""
         try:
             return self._factory() is not None
         except Exception:
@@ -623,13 +649,14 @@ class BackfillController:
             return False
 
     def start(self, full: bool = False) -> tuple[bool, str]:
-        """启动回填任务；已在运行/不可用时拒绝。
+        """Start the backfill task; reject when already running/unavailable.
 
         Args:
-            full: True 忽略水位全量重跑（增量失败/簇陈述修正后补提取）。
+            full: True ignores the watermark for a full rerun (incremental
+                failure or re-extraction after cluster statement correction).
 
         Returns:
-            (是否已启动, 消息)。
+            (started or not, message).
         """
         if self.state.get("running"):
             return False, "回填已在运行中"
@@ -665,7 +692,7 @@ class BackfillController:
         return True, "回填已启动"
 
     async def stop(self) -> None:
-        """插件停机清理：取消运行中的回填任务。"""
+        """Plugin-shutdown cleanup: cancel a running backfill task."""
         task = self._task
         if task is not None and not task.done():
             task.cancel()

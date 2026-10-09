@@ -1,30 +1,42 @@
-"""LocalMemoryKernel：基于 PostgreSQL + pgvector 的本地记忆内核。
+"""LocalMemoryKernel: local memory kernel based on PostgreSQL + pgvector.
 
-写入链路（M2）：
-- ingest: 摘要/bot_self 原文写入 memory_chat_summary（document_id 幂等，
-  写入时计算 embedding，失败置 NULL 待补算）；
-- retain_encoded: 端侧编码多通道——facts 批量写入 memory_persona_fact_raw
-  （extracted_flag=0，附 evidence_key 计分去重键，等待 M4 合并 agent 消费）、
-  relations 结构化三元组零 LLM 合并落 memory_entity_edge（P2 通道）、
-  summary 走 ingest 同路径殿后（失败方向安全，见 retain_encoded docstring）。
+Write path (M2):
+- ingest: summary/bot_self raw text written to memory_chat_summary (document_id
+  idempotent; embedding computed at write time, set to NULL on failure pending
+  backfill);
+- retain_encoded: on-endpoint encoded multi-channel - facts batch-written to
+  memory_persona_fact_raw (extracted_flag=0, carrying evidence_key scoring
+  dedup key, awaiting M4 merge-agent consumption), relations as structured
+  triples landed zero-LLM-merge into memory_entity_edge (P2 channel), summary
+  written last through the same ingest path (failure-direction safe, see the
+  retain_encoded docstring).
 
-召回链路（M3，见开发方案 §9.2）：
-- search: query 实时向量化 -> scope 过滤 + cosine top-N 候选 ->
-  RerankClient 重排序（可配关闭，失败退化纯向量序）-> 相关度阈值 ->
-  top_k 截断（per_user 模式复用同一管线，仅截断阶段换用户配额 +
-  公共位；能力位暂不启用，见 search docstring）；
-- scope 模式：session（默认，语义对齐 hindsight tag 组合）/ user（用户精确，
-  participants 数组过滤天然跨会话）/ user_session（用户 + 会话收紧）；
-- build_injection_text: 话题黑名单二次防线 + token 预算截断 + 注入格式
-  逐字对齐 hindsight 版（主排除在 search 候选层 SQL 结构性完成）；
-- persona_fact 对 recall 不可见由结构保证（事实/簇表不参与检索）。
+Recall path (M3, see dev plan section 9.2):
+- search: query vectorized in real time -> scope filter + cosine top-N
+  candidates -> RerankClient rerank (configurable off; on failure degrades to
+  plain vector order) -> relevance threshold -> top_k truncation (per_user
+  mode reuses the same pipeline, only the truncation stage swaps to per-user
+  quota + shared slots; the capability slot is not wired yet, see the search
+  docstring);
+- scope modes: session (default, semantically aligned with the hindsight tag
+  combination) / user (user-exact, participants array filter naturally
+  cross-session) / user_session (user + session tightened);
+- build_injection_text: topic blacklist second line of defense + token budget
+  truncation + injection format verbatim-aligned with the hindsight version
+  (the main exclusion is done structurally in SQL at the search candidate
+  layer);
+- persona_fact invisibility to recall is guaranteed structurally (fact/cluster
+  tables never participate in retrieval).
 
-DB 故障语义：recall 读取经熔断器守卫，失败记 warning 返回空（fail-open，
-不阻断注入链路，与 hindsight 后端行为对齐）；retain 写路径相反——熔断
-拒绝期/写入执行失败上抛 MemoryDBUnavailable，由 retain_encoded 包装层
-捕获入 pending 重试队列（宿主无重试机制，插件内队列等价实现「内容不丢」）；
-合并 agent（merge_agent）的周期任务另行在周期入口 peek 熔断状态
-（拒绝期整周期跳过，不烧 LLM 预算）。
+DB failure semantics: recall reads are guarded by the circuit breaker, on
+failure they log a warning and return empty (fail-open, does not block the
+injection path, aligned with hindsight backend behavior); the retain write
+path is the opposite - during circuit-open rejection or write execution
+failure it raises MemoryDBUnavailable, caught by the retain_encoded wrapper
+into a pending retry queue (the host has no retry mechanism; the in-plugin
+queue is the equivalent way to keep content loss-free); the merge agent
+(merge_agent) periodic task separately peeks the circuit state at cycle entry
+(skips the whole cycle during the rejection period, no burned LLM budget).
 """
 
 from __future__ import annotations
@@ -76,12 +88,16 @@ _T = TypeVar("_T")
 
 
 class MemoryDBUnavailable(RuntimeError):
-    """记忆库不可用（熔断拒绝期或写入执行失败）。
+    """Memory database unavailable (during a circuit-open rejection period or
+    a write execution failure).
 
-    retain 路径以此上抛：调用方（_do_retain）回滚水位线，本批消息留给
-    下一轮信号重编码（内容不丢）；memory_write 等工具路径由入口捕获，
-    向 LLM 回报写入失败。替代旧 fail-open 契约（拒绝后仍返回
-    document_id）——那会让批次被标已消费而实际未落库，静默丢失。
+    The retain path raises this: the caller (_do_retain) rolls back the
+    watermark and leaves this batch of messages to be re-encoded on the next
+    signal round (content is not lost); tool paths such as memory_write are
+    caught at the entry point, which reports the write failure to the LLM.
+    It replaces the old fail-open contract (which still returned
+    document_id after a rejection) - that let a batch be marked consumed
+    while never actually being persisted, a silent loss.
     """
 
 # scope 合法值
@@ -90,25 +106,35 @@ _VALID_SCOPES = frozenset({"session", "user", "user_session"})
 
 @dataclass
 class RecallHints:
-    """实体命中/P3 关系注入的传输载体（不再驱动召回候选拉取）。
+    """Transport carrier for entity hits / P3 relation injection (no longer
+    drives recall candidate fetching).
 
-    v0.5.1 设计修订：召回提示旁路（实体词典路 + 引用反查路）整体
-    移除——实体路的恒跨会话拉取与会话隔离基线（summary_recall_
-    session_scoped）冲突，引用路的时间窗反查被「引用原文并入
-    recall query 走主路」取代（适配层把被引用消息文本拼进 query，
-    语义召回天然受会话隔离开关管）。hints 仅承载：
+    v0.5.1 design revision: the recall-hint bypass (entity-directory route +
+    reference reverse-lookup route) was removed entirely - the entity route's
+    always-cross-session fetching conflicted with the session-isolation
+    baseline (summary_recall_session_scoped), and the reference route's
+    time-window reverse lookup was replaced by "merge the referenced raw text
+    into the recall query and go through the main route" (the adapter appends
+    the referenced message text to the query; semantic recall is naturally
+    governed by the session-isolation switch). hints only carry:
 
-    - entity_user_keys: 实体命中复合键（"platform:uid"）——画像候选
-      与 P3 关系注入节点匹配的输入；
-    - match_text: 实体词典同源匹配文本（含 @昵称 渲染）——P3 边注入
-      的 label 词形命中面（与名字匹配同一文本，适配层组装）；
-    - bot_addressed: 本轮输入是否 AT bot 或引用 bot 消息（场景 C 硬门槛，
-      适配层判定；私聊恒 True——整场对话就是对 bot 说的。False 时
-      bot 端点边不参与注入）。
-    - bot_user_id: bot 平台 uid（如 QQ 号），适配层从平台适配器解析。
-      与宿主注入的 bot_id（会话标识）是同一 bot 的两种 uid 形态——
-      边表 bot 端点两种形态都存在（提取提示词主形态=bot_id，@段
-      词典渗入副形态=平台 uid），注入按集合匹配通吃（bot_uid_set）。
+    - entity_user_keys: entity-hit composite keys ("platform:uid") - the
+      input for persona-candidate and P3 relation-injection node matching;
+    - match_text: same-source matching text from the entity directory
+      (including @nickname rendering) - the label word-form hit surface for
+      P3 edge injection (same text used for name matching, assembled by the
+      adapter);
+    - bot_addressed: whether this round's input ATs the bot or references a
+      bot message (hard gate for scenario C, decided by the adapter; always
+      True in private chats - the whole conversation is addressed to the
+      bot. When False, bot-endpoint edges do not participate in injection).
+    - bot_user_id: bot platform uid (e.g. a QQ number), resolved by the
+      adapter from the platform adapter. Together with the host-injected
+      bot_id (session identifier) these are the two uid forms of the same
+      bot - both forms exist for bot endpoints in the edge table (the main
+      form in extraction prompts = bot_id, the secondary form leaked from
+      the @-segment dictionary = platform uid), and injection matches by
+      union of the sets (bot_uid_set).
     """
 
     entity_user_keys: list[str] = field(default_factory=list)
@@ -118,13 +144,17 @@ class RecallHints:
 
 
 class _EntityDirectory:
-    """会话级实体词典（名字 → 参与者 (platform, uid) 列表），懒构建 + TTL + LRU。
+    """Session-level entity directory (name -> list of participant
+    (platform, uid)), lazy-built with TTL + LRU.
 
-    名字源由适配层注入（directory_source 回调）：KiraAI 侧取插件滚动行
-    缓存（宿主已观察到的发送者昵称/群名片）——均为可靠名字，不从摘要
-    文本抽数（误抽风险留 v2）。TTL 到期自愈重建；改名/账号合并在 TTL
-    窗口内不感知，属旁路可接受的延迟（词典只是候选来源，误命中由
-    重排与画像空栏兜底）。
+    The name source is injected by the adapter (directory_source callback):
+    the KiraAI side reads the plugin's rolling row cache (sender
+    nicknames / group cards the host has already observed) - all reliable
+    names, never scraped from summary text (mis-extraction risk deferred to
+    v2). TTL expiry triggers a self-healing rebuild; name changes / account
+    merges are invisible within the TTL window, an acceptable latency for a
+    bypass (the directory is only a candidate source; false hits are caught
+    by rerank and the persona blank-slot fallback).
     """
 
     _TTL_SECONDS = 600.0
@@ -137,10 +167,13 @@ class _EntityDirectory:
         self._cache: OrderedDict[str, tuple[float, dict[str, dict[tuple[str, str], str]]]] = OrderedDict()
 
     async def match(self, session_id: str, text: str) -> list[tuple[str, str, str]]:
-        """返回文本命中条目 [(名字, platform, uid)]（去重保序，含重名多键）。
+        """Return text-hit entries [(name, platform, uid)] (deduped,
+        order-preserving, including multi-key for duplicate names).
 
-        结构化返回：召回提示路投影为复合键，画像候选路直接消费
-        （命中的名字即 display_name，保证画像标题与聊天称呼一致）。
+        Structured return: the recall-hint route projects it to composite
+        keys, and the persona-candidate route consumes it directly (the hit
+        name is the display_name, guaranteeing persona titles match chat
+        addressing).
         """
         if not text or not session_id or self._source is None:
             return []
@@ -185,16 +218,19 @@ class _EntityDirectory:
 
 
 class LocalMemoryKernel:
-    """本地记忆内核（PostgreSQL + pgvector）。
+    """Local memory kernel (PostgreSQL + pgvector).
 
-    职责（自 nori-core noriflow 插件平移）：
-    - ingest: 写入 memory_chat_summary（chat_summary / bot_self 两类 kind）
-    - retain_encoded: 端侧编码后双通道写入（chat_summary 表 + fact 原始表），
-      encoder 未装配或编码降级时退化为单通道 ingest（原文走摘要表标记
-      summarized=false，不参与召回，由合并 agent 补编码遍重编码）
-    - search / build_injection_text: M3 召回管线（向量+BM25 双路 ->
-      RRF 融合 -> 重排序 -> 相关度阈值 -> 时间衰减 -> 近重复去重 ->
-      截断；P3 关系小节独立拼装）
+    Responsibilities (ported from the nori-core noriflow plugin):
+    - ingest: writes to memory_chat_summary (chat_summary / bot_self kinds)
+    - retain_encoded: on-endpoint dual-channel write after encoding
+      (chat_summary table + fact raw table); when the encoder is not
+      assembled or encoding degrades, falls back to single-channel ingest
+      (raw text goes to the summary table marked summarized=false, out of
+      recall, re-encoded by the merge agent's backfill pass)
+    - search / build_injection_text: M3 recall pipeline (vector + BM25 dual
+      route -> RRF fusion -> rerank -> relevance threshold -> time decay ->
+      near-duplicate dedup -> truncation; P3 relation section assembled
+      independently)
     """
 
     def __init__(
@@ -212,26 +248,33 @@ class LocalMemoryKernel:
         recall_log: RecallLogWriter | None = None,
         directory_source: Optional[Callable[[str], Awaitable[list[tuple[str, str, str]]]]] = None,
     ) -> None:
-        """初始化记忆内核。
+        """Initialize the memory kernel.
 
         Args:
-            db: 记忆库访问层（已 connect + 迁移完成）。
-            embedding_service: 向量计算服务（不可用时行内向量置 NULL）。
-            circuit_breaker: DB 熔断器。
-            config: 插件运行时配置。
-            bot_id: 当前 bot 唯一标识（bot_self 归属）。
-            encoder: 端侧记忆编码器；None 时 retain_encoded 走单通道降级。
-            bot_nickname: Bot 昵称（编码器提示词排除项）。
-            rerank_client: 重排序客户端（None 或 config.rerank_enabled=false
-                时检索退化为纯向量序）。
-            history_window_provider: 宿主历史窗口块数读取器（近时排除/
-                滚动补回的锚定用；返回 max_memory_length，活读使热改即时
-                生效；None 时两能力关闭）。
-            host_tz_provider: 宿主时区读取器（locale.TZ；插件 timezone
-                未配置时的回退源）。
-            recall_log: 召回评估日志写器（None 关闭日志）。
-        directory_source: 实体词典名字源回调（session_id -> [(名字,
-            platform, uid)]，见 _EntityDirectory；None 关闭词典路）。
+            db: Memory database access layer (already connected + migrated).
+            embedding_service: Embedding service (in-row vectors set to NULL
+                when unavailable).
+            circuit_breaker: DB circuit breaker.
+            config: Plugin runtime configuration.
+            bot_id: Unique identifier of the current bot (bot_self
+                ownership).
+            encoder: On-endpoint memory encoder; None makes
+                retain_encoded degrade to the single channel.
+            bot_nickname: Bot nickname (excluded in the encoder prompt).
+            rerank_client: Rerank client (None or
+                config.rerank_enabled=false degrades retrieval to plain
+                vector order).
+            history_window_provider: Host history-window block count reader
+                (anchor for recent-range exclusion / rolling fill-back;
+                returns max_memory_length, live-read so hot config changes
+                take effect immediately; None disables both features).
+            host_tz_provider: Host timezone reader (locale.TZ; the fallback
+                source when the plugin timezone is not configured).
+            recall_log: Recall evaluation log writer (None disables
+                logging).
+        directory_source: Entity-directory name source callback
+            (session_id -> [(name, platform, uid)], see _EntityDirectory;
+            None disables the directory route).
         """
         self.db = db
         self.embedding_service = embedding_service
@@ -291,42 +334,58 @@ class LocalMemoryKernel:
         summarized: bool = True,
         apply_write_dedup: bool = False,
     ) -> str:
-        """摄入记忆到摘要表（memory_chat_summary）。
+        """Ingest a memory into the summary table (memory_chat_summary).
 
-        kind 语义（对齐 hindsight tag 策略）：
-        - chat_summary：会话对话摘要，participants 存本轮全部发言者
-          （"platform:uid" 复合键，用户精确召回过滤用）；
-        - bot_self：bot 自触发批次原文，participants 留空（召回按 kind 全局命中）。
+        kind semantics (aligned with the hindsight tag strategy):
+        - chat_summary: conversation dialogue summary; participants stores
+          all speakers of this round ("platform:uid" composite keys, used by
+          user-exact recall filtering);
+        - bot_self: bot self-triggered batch raw text; participants is left
+          empty (recall matches globally by kind).
 
-        document_id 策略（幂等去重，沿用 hindsight 哈希策略）：
-        - chat_summary：{session_id}-{md5(content)[:12]}（每轮独立，不覆盖历史）
-        - bot_self：bot-self-{md5(content)[:12]}（相同内容幂等）
-        - 其他：{kind}-{session_id}-{md5(content)[:12]}
+        document_id strategy (idempotent dedup, reusing the hindsight hash
+        strategy):
+        - chat_summary: {session_id}-{md5(content)[:12]} (unique per round,
+          never overwrites history)
+        - bot_self: bot-self-{md5(content)[:12]} (identical content is
+          idempotent)
+        - others: {kind}-{session_id}-{md5(content)[:12]}
 
         Args:
-            content: 记忆内容（摘要正文 / bot_self 原文）。
-            session_id: 会话 ID。
-            user_id: 用户 ID（trigger 发言者，裸 uid 入库）。
-            memory_category: 记忆分类（本地表以 kind 列区分用途，此参数仅兼容契约）。
-            platform: 平台标识（如 "qq"）。
-            group_id: 群 ID（空表示私聊）。
-            kind: 记忆类型（chat_summary / bot_self）。
-            timestamp: 事件时间（None 用 now；入 occurred_at 列）。
-            bot_id: 当前 bot ID（覆盖 self.bot_id，可选）。
-            participant_user_ids: 批次所有发言者的 (platform, user_id) 列表
-                （写入 participants 列；None/空时回退 trigger 单人）。
-            summarized: 编码状态（false=编码降级写入的对话原文，不参与召回，
-                由合并 agent 补编码遍重编码；bot_self 原文直写恒 true）。
-            apply_write_dedup: 是否执行写入侧近重去重（仅 retain 编码摘要
-                路径传 True；工具显式写入/降级原文/bot_self 不参与）。命中
-                时跳过插入但仍返回 document_id（与内容哈希幂等跳过同语义）。
+            content: Memory content (summary body / bot_self raw text).
+            session_id: Session ID.
+            user_id: User ID (the trigger speaker, stored as a bare uid).
+            memory_category: Memory category (the local table distinguishes
+                purposes via the kind column; this parameter only keeps the
+                contract).
+            platform: Platform identifier (e.g. "qq").
+            group_id: Group ID (empty means a private chat).
+            kind: Memory kind (chat_summary / bot_self).
+            timestamp: Event time (None uses now; stored into the
+                occurred_at column).
+            bot_id: Current bot ID (overrides self.bot_id, optional).
+            participant_user_ids: (platform, user_id) list of all speakers in
+                the batch (written into the participants column; None/empty
+                falls back to the trigger speaker alone).
+            summarized: Encoding status (false = conversation raw text
+                written by degraded encoding, does not participate in recall,
+                re-encoded by the merge agent's backfill pass; bot_self raw
+                text is always written with true).
+            apply_write_dedup: Whether to run write-side near-duplicate dedup
+                (only the retain encoded-summary path passes True; explicit
+                tool writes / degraded raw text / bot_self do not
+                participate). On a hit the insert is skipped but document_id
+                is still returned (same semantics as the content-hash
+                idempotent skip).
 
         Returns:
-            document_id。
+            document_id.
 
         Raises:
-            MemoryDBUnavailable: 熔断拒绝期或写入执行失败（retain 调用方
-                回滚水位线待重试；工具入口捕获回报失败）。
+            MemoryDBUnavailable: during a circuit-open rejection period or a
+                write execution failure (the retain caller rolls back its
+                watermark to retry; tool entry points catch it and report the
+                failure).
         """
         occurred_at = timestamp or datetime.now()
         content_hash = hashlib.md5(content.encode()).hexdigest()[:12]
@@ -415,34 +474,47 @@ class LocalMemoryKernel:
         bot_id: str = "",
         participant_user_ids: Optional[list[tuple[str, str]]] = None,
     ) -> list[str]:
-        """摄入原始对话文本（端侧编码后双通道写入）。
+        """Ingest raw conversation text (on-endpoint dual-channel write after
+        encoding).
 
-        签名与上游 nori 版 retain_encoded 契约保持一致
-      （便于经验/数据互通）。
+        The signature stays consistent with the upstream nori
+        retain_encoded contract
+      (for experience/data interoperability).
 
-        通道 1（chat_summary 表）：编码产出的保真摘要（仅覆盖本轮批次），
-          document_id/participants 策略与单通道 ingest 一致，可召回；
-        通道 2（fact 原始表）：每条 EncodedFact 独立写入 memory_persona_fact_raw，
-          extracted_flag=0 等待合并 agent（M4）入簇计分，不参与 recall；
-          evidence_key={session_id}|{occurred_at:日期} 是后续计分去重键，
-          document_id 幂等粒度与之对齐（同会话同日去重、跨会话/跨日复现
-          作为独立证据入库计分）。
+        Channel 1 (chat_summary table): the fidelity summary produced by
+        encoding (covers only this round's batch),
+          document_id/participants strategy is the same as single-channel
+          ingest, recallable;
+        Channel 2 (fact raw table): each EncodedFact is written independently
+        to memory_persona_fact_raw,
+          extracted_flag=0 awaiting the merge agent (M4) to cluster and
+          score, does not participate in recall;
+          evidence_key={session_id}|{occurred_at:date} is the later scoring
+          dedup key, document_id idempotency granularity aligns with it
+          (same-session same-day dedup; cross-session / cross-day recurrence
+          is stored as an independent piece of evidence for scoring).
 
-        编码降级链（graceful degradation）：
-        - encoder 为 None（未装配）-> 原文原样走 chat_summary 单通道；
-        - encode() 抛异常或输出不可解析 -> 内部 fail-open 返回 (原文, [], False)，
-          即单通道行为，不阻断 retain；
-        - 降级写入的原文行 summarized=false：不参与 recall（检索过滤），由
-          合并 agent 补编码遍在 LLM 恢复后重编码（summary 回写原行 + facts
-          入事实表），数据不丢、上下文不污染。
+        Encoding degradation chain (graceful degradation):
+        - encoder is None (not assembled) -> raw text goes through the
+          chat_summary single channel as-is;
+        - encode() raises or the output is unparseable -> internal fail-open
+          returns (raw text, [], False),
+          i.e. single-channel behavior, does not block retain;
+        - degraded raw rows written with summarized=false: do not participate
+          in recall (filtered at retrieval), re-encoded by the
+          merge agent's backfill pass after the LLM recovers (summary
+          rewritten into the same row + facts
+          into the fact table), data not lost, context not polluted.
 
         Args:
-            conversation_text: 带时间戳与发言者标识（含 uid）的对话文本，
-                含历史上下文/本轮批次分隔标记行（信封组装）。
-            其余参数语义同 ingest。
+            conversation_text: conversation text with timestamps and speaker
+                identifiers (including uid),
+                containing the history-context / this-round-batch separator
+                marker lines (envelope assembly).
+            All remaining parameters have the same semantics as ingest.
 
         Returns:
-            document_id 列表（summary 一个 + 每条 fact 各一个）。
+            document_id list (one summary + one per fact).
         """
         if not conversation_text:
             # Guard before the encoder-None branch: an empty input must be a
@@ -590,22 +662,31 @@ class LocalMemoryKernel:
         replaces_cluster_id: Optional[int] = None,
         occurred_at: Optional[datetime] = None,
     ) -> dict:
-        """主动事实写入（memory_write 工具的确定性直写簇路径）。
+        """Active fact write (the deterministic direct-cluster path of the
+        memory_write tool).
 
-        与 retain 的编码提取路径互补：不走编码 LLM、不等合并 agent 周期
-        ——插入 raw 行后立即 apply_fact_merge 成簇（create 或 replace 替代
-        旧簇），显式指令即最高档证据。幂等闭环：document_id 粒度 = 归属
-        uid + 会话 + 日期 + 语句哈希，同日重复写入落同一 raw 行；行已被
-        消费（flag=1）时 apply 乐观锁拒绝返回 {"action": "skipped"}。
-        同轮 retain 对同一事实的编码提取经合并裁定 same 入簇，
-        evidence_key 同键去重不双计分。
+        Complementary to retain's encoded-extraction path: no encoding LLM,
+        no waiting for the merge agent's cycle - after inserting the raw row
+        it immediately applies apply_fact_merge to form a cluster (create, or
+        replace to supersede the old cluster); an explicit instruction is the
+        highest-ranked evidence. Idempotency loop: document_id granularity =
+        owning uid + session + date + statement hash; duplicate writes on the
+        same day land on the same raw row; when the row is already consumed
+        (flag=1) the apply optimistic-lock rejects and returns
+        {"action": "skipped"}. Encoding-extraction of the same fact by
+        retain in the same round is adjudicated same into the cluster by the
+        merge agent; evidence_key dedups on the same key without double
+        scoring.
 
-        语义约束（调用方保证）：category 限主动六维（系统维度
-        recent/uncertain 不经此通道）；归属钉死为参数 user_id（工具层
-        作用域锁定触发者，防越权代写）。
+        Semantic constraints (caller-guaranteed): category is limited to the
+        active six dimensions (system dimensions recent/uncertain do not go
+        through this channel); ownership is pinned to the parameter user_id
+        (the tool layer locks the scope to the trigger user, preventing
+        unauthorized proxy writes).
 
         Raises:
-            MemoryDBUnavailable: 熔断拒绝或任一步失败（工具层转错误文本）。
+            MemoryDBUnavailable: circuit-open rejection or any step failure
+                (the tool layer converts it into an error text).
         """
         if not await self.circuit_breaker.peek_available():
             raise MemoryDBUnavailable("记忆库熔断拒绝期，主动事实写入被拒绝")
@@ -632,7 +713,8 @@ class LocalMemoryKernel:
         )
 
         async def _write(doc_id: str) -> dict:
-            """按给定幂等键落 raw 行并执行成簇/替换，返回 merge 摘要。"""
+            """Land a raw row under the given idempotent key and run
+            cluster/replace, returning the merge summary."""
             row_id: Optional[int] = None
 
             async def _insert() -> None:
@@ -708,27 +790,35 @@ class LocalMemoryKernel:
         group_id: str,
         timestamp: Optional[datetime],
     ) -> list[str]:
-        """将编码产出的事实批量写入 memory_persona_fact_raw。
+        """Batch-write encoded facts into memory_persona_fact_raw.
 
-        statements 一次性批量向量化（单次 embeddings 请求），随后逐条插入；
-        任一条插入失败（含熔断）立即上抛 MemoryDBUnavailable——本方法在
-        retain_encoded 中先于 summary 通道执行，调用方回滚水位线后下轮
-        从零重编码，无半提交残留；document_id 幂等保证重试不产生重复行
-        （同语句 ON CONFLICT 跳过）。旧"跳过该条继续"语义会在熔断期
-        静默永久丢失整批事实（批次已被标消费，违反内容不丢契约）。
+        statements are vectorized at once (a single embeddings request),
+        then inserted one by one;
+        any insert failure (including circuit-open) immediately raises
+        MemoryDBUnavailable - this method runs before the summary channel in
+        retain_encoded; after the caller rolls back the watermark, the next
+        round re-encodes from scratch, leaving no half-committed residue;
+        document_id idempotency guarantees retries do not create duplicate
+        rows
+        (same statement ON CONFLICT skips). The old "skip this row and
+        continue" semantics would silently and permanently lose the whole
+        batch of facts during the rejection period (the batch is already
+        marked consumed, violating the content-loss-free contract).
 
         Args:
-            facts: 编码产出的人物事实列表。
-            platform: 平台标识。
-            session_id: 提取来源会话 ID（证据键组成部分）。
-            group_id: 提取来源群 ID。
-            timestamp: 事实发生时间（None 用 now）。
+            facts: List of encoded person facts.
+            platform: Platform identifier.
+            session_id: Source session ID of extraction (part of the
+                evidence key).
+            group_id: Source group ID of extraction.
+            timestamp: Fact occurrence time (None uses now).
 
         Returns:
-            成功入队的 document_id 列表。
+            List of document_ids successfully queued.
 
         Raises:
-            MemoryDBUnavailable: 任一条插入失败（调用方回滚水位线待重试）。
+            MemoryDBUnavailable: any single insert failure (caller rolls back
+                the watermark to retry).
         """
         occurred_at = self._to_local(timestamp or datetime.now())
         evidence_key = self._build_evidence_key(session_id, occurred_at)
@@ -776,16 +866,22 @@ class LocalMemoryKernel:
     async def _register_fact_code_aliases(
         self, statements: list[str], platform: str, last_seen: datetime
     ) -> None:
-        """事实陈述「用户<uid>（<代号>）」登记为该 uid 别名（旁路增益）。
+        """Register the fact-statement "user<uid> (<alias-code>)" as an alias for
+        that uid (bypass-side gain).
 
-        群聊对某成员的称呼常与名片完全不同形（名片 undefined𝕩𝕩𝕪 vs
-        群称 xxy），消息流别名 upsert 永远学不到这种代号——只有事实陈述
-        里 LLM 写出的「用户3429924750（xxy）」把它与 uid 显式绑定。登记
-        后实体命中（画像候选/问及他人召回/记忆工具名字解析）即刻可用。
+        In group chats, how a member is addressed is often completely
+        different in form from their card name (card undefinedxxxy vs group
+        name xxy), and message-stream alias upsert can never learn such code
+        names - only the fact statement's LLM-written "user3429924750 (xxy)"
+        binds them to the uid explicitly. After registration, entity hits
+        (persona candidate / ask-about-others recall / memory tool name
+        resolution) work immediately.
 
-        旁路定位：失败只记 warning 不上抛——别名是增益不是契约，主写入
-        （raw/summary）失败重试语义不受影响；存量簇由合并 agent 周期
-        兜底（run_cycle 的别名回填遍），本方法只管实时增量。
+        Bypass positioning: on failure only a warning is logged, never
+        raised - aliases are a bonus, not a contract; the retry semantics of
+        the main writes (raw/summary) are unaffected; existing clusters are
+        covered by the merge agent's periodic pass (the alias backfill pass
+        of run_cycle), this method only handles real-time increments.
         """
         if self._alias_store is None or not statements:
             return
@@ -809,27 +905,35 @@ class LocalMemoryKernel:
         timestamp: Optional[datetime],
         bot_user_id: str = "",
     ) -> list[str]:
-        """将编码产出的关系三元组零 LLM 合并写入 memory_entity_edge。
+        """Write encoded relation triples into memory_entity_edge with zero LLM
+        merging.
 
-        单条 executemany 批量提交（结构键合并 + evidence_key 去重计数 +
-        bot 边 pending→active 内联转写在同语句完成，见 db.upsert_entity_edge）；
-        任一失败（含熔断）上抛 MemoryDBUnavailable——本方法在 retain_encoded
-        中位于 facts 之后、summary 之前，调用方入 pending 队列后 DB 恢复时
-        从零重放，无半提交；evidence_key 幂等保证重试不重复计数。
-        document_id 不入库（边表自增主键），仅作返回值/日志可观测。
+        A single executemany batch commit (structural-key merge +
+        evidence_key dedup counting + bot edge pending to active inline
+        transition, all in the same statement, see db.upsert_entity_edge);
+        any failure (including circuit-open) raises
+        MemoryDBUnavailable - this method sits after facts and before
+        summary in retain_encoded; once the caller enqueues to the pending
+        queue, the DB replays from scratch on recovery without half-commit;
+        evidence_key idempotency guarantees retries do not repeat counting.
+        document_id is not persisted (the edge table uses an auto-increment
+        primary key), it only serves the return value / log observability.
 
         Args:
-            relations: 编码产出并校验后的关系三元组列表。
-            platform: 平台标识。
-            session_id: 提取来源会话 ID（证据键组成部分）。
-            timestamp: 关系发生时间（None 用 now）。
-            bot_user_id: bot 平台 uid（bot 端点边 pending/激活门槛判定）。
+            relations: List of validated encoded relation triples.
+            platform: Platform identifier.
+            session_id: Source session ID of extraction (part of the
+                evidence key).
+            timestamp: Relation occurrence time (None uses now).
+            bot_user_id: bot platform uid (for the pending/activation gate
+                of bot-endpoint edges).
 
         Returns:
-            边幂等键列表（可观测用）。
+            List of edge idempotent keys (for observability).
 
         Raises:
-            MemoryDBUnavailable: 批量写入失败（调用方入 pending 队列待重放）。
+            MemoryDBUnavailable: batch write failure (caller enqueues to the
+                pending queue for replay).
         """
         occurred_at = self._to_local(timestamp or datetime.now())
         evidence_key = self._build_evidence_key(session_id, occurred_at)
@@ -900,82 +1004,129 @@ class LocalMemoryKernel:
         entity_user_keys: Optional[list[str]] = None,
         entity_user_ids: Optional[list[str]] = None,
     ) -> list[MemoryItem]:
-        """搜索记忆（向量 + 重排序管线）。
+        """Search memory (vector + rerank pipeline).
 
-        管线：query 实时向量化（与扩选键/近时排除边界并行）->
-        scope 过滤 + cosine top-N 候选（N = max(rerank_candidates, top_k*4)；
-        重排序关闭时 N = top_k*4；扩展键命中恒钉死当前会话，近时排除
-        剔除宿主窗口内最近 K 批本会话摘要；topic_blacklist 非空时黑名单行
-        在 SQL 候选层结构性排除——不占 top_k 名额，注入层另留二次防线）->
-        重排序（rerank_enabled 且客户端
-        可用；失败退化纯向量序）-> 相关度阈值过滤（作用于 rerank 分数或
-        cosine 相似度）-> 时间衰减重排（recall_time_decay_enabled 时
-        score × 2^(-age/H)，仅改排序不过滤）-> 近重复去重（最终序贪心，
-        与已保留条目 cosine ≥ dedup_similarity_threshold 的丢弃）->
-        top_k 截断。
+        Pipeline: query vectorized in real time (in parallel with the
+        expansion-key / recent-range exclusion boundary)->
+        scope filter + cosine top-N candidates (N = max(rerank_candidates,
+        top_k*4);
+        when rerank is off N = top_k*4; expansion-key hits are always pinned
+        to the current session, recent-range exclusion
+        removes the most recent K batches of this session's summaries for the
+        host window; when topic_blacklist is non-empty blacklist rows
+        are structurally excluded at the SQL candidate layer - they do not
+        consume top_k slots, and the injection layer keeps a second line of
+        defense)->
+        rerank (rerank_enabled with a usable
+        client; on failure it degrades to plain vector order) -> relevance
+        threshold filter (applied to rerank scores or
+        cosine similarity) -> time-decay reorder (when
+        recall_time_decay_enabled,
+        score x 2^(-age/H), only reorders, never filters) -> near-duplicate
+        dedup (greedy on the final order,
+        drops anything with cosine >= dedup_similarity_threshold against a
+        kept entry)->
+        top_k truncation.
 
-        v0.5.1 设计修订：召回提示旁路（实体词典/引用反查两路候选
-        拉取）已整体移除——实体命中只喂画像/P3 节点匹配，引用原文由
-        适配层并入 query 走本主路（会话隔离统一由隔离开关管）。
+        v0.5.1 design revision: the recall-hint bypass (entity-directory /
+        reference reverse-lookup candidate
+        fetching) has been removed entirely - entity hits only feed persona /
+        P3 node matching, and referenced raw text is
+        merged into query by the adapter to go through this main route
+        (session isolation is uniformly governed by the isolation switch).
 
-        问及他人召回（entity_user_keys/entity_user_ids，仅 scope=session
-        消费）：query 实体命中的 (platform, uid) 键组——跨会话开放
-        （cross_session=True）时并入主键组（问及者任何会话的摘要，含其
-        与 bot 的私聊，均可被召回）；会话隔离时钉死当前会话（仅实体
-        本会话摘要）。隐私口径由调用方的隔离配置决定，落点见
-        db.search_chat_summaries 实体键组条目。
+        Ask-about-others recall (entity_user_keys/entity_user_ids, consumed
+        only by scope=session): the (platform, uid) key group hit by the
+        query entities - when cross-session is open
+        (cross_session=True) they merge into the primary key group (summaries
+        from any session of the asked-about person, including their
+        private chats with the bot, can be recalled); under session isolation
+        they are pinned to the current session (only the entity's
+        summaries in this session). The privacy posture is determined by the
+        caller's isolation config; the landing point is the entity key group
+        entry of db.search_chat_summaries.
 
-        scope 模式：
-        - session（默认，框架 MemoryStage/planner 路径）：会话 + bot_self；
-          platform+user_id 非空时 AND 追加用户过滤组（对齐 hindsight tag 组合，
-          planner 主动召回不传 platform -> 全会话）；
-        - user：用户精确召回（participants 数组过滤，天然跨会话）；
-        - user_session：user 基础上 AND session_id 收紧。
+        scope modes:
+        - session (default, framework MemoryStage/planner path): session +
+          bot_self;
+          when platform+user_id are non-empty an AND user-filter group is
+          appended (aligned with the hindsight tag combination,
+          planner active recall passes no platform -> whole session);
+        - user: user-exact recall (participants array filter, naturally
+          cross-session);
+        - user_session: user plus AND session_id tightening.
 
-        多用户（user_ids 列表）与 per_user 配额：
-        - per_user=false（默认）：OR 混合单池，单次向量检索，全局 top_k；
-        - per_user=true：复用主路完整管线（扩选/近时排除/混合检索/相关度
-          阈值/时间衰减/近重复去重/滚动补回行排除——候选池按用户数放大），
-          仅截断阶段换配额逻辑：每用户至多 top_k 条（归属判定按行 user_id
-          与 participants 复合键，命中多用户取先有配额者），不可归属行
-          （bot_self 原文/扩选命中）进公共位（合计至多 top_k）。
+        Multi-user (user_ids list) and per_user quota:
+        - per_user=false (default): OR-mixed single pool, one vector search,
+          global top_k;
+        - per_user=true: reuses the full main pipeline (expansion / recent
+          exclusion / hybrid retrieval / relevance
+          threshold / time decay / near-dedup / rolling fill-back row
+          exclusion - the candidate pool is scaled by the user count),
+          only the truncation stage swaps to quota logic: at most top_k rows
+          per user (ownership decided by the row's user_id
+          and participants composite key, earlier-quota owner wins on hits to
+          multiple users), unattributable rows
+          (bot_self raw text / expansion hits) go to the shared slots (at
+          most top_k in total).
 
-        【暂不启用·能力位】per_user 当前无调用方接线（宿主记忆召回
-        均走单池路；它不是 config 开关，是本方法的形参级能力）。
-        后续按需接线，接线前须知：
-        1) 跨平台身份——user_ids 裸 uid 共用单一 platform 前缀，linked
-           accounts（同人多适配器）需 (platform, uid) 对形态；
-        2) identity 级配额——同一人多账号应合桶共享一份配额，否则
-           一人经多账号拿到多份配额；
-        3) 候选池占满——单池按相关度排序，池被单用户行占满时配额只能
-           池内再分配（已按用户数放大候选缓解，非保底——这是与旧分桶
-           实现「每桶 LIMIT 保底」的语义差异，属有意取舍：不再维护
-           第二条检索管线）；
-        4) scope 语义收紧——旧分桶路对 scope="session" 不收紧会话
-           （仅 user_session 传 tighten），单池路 scope 条件全量生效；
-           以 session + per_user 接线时行为从「跨会话配额」变为
-           「会话内配额」，接线前须确认预期口径。
+        [Not wired yet - capability slot] per_user currently has no caller
+        (host memory recall
+        all goes through the single-pool path; it is not a config switch but
+        a capability at the parameter level of this method).
+        Wire it later as needed; before wiring, note:
+        1) cross-platform identity - user_ids bare uids share a single
+           platform prefix, linked
+           accounts (same person across adapters) need the (platform, uid)
+           pair form;
+        2) identity-level quota - one person with multiple accounts should
+           share one bucket of quota, otherwise
+           one person gets multiple quotas through many accounts;
+        3) candidate pool saturation - the single pool is sorted by
+           relevance; when the pool is filled by one user's rows, quota can
+           only be redistributed inside the pool (candidate scaling by user
+           count mitigates, not a guarantee - this is the semantic
+           difference from the old bucketed
+           implementation's "per-bucket LIMIT guarantee", an intentional
+           trade-off: no second
+           retrieval pipeline is maintained);
+        4) scope semantics tightening - the old bucketed route does not
+           tighten sessions for scope="session"
+           (only user_session passes tighten), while the single-pool route
+           applies all scope conditions;
+           wiring with session + per_user changes behavior from
+           "cross-session quota" to
+           "in-session quota", the expected posture must be confirmed before
+           wiring.
 
         Args:
-            query: 检索查询文本。
-            top_k: 返回最大条数（per_user 模式为每用户配额 + 公共位）。
-            session_id: 会话 ID（scope=session/user_session 消费）。
-            user_id: 用户 ID（裸 uid；platform 非空时启用用户过滤组）。
-            platform: 平台标识。
-            bot_id: 当前 bot ID（兼容契约，本地 kind 过滤已覆盖 bot_self）。
-            cross_session: 跨会话放宽（仅 scope=session 生效）。
-            exclude_kinds: 排除的 kind 列表（兼容契约；本地表无 person_fact，
-                事实表结构性不参与 recall，通常无需传入）。
-            scope: session | user | user_session。
-            user_ids: 多用户召回的裸 uid 列表（None 时回落单个 user_id）。
-            per_user: 多用户召回时是否每用户保底配额（暂不启用，见上）。
-            entity_user_keys: 问及他人召回的实体命中复合键列表（仅
-                scope=session 消费）。
-            entity_user_ids: 同上的裸 uid 列表。
+            query: Query text for retrieval.
+            top_k: Maximum number of returned rows (per_user mode means
+                per-user quota + shared slots).
+            session_id: Session ID (consumed by scope=session/user_session).
+            user_id: User ID (bare uid; enables the user-filter group when
+                platform non-empty).
+            platform: Platform identifier.
+            bot_id: Current bot ID (compatibility contract; local kind
+                filtering already covers bot_self).
+            cross_session: Cross-session relaxation (only effective for
+                scope=session).
+            exclude_kinds: List of kind values to exclude (compatibility
+                contract; the local table has no person_fact,
+                fact tables structurally never join recall, usually no need
+                to pass).
+            scope: session | user | user_session.
+            user_ids: List of bare uids for multi-user recall (None falls
+                back to a single user_id).
+            per_user: Whether to give each user a guaranteed quota in
+                multi-user recall (not wired yet, see above).
+            entity_user_keys: List of entity-hit composite keys for
+                ask-about-others recall (consumed only by scope=session).
+            entity_user_ids: Corresponding list of bare uids.
 
         Returns:
-            记忆条目列表（最多 top_k 条；per_user 模式每用户至多 top_k 条
-            另加公共位至多 top_k 条）。
+            List of memory items (at most top_k rows; per_user mode at most
+                top_k rows per user plus up to top_k shared rows).
         """
         if scope not in _VALID_SCOPES:
             raise ValueError(f"不支持的检索 scope: {scope}")
@@ -1203,14 +1354,19 @@ class LocalMemoryKernel:
     async def entity_hint_entries(
         self, session_id: str, text: str
     ) -> list[tuple[str, str, str]]:
-        """实体命中条目 [(名字, platform, uid)]（窗口词典 + 持久别名两层合并）。
+        """Entity-hit entries [(name, platform, uid)] (window dictionary +
+        persistent alias layers merged).
 
-        优先级：窗口词典（会话内发言者，最权威、实时）> 持久别名层
-        （memory_entity_alias，覆盖久未发言/历史改名成员）。持久层重名
-        歧义时窗口命中者优先、无背书则跳过（确定性优先于召回）；合并去重
-        按 (platform, uid)，窗口条目优先保留。召回提示路与画像候选路共用
-        一次命中结果（注入入口一次匹配、两处消费）；recall_hint_enabled
-        关闭或未注入名字源时恒空。
+        Priority: window dictionary (speakers in the session, most
+        authoritative and real-time) > persistent alias layer
+        (memory_entity_alias, covering long-silent / historically-renamed
+        members). On ambiguous names in the persistent layer, the window hit
+        wins, otherwise the entry is skipped (determinism beats recall); dedup
+        is by (platform, uid), window entries are kept first. The recall-hint
+        route and the persona-candidate route share
+        one hit result (one match at the injection entry, consumed in two
+        places); always empty when recall_hint_enabled
+        is off or no name source is injected.
         """
         if not self.config.recall_hint_enabled:
             return []
@@ -1244,7 +1400,8 @@ class LocalMemoryKernel:
 
     @property
     def alias_store(self) -> AliasStore | None:
-        """持久别名层句柄（批次 upsert 落库后 apply_rows 同步内存用）。"""
+        """Handle to the persistent alias layer (used to sync memory via
+        apply_rows after a batch upsert)."""
         return self._alias_store
 
     def make_recall_hints(
@@ -1254,14 +1411,20 @@ class LocalMemoryKernel:
         bot_addressed: bool = False,
         bot_user_id: str = "",
     ) -> RecallHints:
-        """RecallHints 工厂（适配层调用；kira 侧由 main.py inject_memory 组装）。
+        """RecallHints factory (called by the adapter; on the kira side assembled
+        by inject_memory in main.py).
 
-        v0.5.1 起 hints 只承载实体命中（画像候选/P3 节点匹配）与
-        match_text/bot_addressed（P3 边注入信号）——不再驱动召回候选
-        拉取（旁路已移除），anchor 形参已删除。bot_user_id 为 bot 平台
-        uid（场景 C 双形态匹配的副形态）；非空时顺手学习进形态备忘，
-        写侧 is_bot_edge 判定同样受益（平台 uid 形态边正确走 pending/
-        双证据门槛）。
+        Since v0.5.1 hints only carry entity hits (persona candidate / P3
+        node matching) and
+        match_text/bot_addressed (P3 edge-injection signals) - they no longer
+        drive recall candidate
+        fetching (the bypass was removed), and the anchor parameter was
+        deleted. bot_user_id is the bot's platform
+        uid (the secondary form matched by scenario C's dual-form matching);
+        when non-empty it is opportunistically learned into the form memo,
+        and the write-side is_bot_edge judgment also benefits
+        (platform-uid-form edges correctly go through the pending /
+        double-evidence gate).
         """
         uid = (bot_user_id or "").strip()
         if uid:
@@ -1274,9 +1437,11 @@ class LocalMemoryKernel:
         )
 
     def _bot_uid_forms_all(self, explicit: str = "") -> list[str]:
-        """bot uid 全形态有序去重：显式值 -> bot_id -> 学习备忘。
+        """All bot uid forms, deduped in order: explicit value -> bot_id ->
+        learned memo.
 
-        写侧 is_bot_edge 与读侧场景 C 的统一供给（bot_uid_set 语义）。
+        The unified supply for the write-side is_bot_edge and the read-side
+        scenario C (bot_uid_set semantics).
         """
         forms: list[str] = []
         for uid in (explicit, self.bot_id, *sorted(self._bot_uid_forms)):
@@ -1300,45 +1465,66 @@ class LocalMemoryKernel:
         per_user: bool = False,
         hints: Optional[RecallHints] = None,
     ) -> str:
-        """构建注入 LLM 的记忆文本。
+        """Build the memory text to inject into the LLM.
 
-        返回格式（时间标注与归因/时态导语为本插件扩展）：
-            # 相关长期记忆（仅供背景参考；文中"{bot_nickname}"即你自己）
-            以下均为过去某时的群聊记录：各条目中发言者的言行都发生在条目
-            末尾标注的时间，与当前消息的发言者无关，不要把记忆中他人的言行
-            当成眼前正在发生的事。
-            提及旧事时请概括转述、带时效感（如"之前""8月那会儿"），
-            不要提及"记忆/检索"等来源，也不要逐字复述。
-            - {memory_text_1}（约2周前）
-            - {memory_text_2}（今天）
+        Returned format (time labels plus the attribution/tense preamble are
+        plugin extensions):
+            # Related long-term memory (background reference only; "{bot_nickname}" in the text is you)
+            All of the following are group-chat records from sometime in the
+            past: the speaker actions in each entry happened at the time
+            labeled at the end of the entry, unrelated to the current
+            message's speaker; do not treat what others said or did in memory
+            as happening right now.
+            When referring to old matters, summarize and paraphrase with a
+            sense of timing (e.g. "earlier", "around August"),
+            do not mention sources such as "memory/retrieval", and do not
+            quote verbatim.
+            - {memory_text_1} (about 2 weeks ago)
+            - {memory_text_2} (today)
             ...
 
-        导语全部前置（不用尾注）——planner 主动检索会向既有 memory_context
-        末尾追加 bullet，规则置尾会被追加行截断错位。
+        All preamble goes at the front (no trailing notes) - the planner's
+        active recall appends a bullet to the
+        end of the existing memory_context, so a rule placed at the end
+        would be clipped out of alignment by the appended line.
 
-        recall_time_label_enabled 开启时每条尾部追加相对时间标注
-        （本地时区按日粒度）；关闭时条目行不带标注，导语中的时间指代
-        同步改为"更早发生的事"（不再称"条目末尾标注"）。
+        When recall_time_label_enabled is on, each entry gets a relative time
+        label appended (local timezone, day
+        granularity); when off, the entry lines carry no label and the time
+        reference in the preamble
+        changes to "earlier events" (no longer "labeled at the end of the
+        entry").
 
-        无记忆时返回空字符串。exclude_person_facts 为 hindsight 存量数据
-        防御参数：本地事实表结构性不参与 recall，无需等价操作（接受并忽略）。
+        Returns an empty string when there is no memory.
+        exclude_person_facts is a defensive parameter for hindsight legacy
+        data: the local fact table structurally never joins recall, so no
+        equivalent operation is needed (accepted and ignored).
 
-        问及他人召回：hints.entity_user_keys（适配层按批次文本匹配的
-        实体命中）并入主路检索；hints 未携带键时对 query 自匹配一次
-        兜底（planner 主动检索不传 hints 的场景）。跨会话开放时实体键
-        并入主键组，会话隔离时钉死当前会话（落点见 search 实体键参数）。
+        Ask-about-others recall: hints.entity_user_keys (entity hits matched
+        by the adapter against the batch text)
+        merge into the main route retrieval; when hints carry no keys,
+        self-match once against query as a
+        fallback (the case where planner active recall passes no hints). When
+        cross-session is open the entity keys
+        merge into the primary key group, under session isolation they are
+        pinned to the current session (landing point is the search
+        entity-key parameter).
 
         Args:
-            query: 检索查询文本。
-            session_id: 会话 ID。
-            top_k: 返回最大条数。
-            user_id: 用户 ID（platform 非空时启用用户过滤组）。
-            platform: 平台标识。
-            bot_id: 当前 bot ID（兼容契约）。
-            cross_session: 是否跨 session 召回（仅 scope=session 生效）。
-            exclude_person_facts: 兼容契约（本地结构性满足，忽略）。
-            scope/user_ids/per_user: 语义同 search。
-            hints: 召回提示（entity_user_keys 消费为问及他人召回键组）。
+            query: Query text for retrieval.
+            session_id: Session ID.
+            top_k: Maximum number of returned rows.
+            user_id: User ID (enables the user-filter group when platform
+                non-empty).
+            platform: Platform identifier.
+            bot_id: Current bot ID (compatibility contract).
+            cross_session: Whether to recall across sessions (only effective
+                for scope=session).
+            exclude_person_facts: Compatibility contract (locally satisfied
+                structurally, ignored).
+            scope/user_ids/per_user: Same semantics as search.
+            hints: Recall hints (entity_user_keys consumed as the
+                ask-about-others recall key group).
         """
         # Asking-about-others recall keys: explicit hints win (adapter matched
         # the batch text); otherwise self-match once on the query (in-memory
@@ -1489,15 +1675,21 @@ class LocalMemoryKernel:
         platform: str,
         bot_id: str = "",
     ) -> str:
-        """P3 边注入：场景 A/C 关系陈述行 + 邻居画像（独立预算）。
+        """P3 edge injection: scenario A/C relation statement lines + neighbor
+        persona (independent budget).
 
-        匹配文本 = hints.match_text（两侧适配层均为实体词典同源文本，含
-        @昵称 渲染）；label 词形命中 = label in text（与名字匹配同路数，
-        确定性子串）。节点匹配为 (platform, uid) 复合键——实体命中键本就
-        带平台前缀，多适配器数字 uid 撞号时不会把另一平台的人的边/画像
-        错配进来（与画像主路同口径）。画像仅补注「未命中节点的对端」
-        （命中者已走实体候选路），bot 端点无画像；persona_service 未装配
-        时只出陈述行。
+        Matching text = hints.match_text (both adapter sides use the
+        same-source text from the entity directory, including
+        @nickname rendering); label word-form hit = label in text (same
+        mechanism as name matching, deterministic substring). Node matching
+        uses the (platform, uid) composite key - entity-hit keys already
+        carry a platform prefix, so a numeric-uid collision across adapters
+        never mismatches another platform's person's edge/persona
+        in (same semantics as the main persona path). Persona is only
+        appended for the "counterpart of an unhit node"
+        (the hit one already went through the entity candidate route), bot
+        endpoints have no persona; when persona_service is not assembled,
+        only statement lines are emitted.
         """
         text = (hints.match_text or "").strip()
         if not text:
@@ -1625,12 +1817,15 @@ class LocalMemoryKernel:
         return section_text
 
     def _edge_time_qualifier(self, ts: Optional[datetime]) -> str:
-        """边时间限定：截至M月D日（last_seen 本地时区）。
+        """Edge time qualifier: "as of {month}/{day}" (last_seen in local
+        timezone).
 
-        label 存在多值语义（决策 8：不做自动互斥），注入带时间限定让
-        LLM 可自行裁决新旧；naive 时间戳视为已是本地口径（与 _to_local
-        同语义）补配置时区，不走服务器本地时区——配置 timezone 与服务器
-        时区不同时不产生偏差。
+        The label carries multi-value semantics (decision 8: no automatic
+        mutual exclusion), so the injection carries a time qualifier letting
+        the LLM adjudicate old vs new itself; naive timestamps are treated as
+        already local (+ the configured timezone, same semantics as
+        _to_local), never via the server's local timezone - no deviation when
+        the configured timezone and the server timezone differ.
         """
         if ts is None:
             return ""
@@ -1648,21 +1843,27 @@ class LocalMemoryKernel:
 
     @staticmethod
     def _now() -> datetime:
-        """当前 UTC 时间（衰减计算用；独立方法便于测试固定时钟）。"""
+        """Current UTC time (for decay computation; a standalone method lets
+        tests fix the clock)."""
         return datetime.now(timezone.utc)
 
     def _derive_window_batches(self) -> int:
-        """近时排除/滚动补回的窗口锚定：宿主 LLM 可见历史窗口的块数。
+        """Window anchor for recent-range exclusion / rolling fill-back: the host
+        LLM-visible history window length in blocks.
 
-        KiraAI 宿主窗口按「块」截断（session memory 每 chunk = 1 轮，仅
-        保留最近 max_memory_length 块；窗口内容是 OpenAIMessage 字典，
-        不带时间戳，无法按时间锚定边界）。retain 每轮恰好产出一批摘要
-        （回合完成信号触发一次编码），故「最近 K 批已编码摘要」即
-        「窗口内已可见内容」的等价物。经 provider 活读宿主配置（热改
-        即时生效）；失败/未装配返回 0（该轮关闭近时排除与滚动补回）。
+        The KiraAI host window truncates by "blocks" (session memory has 1
+        chunk = 1 round; only the most recent max_memory_length blocks are
+        kept; the window contents are OpenAIMessage dicts without
+        timestamps, so boundaries cannot be anchored by time). retain
+        produces exactly one summary batch per round (a round-completion
+        signal triggers one encoding), so "the most recent K encoded
+        summary batches" is the equivalent of "the contents already visible
+        in the window". Live-read from the provider makes hot config changes
+        effective immediately; on failure / when unassembled it returns 0
+        (recent-range exclusion and rolling fill-back are off for that round).
 
         Returns:
-            窗口块数（0 = 关闭）。
+            Window block count (0 = disabled).
         """
         if not self.config.recall_exclude_history_window:
             return 0
@@ -1690,14 +1891,19 @@ class LocalMemoryKernel:
     async def _derive_expanded_users(
         self, scope: str, session_id: str, platform: str = ""
     ) -> tuple[list[str], list[str]]:
-        """召回扩选：取会话最近 N 批摘要的参与者作为扩展键组。
+        """Recall query expansion: take the participants of the session's most
+        recent N summary batches as the expansion key group.
 
-        扩展键命中在 SQL 侧恒钉死当前会话（见 search_chat_summaries），
-        与 cross_session 开关无关——"问及未在场成员"可命中其参与过的
-        同会话摘要，但不会带出该成员任何跨会话（含私聊）记忆。
-        bot 自身剔除（bot 参与过几乎所有批次，混入等于对本会话取消
-        用户过滤）。仅 scope=session 生效（user/user_session 本就无
-        会话隔离诉求）。
+        Expansion-key hits are always pinned to the current session on the
+        SQL side (see search_chat_summaries),
+        independent of the cross_session switch - "asking about a member not
+        present" can hit summaries they
+        participated in within the same session, but never surfaces any
+        cross-session (including private) memories of that member.
+        The bot itself is excluded (the bot participates in almost every
+        batch; keeping it in would effectively cancel the user filter for
+        this session). Only effective for scope=session (user/user_session
+        have no session-isolation requirement anyway).
         """
         if not (
             self.config.recall_expansion_enabled
@@ -1739,13 +1945,15 @@ class LocalMemoryKernel:
     _ROLLOUT_MEMO_MAX_SESSIONS = 64
 
     def _rollout_excluded_ids(self, session_id: str) -> list[str] | None:
-        """取本会话已注入滚动补回块的 document_id（TTL 内；否则 None）。
+        """Get this session's already-injected rolling-fill-back block
+        document_ids (within TTL; otherwise None).
 
         Args:
-            session_id: 会话 ID。
+            session_id: Session ID.
 
         Returns:
-            待排除的 document_id 列表；无有效 memo 时 None（SQL 不加条件）。
+            List of document_ids to exclude; None when there is no valid memo
+            (SQL applies no condition).
         """
         if not session_id:
             return None
@@ -1761,25 +1969,37 @@ class LocalMemoryKernel:
     async def build_recent_rollout_text(
         self, session_id: str, platform: str = ""
     ) -> str:
-        """构建"窗口外最近批次摘要"注入块（滚动出 history 窗口的会话补回）。
+        """Build the "most recent session summary batches outside the window"
+        injection block (fill back for conversations rolled out of the
+        history window).
 
-        背景：记忆来源只有上下文窗口 + recall 摘要 + 画像，滚动出轮数的
-        会话全靠 recall 补回——但 recall 是 query 驱动的语义检索，刚滚出
-        窗口的近期上下文若无人提起就永久不可见。本方法跳过最近 K 批
-        （K = 宿主窗口块数，与 recall 近时排除同源）直取更早的 N 批，供
-        llm_request 注入为独立 Prompt（时间线置于记忆召回块之前）。
+        Background: memory sources are only the context window + recall
+        summaries + persona, and conversations that roll out of the round
+        count depend entirely on recall to be refilled - but recall is a
+        query-driven semantic search, so recent context just rolled out of
+        the window stays permanently invisible if nobody brings it up. This
+        method skips the most recent K batches (K = host window block count,
+        same source as recall recent-range exclusion) and fetches the earlier
+        N batches for the llm_request to inject as a standalone Prompt
+        (timeline placed before the memory-recall block).
 
-        去重契约：成功注入后 memoize 这些 document_id（会话级 + TTL），
-        同轮的 recall / planner 主动检索经 search() 的行排除跳过这些行，
-        避免"注入块 + recall 块"双份呈现。
+        Dedup contract: after a successful injection, memoize these
+        document_ids (session-level + TTL),
+        so the same round's recall / planner active recall exclude these rows
+        via the search() row exclusion,
+        avoiding a double-presented "injection block + recall block".
 
         Args:
-            session_id: 会话 ID（裸 id；跨适配器同号会话靠 platform 区分）。
-            platform: 平台标识（非空时限定本适配器——OFFSET 名额与近时
-                排除子查询同口径）。
+            session_id: Session ID (bare id; same-numbered sessions across
+                adapters are distinguished by platform).
+            platform: Platform identifier (when non-empty, restrict to this
+                adapter - same convention as the OFFSET quota and the
+                recent-range exclusion subquery).
 
         Returns:
-            注入块文本（无可用内容/开关关闭/窗口边界不可得时返回空串）。
+            The injection block text (empty string when there is no usable
+            content / the switch is off / the window boundary is
+            unavailable).
         """
         if not (self.config.recent_rollout_enabled and session_id):
             return ""
@@ -1850,7 +2070,8 @@ class LocalMemoryKernel:
         return "\n".join(lines)
 
     def _local_tz(self):
-        """本地时区（插件配置 timezone > 宿主 locale.TZ > 服务器本地）。"""
+        """Local timezone (plugin config timezone > host locale.TZ > server
+        local)."""
         if self._local_tz_cache is None:
             self._local_tz_cache = time_labels.resolve_local_tz(
                 (self.config.timezone or "").strip(), self._host_tz_provider
@@ -1858,11 +2079,14 @@ class LocalMemoryKernel:
         return self._local_tz_cache
 
     def _identity_note(self) -> str:
-        """bot 名自指锚（recall 块与滚动补回块共用，防两处措辞漂移）。
+        """Bot-name self-reference anchor (shared by the recall block and the
+        rolling-fill-back block, avoiding wording drift between the two).
 
-        记忆以第三人称记录 bot 言行（库内保留 bot 名原文保字面检索命中），
-        注入时显式告知 LLM 该名即自己，防把记忆中 bot 的言行当成第三方
-        成员的事。
+        Memory records the bot's actions in the third person (the library
+        keeps the bot name verbatim so literal search still matches);
+        when injecting, explicitly tell the LLM that this name is itself,
+        preventing the bot's actions in memory from being taken as another
+        member's.
         """
         return (
             f"；文中“{self.bot_nickname}”即你自己" if self.bot_nickname else ""
@@ -1878,31 +2102,39 @@ class LocalMemoryKernel:
         self._local_tz_cache = None
 
     def _to_local(self, dt: datetime) -> datetime:
-        """幂等键日期口径归一：aware 入参转本地时区，naive 视为已是本地口径。
+        """Idempotent-key date convention normalization: aware inputs are
+        converted to the local timezone, naive ones are treated as already
+        local.
 
-        evidence_key / fact_document_id / relation_document_id 取日期必须
-        用本地口径（宿主传 naive 本地时间戳时原样透传）。任何通路传 aware
-        （UTC）值时直接 strftime 会与 merge agent 补编码路径
-        （merge_agent._to_local 归一）产生跨路径幂等键失配——UTC+8 的
-        00:00-07:59 差一天，同批事实重复入库计分。astimezone 只换表示
-        不变时刻，转出的值随后写库无副作用。
+        evidence_key / fact_document_id / relation_document_id must take the
+        date in local convention (host-passed naive local timestamps are
+        passed through as-is). strftime directly on an aware (UTC) value from
+        any path would mismatch the merge agent's backfill-encoding path
+        (normalized by merge_agent._to_local) - UTC+8's 00:00-07:59 spans a
+        day difference, and the same batch of facts would be re-inserted and
+        double-scored. astimezone only changes the representation, never the
+        instant; the converted value written to the DB has no side effects.
         """
         if dt.tzinfo is None:
             return dt
         return dt.astimezone(self._local_tz())
 
     def _relative_time_label(self, ts: datetime | None) -> str:
-        """注入时间标注（本地时区）：形态由 recall_time_label_mode 决定。
+        """Injection time label (local timezone): the form is decided by
+        recall_time_label_mode.
 
-        实现委托共享模块 time_labels.memory_time_label——画像档案
-        （persona_service）的时效栏需要与 recall 记忆块逐字一致的标注，
-        单点实现防两处漂移。口径详见 time_labels 模块 docstring。
+        The implementation delegates to the shared module
+        time_labels.memory_time_label - the persona service's
+        freshness column needs labels identical to the recall memory block
+        word for word; a single implementation prevents drift between the
+        two. Calibration details live in the time_labels module docstring.
 
         Args:
-            ts: 记忆发生时间（aware；None 或将来时间戳返回空串）。
+            ts: Memory occurrence time (aware; None or a future timestamp
+                returns an empty string).
 
         Returns:
-            标注文本（空串表示不加标注）。
+            The label text (empty string means no label).
         """
         return time_labels.memory_time_label(
             ts,
@@ -1912,24 +2144,33 @@ class LocalMemoryKernel:
         )
 
     def _relative_part(self, days: int) -> str:
-        """相对时距（按日粒度）：委托共享实现（口径见 time_labels）。"""
+        """Relative time distance (day granularity): delegates to the shared
+        implementation (calibration in time_labels)."""
         return time_labels.relative_time_part(days)
 
     def _absolute_part(self, local: datetime, days: int, now_local: datetime) -> str:
-        """绝对时间锚（分层精度）：委托共享实现（口径见 time_labels）。"""
+        """Absolute time anchor (layered precision): delegates to the shared
+        implementation (calibration in time_labels)."""
         return time_labels.absolute_time_part(local, days, now_local)
 
     def _fire_reinforcement(self, rows: list) -> None:
-        """召回访问强化派发（011 生命周期）：最终注入集异步刷新强化时间戳。
+        """Recall reinforcement dispatch (011 lifecycle): asynchronously refresh
+        the reinforcement timestamps of the final injected set.
 
-        语义对齐 iris 的 batch_update_access，但收敛为只刷最终注入集——
-        被 top_k 截掉的候选行不算「被想起」。fire-and-forget：后台任务
-        执行，任何异常仅告警（不走 _guarded_call——强化失败不该计熔断，
-        它不是召回主路的一部分）。任务句柄挂实例集合（事件循环对 task
-        只持弱引用，不持引用可能被 GC 中途取消）。
+        Semantics aligned with iris's batch_update_access, but narrowed to
+        only refreshing the final injected set -
+        candidate rows cut by top_k do not count as "recalled".
+        fire-and-forget: run in a background task, any exception is only
+        warned about (not via _guarded_call - a reinforcement failure should
+        not count toward the circuit breaker,
+        it is not part of the recall main path). Task handles are held on the
+        instance set (the event loop only holds weak references to tasks,
+        so without holding a reference they may be GC-cancelled midway).
 
-        关闭 summary_lifecycle_reinforce_on_recall 时不派发；生命周期
-        总开关不控制本钩子（强化计数独立累积，供开启后首遍判据使用）。
+        No dispatch when summary_lifecycle_reinforce_on_recall is off; the
+        lifecycle
+        master switch does not gate this hook (reinforcement counts
+        accumulate independently, for the first-pass criterion once enabled).
         """
         if not self.config.summary_lifecycle_reinforce_on_recall or not rows:
             return
@@ -1956,7 +2197,8 @@ class LocalMemoryKernel:
         self._reinforce_tasks.add(task)
 
     async def _drain_reinforcement(self) -> None:
-        """等待在飞的强化任务落定（测试钩子：保证断言前写入已发生）。"""
+        """Wait for in-flight reinforcement tasks to settle (test hook: ensures
+        the writes have happened before assertions)."""
         pending = [t for t in self._reinforce_tasks if not t.done()]
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
@@ -1975,7 +2217,7 @@ class LocalMemoryKernel:
         dedup_dropped: int,
         rows: list[dict],
     ) -> None:
-        """落 search 事件（未启用日志时为空操作）。"""
+        """Write a search event (a no-op when logging is not enabled)."""
         if self._recall_log is None:
             return
         self._recall_log.write({
@@ -2011,7 +2253,7 @@ class LocalMemoryKernel:
         injected: list[dict],
         truncated: bool,
     ) -> None:
-        """落 inject 事件（未启用日志时为空操作）。"""
+        """Write an inject event (a no-op when logging is not enabled)."""
         if self._recall_log is None:
             return
         self._recall_log.write({
@@ -2032,18 +2274,23 @@ class LocalMemoryKernel:
         platform: str,
         top_k: int,
     ) -> list[dict]:
-        """per_user 配额截断（纯函数，供单测直调；rows 须已按最终序排好）。
+        """per_user quota truncation (pure function, directly testable; rows must
+        already be sorted in the final order).
 
-        归属判定与主路用户过滤组同口径：行 user_id == uid，或
-        "platform:uid" ∈ 行 participants；命中多用户时取先有配额者
-        （顺序即 uids 序）。不可归属行（bot_self 原文 / 扩选命中的
-        非列名用户行）进公共位——bot_self 在旧分桶实现中随每桶计入
-        某个用户的配额，独立成公共位语义更干净（bot 自身记忆属于
-        全场，不占任何人的名额）。
+        Ownership judgment uses the same convention as the main route's
+        user-filter group: row user_id == uid, or
+        "platform:uid" in the row's participants; on hits to multiple users
+        the earlier-quota owner wins (order follows the uids order).
+        Unattributable rows (bot_self raw text / expansion hits to
+        non-listed users) go to the shared slots - in the old bucketed
+        implementation bot_self was counted into some user's quota per
+        bucket; a standalone shared slot is semantically cleaner (the bot's
+        own memory belongs to everyone, occupying no one's quota).
 
-        【暂不启用】per_user 无调用方接线（见 search docstring 的
-        接线前须知：跨平台身份对 / identity 级合桶 / 候选池占满 /
-        scope 语义收紧）。
+        [Not wired yet] per_user has no caller (see the search docstring's
+        pre-wiring notes: cross-platform identity pairs / identity-level
+        bucket sharing / candidate pool saturation /
+        scope semantics tightening).
         """
         quota = {u: top_k for u in uids}
         shared_left = top_k
@@ -2071,18 +2318,23 @@ class LocalMemoryKernel:
 
     @staticmethod
     def _sort_by_relevance(rows: list[dict]) -> list[dict]:
-        """纯向量序：按 cosine 相关度降序显式排序并回填 score。
+        """Plain vector order: explicitly sort by descending cosine relevance and
+        backfill score.
 
-        SQL 已按 cosine 排序返回，此处再排一次消除对返回序的隐式依赖
-        （分桶去重/桩件等中转可能打乱顺序）。混合检索开启时行携带
-        "rrf"（两路融合分），降级序以融合分为准（否则 BM25 路捞回的
-        稀有条目会被 cosine 序埋没）。
+        SQL already returns rows sorted by cosine; sorting here again
+        removes the implicit dependency on the return order
+        (transit through bucket dedup / stubs may shuffle the order). When
+        hybrid search is on, rows carry
+        "rrf" (the two-route fused score), so the degraded order follows the
+        fused score (otherwise the sparse entries retrieved by the BM25
+        route would be buried by the cosine order).
 
         Args:
-            rows: 候选行列表（含 relevance 字段，hybrid 时含 rrf）。
+            rows: Candidate rows (carrying the relevance field, plus rrf when
+                hybrid).
 
         Returns:
-            排序后的行列表（score 字段已回填）。
+            The sorted row list (the score field is backfilled).
         """
         for row in rows:
             row["score"] = row.get("rrf", row["relevance"])
@@ -2092,14 +2344,17 @@ class LocalMemoryKernel:
     async def _guarded_call(
         self, operation: Callable[[], Awaitable[_T]], description: str
     ) -> _T | None:
-        """熔断守卫的 DB 读取（fail-open：任何失败记日志返回 None，不上抛）。
+        """Circuit-guarded DB read (fail-open: any failure logs and returns None,
+        never raises).
 
         Args:
-            operation: 无参协程工厂（DB 读取操作，返回结果）。
-            description: 日志描述。
+            operation: zero-argument coroutine factory (a DB read operation,
+                returns the result).
+            description: log description.
 
         Returns:
-            操作结果；熔断跳过或执行失败时返回 None。
+            The operation result; None when skipped by circuit-open or the
+            execution failed.
         """
         if not await self.circuit_breaker.is_available():
             logger.warning("记忆库熔断中，跳过: %s", description)
@@ -2114,14 +2369,17 @@ class LocalMemoryKernel:
         return result
 
     async def _guarded(self, operation: Callable[[], Awaitable[None]], description: str) -> bool:
-        """熔断守卫的 DB 操作执行（fail-open：任何失败记日志跳过，不上抛）。
+        """Circuit-guarded DB operation execution (fail-open: any failure logs and
+        skips, never raises).
 
         Args:
-            operation: 无参协程工厂（DB 写入操作）。
-            description: 日志描述（含 document_id）。
+            operation: zero-argument coroutine factory (a DB write
+                operation).
+            description: log description (including document_id).
 
         Returns:
-            True 表示执行成功；False 表示熔断跳过或执行失败。
+            True when the execution succeeded; False when skipped by
+            circuit-open or the execution failed.
         """
         if not await self.circuit_breaker.is_available():
             logger.warning("记忆库熔断中，跳过: %s", description)
@@ -2142,16 +2400,21 @@ class LocalMemoryKernel:
         user_id: str,
         participant_user_ids: Optional[list[tuple[str, str]]],
     ) -> list[str]:
-        """构造 participants 复合键列表（"platform:uid"，去重保序）。
+        """Build the participants composite-key list ("platform:uid", deduped and
+        order-preserving).
 
         Args:
-            kind: 记忆类型（bot_self 留空——召回按 kind 全局命中，无需用户过滤）。
-            platform: 平台标识。
-            user_id: trigger 发言者（participant 列表为空时的回退）。
-            participant_user_ids: 批次所有发言者 (platform, user_id) 列表。
+            kind: Memory kind (bot_self leaves it empty - recall matches
+                globally by kind, no user filter needed).
+            platform: Platform identifier.
+            user_id: trigger speaker (fallback when the participant list is
+                empty).
+            participant_user_ids: (platform, user_id) list of all speakers in
+                the batch.
 
         Returns:
-            复合键列表；bot_self 或无任何发言者时为空列表。
+            The composite-key list; empty for bot_self or when there are no
+            speakers at all.
         """
         if kind == "bot_self":
             return []
@@ -2170,15 +2433,16 @@ class LocalMemoryKernel:
 
     @staticmethod
     def _build_document_id(kind: str, session_id: str, content_hash: str) -> str:
-        """构造摘要表 document_id（幂等键，策略对齐 hindsight 插件）。
+        """Build the summary-table document_id (idempotent key, strategy aligned
+        with the hindsight plugin).
 
         Args:
-            kind: 记忆类型（chat_summary / bot_self / 其他）。
-            session_id: 会话 ID。
-            content_hash: 内容 MD5 哈希（前 12 位）。
+            kind: Memory kind (chat_summary / bot_self / others).
+            session_id: Session ID.
+            content_hash: content MD5 hash (first 12 characters).
 
         Returns:
-            document_id 字符串。
+            The document_id string.
         """
         if kind == "chat_summary":
             # session_id 已含 bot_id（如 group-{gid}-{bot_id}），无需重复
@@ -2189,17 +2453,18 @@ class LocalMemoryKernel:
 
     @staticmethod
     def _build_evidence_key(session_id: str, occurred_at: datetime) -> str:
-        """构造计分证据键 "{session_id}|{occurred_at:日期}"。
+        """Build the scoring evidence key "{session_id}|{occurred_at:date}".
 
-        同一会话同一天的重复提取（历史窗口重叠）天然落在同一键上，
-        被 M4 合并 agent 的 evidence_keys 去重消除。
+        Repeated extractions on the same session and day (overlapping
+        history windows) naturally land on the same key,
+        deduped by the M4 merge agent's evidence_keys.
 
         Args:
-            session_id: 提取来源会话 ID。
-            occurred_at: 事实发生时间。
+            session_id: Source session ID of the extraction.
+            occurred_at: Fact occurrence time.
 
         Returns:
-            证据键字符串。
+            The evidence-key string.
         """
         return f"{session_id}|{occurred_at.strftime('%Y-%m-%d')}"
 
@@ -2210,15 +2475,19 @@ class LocalMemoryKernel:
         scope_session_id: str = "",
         scope_user_id: str = "",
     ) -> bool:
-        """按幂等键删除摘要记忆（memory_remove 维护工具的内核入口）。
+        """Delete a summary memory by idempotent key (the kernel entry of the
+        memory_remove maintenance tool).
 
         Args:
-            document_id: 摘要幂等键。
-            scope_session_id: 作用域锁定非空时追加会话归属限定（下传 DAL）。
-            scope_user_id: 作用域锁定非空时追加用户归属限定（下传 DAL）。
+            document_id: summary idempotent key.
+            scope_session_id: when scope locking is non-empty, appends a
+                session-ownership qualifier (passed down to the DAL).
+            scope_user_id: when scope locking is non-empty, appends a
+                user-ownership qualifier (passed down to the DAL).
 
         Returns:
-            是否删除了行；熔断中或执行失败返回 False。
+            Whether a row was deleted; False when circuit-open or the
+            execution failed.
         """
         return bool(await self._guarded_call(
             lambda: self.db.delete_chat_summary(

@@ -467,9 +467,9 @@ async def test_time_label_disabled() -> None:
 
 
 async def test_injection_format_guide_and_items() -> None:
-    """注入格式：标题 + 归因/时态导语（前置）+ 条目行（标注关闭态）。
+    """Injection format: heading + attribution/tense guide (prepended) + item lines (labels disabled).
 
-    带标注路径见上方 test_time_labels_appended。"""
+    The labeled path is covered above in test_time_labels_appended."""
     db = _CaptureDB(rows=[
         _row("a", 0.9, _NOW - timedelta(days=3)),
         _row("b", 0.8, _NOW - timedelta(days=10)),
@@ -490,8 +490,8 @@ async def test_injection_format_guide_and_items() -> None:
 
 
 async def test_injection_guide_precedes_items() -> None:
-    """导语必须前置在列表上方（非尾注）：planner 主动检索会向既有
-    memory_context 末尾追加 bullet，尾注会被追加行截断错位。"""
+    """The guide must sit above the item list (not as a trailing note): planner-initiated retrieval appends bullets
+    to the end of the existing memory_context, and a trailing note would be cut off and misaligned by the append."""
     db = _CaptureDB(rows=[_row("a", 0.9, _NOW - timedelta(days=3))])
     kernel = _make_kernel(db, recall_time_label_enabled=False)
     text = await kernel.build_injection_text(query="猫", session_id="s1")
@@ -506,8 +506,8 @@ async def test_injection_guide_precedes_items() -> None:
 
 
 async def test_injection_guide_time_phrase_follows_label_switch() -> None:
-    """时间指代随标注开关：开启时称「条目末尾标注的时间」，关闭时改为
-    「更早发生的事」（关闭时条目行无末尾标注，避免指代不存在的标注）。"""
+    """The time reference follows the label switch: when labels are on it refers to "the time labeled at the end of the item",
+    when off it changes to "things that happened earlier" (off state has no end-of-item label, avoiding references to a nonexistent label)."""
     db = _CaptureDB(rows=[_row("a", 0.9, _NOW - timedelta(days=3))])
     kernel_on = _make_kernel(db, recall_time_label_enabled=True)
     text_on = await kernel_on.build_injection_text(query="猫", session_id="s1")

@@ -1,18 +1,19 @@
-"""持久实体别名层（memory_entity_alias 表的内存匹配视图 + 写入辅助）。
+"""Persistent entity alias layer (in-memory match view over the memory_entity_alias table plus write helpers).
 
-职责（P1 别名层，设计见 2026-09 关系图谱方案 P1）：
-- 变体拆分与清洗：括号后缀昵称拆主干/内段（"琳妮特（笨蛋猫娘）" ->
-  "琳妮特（笨蛋猫娘）"/"琳妮特"/"笨蛋猫娘"），过滤单字/符号名与
-  "用户<数字>" fallback 名；
-- 内存匹配：name in text 子串包含（等价于对输入跑 %name%，纯内存
-  零 DB）；重名歧义时窗口词典命中优先，仍歧义则跳过（确定性优先于
-  召回，跳过名单进 debug 日志供审计）；
-- apply_rows：写入侧（批次 upsert / 宿主 messages 对账）落库后同步
-  内存视图，免整表重载；TTL 整表重载仅作跨写入口的自愈。
+Responsibilities (P1 alias layer, design per the 2026-09 relation graph plan P1):
+- Variant splitting and cleaning: split bracket-suffixed nicknames into stem/inner
+  ("Lynette (silly catgirl)" -> "Lynette (silly catgirl)"/"Lynette"/"silly catgirl"); filter out
+  single-char/symbol names and "User<digits>" fallback names;
+- In-memory matching: name in text substring containment (equivalent to running %name% over the
+  input, pure memory, zero DB); on duplicate-name ambiguity the window dictionary hit wins,
+  still ambiguous then skip (determinism over recall, skip list goes into debug logs for audit);
+- apply_rows: after the write side (batch upsert / host messages reconciliation) persists rows,
+  syncs the in-memory view to avoid full-table reloads; TTL full-table reloads only serve as
+  self-healing across write entries.
 
-名字来源（两侧同构：消息流 -> 本表，均不读宿主用户表）：
-- 上游 nori 版：宿主 messages 表回填 + TTL 增量对账（alias_sync.py）；
-- KiraAI：回合批次 sender upsert（main.py 回合完成信号处理内）。
+Name sources (homogeneous on both sides: message stream -> this table, neither reads the host user table):
+- Upstream nori version: host messages table backfill + TTL incremental reconciliation (alias_sync.py);
+- KiraAI: per-round batch sender upsert (inside the main.py round-completion signal handler).
 """
 
 from __future__ import annotations
@@ -41,15 +42,17 @@ _FALLBACK_NAME_RE = re.compile(r"^用户\d+$")
 
 
 def normalize_alias_text(text: str) -> str:
-    """匹配视图归一化：NFKC + casefold。
+    """Match view normalization: NFKC + casefold.
 
-    群名片常见 Unicode 数学字母（"undefined𝕩𝕩𝕪" 的 𝕩=U+1D569）与全角
-    形态，聊天文本里打的往往是 ASCII/半角（"xxy"）——码点不同则子串
-    匹配恒败。NFKC 把 𝕩→x、全角→半角，casefold 统一大小写；两侧
-    （词典键与匹配文本）都过本函数，字节级歧义在匹配面前消失。
+    Group card names often contain Unicode math letters (the 𝕩=U+1D569 in "undefined𝕩𝕩𝕪") and
+    full-width forms, while chat text is usually typed in ASCII/half-width ("xxy"): different code
+    points mean substring matching always fails. NFKC maps 𝕩->x and full-width->half-width, casefold
+    unifies case; both sides (dictionary keys and matched text) pass through this function, so
+    byte-level ambiguity disappears in front of matching.
 
-    DB 存储保留原名（规范名/画像标题展示原样），归一化仅发生在内存
-    匹配视图（加载与匹配两口），语义与 alias_upsert 写入口无关。
+    DB storage keeps the original name (canonical name/persona title shown as-is); normalization
+    only happens in the in-memory match view (load and match entries) and is unrelated to the
+    alias_upsert write semantics.
     """
     return unicodedata.normalize("NFKC", text or "").casefold()
 
@@ -63,12 +66,13 @@ _FACT_CODE_RE = re.compile(r"用户(\d{4,})\s*[（(]\s*([^()（）]{1,24}?)\s*[�
 
 
 def extract_uid_code_names(statement: str) -> list[tuple[str, str]]:
-    """从事实陈述提取「用户<uid>（<代号>）」模式的 (uid, 代号) 列表。
+    """Extract (uid, code) pairs matching the "User<uid> (code)" pattern from fact statements.
 
-    原文直接提取（括号全角/半角通吃），代号保留原文形态——DB 存储
-    与展示用原名（normalize_alias_text 的存储约定），归一化只用于
-    uid（NFKC 统一半角数字）与匹配键。同形多现去重保序。原始形态
-    不作校验——清洗与占位名裁决由 build_fact_code_alias_rows 统一把关。
+    Extraction is direct on the original text (full-width/half-width brackets both work); the code
+    keeps its original form: DB storage and display use the original name (the normalize_alias_text
+    storage convention), normalization only applies to the uid (NFKC unifies half-width digits) and
+    to match keys. Same-form repeats are deduplicated preserving order. Raw forms are not validated:
+    cleaning and placeholder-name verdicts are unified in build_fact_code_alias_rows.
     """
     pairs: list[tuple[str, str]] = []
     for uid, code in _FACT_CODE_RE.findall(statement or ""):
@@ -79,11 +83,11 @@ def extract_uid_code_names(statement: str) -> list[tuple[str, str]]:
 
 
 def _later_ts(a: Optional[datetime], b: Optional[datetime]) -> bool:
-    """None 安全的时间先后比较：None 视作最旧。
+    """None-safe chronological comparison: None counts as the oldest.
 
-    时间值缺失/不可解析不得让比较抛 TypeError——SQLite 标量 MAX 任一
-    参数为 NULL 即返回 NULL（与 PG GREATEST 忽略 NULL 语义不同），
-    TEXT 旧数据格式漂移经 sqlite_parse_ts 也流入 None。
+    Missing/unparseable time values must not make the comparison raise TypeError: SQLite scalar MAX
+    returns NULL if any argument is NULL (unlike PG GREATEST, which ignores NULL), and old-format
+    TEXT data drift also flows into None via sqlite_parse_ts.
     """
     if a is None:
         return False
@@ -97,17 +101,17 @@ def build_fact_code_alias_rows(
     *,
     source: str = "fact",
 ) -> list[dict]:
-    """事实陈述代号 -> 别名行（（platform, 陈述, last_seen) 流）。
+    """Fact statement codes -> alias rows (stream of (platform, statement, last_seen)).
 
-    提取的代号过 clean_alias_name（清洗）与 is_placeholder_name
-    （unknown/undefined/纯数字等 LLM 毒输出拦截，在归一化形上裁决）
-    双重守卫；同 (platform, uid, 归一化名) 去重——行 name 保留首个
-    观测原文（大小写/全角形态，展示原样），last_seen 取更晚
-    （None 视作最旧，见 _later_ts）。
+    Extracted codes pass through a double guard: clean_alias_name (cleaning) and is_placeholder_name
+    (blocks LLM poison output like unknown/undefined/pure digits, decided on the normalized form);
+    deduplicated by (platform, uid, normalized name): the row name keeps the first observed original
+    (case/full-width form, shown as-is), last_seen takes the later one (None counts as the oldest,
+    see _later_ts).
 
     Returns:
-        别名行列表（platform/user_id/name/last_seen/source），供
-        db.alias_upsert 落库 + AliasStore.apply_rows 同步内存。
+        List of alias rows (platform/user_id/name/last_seen/source) for db.alias_upsert to
+        persist and AliasStore.apply_rows to sync in memory.
     """
     by_key: dict[tuple[str, str, str], tuple[str, Optional[datetime]]] = {}
     for platform, statement, last_seen in sources:
@@ -138,7 +142,7 @@ def build_fact_code_alias_rows(
 
 
 def _word_chars(name: str) -> int:
-    """CJK + 字母数字字符数（符号/空白/装饰符不计）。"""
+    """Count of CJK plus alphanumeric characters (symbols/whitespace/decorators not counted)."""
     return sum(
         1
         for ch in name
@@ -147,7 +151,7 @@ def _word_chars(name: str) -> int:
 
 
 def clean_alias_name(name: str) -> str:
-    """清洗单个候选名：去空白；无效（<2 个词字符、"用户\\d+" fallback）返回空串。"""
+    """Clean a single candidate name: strip whitespace; return empty string when invalid (< 2 word chars, "User\\d+" fallback)."""
     cleaned = (name or "").strip()
     if len(cleaned) < 2:
         return ""
@@ -171,15 +175,17 @@ PLACEHOLDER_NAME_SQL = r"^(unknown|undefined|用户[0-9]+|[0-9]+|未知(用户)?
 
 
 def is_placeholder_name(name: str) -> bool:
-    """判定占位名：空/未知[用户][数字]/unknown/undefined/用户\\d+/纯数字。
+    """Judge placeholder names: empty/"unknown[user][digits]"/unknown/undefined/User\\d+/pure digits.
 
-    与 clean_alias_name 的分工：后者管别名表准入（消息流里真有人这么
-    起名），本函数管"能否作实体规范显示名"——"未知"能过清洗但不是
-    可用的规范名，故独立判定。读侧规范名解析与写侧守卫共用同一裁决。
+    Division of labor with clean_alias_name: the latter governs alias table admission (some people in
+    the message stream really do use such names), this function governs whether a name can serve as a
+    canonical entity display name: "unknown" passes cleaning but is not a usable canonical name, hence
+    the separate judgment. Read-side canonical-name resolution and the write-side guard share the same
+    verdict.
 
-    【单源警示】本函数与 PLACEHOLDER_NAME_SQL（db 层 SQL 副本的插值源）
-    是同一规则的两态实现，必须同步演化——任一侧新增占位形态时另一侧
-    静默失守。
+    [Single-source warning] This function and PLACEHOLDER_NAME_SQL (the interpolation source of the
+    db-layer SQL copies) are two stateful implementations of the same rule and must evolve in
+    lockstep: when either side adds a placeholder form the other side goes silently stale.
     """
     cleaned = (name or "").strip()
     if not cleaned:
@@ -190,10 +196,11 @@ def is_placeholder_name(name: str) -> bool:
 
 
 def split_name_variants(name: str) -> list[str]:
-    """拆分名字变体：整串 + 括号外主干 + 各括号内段（均过清洗，去重保序）。
+    """Split name variants: full string + stem outside brackets + each inner bracketed segment (all pass cleaning, deduplicated preserving order).
 
-    "梦瑶月（月月猫）[群低性能bot]" -> 整串 / "梦瑶月" / "月月猫" /
-    "群低性能bot"（主干为全部括号外段拼接——常见单段，多段拼接保语义）。
+    "Yueyao (moon cat) [low-perf group bot]" -> full string / "Yueyao" / "moon cat" /
+    "low-perf group bot" (the stem is the concatenation of all outer segments: commonly a single
+    segment, multi-segment concatenation preserves semantics).
     """
     raw = (name or "").strip()
     if not raw:
@@ -244,17 +251,17 @@ def build_alias_rows(
     source: str,
     variant_cap: int,
 ) -> list[dict]:
-    """原始名观测 -> 别名行（变体拆分 + 每用户上限）。
+    """Raw name observations -> alias rows (variant splitting + per-user cap).
 
     Args:
-        raw: (platform, uid, 原始名, last_seen) 任意顺序、可重复——
-            同名取更晚 last_seen。
-        source: 写入来源标记（backfill | reconcile | batch）。
-        variant_cap: 每 (platform, uid) 保留的变体上限（按 last_seen
-            降序截断——状态播报式名片的十几个变体在此收敛）。
+        raw: (platform, uid, original name, last_seen) in any order, repeats allowed:
+            the same name takes the later last_seen.
+        source: write source marker (backfill | reconcile | batch).
+        variant_cap: per (platform, uid) variant cap kept (truncated by last_seen descending:
+            the dozen-plus variants of status-broadcast cards converge here).
 
     Returns:
-        别名行列表（platform/user_id/name/last_seen/source）。
+        List of alias rows (platform/user_id/name/last_seen/source).
     """
     by_owner: dict[tuple[str, str], dict[str, datetime]] = {}
     for platform, uid, name, last_seen in raw:
@@ -279,7 +286,7 @@ def build_alias_rows(
 
 
 def _to_epoch(ts: object) -> float:
-    """datetime/timestamp -> epoch 秒（naive 按 UTC 补齐；缺失返回 0）。"""
+    """datetime/timestamp -> epoch seconds (naive treated as UTC; missing returns 0)."""
     if isinstance(ts, datetime):
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
@@ -291,7 +298,7 @@ def _to_epoch(ts: object) -> float:
 
 
 class AliasStore:
-    """持久别名内存视图：加载/匹配/写后同步（reply 路径零 DB 依赖）。"""
+    """Persistent alias in-memory view: load/match/post-write sync (zero DB dependency on the reply path)."""
 
     _REFRESH_TTL_SECONDS = 600.0
 
@@ -302,7 +309,7 @@ class AliasStore:
         variant_cap: int = 8,
         stopwords: Optional[Iterable[str]] = None,
     ) -> None:
-        """Args: db 为 None 时仅 apply_rows 驱动的内存视图可用（测试用）。"""
+        """Args: when db is None only the apply_rows-driven in-memory view is available (for tests)."""
         self._db = db
         self._variant_cap = variant_cap
         # 停用词同样以归一化形态比对（视图键是归一化名，口径一致）
@@ -324,16 +331,16 @@ class AliasStore:
 
     @property
     def size(self) -> int:
-        """内存视图中的名字数（监控/日志用）。"""
+        """Number of names in the in-memory view (for monitoring/logs)."""
         return len(self._names)
 
     @property
     def variant_cap(self) -> int:
-        """每用户变体上限（写入侧构造 build_alias_rows 参数用）。"""
+        """Per-user variant cap (the parameter the write side passes to build_alias_rows)."""
         return self._variant_cap
 
     async def refresh_if_due(self, force: bool = False) -> None:
-        """TTL 整表重载（自愈跨写入口；表小全量拉取，成本毫秒级）。"""
+        """TTL full-table reload (self-heals across write entries; the table is small so a full fetch costs milliseconds)."""
         if self._db is None:
             return
         now = time.monotonic()
@@ -373,7 +380,7 @@ class AliasStore:
         logger.info("持久别名视图已加载: %d 名", len(names))
 
     def apply_rows(self, rows: list[dict]) -> None:
-        """写入侧落库后同步内存（增量，免整表重载）。"""
+        """Sync in-memory state after the write side persists rows (incremental, no full-table reload)."""
         for row in rows:
             name = row.get("name") or ""
             if not name:
@@ -402,11 +409,12 @@ class AliasStore:
                 self._by_owner[pair] = (name, epoch)
 
     def name_for(self, platform: str, uid: str) -> str:
-        """uid -> 最新非占位别名（反向视图；未命中返回空串）。
+        """uid -> latest non-placeholder alias (reverse view; empty string when not found).
 
-        写侧占位名守卫的解析源：LLM 输出"未知"/uid 兜底形时用该 uid 的
-        最新可用别名顶替，未命中留空（由 upsert 语句保旧名，读侧图谱
-        解析再兜底）。与 _names 同源同步，纯内存零 DB。
+        Resolution source for the write-side placeholder-name guard: when the LLM outputs an
+        "unknown"/uid fallback form, substitute this uid's latest usable alias; leave empty when not
+        found (the upsert statement keeps the old name, and read-side graph resolution falls back
+        again). Kept in sync from the same source as _names, pure memory, zero DB.
         """
         hit = self._by_owner.get((platform or "", str(uid or "")))
         return hit[0] if hit else ""
@@ -414,24 +422,26 @@ class AliasStore:
     def match(
         self, text: str, window_pairs: set[tuple[str, str]]
     ) -> tuple[list[tuple[str, str, str]], list[str]]:
-        """子串包含匹配（归一化 name in 归一化 text）。
+        """Substring containment match (normalized name in normalized text).
 
-        两侧都过 normalize_alias_text（NFKC + casefold）：名片里的
-        Unicode 数学字母/全角形态与聊天文本的 ASCII/半角写法在字节级
-        不同、语义上是同一称呼——归一化后子串匹配才能命中（DB 原名
-        不动，仅内存匹配视图归一化，见 normalize_alias_text）。
+        Both sides pass through normalize_alias_text (NFKC + casefold): Unicode math letters /
+        full-width forms in card names and the ASCII/half-width spellings in chat text differ at the
+        byte level yet are semantically the same name: substring matching can only hit after
+        normalization (DB original names stay untouched, only the in-memory match view is normalized,
+        see normalize_alias_text).
 
-        歧义裁决：名字对应多个 (platform, uid) 时——窗口词典（会话内
-        权威）命中者优先；无窗口背书且仍多义则跳过并记入返回值第二项
-        （确定性优先于召回；不按 recency 猜测，跳过名单供 debug 审计）。
+        Ambiguity resolution: when a name maps to multiple (platform, uid) pairs, the window
+        dictionary (in-session authority) hit takes precedence; with no window endorsement and still
+        ambiguous, the name is skipped and recorded into the second return value (determinism over
+        recall; no recency guessing, the skip list is for debug audit).
 
         Args:
-            text: 本轮匹配文本（含 @昵称 渲染的 plain_text）。
-            window_pairs: 窗口词典本轮命中的 (platform, uid) 集合。
+            text: current round match text (includes plain_text rendered for @nickname).
+            window_pairs: set of (platform, uid) hits from the window dictionary this round.
 
         Returns:
-            (命中条目 [(名字, platform, uid)], 歧义跳过的名字列表)。
-            名字为该键的展示原名（非归一化形）。
+            (Hit entries [(name, platform, uid)], names skipped due to ambiguity).
+            Names are the display originals for the key (not the normalized form).
         """
         if not text:
             return [], []

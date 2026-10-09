@@ -80,7 +80,8 @@ async def supersede_backfill_edges_of(conn, cluster_ids: list[int]) -> int:
     ``cluster_ids`` — edges that also carry online evidence (``session|date``
     keys) or a living backfill source stay active. Used by the merge replace
     path, manual cluster kills and per-user erasure so a corrected/replaced
-    cluster ("表姐不是姐姐") stops injecting its old relation edges.
+    cluster (e.g. "cousin is not my sister") stops injecting its old
+    relation edges.
 
     Args:
         conn: asyncpg connection (caller owns the transaction).
@@ -1829,7 +1830,7 @@ class MemoryDatabase(MemoryBackend):
         Scans last_seen-descending and takes the first non-placeholder name
         per uid (that uid's latest usable name); the secondary key name ASC
         keeps the pick deterministic on same-second ties. Placeholder names
-        (未知*/用户\\d+/digits-only etc.) never serve as canonical names;
+        (unknown*/user\\d+/digits-only etc.) never serve as canonical names;
         the predicate is the same source as the write-side guard
         (alias_store.is_placeholder_name).
 
@@ -1939,7 +1940,7 @@ class MemoryDatabase(MemoryBackend):
         monotonic like last_seen — replaying older batches from the pending
         queue or backfilling older clusters must not rewind occurrence
         time); endpoint names refresh too, except placeholder names
-        (empty / 未知* / 用户\\d+ / digits-only / unknown / undefined; the
+        (empty / unknown* / user\\d+ / digits-only / unknown / undefined; the
         rule is dual-implemented in alias_store.is_placeholder_name and the
         two copies must stay in sync) never overwrite an existing name —
         the LLM occasionally emits placeholders and a good name must not be
@@ -2831,15 +2832,18 @@ class MemoryDatabase(MemoryBackend):
         occurred_at: datetime,
         embedding: list[float] | None,
     ) -> int | None:
-        """插入原始事实并返回行 id（memory_write 确定性直写前置）。
+        """Insert a raw fact and return the row id (memory_write deterministic
+        write-in prefix).
 
-        与 insert_persona_fact_raw 的差异：幂等冲突时 DO UPDATE 刷新
-        display_name 并 RETURNING id——工具路径随后要对该行执行
-        apply_fact_merge（消费 extracted_flag），必须拿到行 id。空串
-        不覆盖既有名字（工具路径恒传 ""，而编码路径可能已解析出真名，
-        裸 SET 会把名字刷空）。冲突行已被合并 agent 消费（flag=1）时，
-        apply 的乐观锁翻 flag 失败返回 {"action": "skipped"}，工具层
-        据此报告「已记录」。
+        Difference from insert_persona_fact_raw: on an idempotent conflict a DO
+        UPDATE refreshes display_name and RETURNING id — the tool path then runs
+        apply_fact_merge on that row (consuming extracted_flag), so it must get
+        the row id. An empty string never overwrites an existing name (the tool
+        path always passes "", while the encode path may already have resolved a
+        real name on the same key; a bare SET would blank it). When the
+        conflicting row was already consumed by the merge agent (flag=1), the
+        apply optimistic-lock flag flip fails and returns
+        {"action": "skipped"}, which the tool layer reports as "recorded".
         """
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -2875,11 +2879,14 @@ class MemoryDatabase(MemoryBackend):
         include_inactive: bool = False,
         only_inactive: bool = False,
     ) -> list[dict]:
-        """簇表语义检索（主动记忆工具 target=fact / memory_lookup 取数面）。
+        """Cluster-table semantic search (data surface used by the active
+        memory tools target=fact / memory_lookup).
 
-        与 search_cluster_candidates 的差异：面向结论级消费（工具/维护），
-        非合并 agent 的候选形态——默认只返回生效簇（active/profiled），
-        include_inactive 时放开墓碑/待定并携带状态标注。
+        Difference from search_cluster_candidates: oriented to
+        conclusion-level consumption (tools/maintenance), not the merge
+        agent's candidate shape — by default only effective clusters
+        (active/profiled) are returned; include_inactive opens tombstones/
+        pending and carries status annotation.
         """
         # only_inactive (memory_lookup deep-dig path) narrows to
         # non-active statuses in SQL — active/profiled clusters never enter
@@ -2919,7 +2926,8 @@ class MemoryDatabase(MemoryBackend):
     async def fetch_cluster_owner(
         self, cluster_id: int
     ) -> tuple[str, str] | None:
-        """查簇归属（memory_write 的 replace 目标校验用，工具层作用域锁定）。"""
+        """Cluster ownership lookup (memory_write replace-target validation;
+        tool-layer scope lock)."""
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 f"SELECT platform, user_id FROM {FACT_CLUSTER_TABLE} "
@@ -2936,16 +2944,22 @@ class MemoryDatabase(MemoryBackend):
         platform: str = "",
         user_id: str = "",
     ) -> dict:
-        """簇状态维护操作（memory_correct 的 db 落点，单事务）。
+        """Cluster status maintenance op (memory_correct db landing, single
+        transaction).
 
-        三种确定性状态调整（不动 canonical_statement/score 主语义）：
-        - drop：→dead 并清画像投影行（立即出画像；簇体保留可复活）；
-        - dispute：打矛盾标记 contradicted_at（不动 updated_at——画像
-          投影/排序不受影响；衰减遍的证据地板豁免带标记的簇）；
-        - reactivate：dead/pending_uncertain → active（replaced 不在此列
-          ——有继任簇，直接复活会与继任并存矛盾，调用方应提示对继任
-          簇 dispute）。归属不符与不存在同款输出（不向调用方泄露他人
-          簇的存在性）。
+        Three deterministic status adjustments (primary semantics of
+        canonical_statement/score untouched):
+        - drop: -> dead and clears the profile projection row (leaves the
+          profile immediately; the cluster body survives and can revive);
+        - dispute: stamps the contradiction mark contradicted_at (leaves
+          updated_at alone — profile projection/ordering unaffected; the
+          decay pass's evidence floor exempts marked clusters);
+        - reactivate: dead/pending_uncertain -> active (replaced is not
+          in this set: it has a successor, reviving it directly would
+          coexist with the successor in contradiction, so the caller
+          should advise disputing the successor cluster). Ownership
+          mismatch and nonexistence read identically (never leaks that
+          another user's cluster exists).
         """
         owner_conds: list[str] = []
         owner_args: list[str] = []
@@ -3031,7 +3045,8 @@ class MemoryDatabase(MemoryBackend):
     async def _cluster_current_status(
         conn, cluster_id: int, owner_clause: str = "", owner_args=()
     ) -> dict:
-        """回读簇现态（状态操作的未变更分支：给调用方精确提示用）。"""
+        """Re-read the cluster's current state (unchanged branch of a status
+        op: precise feedback for the caller)."""
         row = await conn.fetchrow(
             f"SELECT status, replaced_by FROM {FACT_CLUSTER_TABLE} "
             f"WHERE id = $1{owner_clause}",
@@ -3049,7 +3064,7 @@ class MemoryDatabase(MemoryBackend):
     async def restore_summary(
         self, summary_id: int, session_id: str = ""
     ) -> bool:
-        """恢复归档摘要（memory_correct reactivate / 维护页操作）。"""
+        """Restore an archived summary (memory_correct reactivate / admin page op)."""
         session_cond = " AND session_id = $2" if session_id else ""
         async with self.pool.acquire() as conn:
             status = await conn.execute(
@@ -3071,13 +3086,19 @@ class MemoryDatabase(MemoryBackend):
         reinforce_window_days: int,
         batch_size: int,
     ) -> int:
-        """归档遍：超龄且强化窗口内无召回命中的行置 archived（keyset 分页）。
+        """Archive pass: rows past age and not recalled inside the reinforce
+        window flip to archived (keyset pagination).
 
-        两段式（先 SELECT 候选快照、后 UPDATE 复查判据）+ keyset 分页：
-        满批判定取候选数而非 UPDATE 影响行数——复查剔除会使影响行数偏小，
-        提前返回会滞留剩余合格行到下周期。SELECT 以 id > last_id 按主键
-        推进，已处理段不重扫；UPDATE 复查强化判据收敛召回并发竞态
-        （「刚被想起的记忆被误归档」且归档后双侧排除无法自愈）。
+        Two-phase (SELECT candidate snapshot first, then UPDATE re-checks
+        the criteria) + keyset pagination: full-batch detection counts
+        candidates, not the UPDATE rowcount — the re-check prunes rows so
+        the rowcount undercounts, and an early return would strand the
+        remaining eligible rows until the next cycle. SELECT advances by
+        primary key (id > last_id), never re-scanning the processed
+        segment; the UPDATE re-checks the recall criteria to converge the
+        recall concurrency race ("freshly recalled memory wrongly
+        archived"; once archived both sides exclude it and it cannot
+        self-heal).
         """
         total = 0
         last_id = 0
@@ -3125,7 +3146,8 @@ class MemoryDatabase(MemoryBackend):
                 last_id = ids[-1]
 
     async def reinforce_summaries(self, document_ids: list[str]) -> None:
-        """召回访问强化：刷新 last_recall_at 与 recall_count（归档豁免判据）。"""
+        """Recall-access reinforcement: refresh last_recall_at and recall_count
+        (the archive-exemption criterion)."""
         if not document_ids:
             return
         async with self.pool.acquire() as conn:

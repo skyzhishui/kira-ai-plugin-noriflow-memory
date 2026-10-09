@@ -1,17 +1,17 @@
-"""Kira 记忆数据迁入 harness（python 直跑，无 pytest 依赖）。
+"""Kira memory data import harness (python direct-run, no pytest dependency).
 
-覆盖（真 SQLite 库 + 临时源目录）：
-- 会话映射：KiraAI "seki:dm:UID"/"seki:gm:GID" -> 现网裸 session_id +
-  platform 前缀复合 participants；sm/非法会话跳过；
-- chunk 组装：信封行（uid/name/self 属性）、内嵌时间戳解析、防伪装
-  中性化、无 sender 系统通知不带归属属性；
-- TOML 事实/洞察 -> persona_fact_raw（kernel 幂等键同式、importance->
-  confidence、群实体归属群 ID、global/self 归属 bot、archive/skills 跳过）；
-- profile.json -> 别名行（name/nickname/aliases 去重，source=kira_memory_import）；
-- 幂等重跑：二次执行实插量为 0，kv 标记更新；
-- 源目录只读性：迁入前后源文件内容与 mtime 不变。
+Coverage (real SQLite db + temporary source dir):
+- Session mapping: KiraAI "seki:dm:UID"/"seki:gm:GID" -> production bare session_id +
+  platform-prefixed composite participants; sm/illegal sessions skipped;
+- chunk assembly: envelope lines (uid/name/self attributes), embedded timestamp parsing, anti-mimicry
+  neutralization, sender-less system notices carry no attribution attributes;
+- TOML facts/reflections -> persona_fact_raw (kernel-identical idempotency keys, importance->
+  confidence, group entities owned by the group id, global/self owned by bot, archive/skills skipped);
+- profile.json -> alias rows (name/nickname/aliases deduped, source=kira_memory_import);
+- idempotent re-run: second execution inserts 0 rows, kv marker updates;
+- source-dir read-only guarantee: source file content and mtime unchanged before/after import.
 
-运行（插件目录）：
+Run (plugin dir):
     python tests/test_kira_memory_import.py
 """
 

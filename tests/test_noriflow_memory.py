@@ -1,13 +1,14 @@
-"""kira-ai-plugin-noriflow-memory 自包含桩测试。
+"""Self-contained stub tests for kira-ai-plugin-noriflow-memory.
 
-不依赖真实 KiraAI 核心与 PostgreSQL：core.* 以桩模块注入，asyncpg 用真包、
-数据库交互以 FakeDB/FakePool 替身承接。运行：
+Does not depend on the real KiraAI core or PostgreSQL: core.* is injected as
+stub modules, asyncpg uses the real package, and DB interactions are handled
+by FakeDB/FakePool stand-ins. Run:
 
     python tests/test_noriflow_memory.py
 
-覆盖：配置容错 / 信封格式 / 编码器解析 / 合并裁定决策 / kernel 双通道写入
-与 bot 事实过滤 / 画像拼装与黑名单 / 工具三件套 / enabled_tools 门控 /
-retain 编排（回合信号、水位线增量、失败回滚）/ 自动禁用 simple_memory /
+Coverage: config fault tolerance / envelope format / encoder parsing / merge-verdict decisions / kernel dual-channel
+write with bot fact filtering / persona assembly and blacklist / the three core tools / enabled_tools gating /
+retain orchestration (turn signal, watermark incremental, failure rollback) / auto-disabling simple_memory /
 maintenance API validation/degradation / 2026-09-11 review-fix regression
 batch (watermark critical section, full config reflection, manual cluster
 paths, re-encode channel alignment, audit poison batch, SQL shapes,
@@ -50,12 +51,12 @@ from plugin_env import install_host_stubs, load_plugin_module  # noqa: E402
 
 
 def _install_core_stubs() -> None:
-    """兼容别名：桩安装实现迁至 plugin_env（直跑入口保持可用）。"""
+    """Compatibility alias: the stub-install implementation moved to plugin_env (the direct-run entry stays usable)."""
     install_host_stubs()
 
 
 def _load_plugin_module():
-    """加载插件主模块（幂等；pytest 收集与 python 直跑共用同一实例）。"""
+    """Loads the plugin main module (idempotent; pytest collection and python direct-run share the same instance)."""
     return load_plugin_module()
 
 
@@ -118,7 +119,7 @@ class FakePool:
 
 
 class FakeDB:
-    """承接 MemoryDatabase 接口的替身（记录调用）。"""
+    """Stand-in fulfilling the MemoryDatabase interface (records calls)."""
 
     def __init__(self, *args, **kwargs):
         self.pool = FakePool()
@@ -258,7 +259,7 @@ def make_msg(uid, text, mid=None, ts=None, notice=False, mentioned=False, self_i
 
 
 class FakeEventBus:
-    """字符串键多播事件总线替身（对齐 core.event_bus.EventBus 订阅面）。"""
+    """String-keyed multicast event-bus stand-in (mirrors the core.event_bus.EventBus subscription surface)."""
 
     def __init__(self):
         self.subs: dict = {}
@@ -314,10 +315,10 @@ class FakeCtx:
 
 
 def _ready_plugin(mod, cfg=None, ctx=None):
-    """构造并完成 initialize 的插件实例（FakeDB 注入）。
+    """Builds and completes an initialize'd plugin instance (with FakeDB injected).
 
-    initialize 会启动后台任务，测试结束前在同一 loop 内停掉，避免
-    跨 loop 的 pending task 警告。
+    initialize starts background tasks; they are stopped inside the same loop before the test ends to avoid
+    cross-loop pending-task warnings.
     """
     cfg = cfg if cfg is not None else {"dsn": "postgres://u:p@127.0.0.1:5432/db"}
     ctx = ctx or FakeCtx()
@@ -433,7 +434,7 @@ class TestConfigBuilder(unittest.TestCase):
 
 
 class TestFastLlmExit(unittest.TestCase):
-    """结构化出口：schema 走强制工具调用，无 tool_call 回退文本。"""
+    """Structured exit: schema goes through a forced tool call, with text fallback when no tool_call is present."""
 
     class _Resp:
         def __init__(self, text="", tool_calls=None):
@@ -585,8 +586,8 @@ class TestMergeDecisions(unittest.TestCase):
 
 
 class TestMergeDisposition(unittest.TestCase):
-    """合并处置 review 修复批：replaced 墓碑处置 guard（C）/ 继任簇矛盾
-    标记（C）/ 事实幂等键粒度（A）——与上游 test_merge_disposition.py 对齐。"""
+    """Merge disposition review fix batch: replaced tombstone-guard disposal (C) / successor-cluster contradiction
+    marking (C) / fact idempotency-key granularity (A) — aligned with the upstream test_merge_disposition.py."""
 
     @staticmethod
     def _fact(confidence="high", occurred=None):
@@ -1100,7 +1101,7 @@ class TestPersonaService(unittest.TestCase):
 
 
 class TestMergeAgentCycle(unittest.TestCase):
-    """P1-2 / P2-1 / P2-2 相关的合并 agent 周期行为。"""
+    """Merge-agent cycle behavior for P1-2 / P2-1 / P2-2."""
 
     class CycleDB(FakeDB):
         def __init__(self):
@@ -2512,7 +2513,7 @@ class TestHelpers(unittest.TestCase):
 
 # ---------------------------------------------------------------------------
 class TestSummaryState(unittest.TestCase):
-    """summarized 编码状态链路：降级标记 + 补编码遍（003_summary_state）。"""
+    """summarized encoding-state chain: degraded flag + re-encode pass (003_summary_state)."""
 
     def _unsummarized_row(self):
         return {
@@ -2670,7 +2671,7 @@ class TestSummaryState(unittest.TestCase):
 
 
 class TestRecallTimeDecay(unittest.TestCase):
-    """recall 时间衰减（recall_time_decay_enabled / half_life 两开关）。"""
+    """Recall time decay (recall_time_decay_enabled / half_life switches)."""
 
     _NOW = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -2809,7 +2810,7 @@ class TestRecallEmbedGuard(unittest.TestCase):
 
 
 class TestEntityRecall(unittest.TestCase):
-    """问及他人召回（实体键组）：SQL 落点与 kernel 键组传递。"""
+    """Asking-about-others recall (entity key groups): SQL landing points and kernel key-group passing."""
 
     def _db_sql(self, **kw):
         db = mod.MemoryDatabase(mod._build_config({"dsn": "x"}))
@@ -2923,7 +2924,7 @@ class TestEntityRecall(unittest.TestCase):
 
 
 class TestWriteDedup(unittest.TestCase):
-    """写入侧近重去重（write_dedup_* 三键 + ingest apply_write_dedup 门控）。"""
+    """Write-side near-duplicate dedup (the three write_dedup_* keys + ingest apply_write_dedup gating)."""
 
     class DedupDB:
         def __init__(self, scores=None, fail_fetch=False):

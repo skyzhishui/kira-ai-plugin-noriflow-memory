@@ -1,14 +1,14 @@
-"""记忆维护 API 数据层——SQLite SQL 体（webui_store_pg 的方言对应实现）。
+"""Memory maintenance API data layer: SQLite SQL body (dialect counterpart of webui_store_pg).
 
-与 webui_store_pg.py 函数一一对应；方言改写要点：
-- ILIKE -> LIKE（SQLite LIKE 对 ASCII 恒不区分大小写；转义口径与 PG 一致）；
-- unnest(evidence_keys) -> json_each EXISTS；cardinality -> json_array_length；
-- array_remove/ANY -> 事务内读-改-写（JSON 数组 Python 侧维护）；
-- DISTINCT ON -> row_number() 窗口；row 值构造去掉 ::text 强转；
-- FOR UPDATE -> 普通 SELECT（单写者，BEGIN IMMEDIATE 已串行化）；
-- now() -> Python 供给参数；
-- 行读出统一经 db.sqlite._decode_row 还原（时间/JSON/布尔/向量），与
-  asyncpg 行为一致。
+Functions map one-to-one with webui_store_pg.py; dialect rewrite notes:
+- ILIKE -> LIKE (SQLite LIKE is always case-insensitive for ASCII; escape convention matches PG);
+- unnest(evidence_keys) -> json_each EXISTS; cardinality -> json_array_length;
+- array_remove/ANY -> read-modify-write inside a transaction (JSON array maintained on the Python side);
+- DISTINCT ON -> row_number() window; row constructor drops the ::text casts;
+- FOR UPDATE -> plain SELECT (single writer, BEGIN IMMEDIATE already serializes);
+- now() -> parameter supplied by Python;
+- row reads go through db.sqlite._decode_row uniformly (timestamps/JSON/bools/vectors), matching
+  asyncpg behavior.
 """
 
 from __future__ import annotations
@@ -22,13 +22,13 @@ from .webui_store import _ilike
 
 
 def _pool(backend):
-    """连接池解析：backend 对象取 .pool；裸池（旧调用方/测试桩）原样。"""
+    """Pool resolution: take .pool from the backend object; bare pools (legacy callers/test stubs) passed through as-is."""
     return backend.pool if hasattr(backend, "pool") else backend
 
 
 async def fetch_overview(backend) -> tuple[dict, list]:
-    """概览 KPI 原始查询（users_with_clusters 以 GROUP BY 子查询等价
-    PG 的 count(DISTINCT (platform, user_id))——SQLite 无行构造 DISTINCT）。"""
+    """Overview KPI raw query (users_with_clusters uses a GROUP BY subquery to match
+    PG's count(DISTINCT (platform, user_id)): SQLite has no row-constructor DISTINCT)."""
     async with _pool(backend).acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -59,7 +59,7 @@ async def fetch_overview(backend) -> tuple[dict, list]:
 
 
 async def fetch_users_data(backend, keyword: str, page: int, size: int) -> dict:
-    """有事实/簇的用户清单——原始查询（DISTINCT ON 改窗口函数）。"""
+    """Users with facts/clusters: raw query (DISTINCT ON rewritten as a window function)."""
     params: list = []
     where = ""
     if keyword:
@@ -127,10 +127,10 @@ async def fetch_users_data(backend, keyword: str, page: int, size: int) -> dict:
 
 
 async def delete_fact(backend, fact_id: int) -> dict:
-    """删除原始事实并同步清理簇表 source_fact_ids 引用（同一事务）。
+    """Delete a raw fact and clean up the source_fact_ids references in the cluster table within the same transaction.
 
-    array_remove 语义改写：事务内取受影响簇 -> Python 维护 JSON 数组 ->
-    逐行写回（BEGIN IMMEDIATE 串行化，无丢更新）。
+    array_remove semantics rewritten: fetch affected clusters inside the transaction -> maintain the
+    JSON array in Python -> write rows back one by one (BEGIN IMMEDIATE serializes, no lost updates).
     """
     async with _pool(backend).acquire() as conn:
         async with conn.transaction():
@@ -165,7 +165,7 @@ async def delete_fact(backend, fact_id: int) -> dict:
 async def fetch_clusters_data(
     backend, page: int, size: int, filters: dict
 ) -> dict:
-    """事实簇分页浏览——原始查询（unnest EXISTS -> json_each）。"""
+    """Fact cluster paginated browsing: raw query (unnest EXISTS -> json_each)."""
     conditions: list[str] = []
     params: list = []
 
@@ -213,7 +213,7 @@ async def fetch_clusters_data(
 
 
 async def select_cluster_for_update(conn, cluster_id: int):
-    """簇行读取（SQLite 单写者，无需 FOR UPDATE）。"""
+    """Read a cluster row (SQLite single writer, no FOR UPDATE needed)."""
     return await conn.fetchrow(
         "SELECT * FROM memory_fact_cluster WHERE id = $1", cluster_id
     )
@@ -223,7 +223,7 @@ async def update_cluster_row(
     conn, cluster_id: int, statement: str, score, status: str,
     statement_changed: bool,
 ) -> None:
-    """簇修正 UPDATE（SQLite：时间戳由 Python 供给，覆盖 pg 版同签名）。"""
+    """Cluster correction UPDATE (SQLite: timestamp supplied by Python; same signature as the pg version)."""
     from .db.sqlite import _now_ts
 
     now = _now_ts()
@@ -251,7 +251,7 @@ async def update_cluster_row(
 
 
 async def fetch_relation_graph_data(backend) -> dict:
-    """关系图谱原始查询（别名 join unnest -> 行值 IN）。"""
+    """Relation graph raw query (alias join unnest -> row-value IN)."""
     async with _pool(backend).acquire() as conn:
         rows = await conn.fetch(
             """
@@ -298,7 +298,7 @@ async def fetch_relation_graph_data(backend) -> dict:
 
 
 async def update_relation_edge(backend, edge_id: int, new_status: str) -> dict:
-    """人工修正边状态（时间戳由 Python 供给）。"""
+    """Manually correct an edge status (timestamp supplied by Python)."""
     from .db.sqlite import _now_ts
 
     now = _now_ts()

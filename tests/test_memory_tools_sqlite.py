@@ -1,15 +1,15 @@
-"""记忆工具 + 摘要生命周期真 SQLite 集成 harness（python 直跑）。
+"""Memory tools + summary lifecycle real-SQLite integration harness (python direct-run).
 
-对齐 nori 侧五件套移植的 db/kernel 落点验证（tempfile 真库）：
-- db 五方法：upsert_persona_fact_raw_for_apply / search_fact_clusters /
-  fetch_cluster_owner / cluster_status_op（drop/dispute/reactivate + 归属
-  校验）/ restore_summary；
-- kernel.write_fact 确定性直写（create 成簇 / replace 替代继承）；
-- 生命周期：archive_stale_summaries（超龄/强化豁免/最低保留期/keyset
-  分批/UPDATE 复查）、reinforce_summaries 续命、检索结构性排除归档行、
-  include_archived 维护通道。
+Validates the db/kernel landing points of the nori-side five-tool migration (tempfile real db):
+- db five methods: upsert_persona_fact_raw_for_apply / search_fact_clusters /
+  fetch_cluster_owner / cluster_status_op (drop/dispute/reactivate + owner
+  validation) / restore_summary;
+- kernel.write_fact deterministic direct write (create makes a cluster / replace inherits);
+- lifecycle: archive_stale_summaries (over-age / reinforce exemption / minimum retention / keyset
+  batching / UPDATE recheck), reinforce_summaries renewal, search structurally excludes archived rows,
+  include_archived maintenance channel.
 
-运行（插件目录）：
+Run (plugin dir):
     python tests/test_memory_tools_sqlite.py
 """
 

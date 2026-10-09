@@ -1,18 +1,18 @@
-"""2026-09-12 review 修复批回归测试（pytest / python 直跑两用）。
+"""2026-09-12 review fix batch regression tests (works both under pytest and python direct-run).
 
-覆盖（对照 review 2026-09-12 编号）：
-- Bug1 memory_search 工具路径实体词典：复合 sid 传词典 + _directory_names
-  裸 session_id 尾段反查兜底（此前裸 id 恒 miss，窗口词典路失效）；
-- Bug2 _edge_time_qualifier naive 时间戳按配置时区（此前走服务器本地
-  时区，timezone 配置与服务器时区不同时边界日期偏差）；
-- Bug3 关系回填复活簇待办：精取/批处理失败重新登记（此前先清后用，
-  水位之下的簇增量模式失去重试机会）；
-- Bug4 merge 归一化遍预算耗尽在候选检索前短路（此前每条事实照跑
-  HNSW 候选查询）；
-- Bug5 反向回声预检与落库同连接同事务（此前两次独立 acquire，并发
-  retain 可在窗口内互插镜像边）。
+Coverage (keyed to the 2026-09-12 review numbering):
+- Bug1 memory_search tool-path entity directory: composite sid passed to the directory + _directory_names
+  bare session_id tail lookup fallback (previously the bare id always missed, breaking the window-dictionary path);
+- Bug2 _edge_time_qualifier treats naive timestamps per the configured timezone (previously used the server's
+  local timezone, drifting boundary dates when the timezone config differs from the server);
+- Bug3 relation-backfill revived-cluster todo: precise fetch / batch failure re-registers (previously cleared-then-used,
+  clusters below the watermark lost retry chances in incremental mode);
+- Bug4 merge normalization pass short-circuits before candidate retrieval when the budget is exhausted (previously
+  every fact still ran the HNSW candidate query);
+- Bug5 reverse-echo pre-check and write share one connection and one transaction (previously two independent
+  acquires, so concurrent retain could interleave mirror edges within the window).
 
-运行（插件目录）：
+Run (plugin dir):
     python tests/test_fix_batch_20260912.py
 """
 
@@ -49,7 +49,7 @@ RelationBackfill = _backfill.RelationBackfill
 
 
 def _try_zoneinfo(name: str):
-    """tzdata 缺失环境（个别极简容器）跳过时区用例而非误报。"""
+    """Environments missing tzdata (some minimal containers) skip timezone cases instead of false-failing."""
     from zoneinfo import ZoneInfo
 
     try:
@@ -263,7 +263,7 @@ class TestBug4BudgetShortCircuit(unittest.TestCase):
 
 
 class _CountingEdgePool:
-    """单连接池替身：计数 acquire 次数（预检+落库应共用一次 acquire）。"""
+    """Single-connection pool stand-in: counts acquire calls (pre-check + write must share one acquire)."""
 
     def __init__(self, fetch_rows=None):
         self.acquire_count = 0

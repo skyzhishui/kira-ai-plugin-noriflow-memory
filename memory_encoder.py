@@ -1,24 +1,32 @@
-"""端侧记忆编码器（MemoryEncoder）——自 hindsight 插件 vendor。
+"""On-device memory encoder (MemoryEncoder), vendored from the hindsight plugin.
 
-把对话文本编码为「保真摘要 + 可信人物事实 + 可选结构化关系」三部分
-（一次 LLM 调用），供 LocalMemoryKernel.retain_encoded 多通道写入消费：
-- summary 走 memory_chat_summary 表（可召回原材料）；
-- facts 每条独立写入 memory_persona_fact_raw 表（合并 agent 消费，不参与 recall）；
-- relations（P2，relations_enabled 开启时）：结构化关系三元组零 LLM
-  合并落 memory_entity_edge 表（bot 可作端点，与 facts 的 bot 硬过滤隔离）。
-  扩展节为独立提示词文件 memory_relations.prompt 附加在基础提示词尾部——
-  与 nori-core 上游同构；关闭时编码行为与现状逐字一致。
+Encodes conversation text into three parts: "faithful summary + trustworthy
+person facts + optional structured relations" (one LLM call), consumed by
+LocalMemoryKernel.retain_encoded's multi-channel write:
+- summary goes to the memory_chat_summary table (recallable raw material);
+- each fact is written independently to memory_persona_fact_raw (consumed by
+  the merge agent; not part of recall);
+- relations (P2, when relations_enabled is on): structured relation
+  triples are written to memory_entity_edge with zero LLM merging (the bot
+  may be an endpoint; isolated from the facts channel's hard bot filter).
+  The extension section is a standalone prompt file memory_relations.prompt
+  appended after the base prompt, isomorphic with nori-core upstream; when
+  disabled, encoding behavior is verbatim-identical to the current state.
 
-【通用契约】prompts/memory_encode.prompt 以上游 nori 版同名文件为准
-（上游权威副本，本插件为移植副本）：
-编码输入与之同构（含"历史上下文/本轮批次"分隔标记行），分隔标记说明、
-本轮范围限定、摘要长度上限与 bot 自身信息排除硬规则属于通用条款，
-上游修改后本副本必须同步保持逐字一致（2026-09-03 已同步：
-提示词内裸 "bot" 字样全部替换为 {bot_nickname} 占位符，两副本同步修改）。
+[Common contract] prompts/memory_encode.prompt follows the upstream nori
+version of the same file (the upstream authoritative copy; this plugin is a
+ported copy): the encoding input is isomorphic with it (including the
+"history context / current batch" separator marker line); the separator
+description, current-batch scope restriction, summary length cap, and the
+hard rule excluding the bot's own info are common clauses; after upstream
+changes, this copy must stay verbatim-synced (synced 2026-09-03: all bare
+"bot" tokens in the prompt replaced with the {bot_nickname} placeholder,
+both copies synced).
 
-fail-open 设计：编码/解析/校验任何环节失败均降级返回
-(conversation_text, [], [], False)，由调用方走单通道旧行为（原文写入摘要表并
-标记 summarized=false 不参与召回），不阻断 retain。
+fail-open design: any failure in encode/parse/validate degrades to
+(conversation_text, [], [], False); the caller takes the single-channel old
+behavior (writing the raw text to the summary table marked summarized=false,
+not participating in recall), without blocking retain.
 """
 
 from __future__ import annotations
@@ -119,14 +127,15 @@ _ENCODE_TOOL_NAME = "submit_memory_encoding"
 
 
 class MemoryEncoder:
-    """端侧记忆编码器：对话文本 -> (summary, facts)。
+    """On-device memory encoder: conversation text -> (summary, facts).
 
-    使用 PromptLoader 加载编码提示词模板（构造器支持任意目录），
-    通过 FastLlmExit（run_structured 出口）单次调用完成编码。
+    Loads the encoding prompt template via PromptLoader (the constructor
+    accepts any directory), and does the encoding in a single call through
+    FastLlmExit (run_structured exit).
 
     Attributes:
-        llm: FastLlmExit 实例（run_structured 结构化出口）。
-        prompt_dir: 编码提示词模板目录。
+        llm: FastLlmExit instance (run_structured structured exit).
+        prompt_dir: Encoding prompt template directory.
     """
 
     def __init__(
@@ -137,21 +146,28 @@ class MemoryEncoder:
         relations_enabled: bool = False,
         config: Optional["LocalMemoryConfig"] = None,
     ) -> None:
-        """初始化编码器。
+        """Initialize the encoder.
 
         Args:
-            llm: FastLlmExit 实例（fast LLM 文本出口）。
-            prompt_dir: 提示词模板目录；None 时默认本插件 prompts/ 目录
-                （Path(__file__).parent / "prompts"）。
-            input_max_chars: 编码输入字符上限（0 = 不截断）。超长输入直送
-                LLM 大概率失败/超时，降级原文入库后补编码遍每周期对同一
-                毒丸行重跑再失败（队首阻塞）——截断保底让编码始终可完成。
-            relations_enabled: P2 关系提取开关——开启时在编码提示词尾部
-                附加 memory_relations 扩展节（relations 独立数组），关闭
-                时提示词与既有行为逐字一致（灰度回归保证）。
-            config: 插件运行时配置（可选）：提供时 input_max_chars /
-                relations_enabled 运行时按次读该实例——维护页保存配置后
-                即刻生效，无需重启；构造参数作为缺省回退。
+            llm: FastLlmExit instance (fast LLM text exit).
+            prompt_dir: Prompt template directory; None defaults to this
+                plugin's prompts/ directory (Path(__file__).parent / "prompts").
+            input_max_chars: Encoding input char cap (0 = no truncation).
+                Over-long input fed directly to the LLM will most likely
+                fail/time out; after degrading to raw-text storage the
+                backfill pass reruns the same poison-pill row every cycle
+                and keeps failing (head-of-queue blocking), so truncation is
+                the floor that keeps encoding always completable.
+            relations_enabled: P2 relation-extraction switch, when on,
+                appends the memory_relations extension section after the
+                encoding prompt tail (an independent relations array); when
+                off, the prompt is verbatim-identical to existing behavior
+                (grayscale regression guarantee).
+            config: Plugin runtime config (optional): when provided,
+                input_max_chars / relations_enabled read this instance per
+                call at runtime, taking effect immediately after saving config
+                on the maintenance page; constructor params are the default
+                fallback.
         """
         self.llm = llm
         self.prompt_dir = Path(prompt_dir or (Path(__file__).resolve().parent / "prompts"))
@@ -162,14 +178,14 @@ class MemoryEncoder:
 
     @property
     def input_max_chars(self) -> int:
-        """编码输入字符上限（config 提供时运行时读，支持热生效）。"""
+        """Encoding input char cap (read at runtime from config when provided, hot-effective)."""
         if self._config is not None:
             return max(int(self._config.encode_input_max_chars or 0), 0)
         return self._static_input_max_chars
 
     @property
     def relations_enabled(self) -> bool:
-        """P2 关系提取开关（config 提供时运行时读，支持热生效）。"""
+        """P2 relation-extraction switch (read at runtime from config when provided, hot-effective)."""
         if self._config is not None:
             return bool(self._config.relation_extract_enabled)
         return self._static_relations_enabled
@@ -180,31 +196,37 @@ class MemoryEncoder:
         bot_nickname: str,
         bot_user_id: str = "",
     ) -> tuple[str, list[EncodedFact], list[EncodedRelation], bool]:
-        """编码对话文本为 (summary, facts, relations, encoded_ok)。
+        """Encode conversation text as (summary, facts, relations, encoded_ok).
 
-        编码输入为空串时直接返回 ("", [], [], False)，不走 LLM。
-        任何异常（LLM 调用失败 / 输出不可解析 / 校验失败）均 fail-open：
-        返回 (conversation_text, [], [], False) 并记录 warning，由调用方走单通道
-        旧行为（原文写入摘要表并标记 summarized=false，不参与召回）。
-        encoded_ok=False 供调用方区分"编码产物"与"降级原文"——降级原文行
-        由合并 agent 补编码遍在 LLM 恢复后重编码（relations 随 facts 一并
-        丢失并在补编码时恢复）。
+        Returns ("", [], [], False) directly without calling the LLM when
+        the encoding input is an empty string. Any exception (LLM call
+        failure / unparseable output / validation failure) is fail-open:
+        return (conversation_text, [], [], False) with a warning logged, and
+        the caller takes the single-channel old behavior (raw text written
+        to the summary table marked summarized=false, not participating in
+        recall). encoded_ok=False lets the caller distinguish "encoded
+        product" from "degraded raw text": degraded-raw rows get re-encoded
+        by the merge agent's backfill pass after the LLM recovers (relations
+        are lost alongside facts and restored on backfill).
 
         Args:
-            conversation_text: 带时间戳与发言者标识（含 userid）的对话文本，
-                格式由调用方（main.py retain 编排）统一构造（envelope 模块），
-                含历史上下文/本轮批次分隔标记行。
-            bot_nickname: Bot 昵称（用于提示词排除项，识别 self="true" 行）。
-            bot_user_id: Bot 平台 ID（用于提示词排除项——用户发言中 @bot /
-                提及 bot 名称与号码时，防止 bot 自身信息被提取为人物事实；
-                relations 通道中 bot 仅可作端点）。
+            conversation_text: Conversation text with timestamps and speaker
+                markers (including userid), assembled uniformly by the
+                caller (main.py retain orchestration, envelope module),
+                including the history-context/current-batch separator marker line.
+            bot_nickname: Bot nickname (used as prompt exclusion, identifies self="true" lines).
+            bot_user_id: Bot platform id (used as prompt exclusion, to
+                prevent bot info from being extracted as person facts when
+                user messages @-mention the bot / mention its name and
+                number; in the relations channel the bot may only be an endpoint).
 
         Returns:
-            (summary, facts, relations, encoded_ok) 四元组；summary 为保真
-            压缩摘要，facts 为校验后的事实列表，relations 为校验后的关系
-            三元组列表（relations_enabled=False 时恒空），encoded_ok=False
-            表示本次产出为降级原文（summary 即输入原文、facts/relations
-            为空）。
+            A four-tuple (summary, facts, relations, encoded_ok): summary is
+            the faithful condensed summary, facts the validated fact list,
+            relations the validated relation-triple list (always empty when
+            relations_enabled=False), encoded_ok=False means this output is
+            degraded raw text (summary is the input text verbatim,
+            facts/relations empty).
         """
         if not conversation_text:
             return "", [], [], False
@@ -263,18 +285,20 @@ class MemoryEncoder:
     def _parse_payload(
         self, payload: dict
     ) -> tuple[str, list[EncodedFact], list[EncodedRelation]]:
-        """解析并校验编码 LLM 输出的 payload。
+        """Parse and validate the payload from the encoding LLM output.
 
-        逐条校验 facts：user_id/statement 非空、category/confidence 合法值，
-        非法条目丢弃并计数记录日志（宁缺毋滥）。relations 同口径逐条校验
-        （两端 uid 非空且互异、label 2-8 字、statement 非空）。
+        Validates each fact: user_id/statement non-empty, category/confidence
+        legal values; illegal entries are dropped and counted in a log (rather
+        nothing than garbage). relations follow the same validation of each
+        entry (both endpoint uids non-empty and distinct, label 2-8 chars,
+        statement non-empty).
 
         Args:
-            payload: safe_parse_llm_json 成功解析的 dict。
+            payload: dict successfully parsed by safe_parse_llm_json.
 
         Returns:
-            (summary, facts, relations)；summary 缺失/非字符串时为空串，
-            facts/relations 为校验后列表。
+            (summary, facts, relations); summary is an empty string when
+            missing/not a string, facts/relations are the validated lists.
         """
         summary = payload.get("summary")
         summary_text = summary.strip() if isinstance(summary, str) else ""
@@ -313,19 +337,21 @@ class MemoryEncoder:
 
     @staticmethod
     def _parse_fact(item: object) -> Optional[EncodedFact]:
-        """解析单条事实 dict 为 EncodedFact；字段非法返回 None。
+        """Parse a single fact dict into EncodedFact; return None for invalid fields.
 
-        statement 超过 _FACT_STATEMENT_MAX_CHARS 时截断保留（不丢弃——
-        截断的事实仍可用；对照关系通道 parse_relation 对超长是整条拒绝，
-        事实通道选择截断是因为簇 canonical_statement 直接继承该值，
-        极端长陈述会放大簇表与裁定/注入 prompt 体积）。
+        Statements longer than _FACT_STATEMENT_MAX_CHARS are truncated and
+        kept (not discarded, a truncated fact is still usable; contrast the
+        relation channel's parse_relation which rejects over-long entries
+        wholesale). The fact channel truncates because the cluster
+        canonical_statement inherits this value directly, and extreme-length
+        statements would bloat cluster tables and arbitration/injection prompt size.
 
         Args:
-            item: facts 数组元素（期望 dict）。
+            item: element of the facts array (expected dict).
 
         Returns:
-            EncodedFact；user_id/statement 缺失、category/confidence 越界
-            或字段类型错误时返回 None。
+            EncodedFact; None when user_id/statement missing, category/
+            confidence out of range, or a field has the wrong type.
         """
         if not isinstance(item, dict):
             return None

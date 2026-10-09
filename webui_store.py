@@ -1,10 +1,12 @@
-"""记忆维护 API 的共享数据访问层（双后端拆分，方案 §6）。
+"""Shared data-access layer for the memory maintenance API (dual-backend split, §6).
 
-本模块保留与方言无关的部分：常量/白名单、分页与过滤参数校验、行装配
-（_dt 时间序列化等纯 Python 逻辑），以及方言完全一致的 SQL；方言分歧的
-SQL 体下沉到 webui_store_pg.py / webui_store_sqlite.py（函数一一对应），
-按 ``backend.dialect`` 派发。查询/分页/修正 SQL 与 nori 上游版逐字一致
-（PG 路）；错误经 fastapi HTTPException 上抛。
+This module keeps the dialect-agnostic parts: constants and whitelists,
+pagination and filter parameter validation, row assembly (pure Python
+logic like _dt datetime serialization), and dialect-identical SQL; the
+dialect-divergent SQL bodies live in webui_store_pg.py / webui_store_sqlite.py
+(functions map one-to-one), dispatched by ``backend.dialect``.
+Query/pagination/correction SQL matches the upstream nori version verbatim
+(PG path); errors surface as fastapi HTTPException.
 """
 
 from __future__ import annotations
@@ -51,17 +53,17 @@ DO UPDATE SET statement = excluded.statement,
 
 
 def _dialect(backend) -> str:
-    """后端方言（测试桩无 dialect 属性时按 postgres 处理）。"""
+    """Backend dialect (test stubs without a dialect attribute are treated as postgres)."""
     return getattr(backend, "dialect", "postgres")
 
 
 def _pool(backend):
-    """连接池解析：backend 对象取 .pool；裸池（旧调用方/测试桩）原样。"""
+    """Resolve the connection pool: take .pool from a backend object; pass a bare pool (legacy callers/test stubs) through unchanged."""
     return backend.pool if hasattr(backend, "pool") else backend
 
 
 def _impl(backend):
-    """按后端方言取 SQL 体实现模块（惰性导入避免环）。"""
+    """Return the SQL-body implementation module for the backend dialect (lazy import to avoid cycles)."""
     if _dialect(backend) == "sqlite":
         from . import webui_store_sqlite as impl
 
@@ -72,7 +74,7 @@ def _impl(backend):
 
 
 def _decode_backend_rows(backend, rows) -> list[dict]:
-    """SQLite 行统一解码（时间/JSON/布尔/向量），PG 行 dict 原样。"""
+    """Uniform decoding for SQLite rows (time/JSON/bool/vector); PG rows stay as dicts."""
     if _dialect(backend) == "sqlite":
         from .db.sqlite import _decode_rows
 
@@ -81,33 +83,37 @@ def _decode_backend_rows(backend, rows) -> list[dict]:
 
 
 def _like_op(backend) -> str:
-    """关键词匹配运算符（SQLite LIKE 对 ASCII 恒不区分大小写）。"""
+    """Keyword-match operator (SQLite LIKE is always case-insensitive for ASCII)."""
     return "LIKE" if _dialect(backend) == "sqlite" else "ILIKE"
 
 
 def _like_suffix(backend) -> str:
-    """LIKE 匹配后缀：SQLite 无默认转义符，反斜杠转义模式须显式
-    ESCAPE（PG 的 LIKE/ILIKE 默认转义符即反斜杠，无需子句）。"""
+    """LIKE suffix: SQLite has no default escape character, so backslash
+    escape patterns require an explicit ESCAPE clause (PG's LIKE/ILIKE
+    default escape is backslash, no clause needed)."""
     return " ESCAPE '\\'" if _dialect(backend) == "sqlite" else ""
 
 
 def _escape_like(keyword: str) -> str:
-    """LIKE 模式元字符转义（\\ % _ → 字面量；默认转义符为 \\）。"""
+    """Escapes LIKE pattern metacharacters (\\ % _ become literals; the default escape is \\)."""
     return keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _ilike(keyword: str) -> str:
-    """ILIKE/LIKE 模式串：元字符转义后前后通配。"""
+    """ILIKE/LIKE pattern: metacharacters escaped, then wrapped with leading and trailing wildcards."""
     return f"%{_escape_like(keyword)}%"
 
 
 def _dt(value: Optional[datetime]) -> str:
-    """时间序列化（None -> 空串；展示前统一转服务器本地时区）。
+    """Datetime serialization (None -> empty string; converted to the server
+    local timezone before display).
 
-    asyncpg 读 timestamptz 恒返回 UTC aware 值，直接 isoformat 输出的
-    是 UTC 墙钟；维护页前端按前缀截断展示（不解析偏移），会把 UTC 当
-    本地时间显示。转本地后输出形如 "...+08:00"，前端截断即得本地墙钟。
-    naive 值视为已是本地口径原样输出。
+    asyncpg always returns UTC-aware timestamptz values, so a direct isoformat
+    output is the UTC wall clock; the maintenance-page frontend truncates the
+    prefix for display (it does not parse the offset) and would show UTC as
+    local time. After conversion the output looks like "...+08:00", and
+    truncation yields the local wall clock. Naive values are treated as
+    already local and passed through unchanged.
     """
     if not value:
         return ""
@@ -123,7 +129,7 @@ def _page(page: int, size: int) -> tuple[int, int]:
 
 
 async def fetch_overview(backend) -> dict:
-    """概览 KPI：各表行数/待处理量/状态分布/kv 任务状态。"""
+    """Overview KPIs: per-table row counts, pending amounts, status distribution, kv task status."""
     row, kv = await _impl(backend).fetch_overview(backend)
     return {
         **row,
@@ -137,7 +143,7 @@ async def fetch_overview(backend) -> dict:
 async def fetch_users(
     backend, keyword: str, page: int, size: int
 ) -> dict:
-    """有事实/簇的用户清单（画像页用户选择器数据源）。"""
+    """Listing of users that have facts/clusters (data source for the persona-page user picker)."""
     page, size = _page(page, size)
     data = await _impl(backend).fetch_users_data(backend, keyword, page, size)
     rows = data["rows"]
@@ -175,7 +181,7 @@ async def fetch_facts(
     extracted: str = "",
     q: str = "",
 ) -> dict:
-    """原始事实分页浏览（多维过滤；SQL 与方言无关，ILIKE 按后端切换）。"""
+    """Paginated raw-fact browsing (multi-dimension filtering; SQL is dialect-agnostic, ILIKE toggled by backend)."""
     page, size = _page(page, size)
     like_op = _like_op(backend)
     conditions: list[str] = []
@@ -244,12 +250,15 @@ async def fetch_facts(
 
 
 async def delete_fact(backend, fact_id: int) -> dict:
-    """删除原始事实（误提取清理）。
+    """Delete a raw fact (miscapture cleanup).
 
-    已入簇事实的评分状态机不受影响（score/evidence_count 是裁定结果），
-    但同步把该 id 从相关簇的 source_fact_ids 引用中移除——否则引用悬挂、
-    簇页「证据」计数（cardinality(source_fact_ids)）虚高。删除与清理
-    同一事务，回滚时两不落单。
+    The scoring state machine of facts already merged into clusters is
+    unaffected (score/evidence_count are adjudication results), but the id is
+    also removed from the source_fact_ids references of related clusters;
+    otherwise references go stale and the cluster page "evidence" count
+    (cardinality(source_fact_ids)) would be inflated. Deletion and cleanup
+    run in the same transaction, so a rollback never leaves one done without
+    the other.
     """
     row = await _impl(backend).delete_fact(backend, fact_id)
     logger.info(
@@ -269,7 +278,7 @@ async def fetch_clusters(
     session_id: str = "",
     q: str = "",
 ) -> dict:
-    """事实簇分页浏览（画像来源，含确信度分值）。"""
+    """Paginated fact-cluster browsing (persona source, including confidence scores)."""
     page, size = _page(page, size)
     filters = {
         "user_id": user_id.strip(),
@@ -314,13 +323,18 @@ async def fetch_clusters(
 async def update_cluster(
     backend, cluster_id: int, body: dict
 ) -> dict:
-    """修正簇：陈述/分数/状态；画像表投影同步（保持表即画像的一致性）。
+    """Correct a cluster: statement/score/status; the persona-table projection
+    stays in sync (the table remains identical to the persona).
 
-    状态为「保持现值」的提交（弹窗恒带 status 字段）视同未提交状态——
-    replaced 墓碑簇只改陈述/分数的保存因此可放行（真正的迁出仍被拒）。
-    手工置 replaced/dead 时联动下线其回填来源边；手工复活
-    pending/dead 簇时登记关系回填待办（复活簇的存量陈述需补提取）。
-    事务内簇行读取/修正 UPDATE 按方言派发（FOR UPDATE / now()）。
+    A submission whose status is "keep current value" (the modal always sends
+    the status field) counts as not submitting a status, so a replaced
+    tombstone cluster can still save statement/score changes (a real
+    migration out remains rejected). Manually setting replaced/dead also
+    retires the cluster's backfill-sourced edges; manually reviving a
+    pending_uncertain/dead cluster registers a relation-backfill pending job
+    (existing statements of the revived cluster need re-extraction). Within
+    the transaction the cluster row read and correction UPDATE are dispatched
+    by dialect (FOR UPDATE / now()).
     """
     new_statement = body.get("canonical_statement")
     new_score = body.get("score")
@@ -451,8 +465,9 @@ async def update_cluster(
 
 
 def _now_ts(backend) -> str:
-    """画像投影 upsert 的 updated_at（SQLite 由 Python 供给；PG 由 SQL
-    now() 生成——此处值仅 SQLite 路消费，PG 路忽略该参数）。"""
+    """updated_at for the persona-projection upsert (SQLite supplies it from
+    Python; PG generates it via SQL now(). This value is consumed only on the
+    SQLite path; the PG path ignores it)."""
     if _dialect(backend) == "sqlite":
         from .db.sqlite import _now_ts as _sqlite_now
 
@@ -466,13 +481,14 @@ async def fetch_profile_preview(
     platform: str,
     user_id: str,
 ) -> dict:
-    """画像预览（复用 LocalPersonaService 拼装：所见即注入）。
+    """Persona preview (reuses LocalPersonaService assembly: what you see is
+    what gets injected).
 
     Args:
-        db: MemoryBackend（拼装数据源与 persona_service 同源）。
-        persona_service: LocalPersonaService 实例。
-        platform: 平台标识。
-        user_id: 用户 ID。
+        db: MemoryBackend (assembly data source, same source as persona_service).
+        persona_service: LocalPersonaService instance.
+        platform: Platform identifier.
+        user_id: User ID.
     """
     injection_text = await persona_service.build_profile_text(
         user_id=user_id, platform=platform
@@ -515,7 +531,7 @@ async def fetch_summaries(
     kind: str = "",
     q: str = "",
 ) -> dict:
-    """对话摘要分页浏览（recall 语料 = 注入事实来源）。"""
+    """Paginated conversation-summary browsing (recall corpus, the injected fact source)."""
     page, size = _page(page, size)
     like_op = _like_op(backend)
     conditions: list[str] = []
@@ -578,14 +594,18 @@ async def fetch_summaries(
 
 
 async def update_summary(backend, summary_id: int, body: dict) -> dict:
-    """修正摘要内容（embedding 置 NULL 待重算；search_text 同步重分词）。
+    """Correct a summary's content (embedding set to NULL pending recompute; search_text re-tokenized in sync).
 
-    管理员修正视为内容终态：summarized 翻 true——修正行立即重新参与
-    召回，且不被合并 agent 补编码遍再编码（防手工内容被覆盖）。
-    search_text 必须随新正文重算：补算任务只扫 search_text IS NULL 的
-    行，不重算会带着旧正文的 BM25 分词（混合检索按旧内容命中、注入
-    的却是新内容）。SQL 与方言无关；SQLite 侧 FTS5 影子表由触发器
-    语义的补算遍兜底（search_text 置新值不经过本路径时由回填遍收敛）。
+    An admin correction is treated as the content's final state: summarized
+    flips to true, so the corrected row immediately rejoins recall and is
+    not re-encoded by the merge agent's backfill pass (protects manual edits
+    from being overwritten). search_text must be recomputed with the new
+    body: the backfill job only scans rows where search_text IS NULL, so not
+    recomputing would leave the old body's BM25 tokens (hybrid retrieval
+    matches on stale content while the injected text is new). SQL is
+    dialect-independent; on the SQLite side the FTS5 shadow table is kept
+    consistent by the trigger-based backfill pass (when a new search_text is
+    set without going through this path, the backfill pass converges it).
     """
     content = str(body.get("content", "")).strip()
     if not content:
@@ -628,7 +648,7 @@ async def update_summary(backend, summary_id: int, body: dict) -> dict:
 
 
 async def delete_summary(backend, summary_id: int) -> dict:
-    """删除摘要（错误/敏感轮次从 recall 语料移除）。"""
+    """Delete a summary (removes an erroneous or sensitive turn from the recall corpus)."""
     async with _pool(backend).acquire() as conn:
         head_expr = (
             "substr(content, 1, 60)" if _dialect(backend) == "sqlite"
@@ -654,16 +674,20 @@ async def delete_summary(backend, summary_id: int) -> dict:
 
 
 async def fetch_relation_graph(backend, bot_user_id: str = "") -> dict:
-    """关系图谱数据：全量边（含 pending）+ 组装节点 + 统计。
+    """Relation-graph data: all edges (including pending), assembled nodes, and statistics.
 
-    与上游 nori 版关系图谱接口同构（节点 platform:uid 复合键、
-    规范名解析、bot 节点标注、degree 统计）；回填可用性由 main 层 API
-    处理器并入（控制器状态挂插件实例）。
+    Isomorphic to the upstream nori relation-graph endpoint (platform:uid
+    composite node keys, canonical-name resolution, bot-node marking, degree
+    stats); backfill availability is folded in by the main-layer API handler
+    (controller state hangs off the plugin instance).
 
-    端点显示名经规范名解析统一（按 uid 唯一）：别名表最新名 > 边上
-    名字（非占位）> uid。边表结构键本就是 uid，不存在实体分裂，此层
-    只解决"同一 uid 多个显示名"的展示一致性问题。（上游 nori 版另有
-    身份映射最高优先级层，kira 宿主无该概念，此层缺省。）
+    Endpoint display names are unified via canonical-name resolution (unique
+    per uid): alias-table latest name > edge name (non-placeholder) > uid.
+    Edge-table structural keys are already uids, so no entity split exists;
+    this layer only fixes the "one uid, multiple display names" display
+    consistency issue. (The upstream nori version has an extra identity-map
+    layer at top priority; the kira host has no such concept, so this layer
+    omits it.)
     """
     data = await _impl(backend).fetch_relation_graph_data(backend)
     rows = data["rows"]
@@ -749,12 +773,15 @@ async def fetch_relation_graph(backend, bot_user_id: str = "") -> dict:
 
 
 async def update_relation_edge(backend, edge_id: int, body: dict) -> dict:
-    """人工修正边状态（active/pending/superseded）。
+    """Manually correct an edge's status (active/pending/superseded).
 
-    墓碑保护语义：置 superseded 后新证据不再自动激活该边（恢复走本
-    端点人工置回）；statement/端点/label 不可编辑（结构键与陈述是
-    证据快照，改等于删旧建新）。人工置墓碑写入 supersede_reason 留痕
-    （可追溯），updated_at 同步推进（在途审计批的乐观锁据此跳过）。
+    Tombstone-protection semantics: once superseded, new evidence no longer
+    reactivates the edge (recovery goes through this endpoint's manual reset);
+    statement/endpoints/label are not editable (structural keys and the
+    statement are an evidence snapshot; changing them equals delete-and-recreate).
+    Manually setting the tombstone writes supersede_reason for traceability,
+    and updated_at advances in step (in-flight audit batches skip it via the
+    optimistic lock).
     """
     new_status = body.get("status")
     if new_status not in _EDGE_STATUSES:
@@ -774,7 +801,7 @@ async def update_relation_edge(backend, edge_id: int, body: dict) -> dict:
 
 
 async def delete_relation_edge(backend, edge_id: int) -> dict:
-    """物理删除关系边（误提取清理；日常下线用状态修正置 superseded）。"""
+    """Physically delete a relation edge (miscapture cleanup; for routine takedowns, mark superseded via status correction)."""
     async with _pool(backend).acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -797,15 +824,16 @@ async def delete_relation_edge(backend, edge_id: int) -> dict:
 async def delete_user_memories(
     backend, platform: str, user_id: str
 ) -> dict:
-    """Per-user erasure: cascade delete plugin-owned memory rows (one txn).
+    """Per-user erasure: cascade-delete plugin-owned memory rows (one txn).
 
     Covers profile projections, fact clusters, raw facts, aliases and
     relation edges owned by (platform, user_id). Backfill-sourced edges of
     the user's clusters are retired (superseded) rather than deleted only
-    when they carry other evidence — same propagation rule as cluster
+    when they carry other evidence, the same propagation rule as cluster
     replace. Chat summaries are session-scoped and may involve other
-    members, so they are intentionally not cascaded. SQL 与方言无关
-    （execute 状态串解析依赖池 shim 的 asyncpg 兼容形态）。
+    members, so they are intentionally not cascaded. SQL is dialect-
+    independent (parsing the execute status string relies on the pool
+    shim's asyncpg-compatible form).
     """
     platform = (platform or "").strip()
     user_id = (user_id or "").strip()
