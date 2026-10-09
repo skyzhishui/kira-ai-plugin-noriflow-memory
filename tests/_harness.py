@@ -14,9 +14,10 @@ Convention: test files load the plugin submodules they need through
 load_module before use; main.py is always loaded last (its import chain
 pulls in the other submodules via the package stub).
 
-Note: test_noriflow_memory.py (the unittest main suite) stays
-self-contained — it is spec-exec'd under a separate module name by
-test_config_web.py and does not import this module.
+Note: test_noriflow_memory.py (the unittest main suite) does not
+import this module — it boots through plugin_env.py (host stubs +
+plugin loader) and is spec-exec'd under a separate module name by
+test_config_web.py.
 """
 
 from __future__ import annotations
