@@ -200,6 +200,8 @@ def _hint_row(row_id: int, content: str, *, relevance: float = 0.9, **extra) -> 
 
 
 def _make_kernel(db, *, window_batches=None, rerank=None, **cfg_over) -> LocalMemoryKernel:
+    # 时间标注既有断言锁旧纯相对形态；mode 专项覆盖见 test_time_label.py
+    cfg_over.setdefault("recall_time_label_mode", "relative")
     config = LocalMemoryConfig(dsn="postgresql://stub", **cfg_over)
     provider = None if window_batches is None else (lambda: window_batches)
     kernel = LocalMemoryKernel(
@@ -459,8 +461,64 @@ async def test_time_label_disabled() -> None:
     rows = [_row("a", 0.9, _NOW - timedelta(days=3))]
     kernel = _make_kernel(_CaptureDB(rows=rows), recall_time_label_enabled=False)
     text = await kernel.build_injection_text(query="猫", session_id="s1")
-    assert text.splitlines()[1] == "- 内容-a", "关闭时与 hindsight 逐字一致"
+    item = [l for l in text.splitlines() if l.startswith("- ")]
+    assert item == ["- 内容-a"], "关闭时条目行不带时间标注"
     print("PASS test_time_label_disabled")
+
+
+async def test_injection_format_guide_and_items() -> None:
+    """注入格式：标题 + 归因/时态导语（前置）+ 条目行（标注关闭态）。
+
+    带标注路径见上方 test_time_labels_appended。"""
+    db = _CaptureDB(rows=[
+        _row("a", 0.9, _NOW - timedelta(days=3)),
+        _row("b", 0.8, _NOW - timedelta(days=10)),
+    ])
+    kernel = _make_kernel(db, recall_time_label_enabled=False)
+
+    text = await kernel.build_injection_text(query="猫", session_id="s1", top_k=5)
+    assert text == (
+        "# 相关长期记忆（仅供背景参考）\n"
+        "以下均为过去某时的群聊记录：各条目都是更早发生的事，"
+        "与当前消息的发言者无关，不要把记忆中他人的言行当成眼前正在发生的事。\n"
+        "提及旧事时请概括转述、带时效感（如“之前”“8月那会儿”），"
+        "不要提及“记忆/检索”等来源，也不要逐字复述。\n"
+        "- 内容-a\n"
+        "- 内容-b"
+    )
+    print("PASS test_injection_format_guide_and_items")
+
+
+async def test_injection_guide_precedes_items() -> None:
+    """导语必须前置在列表上方（非尾注）：planner 主动检索会向既有
+    memory_context 末尾追加 bullet，尾注会被追加行截断错位。"""
+    db = _CaptureDB(rows=[_row("a", 0.9, _NOW - timedelta(days=3))])
+    kernel = _make_kernel(db, recall_time_label_enabled=False)
+    text = await kernel.build_injection_text(query="猫", session_id="s1")
+    lines = text.split("\n")
+    item_idx = next(i for i, l in enumerate(lines) if l.startswith("- "))
+    guide_idx = next(
+        i for i, l in enumerate(lines) if l.startswith("以下均为过去某时的群聊记录")
+    )
+    assert guide_idx < item_idx, "导语须在条目行上方"
+    assert lines[-1] == "- 内容-a", "末行为条目（尾注会破坏追加结构）"
+    print("PASS test_injection_guide_precedes_items")
+
+
+async def test_injection_guide_time_phrase_follows_label_switch() -> None:
+    """时间指代随标注开关：开启时称「条目末尾标注的时间」，关闭时改为
+    「更早发生的事」（关闭时条目行无末尾标注，避免指代不存在的标注）。"""
+    db = _CaptureDB(rows=[_row("a", 0.9, _NOW - timedelta(days=3))])
+    kernel_on = _make_kernel(db, recall_time_label_enabled=True)
+    text_on = await kernel_on.build_injection_text(query="猫", session_id="s1")
+    assert "都发生在条目末尾标注的时间" in text_on
+
+    db2 = _CaptureDB(rows=[_row("b", 0.9, _NOW - timedelta(days=3))])
+    kernel_off = _make_kernel(db2, recall_time_label_enabled=False)
+    text_off = await kernel_off.build_injection_text(query="猫", session_id="s1")
+    assert "都发生在条目末尾标注的时间" not in text_off
+    assert "各条目都是更早发生的事" in text_off
+    print("PASS test_injection_guide_time_phrase_follows_label_switch")
 
 
 # ----------------------------------------------------------------------
@@ -1317,6 +1375,9 @@ async def main() -> None:
     await test_time_labels_appended()
     await test_time_label_falls_back_to_host_tz()
     await test_time_label_disabled()
+    await test_injection_format_guide_and_items()
+    await test_injection_guide_precedes_items()
+    await test_injection_guide_time_phrase_follows_label_switch()
     await test_recall_log_writes_search_and_inject()
     test_parse_vector()
     await test_sql_assembly_expansion_and_window()

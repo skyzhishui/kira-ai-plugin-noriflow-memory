@@ -42,12 +42,18 @@
     "default": [
       "memory_search",
       "memory_write",
-      "memory_remove"
+      "memory_remove",
+      "memory_profile",
+      "memory_lookup",
+      "memory_correct"
     ],
     "options": [
       "memory_search",
       "memory_write",
-      "memory_remove"
+      "memory_remove",
+      "memory_profile",
+      "memory_lookup",
+      "memory_correct"
     ],
     "hint": "Select which memory tools to expose to the AI. Deselect to disable.",
     "locales": {
@@ -242,6 +248,12 @@
     "default": 30,
     "hint": "recent 动态条目的过期天数。"
   },
+  "commitment_expire_days": {
+    "type": "integer",
+    "name": "约定维度过期天数",
+    "default": 60,
+    "hint": "commitment 约定条目的过期天数：最近一次被确认后超过此天数无新证据，降为待定出画像（簇体保留可复活；持续被提起的约定自动续期）。"
+  },
   "recent_promote_threshold": {
     "type": "float",
     "name": "近期进画像阈值",
@@ -298,7 +310,49 @@
     "type": "switch",
     "name": "工具作用域锁定",
     "default": true,
-    "hint": "开启时 memory_search/write/remove 忽略 AI 显式传入的 session_id/user_id，钉死为触发会话/触发者（memory_remove 只能删触发作用域内的行）——防白名单命中后借参数横向读写他人记忆。关闭恢复显式参数语义（群聊白名单 = 全群成员可跨用户操作，慎开）。"
+    "hint": "开启时全部记忆工具忽略 AI 显式传入的 session_id/user_id，钉死为触发会话/触发者（fact 检索/写入/更正/删除同样钉死：memory_write 的 replace 目标簇必须属于触发者）——防白名单命中后借参数横向读写他人记忆。关闭恢复显式参数语义（群聊白名单 = 全群成员可跨用户操作，慎开）。"
+  },
+  "memory_tools_enabled": {
+    "type": "switch",
+    "name": "维护工具三件",
+    "default": true,
+    "hint": "memory_profile / memory_lookup / memory_correct 三件的总开关（search/write/remove 由上方 enabled_tools 管理）。关闭则不注入给 AI。"
+  },
+  "summary_lifecycle_enabled": {
+    "type": "switch",
+    "name": "摘要生命周期（归档）",
+    "default": false,
+    "hint": "开启后合并 agent 周期执行归档遍：written_at 超过归档时限且强化窗口内无召回命中的摘要行置 archived，结构性退出召回（原文保留可恢复）。归档时限 = 最低保留期 + 3×半衰期。"
+  },
+  "summary_lifecycle_grace_days": {
+    "type": "integer",
+    "name": "生命周期最低保留期（天）",
+    "default": 30,
+    "hint": "written_at 距今不足此值的行永不归档。"
+  },
+  "summary_lifecycle_half_life_days": {
+    "type": "float",
+    "name": "生命周期半衰期（天）",
+    "default": 90.0,
+    "hint": "归档时限 = 最低保留期 + 3×半衰期；越小越快归档。"
+  },
+  "summary_lifecycle_reinforce_window_days": {
+    "type": "integer",
+    "name": "访问强化窗口（天）",
+    "default": 90,
+    "hint": "最近一次被召回命中在窗口内的行豁免归档（一次召回续命一个窗口）。"
+  },
+  "summary_lifecycle_interval_days": {
+    "type": "integer",
+    "name": "归档遍周期（天）",
+    "default": 7,
+    "hint": "归档遍执行周期；时间点 kv 持久化，重启不丢。首遍延后至强化窗口之后（存量行先预积累强化信号，防误归档）。"
+  },
+  "summary_lifecycle_reinforce_on_recall": {
+    "type": "switch",
+    "name": "召回访问强化",
+    "default": true,
+    "hint": "最终注入集的行异步刷新 last_recall_at/recall_count（独立于生命周期总开关——为归档判据预积累信号，防首遍误判）。"
   },
   "recall_expansion_enabled": {
     "type": "switch",

@@ -1,5 +1,124 @@
 # Changelog
 
+## v1.17.0 (2026-10-07, main 分支)
+
+### feat: 画像 8 维度扩展对齐 nori（preference/commitment + 生命周期）
+
+补齐本版本工具对齐时遗留的画像呈现面与编码面——此前 memory_write
+可写 preference/commitment，但画像渲染六栏静默丢弃这两类行、编码器
+值域也不含它们（memory_profile 工具描述的 8 项口径与实现不符）：
+
+- **画像栏位**：persona_service `_SECTION_ORDER` 扩为 8 维——
+  preference（喜好偏好，序列化并入 established_notes）与 commitment
+  （约定承诺，并入 memory_points）插于已知事实与互动偏好之间；
+  contracts.PersonProfile 补 memory_points 字段；
+- **「其他名称」栏**（对齐 nori）：alias 层历史名变体（last_seen
+  降序，最多 5 个），置于基本信息之后；排除当前称呼（块抬头名先取
+  再拼装）；无变体整栏省略（不写「暂无」占位）；db 双后端新增
+  fetch_alias_variants（占位名守卫过滤，PG ANY / sqlite IN 同构）；
+- **commitment 生命周期**：decay_pass 新增 commitment 维度过期分支
+  ——起算点 COALESCE(last_evidence_at, occurred_at)（簇合并推进最近
+  确认时间，持续被提起的约定持续续期；承诺日期在陈述文本内非结构化
+  列），超窗（commitment_expire_days，默认 60 天）降 pending_uncertain
+  出画像（簇体保留可复活）；与 recent 同为日历语义不受缺席冻结门控；
+  统计键新增 expired_commitment（双后端同构）；
+- **编码器**：category 值域六选一 → 八选一（prompt 定义 +
+  _VALID_CATEGORIES + 结构化输出 enum 三处同步），编码链路开始产出
+  preference/commitment 事实；
+- **配置/维护页**：commitment_expire_days 配置项（schema.json +
+  config_web 评分状态机分组 + _build_config 接线，反射测试锁定）；
+- **测试**：test_noriflow 新增八栏渲染 / 其他名称排除当前称呼 / 栏
+  序用例；test_sqlite_backend 新增 commitment 过期真库回归（降级出
+  画像 + 簇体存活）+ migrations_applied 断言补 012（存量遗漏）；
+  10 套 direct-run 全绿。
+
+### feat(tools+lifecycle): 对齐 nori 侧工具五件套 + 摘要生命周期（归档/强化）
+
+**主动工具对齐**（语义与 nori 侧 v0.10.8 同源，handler 形态适配 KiraAI）：
+
+- `memory_search` 升级双目标：summary=对话摘要（原管线不变）+ **fact=
+  事实簇语义检索**（结论级，簇表 cosine + 维度过滤 + name 归属收窄）；
+  `category=relation` 按成员名字查关系边（复用 fetch_active_edges）。
+- `memory_write` 语义升级为**确定性事实直写**（对齐 nori）：raw 插入后
+  立即 `apply_fact_merge` 成簇（create/replace），不等合并 agent 周期；
+  六维 category + confidence + `replaces_cluster_id` 原子替换；幂等闭环
+  （document_id 粒度 + 乐观锁 skipped）；**replace 目标归属校验**
+  （fetch_cluster_owner，跨用户替代拒绝——nori PR#4 安全修复同款）。
+  旧「写摘要行」语义由 memory_remove/维护页承担。
+- 新增 `memory_profile`：按名字查成员画像（画像块外兜底；实体命中
+  match 机制解析名字，重名歧义返回候选不猜）。
+- 新增 `memory_lookup`：维护性深查——归档摘要（include_archived）+
+  失效/被替代/待定簇（include_inactive），带状态标注供恢复定位。
+- 新增 `memory_correct`：记忆状态调整（簇 drop/dispute/reactivate、
+  摘要 reactivate），reason 必填审计留痕；归属不符与不存在同款输出
+  （不泄露他人簇存在性）；replaced 簇指向继任簇给精确提示。
+- **记忆工具准则注入**（`:tools` prompt 段，对齐 nori guidance）：防
+  播报措辞（查到的记忆当亲历自然叙述 / 答应记住自然应下）+ 工具分工；
+  本轮至少一件记忆工具可用时注入。
+- 门控：`enabled_tools` 管六件全集（search/write/remove + 新三件）；
+  `memory_tools_enabled`（默认开）总开关管新三件；白名单/作用域锁定
+  机制全量适用（search fact 通道同样钉死触发者作用域）。
+
+**db 层新增**（base 抽象 + postgres/sqlite 双实现，PG 版自 nori 平移）：
+
+`upsert_persona_fact_raw_for_apply`（DO UPDATE RETURNING id）、
+`search_fact_clusters`（sqlite 版复刻 FTS 检索的 Python cosine 模式）、
+`fetch_cluster_owner`、`cluster_status_op`（drop 清投影/dispute 打标/
+reactivate 白名单）、`restore_summary`（会话归属校验）、
+`archive_stale_summaries`、`reinforce_summaries`；kernel 新增
+`write_fact`（直写簇路径）与 `_fire_reinforcement`（召回命中强化
+fire-and-forget）。
+
+**摘要生命周期**（对齐 nori 011 迁移 + v0.10.7 机制，默认关）：
+
+- 迁移 011（sqlite 方言，版本序列与 PG 共享）/ 011（PG）：`archived/archived_at/last_recall_at/
+  recall_count` 四列 + partial index；检索 SQL 结构性排除归档行
+  （双后端同款，含兜底 where 分支）。
+- 归档遍（挂合并 agent 周期，kv 门控）：超龄（最低保留期 + 3×半衰期）
+  且强化窗口内无召回命中 → archived；keyset 分页 + 两段式复查（候选
+  数判满批 / UPDATE 时复查判据收敛召回并发竞态）；**首遍延后至强化
+  窗口后**（存量行强化预积累，防升级瞬间误归档高频记忆）。
+- 召回访问强化：最终注入集异步刷新 last_recall_at/recall_count
+  （`summary_lifecycle_reinforce_on_recall` 默认开，不受总开关门控——
+  预累积信号防首遍误判）。
+- 配置组 `summary_lifecycle_*` 六项 + 维护页 schema「摘要生命周期」分组。
+
+**测试**：新增 `tests/test_memory_tools_sqlite.py`（真 SQLite 集成
+28 checks：直写链/状态机三动作与归属校验/簇检索过滤/lifecycle 判据
+边界/keyset 分批/检索排除归档）；`test_noriflow_memory.py` 的 write
+用例适配新语义；`migrations_applied` 断言更新 [1, 2]；9 套 direct-run
+全绿。
+
+### feat(recall): 混合分层时间标注——recall_time_label_mode 形态开关（PR #4）
+
+对齐 nori 侧 PR#7（feat/recall-time-label-and-review-fixes）：
+
+- 三态形态开关 `recall_time_label_mode`（relative / absolute / both，
+  默认 both）；absolute 分层精度——7 天内带时分（近事可辨批内时序），
+  更久只到日期，跨年带年份
+- 将来时间戳守卫按完整时刻比较（同日内未来时刻一并拦截）
+- 跨年近事（days<7 且跨年）绝对部分带年份，不被时分短路丢掉
+- Literal 白名单装配期拒绝非法值；热切换直赋未知值按 relative 兜底
+  落告警（`_relative_time_label` 按注入记忆逐条执行，模块级按值去重
+  防日志洪泛）
+- 新增 tests/test_time_label.py 10 用例；既有标注断言经 _make_kernel
+  显式 relative 锁旧形态
+
+### feat: 实体关系边复合键口径补齐（PR #5）
+
+- entity_edge.py 三函数 bot 判定复合键化（形态×session_platform）：
+  select_relation_edges（bot 端点误判/场景 C 锚）、
+  relation_statement_line（渲染层裸 uid 撞号把真人渲染成 bot 昵称）、
+  neighbor_profile_uids（裸 uid 排除漏注入真人画像）；
+  session_platform 必填 kwarg，漏传 TypeError 不静默退回裸判定
+- db 层：fetch_alias_names_by_owner owners 三态契约（None=全表原
+  语义；空列表/过滤后空=短路返回 {} 不落全表）；fetch_active_edges
+  非空字符串入参 fail fast（空串保持旧容忍）
+- migrations/ + migrations_sqlite/ 012：复合键读路径表达式部分索引
+  （postgres ANY 下推验证；sqlite EXPLAIN QUERY PLAN USING INDEX 验证）
+- 测试：跨平台 bot 撞号三面用例（select/statement_line/neighbor）、
+  owners 三态 db 层契约用例、fail fast 用例
+
 ## v1.16.1 (2026-09-12, sqlite-backend 分支)
 
 ### refactor: KiraOS 去 residual 品牌——模块更名 kira_memory_import + kv 键迁移

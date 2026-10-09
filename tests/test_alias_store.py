@@ -37,8 +37,11 @@ _main = load_module("main")
 
 AliasStore = _alias_store.AliasStore
 build_alias_rows = _alias_store.build_alias_rows
+build_fact_code_alias_rows = _alias_store.build_fact_code_alias_rows
 clean_alias_name = _alias_store.clean_alias_name
+extract_uid_code_names = _alias_store.extract_uid_code_names
 is_placeholder_name = _alias_store.is_placeholder_name
+normalize_alias_text = _alias_store.normalize_alias_text
 split_name_variants = _alias_store.split_name_variants
 MemoryDBCircuitBreaker = _circuit_breaker.MemoryDBCircuitBreaker
 LocalMemoryConfig = _config.LocalMemoryConfig
@@ -369,12 +372,182 @@ async def test_alias_upsert_batch_wiring() -> None:
 
 
 # ---------------------------------------------------------------------------
+#  归一化匹配（NFKC + casefold）与事实代号别名
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_alias_text() -> None:
+    # 名片 undefined𝕩𝕩𝕪（𝕩=U+1D569）NFKC 后即 undefinedxxy——含 "xxy"
+    assert normalize_alias_text("undefined𝕩𝕩𝕪") == "undefinedxxy"
+    # 全角字母/数字/括号转半角；大小写收敛
+    assert normalize_alias_text("ＸＹＺ（测试）") == "xyz(测试)"
+    assert normalize_alias_text("Shizuku") == "shizuku"
+    assert normalize_alias_text("") == ""
+
+
+def test_alias_store_match_unicode_variants() -> None:
+    """名片 Unicode 变体名 vs 文本 ASCII/半角写法：归一化后子串命中。"""
+    store = _store_with({
+        "𝕩𝕩𝕪": [("qq", "3429924750")],  # 数学字母名片（NFKC 后即 xxy）
+        "Ｓｈｉｚｕｋｕ": [("qq", "u2")],  # 全角名片
+        "Shizuku": [("qq", "u3")],  # 与上行归一化后同名（半角异大小写）
+    })
+    hits, _ = store.match("seki还记得xxy吗", set())
+    assert ("𝕩𝕩𝕪", "qq", "3429924750") in hits
+    assert all(h[0] != "xxy" for h in hits)  # 展示名保留名片原样
+    hits, skipped = store.match("shizuku 在吗", set())
+    assert hits == []
+    assert skipped in (["Ｓｈｉｚｕｋｕ"], ["Shizuku"])
+
+
+def test_extract_uid_code_names() -> None:
+    """「用户<uid>（<代号>）」提取：全角/半角括号、多对去重、uid 位数下限。"""
+    stmt = "与用户3429924750（xxy）关系亲密，同时与用户2374893963(忆熙阿)互动频繁。"
+    assert extract_uid_code_names(stmt) == [
+        ("3429924750", "xxy"),
+        ("2374893963", "忆熙阿"),
+    ]
+    assert extract_uid_code_names("用户10001（阿明）和用户10001（阿明）") == [
+        ("10001", "阿明")
+    ]
+    assert extract_uid_code_names("用户123（小明）") == []  # uid 不足 4 位
+    assert extract_uid_code_names("用户10001 阿明") == []  # 括号缺失
+    # 代号保留原文形态（大小写/全角——DB 与展示用原名，归一化只作匹配键）
+    assert extract_uid_code_names("用户10001（Kai）是熟人") == [("10001", "Kai")]
+    assert extract_uid_code_names("用户10001（Ｋａｉ）是熟人") == [("10001", "Ｋａｉ")]
+    assert extract_uid_code_names("用户１０００１（阿明）") == [("10001", "阿明")]  # uid 全角归一
+
+
+def test_build_fact_code_alias_rows() -> None:
+    """代号行构建：清洗+占位过滤+同键取更晚 last_seen。"""
+    ts_old = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    ts_new = datetime(2026, 9, 11, tzinfo=timezone.utc)
+    rows = build_fact_code_alias_rows([
+        ("qq", "与用户3429924750（xxy）关系亲密。", ts_old),
+        ("qq", "用户3429924750（xxy）今天上线了", ts_new),
+        ("qq", "用户10002（undefined）说话奇怪", ts_old),
+        ("qq", "用户10003（！！）刷屏", ts_old),
+        ("", "用户10004（阿明）", ts_old),
+    ])
+    assert rows == [{
+        "platform": "qq",
+        "user_id": "3429924750",
+        "name": "xxy",
+        "last_seen": ts_new,
+        "source": "fact",
+    }]
+    # 同归一化键多形态：行 name 保留首个观测原文，last_seen 取更晚
+    rows = build_fact_code_alias_rows([
+        ("qq", "用户10001（Kai）今天上线", ts_old),
+        ("qq", "用户10001（kai）又上线", ts_new),
+    ])
+    assert rows == [{
+        "platform": "qq",
+        "user_id": "10001",
+        "name": "Kai",
+        "last_seen": ts_new,
+        "source": "fact",
+    }]
+    # last_seen=None（SQLite 标量 MAX/时间戳解析失败路径）不崩，视作最旧
+    rows = build_fact_code_alias_rows([
+        ("qq", "用户10006（阿明）先出现", None),
+        ("qq", "用户10006（阿明）后出现", ts_new),
+    ])
+    assert rows == [{
+        "platform": "qq",
+        "user_id": "10006",
+        "name": "阿明",
+        "last_seen": ts_new,
+        "source": "fact",
+    }]
+
+
+def test_alias_store_fact_code_alias_end_to_end() -> None:
+    """事实代号行 apply 后：文本命中 -> (display, platform, uid)。"""
+    store = AliasStore(db=None, variant_cap=8)
+    store.apply_rows([{
+        "platform": "qq", "user_id": "3429924750", "name": "xxy",
+        "last_seen": datetime(2026, 9, 11, tzinfo=timezone.utc),
+        "source": "fact",
+    }])
+    hits, skipped = store.match("seki还记得xxy吗", set())
+    assert hits == [("xxy", "qq", "3429924750")]
+    assert skipped == []
+
+
+def test_alias_store_display_per_pair() -> None:
+    """同归一化键多 uid：命中条目各带各的观测原名，不串贴他人称呼。"""
+    store = AliasStore(db=None, variant_cap=8)
+    store.apply_rows([
+        {"platform": "qq", "user_id": "20001", "name": "Shizuku",
+         "last_seen": datetime(2026, 9, 11, tzinfo=timezone.utc),
+         "source": "batch"},
+        {"platform": "qq", "user_id": "20002", "name": "Ｓｈｉｚｕｋｕ",
+         "last_seen": datetime(2026, 9, 12, tzinfo=timezone.utc),
+         "source": "batch"},
+    ])
+    hits, skipped = store.match(
+        "shizuku 在吗", {("qq", "20001"), ("qq", "20002")}
+    )
+    assert skipped == []
+    assert sorted(hits) == sorted([
+        ("Shizuku", "qq", "20001"),
+        ("Ｓｈｉｚｕｋｕ", "qq", "20002"),
+    ])
+
+
+async def test_entity_directory_display_per_pair() -> None:
+    """会话实体词典同归一化键多 uid：命中条目各带各的观测原名，不串贴
+    （与 AliasStore._display_by_pair 同款口径）。"""
+    async def source(session_id: str):
+        return [("Shizuku", "qq", "400"), ("Ｓｈｉｚｕｋｕ", "web", "500")]
+
+    d = _EntityDirectory(source)
+    hits = await d.match("s1", "shizuku 在吗")
+    assert sorted(hits) == sorted([
+        ("Shizuku", "qq", "400"),
+        ("Ｓｈｉｚｕｋｕ", "web", "500"),
+    ])
+
+
+class _RefreshDbStub:
+    async def alias_fetch_all(self):
+        return [
+            {"platform": "qq", "user_id": 40001, "name": "Shizuku",
+             "last_seen_epoch": 100.0},
+            {"platform": "qq", "user_id": "40002", "name": "Ｓｈｉｚｕｋｕ",
+             "last_seen_epoch": 200.0},
+        ]
+
+
+async def test_alias_store_refresh_display_by_pair() -> None:
+    """refresh 路径（TTL 整表重载）与 apply_rows 同口径：uid 统一 str，
+    同键多 uid 展示名按对命中——DB 返回整数 uid 时不回退键级兜底串贴。"""
+    store = AliasStore(db=_RefreshDbStub(), variant_cap=8)
+    await store.refresh_if_due(force=True)
+    hits, skipped = store.match(
+        "shizuku 在吗", {("qq", "40001"), ("qq", "40002")}
+    )
+    assert skipped == []
+    assert sorted(hits) == sorted([
+        ("Shizuku", "qq", "40001"),
+        ("Ｓｈｉｚｕｋｕ", "qq", "40002"),
+    ])
+
+
+# ---------------------------------------------------------------------------
 #  运行器
 # ---------------------------------------------------------------------------
 
 
 async def main() -> None:
     test_clean_alias_name_filters()
+    test_normalize_alias_text()
+    test_alias_store_match_unicode_variants()
+    test_extract_uid_code_names()
+    test_build_fact_code_alias_rows()
+    test_alias_store_fact_code_alias_end_to_end()
+    test_alias_store_display_per_pair()
     test_split_name_variants_brackets()
     test_build_alias_rows_cap_and_dedup()
     test_alias_store_match_basic_and_ambiguity()
@@ -385,6 +558,8 @@ async def main() -> None:
     await test_alias_upsert_sql_and_params()
     await test_entity_hint_entries_merges_alias_layer()
     await test_entity_hint_entries_alias_disabled()
+    await test_entity_directory_display_per_pair()
+    await test_alias_store_refresh_display_by_pair()
     await test_alias_upsert_batch_wiring()
     print("ALL PASS")
 

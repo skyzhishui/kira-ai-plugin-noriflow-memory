@@ -1,7 +1,8 @@
 """LocalPersonaService：簇表 + 画像表的确定性画像拼装（M5，开发方案 §9.3）。
 
 设计（与 hindsight 的本质差异）：
-- 画像 = 表内容的**确定性投影**：六栏模板 + 固定排序（score DESC ->
+- 画像 = 表内容的**确定性投影**：栏位模板（8 维度 + 条件性"其他
+  名称"栏）+ 固定排序（score DESC ->
   updated_at DESC -> id ASC）+ 每栏上限，同样的表内容产出逐字节相同的
   画像文本；无 LLM 参与、无全量重写，画像变化 ⇔ 簇状态变化；
 - 数据源：前五栏取画像表（profiled 簇的投影行），待定信息栏取簇表
@@ -17,11 +18,13 @@ from __future__ import annotations
 
 from core.logging_manager import get_logger
 
+from datetime import datetime, timezone
 from typing import Optional
 
 from .config import LocalMemoryConfig
 from .contracts import PersonaCandidate, PersonProfile
 from .db import MemoryDatabase
+from .time_labels import memory_time_label, resolve_local_tz
 
 logger = get_logger("noriflow_memory.persona", "cyan")
 
@@ -30,18 +33,30 @@ INJECTION_HEADER = "# 用户画像-背景信息"
 INJECTION_DISCLAIMER = "以下记录属于内部推理素材，回复时请概括转述，不要逐字照读。"
 INJECTION_FOOTER = "把它当作理解对方的一份额外参考即可；一旦与当前对话冲突，以当前对话为准。"
 
-# 六栏固定顺序：(category, 栏名, PersonProfile 字段名)。
-# 字段名是上游 nori persona 模块的运行时序列化契约，不可改动。
+# 栏位固定顺序：(category, 栏名, PersonProfile 字段名)。
+# 字段名是上游 persona 模块的运行时序列化契约，不可改动。
+# preference/commitment（画像 8 维度扩展，对齐 nori 侧）：暂无核心侧
+# 专属字段（get_profile 为休眠 API，宿主只消费注入 markdown），序列化
+# 时 preference 并入 established_notes、commitment 并入 memory_points
+# （记忆要点——语义恰为"要记住的约定"）；核心侧加字段后改为直映射。
 _SECTION_ORDER = [
     ("identity", "基本信息", "persona_backdrop"),
     ("naming", "称呼偏好", "addressing_style"),
     ("stable", "已知事实", "established_notes"),
+    ("preference", "喜好偏好", "established_notes"),
+    ("commitment", "约定承诺", "memory_points"),
     ("interaction", "互动偏好", "rapport_rules"),
     ("recent", "近期动态", "recent_updates"),
 ]
 _UNCERTAIN_TITLE = "待定信息"
 _EMPTY_ITEM = "暂无"
 _PER_SECTION_LIMIT = 5
+# 时效栏：条目带发生时间尾注，口径对齐 recall 记忆块（time_labels）
+_TIME_LABELED_CATEGORIES = {"recent"}
+# "其他名称"栏：唯一非事实栏（alias 层历史名变体，身份参考元数据），
+# 置于基本信息之后；无变体整栏省略（不写"暂无"占位），最多最近 5 个
+_ALIAS_SECTION_TITLE = "其他名称"
+_ALIAS_NAMES_LIMIT = 5
 
 
 class LocalPersonaService:
@@ -53,6 +68,7 @@ class LocalPersonaService:
         config: LocalMemoryConfig,
         bot_nickname: str = "",
         identity_resolver: object | None = None,
+        host_tz_provider: object | None = None,
     ) -> None:
         """初始化。
 
@@ -64,11 +80,30 @@ class LocalPersonaService:
             identity_resolver: 可选身份映射解析器——多渠道同一人
                 （accounts 关联 qq/web 账号）时读侧按身份合并画像；
                 画像写入仍按来源账号键独立落库，仅读取时合并注入。
+            host_tz_provider: 宿主时区活读回调（与 kernel 同源传入）——
+                时区解析链"配置名 > 宿主 > 服务器本地"与 recall 注入
+                保持同一口径。
         """
         self._db = db
         self._config = config
         self.bot_nickname = bot_nickname or "AI"
         self._identity_resolver = identity_resolver
+        self._host_tz_provider = host_tz_provider
+        self._tz_cache: object | None = None
+
+    def _local_tz(self) -> object:
+        """本地时区（懒解析缓存，解析链与 kernel 同款：配置名 > 宿主
+        provider > 服务器本地）——防非法 timezone 配置在每次画像注入时
+        重复落 warning。"""
+        if self._tz_cache is None:
+            self._tz_cache = resolve_local_tz(
+                (self._config.timezone or "").strip(), self._host_tz_provider
+            )
+        return self._tz_cache
+
+    def reset_local_tz_cache(self) -> None:
+        """时区配置变更后失效缓存（维护页保存路径，与 kernel 同款）。"""
+        self._tz_cache = None
 
     # ------------------------------------------------------------------
     #  写接口：均为语义适配 no-op（表驱动画像，唯一变更通道是评分状态机）
@@ -158,16 +193,7 @@ class LocalPersonaService:
         """
         if not platform:
             return ""
-        markdown = await self._assemble_profile_markdown(platform, user_id)
-        if not markdown:
-            return ""
-        markdown = self._filter_blacklist(markdown)
-        if not markdown:
-            return ""
-        logger.debug(
-            "画像注入 session=%s: 1 人 [%s+%s]",
-            session_id, user_id, platform,
-        )
+        # 抬头名先取：其他名称栏需以当前称呼做排除
         keys = self._linked_keys(platform, user_id)
         if keys is not None:
             platforms = [p for p, _ in keys]
@@ -180,6 +206,18 @@ class LocalPersonaService:
             display_name = (
                 await self._db.fetch_latest_display_name(platform, user_id) or user_id
             )
+        markdown = await self._assemble_profile_markdown(
+            platform, user_id, current_name=display_name
+        )
+        if not markdown:
+            return ""
+        markdown = self._filter_blacklist(markdown)
+        if not markdown:
+            return ""
+        logger.debug(
+            "画像注入 session=%s: 1 人 [%s+%s]",
+            session_id, user_id, platform,
+        )
         return (
             f"{INJECTION_HEADER}\n"
             f"{INJECTION_DISCLAIMER}\n\n"
@@ -221,15 +259,16 @@ class LocalPersonaService:
             if identity_key in seen:
                 continue
             seen.add(identity_key)
+            # 抬头名先取：其他名称栏需以当前称呼做排除
+            display_name = candidate.display_name or candidate.user_id
             markdown = await self._assemble_profile_markdown(
-                candidate.platform, candidate.user_id
+                candidate.platform, candidate.user_id, current_name=display_name
             )
             if not markdown:
                 continue
             markdown = self._filter_blacklist(markdown)
             if not markdown:
                 continue
-            display_name = candidate.display_name or candidate.user_id
             blocks.append(f"{display_name}：\n{markdown}")
             injected_names.append(
                 f"[{candidate.user_id}+{display_name}]"
@@ -266,16 +305,21 @@ class LocalPersonaService:
             return None
         return keys
 
-    async def _assemble_profile_markdown(self, platform: str, user_id: str) -> str:
-        """按六栏固定顺序确定性拼装画像档案（空栏写"暂无"）。
+    async def _assemble_profile_markdown(
+        self, platform: str, user_id: str, current_name: str = ""
+    ) -> str:
+        """按栏位固定顺序确定性拼装画像档案（空栏写"暂无"）。
 
-        完全无内容（无画像行也无待定簇）时返回空字符串（调用方据此
-        判定"无画像"，不产出全空档案）。身份关联多键时走 multi 查询，
-        跨键画像行合并为同一份档案（排序/去重见 db 层 multi 方法）。
+        完全无内容（无画像行、无待定簇且无名变体）时返回空字符串（调用
+        方据此判定"无画像"，不产出全空档案）。身份关联多键时走 multi
+        查询，跨键画像行合并为同一份档案（排序/去重见 db 层 multi 方法）。
+        "其他名称"栏内容为 alias 层采集的历史名变体（含历史昵称/名片，
+        排除当前称呼 current_name），跨键合并按 db 层 last_seen 降序。
 
         Args:
             platform: 平台标识。
             user_id: 用户 ID。
+            current_name: 该用户当前称呼（块抬头名），其他名称栏排除项。
 
         Returns:
             画像档案 markdown；无任何内容时空字符串。
@@ -291,23 +335,55 @@ class LocalPersonaService:
                 platforms, uids, _PER_SECTION_LIMIT
             )
         else:
+            platforms, uids = [platform], [user_id]
             sections = await self._db.fetch_profile_sections(
                 platform, user_id, _PER_SECTION_LIMIT
             )
             uncertain = await self._db.fetch_uncertain_statements(
                 platform, user_id, _PER_SECTION_LIMIT
             )
-        if not sections and not uncertain:
+        variants_map = await self._db.fetch_alias_variants(platforms, uids)
+        alias_names: list[str] = []
+        for key in keys or [(platform, user_id)]:
+            for name in variants_map.get(key, []):
+                if name != current_name and name not in alias_names:
+                    alias_names.append(name)
+        if not sections and not uncertain and not alias_names:
             return ""
 
         parts: list[str] = []
+        now = self._now()
+        local_tz = self._local_tz()
+        mode = self._config.recall_time_label_mode
+
+        def _label(ts: object) -> str:
+            label = memory_time_label(ts, now=now, local_tz=local_tz, mode=mode)
+            return f"（{label}）" if label else ""
+
         for category, title, _ in _SECTION_ORDER:
             items = sections.get(category, [])
-            lines = [f"- {s}" for s in items] or [f"- {_EMPTY_ITEM}"]
+            if category in _TIME_LABELED_CATEGORIES:
+                lines = [f"- {s}{l}" if (l := _label(ts)) else f"- {s}"
+                    for s, ts in items
+                ] or [f"- {_EMPTY_ITEM}"]
+            else:
+                lines = [f"- {s}" for s, _ in items] or [f"- {_EMPTY_ITEM}"]
             parts.append(f"## {title}\n" + "\n".join(lines))
-        uncertain_lines = [f"- {s}" for s in uncertain] or [f"- {_EMPTY_ITEM}"]
+            if category == "identity" and alias_names:
+                parts.append(
+                    f"## {_ALIAS_SECTION_TITLE}\n"
+                    + f"- {'、'.join(alias_names[:_ALIAS_NAMES_LIMIT])}"
+                )
+        uncertain_lines = [
+            f"- {s}{l}" if (l := _label(ts)) else f"- {s}" for s, ts in uncertain
+        ] or [f"- {_EMPTY_ITEM}"]
         parts.append(f"## {_UNCERTAIN_TITLE}\n" + "\n".join(uncertain_lines))
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _now() -> datetime:
+        """当前 UTC 时间（独立方法便于测试固定时钟）。"""
+        return datetime.now(timezone.utc)
 
     def _filter_blacklist(self, markdown: str) -> str:
         """按话题黑名单逐行过滤画像内容（与 recall 过滤对齐）。
@@ -351,7 +427,7 @@ class LocalPersonaService:
 
         Args:
             user_id: 用户 ID。
-            markdown: 六栏档案文本。
+            markdown: 栏位模板档案文本。
 
         Returns:
             PersonProfile（字段名是核心侧契约，见 _SECTION_ORDER 注释）。

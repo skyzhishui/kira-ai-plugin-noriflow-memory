@@ -64,7 +64,7 @@ async def fetch_users_data(backend, keyword: str, page: int, size: int) -> dict:
     where = ""
     if keyword:
         params.append(_ilike(keyword))
-        where = "WHERE c.user_id LIKE $1"
+        where = "WHERE c.user_id LIKE $1 ESCAPE '\\'"
     async with _pool(backend).acquire() as conn:
         total = await conn.fetchval(
             f"""
@@ -186,7 +186,7 @@ async def fetch_clusters_data(
             filters["session_evidence_prefix"],
         )
     if filters["q"]:
-        add("canonical_statement LIKE ${n}", filters["q_pattern"])
+        add("canonical_statement LIKE ${n} ESCAPE '\\'", filters["q_pattern"])
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     async with _pool(backend).acquire() as conn:
