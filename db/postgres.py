@@ -1984,6 +1984,10 @@ class MemoryDatabase(MemoryBackend):
             )
         if not rows:
             return
+        # Echo pre-check and the write must share one connection (fix
+        # batch 2026-09-12): two acquires open a window where a mirrored
+        # edge interleaves between the check and the executemany, and the
+        # reverse-echo skip then misses the dual-active pair it exists for.
         async with self.pool.acquire() as conn:
             existing_keys = await self._fetch_existing_edge_keys(conn, rows)
             rows, skipped = split_reverse_echo_rows(rows, existing_keys)
@@ -1991,34 +1995,33 @@ class MemoryDatabase(MemoryBackend):
                 logger.info(
                     "关系边反向回声跳过 %d 条（镜像方向已在库/同批先到）", skipped
                 )
-        if not rows:
-            return
-        payload = [
-            (
-                r["platform"],
-                r["subject_uid"],
-                r["object_uid"],
-                r["subject_name"],
-                r["object_name"],
-                r["relation_label"],
-                r["statement"],
+            if not rows:
+                return
+            payload = [
                 (
-                    "pending"
-                    if r["is_bot_edge"] and int(r["min_evidence"]) > 1
-                    else "active"
-                ),
-                r["confidence"],
-                _ensure_tz(r["occurred_at"]),
-                r["evidence_key"],
-                bool(r["is_bot_edge"]),
-                int(r["min_evidence"]),
-                bool(r.get("count_on_conflict", True)),
-            )
-            for r in rows
-        ]
-        # Placeholder-name pattern is the single-source constant from
-        # alias_store (the Python predicate and both SQL copies must not drift).
-        async with self.pool.acquire() as conn:
+                    r["platform"],
+                    r["subject_uid"],
+                    r["object_uid"],
+                    r["subject_name"],
+                    r["object_name"],
+                    r["relation_label"],
+                    r["statement"],
+                    (
+                        "pending"
+                        if r["is_bot_edge"] and int(r["min_evidence"]) > 1
+                        else "active"
+                    ),
+                    r["confidence"],
+                    _ensure_tz(r["occurred_at"]),
+                    r["evidence_key"],
+                    bool(r["is_bot_edge"]),
+                    int(r["min_evidence"]),
+                    bool(r.get("count_on_conflict", True)),
+                )
+                for r in rows
+            ]
+            # Placeholder-name pattern is the single-source constant from
+            # alias_store (the Python predicate and both SQL copies must not drift).
             await conn.executemany(
                 f"""
                 INSERT INTO memory_entity_edge (

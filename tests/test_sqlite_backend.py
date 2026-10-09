@@ -397,7 +397,7 @@ async def main_async() -> None:
     sections = await db.fetch_profile_sections("qq", "u1", 5)
     check(
         "profile_sections",
-        sections.get("stable") == ["小明喜欢玩塞尔达"], str(sections),
+        sections.get("stable") == [("小明喜欢玩塞尔达", now)], str(sections),
     )
     name = await db.fetch_latest_display_name("qq", "u1")
     check("display_name", name == "小明", str(name))
@@ -450,7 +450,7 @@ async def main_async() -> None:
     sections = await db.fetch_profile_sections("qq", "u1", 5)
     check(
         "replace_profile_projection",
-        sections.get("stable") == ["小明其实更喜欢空洞骑士"], str(sections),
+        sections.get("stable") == [("小明其实更喜欢空洞骑士", now)], str(sections),
     )
 
     # 衰减遍（缺席冻结 + 证据地板 + 死亡窗口）
@@ -663,7 +663,7 @@ async def main_async() -> None:
     sections = await db.fetch_profile_sections("qq", "u1", 5)
     check(
         "webui_update_cluster_projection",
-        sections.get("stable") == ["小明最喜欢的是空洞骑士"], str(sections),
+        sections.get("stable") == [("小明最喜欢的是空洞骑士", now)], str(sections),
     )
 
     summaries = await webui.fetch_summaries(db, 1, 10, q="猫")

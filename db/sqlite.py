@@ -1865,6 +1865,9 @@ class SQLiteMemoryDatabase(MemoryBackend):
             )
         if not rows:
             return
+        # Echo pre-check and the write must share one connection (same
+        # contract as the PG version): two acquires open a window where a
+        # mirrored edge interleaves between the check and the executemany.
         async with self.pool.acquire() as conn:
             existing_keys = await self._fetch_existing_edge_keys(conn, rows)
             rows, skipped = split_reverse_echo_rows(rows, existing_keys)
@@ -1872,31 +1875,30 @@ class SQLiteMemoryDatabase(MemoryBackend):
                 logger.info(
                     "关系边反向回声跳过 %d 条（镜像方向已在库/同批先到）", skipped
                 )
-        if not rows:
-            return
-        now = _now_ts()
-        payload = [
-            (
-                r["platform"],
-                r["subject_uid"],
-                r["object_uid"],
-                r["subject_name"],
-                r["object_name"],
-                r["relation_label"],
-                r["statement"],
-                "pending" if r["is_bot_edge"] and int(r["min_evidence"]) > 1
-                else "active",
-                r["confidence"],
-                sqlite_format_ts(_ensure_tz(r["occurred_at"])),
-                r["evidence_key"],
-                1 if r["is_bot_edge"] else 0,
-                int(r["min_evidence"]),
-                1 if r.get("count_on_conflict", True) else 0,
-                now,
-            )
-            for r in rows
-        ]
-        async with self.pool.acquire() as conn:
+            if not rows:
+                return
+            now = _now_ts()
+            payload = [
+                (
+                    r["platform"],
+                    r["subject_uid"],
+                    r["object_uid"],
+                    r["subject_name"],
+                    r["object_name"],
+                    r["relation_label"],
+                    r["statement"],
+                    "pending" if r["is_bot_edge"] and int(r["min_evidence"]) > 1
+                    else "active",
+                    r["confidence"],
+                    sqlite_format_ts(_ensure_tz(r["occurred_at"])),
+                    r["evidence_key"],
+                    1 if r["is_bot_edge"] else 0,
+                    int(r["min_evidence"]),
+                    1 if r.get("count_on_conflict", True) else 0,
+                    now,
+                )
+                for r in rows
+            ]
             await conn.executemany(
                 f"""
                 INSERT INTO memory_entity_edge (

@@ -24,7 +24,6 @@ import asyncio
 import json
 import sys
 
-import pytest
 from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +32,16 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _harness import load_module  # noqa: E402
+
+
+async def await_raises(exc: type[BaseException], awaitable) -> None:
+    """Direct-run stand-in for ``pytest.raises`` (suite must stay
+    pytest-free per CI design; the file docstring promises the same)."""
+    try:
+        await awaitable
+    except exc:
+        return
+    raise AssertionError(f"expected {exc.__name__} to be raised")
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 
@@ -364,13 +373,10 @@ async def test_fetch_active_edges_params() -> None:
     await db.fetch_active_edges([], ["qq:9900000004", "qq:bot-1"])
     assert pool.queries[2][1] == [[], ["qq:9900000004", "qq:bot-1"]]
     # 非空字符串入参 fail fast（空串 falsy 保持旧容忍，上文已覆盖）
-    with pytest.raises(TypeError):
-        await db.fetch_active_edges("qq:123")
-    with pytest.raises(TypeError):
-        await db.fetch_active_edges([], "qq:bot-1")
+    await await_raises(TypeError, db.fetch_active_edges("qq:123"))
+    await await_raises(TypeError, db.fetch_active_edges([], "qq:bot-1"))
     # bytes 迭代出 int 同样静默落空，一并 fail fast
-    with pytest.raises(TypeError):
-        await db.fetch_active_edges(b"qq:123")
+    await await_raises(TypeError, db.fetch_active_edges(b"qq:123"))
 
 
 async def test_fetch_alias_names_by_owner_owners_contract() -> None:
