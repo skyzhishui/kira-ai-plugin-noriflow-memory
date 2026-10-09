@@ -7,7 +7,7 @@ WebUI 可视化维护页。
 
 存储后端由 `storage_backend` 配置选择（`postgres | sqlite | auto`，auto =
 配了 dsn 用 postgres，否则 sqlite）；同一套 kernel / 合并 agent / 提示词 /
-WebUI 逻辑跑在两个后端上（双后端方案见 `docs/plans/`）。
+WebUI 逻辑跑在两个后端上（双后端方案演进见本仓 `CHANGELOG.md`）。
 
 ## 功能简介
 
@@ -21,9 +21,9 @@ WebUI 逻辑跑在两个后端上（双后端方案见 `docs/plans/`）。
   另附历史名变体的「其他名称」栏），群聊支持多人画像；
 - **关系图谱**：从聊天中提取成员间关系（「A 的姐姐是 B」式陈述），话题
   涉及时自动在上下文带出相关人物关系（默认关，配置或维护页开启）；
-- **AI 记忆工具**：bot 可主动查证、写入、更正、深查记忆
-  （memory_search / write / profile / lookup / correct 等），并注入
-  记忆工具准则——查到的记忆当亲历自然叙述，不播报操作过程；
+- **AI 记忆工具**：bot 可主动查证、写入、删除、更正、深查记忆
+  （memory_search / write / remove / profile / lookup / correct 六件），
+  并注入记忆工具准则——查到的记忆当亲历自然叙述，不播报操作过程；
 - **记忆新陈代谢**：长期未被召回的记忆自动归档并退出召回范围
   （原文保留、可恢复），被召回的记忆自动续期（默认关，配置或维护页开启）；
 - **WebUI 维护页**：KiraAI 侧边栏「长期记忆」页——概览 KPI、事实簇修正、
@@ -97,7 +97,7 @@ flowchart TD
         R1 --> R2 --> R3 --> R4 --> R5 --> R6 --> R7 --> R8 --> R9
     end
 
-    T1["LLM 记忆工具<br/>memory_search / memory_write / memory_remove"]
+    T1["LLM 记忆工具六件<br/>memory_search / write / remove<br/>+ profile / lookup / correct"]
 
     W9 -- "摘要表（可召回）" --> R4
     W4 -- "事实原始表" --> B2
@@ -189,7 +189,7 @@ flowchart TD
 | rerank_candidates | integer | 50 | 进入重排序的候选数 |
 | failure_threshold | integer | 5 | DB 熔断阈值 |
 | recovery_seconds | float | 60 | 熔断恢复时间 |
-| tool_scope_locked | bool | true | 工具作用域锁定：忽略 AI 显式传入的 session_id/user_id，钉死为触发会话/触发者；关闭 = 显式参数生效（群聊白名单内可跨用户操作，慎开） |
+| tool_scope_locked | bool | true | 工具作用域锁定：memory_search/write 忽略 AI 显式传入的 session_id/user_id（write 另含 platform），钉死为触发会话/触发者；memory_remove 无作用域入参，删除限定触发作用域（无法推导时拒绝）；memory_profile/lookup/correct 与指名检索（search 的 name）恒钉死触发者、不受本开关影响；关闭 = 显式参数生效（群聊白名单内可跨用户操作，慎关） |
 
 ## 安装与依赖
 
@@ -225,13 +225,18 @@ python tests/test_alias_store.py            # 持久实体别名层
 python tests/test_entity_edge.py            # 实体关系边（提取落库/边注入）
 python tests/test_relation_backfill.py      # 存量关系回填 + 关系图谱数据层
 python tests/test_config_web.py             # 维护页设置栏（schema/掩码/落盘/热更新）
+python tests/test_time_label.py             # 时间标注（三形态/分层精度/naive 换算）
+python tests/test_fix_batch_20260912.py     # 2026-09-12 review 修复批回归
 python tests/test_kira_memory_import.py          # Kira 记忆迁入工具真文件 harness
 python tests/test_sqlite_backend.py         # SQLite 后端真库集成（收敛管线/recall/alias/edge/WebUI）
 python tests/test_memory_tools_sqlite.py    # 记忆工具五件套 + 生命周期真 SQLite 集成（直写链/状态机/归档判据）
 ```
 
-测试桩基建（宿主桩/装载器）收敛在 `tests/_harness.py`；主套件
-test_noriflow_memory.py 保持自包含。修复类改动直接扩展对应模块的
+共享桩基建两件：`tests/_harness.py`（宿主桩 + load_module 装载器）与
+`tests/plugin_env.py`（宿主桩 + 插件包装载，pytest 与 python 直跑两用）；
+load_module 系文件依赖前者，主套件与修复回归批依赖后者。真库/真文件
+套件（kira_memory_import / sqlite_backend / memory_tools_sqlite 与
+真机 live_check）自带桩、不依赖共享基建。修复类改动直接扩展对应模块的
 既有测试文件/TestCase，不再另起回归文件。
 
 ## 真机回环验证（部署机）
