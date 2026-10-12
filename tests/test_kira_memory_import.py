@@ -308,8 +308,8 @@ async def main_async() -> None:
     await db.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
 
     preview = ki.scan_source(source)
-    check("preview_counts", preview["sessions"] == 2 and preview["chunks"] == 4
-          and preview["messages"] == 8 and preview["toml_files"] == 4
+    check("preview_counts", preview["sessions"] == 2 and preview["chunks"] == 3
+          and preview["messages"] == 6 and preview["toml_files"] == 4
           and preview["profiles"] == 1 and preview["archive_files"] == 1,
           str(preview))
 
@@ -481,8 +481,8 @@ async def main_async() -> None:
          "content": [[{"role": "user", "content": "x"}]]},
     ]
     host_preview = ki.scan_host_sessions(host_sessions)
-    check("host_preview_sessions", host_preview["sessions"] == 2, str(host_preview))
-    check("host_preview_chunks", host_preview["chunks"] == 2, str(host_preview))
+    check("host_preview_sessions", host_preview["sessions"] == 1, str(host_preview))
+    check("host_preview_chunks", host_preview["chunks"] == 1, str(host_preview))
 
     host_stats = await ki.run_host_db_import(
         db, sessions=host_sessions, bot_nickname="Kira",

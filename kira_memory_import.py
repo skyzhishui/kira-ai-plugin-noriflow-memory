@@ -225,6 +225,19 @@ def chunk_occurred_at(chunk: list, fallback: datetime) -> datetime:
     return max(stamps) if stamps else fallback
 
 
+def _is_importable_chunk(chunk: list) -> bool:
+    """Whether a chunk yields a summary row (the write path's skip predicate)."""
+    if not isinstance(chunk, list):
+        return False
+    return any(
+        isinstance(m, dict)
+        and m.get("role") == "user"
+        and not is_system_notice(m)
+        and str(m.get("content") or "").strip()
+        for m in chunk
+    )
+
+
 def build_chat_summary_rows(
     session_key: str,
     content: list,
@@ -254,13 +267,7 @@ def build_chat_summary_rows(
         stats["system_notice_msgs_skipped"] += sum(
             1 for m in chunk if is_system_notice(m)
         )
-        if not any(
-            isinstance(m, dict)
-            and m.get("role") == "user"
-            and not is_system_notice(m)
-            and str(m.get("content") or "").strip()
-            for m in chunk
-        ):
+        if not _is_importable_chunk(chunk):
             stats["chunks_bot_only_skipped"] += 1
             continue
         content_text = compose_chunk_content(chunk, bot_nickname)
@@ -334,11 +341,12 @@ def scan_source(source_path: str | Path) -> dict:
             mem = body.get("memory")
             if not isinstance(mem, list):
                 continue
+            importable = [c for c in mem if _is_importable_chunk(c)]
+            if not importable:
+                continue
             out["sessions"] += 1
-            out["chunks"] += len(mem)
-            out["messages"] += sum(
-                len(c) for c in mem if isinstance(c, list)
-            )
+            out["chunks"] += len(importable)
+            out["messages"] += sum(len(c) for c in importable)
 
     for toml_path, _ns, _p, _u in _iter_toml_files(source):
         out["toml_files"] += 1
@@ -710,16 +718,24 @@ def _host_session_fallback_time(session) -> datetime:
 
 
 def scan_host_sessions(sessions: list) -> dict:
-    """Read-only preview counts for the host-DB import source."""
+    """Read-only preview counts for the host-DB import source.
+
+    Mirrors the write path (``_is_importable_chunk``): only sessions with at
+    least one importable batch are reported, and only importable batches are
+    counted, so the preview matches the rows actually written.
+    """
     out = {"sessions": 0, "chunks": 0, "messages": 0}
     for session in sessions or []:
         key = _host_session_key(session)
         content = _host_session_content(session)
         if not key or not content or not parse_kira_memory_session(key):
             continue
+        importable = [c for c in content if _is_importable_chunk(c)]
+        if not importable:
+            continue
         out["sessions"] += 1
-        out["chunks"] += len(content)
-        out["messages"] += sum(len(c) for c in content if isinstance(c, list))
+        out["chunks"] += len(importable)
+        out["messages"] += sum(len(c) for c in importable)
     return out
 
 
