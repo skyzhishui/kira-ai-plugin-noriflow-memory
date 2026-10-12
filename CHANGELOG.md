@@ -1,6 +1,25 @@
 # Changelog
 
-## Unreleased
+## v1.17.1 (2026-10-12)
+
+### fix: KiraAI v3.0.0 兼容（配置落盘 / 存量迁入 / 声明校准）
+
+对齐 KiraAI v3.0.0-rc.1：
+
+- **配置落盘修复**：维护页设置栏保存延迟 import 的 `PLUGIN_CONFIG_DIR`
+  由已删除的 `core.plugin.plugin_registry` 改到 `core.plugin.manager`——
+  此前该 import 抛错被兜底 except 吞掉，配置只热生效、不落盘，宿主重启
+  回退旧值；
+- **存量迁入新增宿主数据库源**：v3 起 KiraAI 会话入库（`chat_sessions`）、
+  不再更新 `data/memory/chat_memory.json`，文件式迁入无法覆盖升级后新
+  产生的记忆；新增「宿主数据库迁入」（经 `ctx.session_mgr.get_sessions`
+  读取，复用同一 chunk→summary 管线与幂等键，仅迁会话摘要），维护页新增
+  对应卡片；文件迁入保留为 v2 遗留存量通道。内部抽取
+  `build_chat_summary_rows` 供两源共用（消除重复的 chunk 组装逻辑）；
+- **core_version 声明**：`>=2.31.0` → `>=3.0.0rc1`（`>=3.0.0` 会拒绝当前
+  rc.1 预发布版本）；
+- 宿主 `plugin_configs` 内存同步加存在性防御：宿主结构变化时降级为仅
+  落盘 + 告警，而非抛 AttributeError 中断保存。
 
 ### docs: README 口径修正 + 同源描述同步
 
