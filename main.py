@@ -79,7 +79,9 @@ from .kira_memory_import import (
     default_source_path,
     migrate_legacy_import_kv,
     read_last_run,
+    run_host_db_import,
     run_kira_memory_import,
+    scan_host_sessions,
     scan_source,
 )
 from .memory_encoder import MemoryEncoder
@@ -3061,6 +3063,50 @@ class NoriflowMemoryPlugin(BasePlugin):
             "[WebUI] Kira 记忆数据迁入完成: summary_rows=%s fact_rows=%s aliases=%s",
             stats.get("summary_rows"), stats.get("fact_rows"),
             stats.get("aliases_upserted"),
+        )
+        return {"ok": True, "stats": stats}
+
+    @register.api(method="GET", path="/memory/kira_memory/import_host/preview")
+    async def api_kira_memory_import_host_preview(self):
+        """Preview the host-DB import source (KiraAI v3 keeps session memory in its database)."""
+        session_mgr = getattr(self.ctx, "session_mgr", None)
+        if session_mgr is None:
+            raise HTTPException(status_code=503, detail="宿主 session_mgr 不可用")
+        backend = self._pool_or_503()
+        sessions = await session_mgr.get_sessions(include_content=True)
+        return {
+            "source_path": "host_db",
+            "preview": scan_host_sessions(sessions),
+            "last_run": await read_last_run(backend),
+        }
+
+    @register.api(method="POST", path="/memory/kira_memory/import_host")
+    async def api_kira_memory_import_host_run(self):
+        """Import the host database's sessions (conversation summaries only).
+
+        v3 writes session context to the database and stops updating
+        data/memory/chat_memory.json, so this entry point covers memory
+        created after the upgrade; the file-based import stays for the
+        legacy v2 tree.
+        """
+        if getattr(self, "_kira_memory_import_running", False):
+            raise HTTPException(status_code=409, detail="已有一次迁入在执行中")
+        backend = self._pool_or_503()
+        session_mgr = getattr(self.ctx, "session_mgr", None)
+        if session_mgr is None:
+            raise HTTPException(status_code=503, detail="宿主 session_mgr 不可用")
+        _, _, bot_nickname = self._kira_memory_bot_identity()
+        self._kira_memory_import_running = True
+        try:
+            sessions = await session_mgr.get_sessions(include_content=True)
+            stats = await run_host_db_import(
+                backend, sessions=sessions, bot_nickname=bot_nickname,
+            )
+        finally:
+            self._kira_memory_import_running = False
+        logger.info(
+            "[WebUI] 宿主数据库记忆迁入完成: sessions=%s summary_rows=%s",
+            stats.get("sessions"), stats.get("summary_rows"),
         )
         return {"ok": True, "stats": stats}
 

@@ -456,6 +456,61 @@ async def main_async() -> None:
     except FileNotFoundError:
         check("missing_dir_rejected", True)
 
+    # ---- 宿主数据库迁入（v3 会话入库；Session 对象与 record dict 两形态）----
+    host_sessions = [
+        types.SimpleNamespace(
+            sid="discord:dm:20001",
+            content=[[
+                {"role": "user",
+                 "content": "[Sep 12 2026 10:00 Sat] 我今天要加班",
+                 "sender_id": "20001", "sender_name": "Alice"},
+                {"role": "assistant", "content": "<msg><text>辛苦了</text></msg>"},
+            ]],
+            updated_at=1789200000,
+        ),
+        types.SimpleNamespace(
+            sid="discord:gm:30009",
+            content=[[
+                {"role": "user",
+                 "content": "[Sep 12 2026 11:00 Sat] Notice [user_id: system_qzone_task] | 任务"},
+                {"role": "assistant", "content": "<msg />"},
+            ]],
+            updated_at=1789200000,
+        ),
+        {"session_key": "discord:sm:sys",
+         "content": [[{"role": "user", "content": "x"}]]},
+    ]
+    host_preview = ki.scan_host_sessions(host_sessions)
+    check("host_preview_sessions", host_preview["sessions"] == 2, str(host_preview))
+    check("host_preview_chunks", host_preview["chunks"] == 2, str(host_preview))
+
+    host_stats = await ki.run_host_db_import(
+        db, sessions=host_sessions, bot_nickname="Kira",
+    )
+    check("host_stats_source", host_stats["source"] == "host_db", str(host_stats))
+    check("host_stats_sessions", host_stats["sessions"] == 2, str(host_stats))
+    check("host_stats_summary_rows", host_stats["summary_rows"] == 1, str(host_stats))
+    check("host_gm_bot_only_skipped", host_stats["chunks_bot_only_skipped"] == 1,
+          str(host_stats))
+    host_row = dict(await conn.fetchrow(
+        "SELECT * FROM memory_chat_summary WHERE session_id='20001'"))
+    check("host_row_platform", host_row["platform"] == "discord", str(host_row["platform"]))
+    check("host_row_user", host_row["user_id"] == "20001", str(host_row["user_id"]))
+    check("host_row_summarized_false", not host_row["summarized"], str(host_row["summarized"]))
+    check("host_row_content_envelope", 'uid="20001"' in host_row["content"],
+          host_row["content"][:120])
+    check("host_gm_notice_absent", await conn.fetchval(
+        "SELECT count(*) FROM memory_chat_summary WHERE session_id='30009'") == 0)
+
+    host_stats2 = await ki.run_host_db_import(
+        db, sessions=host_sessions, bot_nickname="Kira",
+    )
+    check("host_rerun_idempotent", host_stats2["summary_rows"] == 0
+          and host_stats2["summary_skipped"] == 1, str(host_stats2))
+    host_marker = await ki.read_last_run(db)
+    check("host_marker_source", host_marker is not None
+          and host_marker["source"] == "host_db", str(host_marker))
+
     await db.close()
     tmp.cleanup()
 
