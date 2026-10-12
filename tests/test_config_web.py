@@ -183,13 +183,13 @@ class TestConfigApi(unittest.TestCase):
             async def set_plugin_enabled(self, pid, enabled):
                 self.enabled[pid] = enabled
 
-        # handler 内延迟 import core.plugin.plugin_registry：测试环境 core
+        # handler 内延迟 import core.plugin.manager：测试环境 core
         # 是桩包，预注一个带 PLUGIN_CONFIG_DIR 的桩模块（指向临时目录）
         core_pkg = sys.modules.get("core")
-        if core_pkg is not None and "core.plugin.plugin_registry" not in sys.modules:
-            reg_stub = types.ModuleType("core.plugin.plugin_registry")
-            reg_stub.PLUGIN_CONFIG_DIR = self._tmp_config_dir.name
-            sys.modules["core.plugin.plugin_registry"] = reg_stub
+        if core_pkg is not None and "core.plugin.manager" not in sys.modules:
+            reg_stub = types.ModuleType("core.plugin.manager")
+            reg_stub.PLUGIN_CONFIG_DIR = Path(self._tmp_config_dir.name)
+            sys.modules["core.plugin.manager"] = reg_stub
 
         ctx = self.base.FakeCtx()
         ctx.plugin_mgr = _PM()
@@ -224,7 +224,7 @@ class TestConfigApi(unittest.TestCase):
         self.assertEqual(d["values"]["recall_top_k"], 5)
 
         # PUT：热字段 + restart 字段
-        reg_stub = sys.modules.get("core.plugin.plugin_registry")
+        reg_stub = sys.modules.get("core.plugin.manager")
         if reg_stub is not None:
             reg_stub.PLUGIN_CONFIG_DIR = Path(self._tmp_config_dir.name)
         try:
@@ -233,7 +233,7 @@ class TestConfigApi(unittest.TestCase):
             r = asyncio.run(inst.api_memory_config_put({"values": values}))
         finally:
             if reg_stub is not None:
-                sys.modules.pop("core.plugin.plugin_registry", None)
+                sys.modules.pop("core.plugin.manager", None)
 
         self.assertTrue(r["saved"])
         self.assertEqual(r["changes"], 2)
