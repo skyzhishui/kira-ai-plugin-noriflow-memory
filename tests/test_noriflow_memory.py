@@ -2496,12 +2496,28 @@ class TestPluginTools(unittest.TestCase):
         out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact", top_k=2))
         self.assertEqual(out.count("- 旧名2(9900000002)的朋友是"), 2)
 
-    def test_56n_search_fact_memory_db_unavailable_is_reported(self):
+    def test_56n_search_fact_relation_db_unavailable_fails_open(self):
         inst = self._inst()
         inst._memory_kernel = self._fact_kernel()
+        inst._db.fact_search_rows = [{
+            "id": 1, "platform": "napcat", "user_id": self.ALLOWED_UID,
+            "score": 0.9, "canonical_statement": "喜欢猫",
+            "category": "preference", "status": "active", "evidence_count": 1,
+        }]
         inst._db.edges_exc = mod.MemoryDBUnavailable("db down")
         out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
-        self.assertIn("记忆检索暂时不可用", out)
+        self.assertIn("【事实】", out)
+        self.assertNotIn("记忆检索暂时不可用", out)
+        self.assertNotIn("【关系】", out)
+
+    def test_56n2_search_fact_alias_db_unavailable_keeps_snapshot_edges(self):
+        inst = self._inst()
+        inst._memory_kernel = self._fact_kernel()
+        inst._db.edges = [self._relation_edge(subject=self.ALLOWED_UID)]
+        inst._db.alias_names_exc = mod.MemoryDBUnavailable("db down")
+        out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
+        self.assertIn("【关系】", out)
+        self.assertIn("旧名2(9900000002)", out)
 
     def test_56o_search_fact_with_no_facts_or_relations_reports_combined_empty(self):
         inst = self._inst()
@@ -2558,6 +2574,18 @@ class TestPluginTools(unittest.TestCase):
         inst._db.edges = [self._relation_edge(subject="bot01", object_=self.ALLOWED_UID)]
         out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
         self.assertIn("Kira(bot01)", out)
+
+    def test_56z_search_fact_bot_kernel_fallback_is_preserved(self):
+        inst = self._inst()
+        inst._bot_user_id = ""
+        inst._bot_nickname = "Kira"
+        kernel = self._fact_kernel()
+        kernel.bot_id = "kernel-bot"
+        kernel._bot_uid_forms_all = lambda explicit: [explicit] if explicit else []
+        inst._memory_kernel = kernel
+        inst._db.edges = [self._relation_edge(subject="kernel-bot", object_=self.ALLOWED_UID)]
+        out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
+        self.assertIn("Kira(kernel-bot)", out)
 
     def test_56t_search_fact_platform_recovery_without_session(self):
         inst = self._inst()

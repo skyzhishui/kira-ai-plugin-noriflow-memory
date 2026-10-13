@@ -2273,8 +2273,6 @@ class NoriflowMemoryPlugin(BasePlugin):
                         [f"{target_platform}:{target_uid}"]
                     )
                 ]
-            except MemoryDBUnavailable:
-                raise
             except Exception:
                 logger.warning("memory_search 关系边查询失败（跳过关系小节）", exc_info=True)
 
@@ -2294,8 +2292,6 @@ class NoriflowMemoryPlugin(BasePlugin):
                         endpoint = str(edge.get(f"{side}_uid") or "")
                         if names.get((eplat, endpoint)):
                             edge[f"{side}_name"] = names[(eplat, endpoint)]
-            except MemoryDBUnavailable:
-                raise
             except Exception:
                 logger.warning("memory_search 关系边规范名解析失败（回退快照名）", exc_info=True)
 
@@ -2308,7 +2304,7 @@ class NoriflowMemoryPlugin(BasePlugin):
             bot_uid_forms = getattr(kernel, "_bot_uid_forms_all", None)
             if callable(bot_uid_forms):
                 try:
-                    bot_uid = bot_uid_forms(self._bot_user_id)
+                    bot_uid = bot_uid_forms(bot_uid)
                 except Exception:
                     logger.warning("关系边 bot 标识解析失败（回退主 uid）", exc_info=True)
             for edge in edges[:top_k]:
