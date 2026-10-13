@@ -2239,14 +2239,15 @@ class NoriflowMemoryPlugin(BasePlugin):
         target_platform = resolved[0] if resolved else plat
         target_uid = resolved[1] if resolved else uid
         if not target_platform:
-            row_platforms = {
-                str(row.get("platform") or "") for row in rows
-                if str(row.get("user_id") or "") == target_uid and row.get("platform")
-            }
-            if len(row_platforms) == 1:
-                target_platform = next(iter(row_platforms))
-            elif not rows and target_uid == trigger_uid:
+            if target_uid == trigger_uid and session_platform:
                 target_platform = session_platform
+            else:
+                row_platforms = {
+                    str(row.get("platform") or "") for row in rows
+                    if str(row.get("user_id") or "") == target_uid and row.get("platform")
+                }
+                if len(row_platforms) == 1:
+                    target_platform = next(iter(row_platforms))
         relation_scope_missing = not target_platform
         fact_lines: list[str] = []
         for r in rows:

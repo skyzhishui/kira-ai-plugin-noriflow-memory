@@ -2611,21 +2611,27 @@ class TestPluginTools(unittest.TestCase):
         self.assertEqual(inst._db.edge_calls[0], ("edges", ["qq:" + self.ALLOWED_UID]))
 
     def test_56u_search_fact_unknown_or_ambiguous_platform_is_explicit(self):
-        for platforms in ([], ["qq", "telegram"]):
-            with self.subTest(platforms=platforms):
-                inst = self._inst(extra_cfg={"tool_scope_locked": False})
-                inst._memory_kernel = self._fact_kernel()
-                inst._db.fact_search_rows = [{
-                    "id": i, "platform": p, "user_id": self.ALLOWED_UID,
-                    "score": 1, "canonical_statement": "喜欢猫", "category": "stable",
-                    "status": "active", "evidence_count": 1,
-                } for i, p in enumerate(platforms)]
-                out = asyncio.run(inst.memory_search(
-                    self._tool_event(), query="猫", target="fact", user_id=self.ALLOWED_UID,
-                ) if platforms else inst.memory_search(self._bare_event(), query="猫", target="fact"))
-                self.assertIn("平台", out)
-                self.assertIn("暂不可", out)
-                self.assertEqual(inst._db.edge_calls, [])
+        inst = self._inst(extra_cfg={"tool_scope_locked": False})
+        inst._memory_kernel = self._fact_kernel()
+        inst._db.fact_search_rows = [{
+            "id": i, "platform": p, "user_id": self.ALLOWED_UID,
+            "score": 1, "canonical_statement": "喜欢猫", "category": "stable",
+            "status": "active", "evidence_count": 1,
+        } for i, p in enumerate(("qq", "telegram"))]
+        inst._db.edges = [self._relation_edge(subject=self.ALLOWED_UID, platform="napcat")]
+        out = asyncio.run(inst.memory_search(
+            self._tool_event(), query="猫", target="fact", user_id=self.ALLOWED_UID,
+        ))
+        self.assertIn("【关系】", out)
+        self.assertEqual(inst._db.edge_calls[0], ("edges", ["napcat:" + self.ALLOWED_UID]))
+
+        bare = self._inst(extra_cfg={"tool_scope_locked": False})
+        bare._memory_kernel = self._fact_kernel()
+        bare._db.fact_search_rows = []
+        out = asyncio.run(bare.memory_search(self._bare_event(), query="猫", target="fact"))
+        self.assertIn("平台", out)
+        self.assertIn("暂不可", out)
+        self.assertEqual(bare._db.edge_calls, [])
 
     def test_56v_relation_fake_obeys_empty_scope_and_recent_edge_order(self):
         db = FakeDB()
