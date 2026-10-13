@@ -78,8 +78,11 @@ from .envelope import HISTORY_BATCH_SEPARATOR, format_history_message
 from .kira_memory_import import (
     default_source_path,
     migrate_legacy_import_kv,
+    read_host_last_run,
     read_last_run,
+    run_host_db_import,
     run_kira_memory_import,
+    scan_host_sessions,
     scan_source,
 )
 from .memory_encoder import MemoryEncoder
@@ -3064,6 +3067,50 @@ class NoriflowMemoryPlugin(BasePlugin):
         )
         return {"ok": True, "stats": stats}
 
+    @register.api(method="GET", path="/memory/kira_memory/import_host/preview")
+    async def api_kira_memory_import_host_preview(self):
+        """Preview the host-DB import source (KiraAI v3 keeps session memory in its database)."""
+        session_mgr = getattr(self.ctx, "session_mgr", None)
+        if session_mgr is None:
+            raise HTTPException(status_code=503, detail="宿主 session_mgr 不可用")
+        backend = self._pool_or_503()
+        sessions = await session_mgr.get_sessions(include_content=True)
+        return {
+            "source_path": "host_db",
+            "preview": scan_host_sessions(sessions),
+            "last_run": await read_host_last_run(backend),
+        }
+
+    @register.api(method="POST", path="/memory/kira_memory/import_host")
+    async def api_kira_memory_import_host_run(self):
+        """Import the host database's sessions (conversation summaries only).
+
+        v3 writes session context to the database and stops updating
+        data/memory/chat_memory.json, so this entry point covers memory
+        created after the upgrade; the file-based import stays for the
+        legacy v2 tree.
+        """
+        if getattr(self, "_kira_memory_import_running", False):
+            raise HTTPException(status_code=409, detail="已有一次迁入在执行中")
+        backend = self._pool_or_503()
+        session_mgr = getattr(self.ctx, "session_mgr", None)
+        if session_mgr is None:
+            raise HTTPException(status_code=503, detail="宿主 session_mgr 不可用")
+        _, _, bot_nickname = self._kira_memory_bot_identity()
+        self._kira_memory_import_running = True
+        try:
+            sessions = await session_mgr.get_sessions(include_content=True)
+            stats = await run_host_db_import(
+                backend, sessions=sessions, bot_nickname=bot_nickname,
+            )
+        finally:
+            self._kira_memory_import_running = False
+        logger.info(
+            "[WebUI] 宿主数据库记忆迁入完成: sessions=%s summary_rows=%s",
+            stats.get("sessions"), stats.get("summary_rows"),
+        )
+        return {"ok": True, "stats": stats}
+
     # ------------------------------------------------------------------
     #  设置栏（插件配置读写：真相源在宿主，运行时实例就地热更新）
     # ------------------------------------------------------------------
@@ -3142,10 +3189,20 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 2) 宿主真相源同步：内存 dict（宿主配置页/下次 init_plugin 读）+ 磁盘
         merged_host = dict(host_values)
         merged_host.update(changed)
-        pm.plugin_configs[pid] = merged_host
+        # Do NOT use pm.update_plugin_config: it calls init_plugin and tears down
+        # the running plugin (pools/background tasks); sync the in-memory dict
+        # defensively instead, degrading to disk-only + warning if it is absent.
+        if isinstance(getattr(pm, "plugin_configs", None), dict):
+            pm.plugin_configs[pid] = merged_host
+        else:
+            logger.warning(
+                "宿主 PluginManager 未暴露 plugin_configs，内存配置未同步"
+                "（磁盘写入仍会执行，宿主重启后生效）"
+            )
         persistence_error = ""
         try:
-            from core.plugin.plugin_registry import PLUGIN_CONFIG_DIR
+            # v3: plugin_registry was removed; PLUGIN_CONFIG_DIR moved to core.plugin.manager
+            from core.plugin.manager import PLUGIN_CONFIG_DIR
 
             config_web.persist_host_config(
                 PLUGIN_CONFIG_DIR, pid, changed, host_values

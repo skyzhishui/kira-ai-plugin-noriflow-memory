@@ -183,13 +183,13 @@ class TestConfigApi(unittest.TestCase):
             async def set_plugin_enabled(self, pid, enabled):
                 self.enabled[pid] = enabled
 
-        # handler 内延迟 import core.plugin.plugin_registry：测试环境 core
+        # handler 内延迟 import core.plugin.manager：测试环境 core
         # 是桩包，预注一个带 PLUGIN_CONFIG_DIR 的桩模块（指向临时目录）
         core_pkg = sys.modules.get("core")
-        if core_pkg is not None and "core.plugin.plugin_registry" not in sys.modules:
-            reg_stub = types.ModuleType("core.plugin.plugin_registry")
-            reg_stub.PLUGIN_CONFIG_DIR = self._tmp_config_dir.name
-            sys.modules["core.plugin.plugin_registry"] = reg_stub
+        if core_pkg is not None and "core.plugin.manager" not in sys.modules:
+            reg_stub = types.ModuleType("core.plugin.manager")
+            reg_stub.PLUGIN_CONFIG_DIR = Path(self._tmp_config_dir.name)
+            sys.modules["core.plugin.manager"] = reg_stub
 
         ctx = self.base.FakeCtx()
         ctx.plugin_mgr = _PM()
@@ -224,7 +224,7 @@ class TestConfigApi(unittest.TestCase):
         self.assertEqual(d["values"]["recall_top_k"], 5)
 
         # PUT：热字段 + restart 字段
-        reg_stub = sys.modules.get("core.plugin.plugin_registry")
+        reg_stub = sys.modules.get("core.plugin.manager")
         if reg_stub is not None:
             reg_stub.PLUGIN_CONFIG_DIR = Path(self._tmp_config_dir.name)
         try:
@@ -233,7 +233,7 @@ class TestConfigApi(unittest.TestCase):
             r = asyncio.run(inst.api_memory_config_put({"values": values}))
         finally:
             if reg_stub is not None:
-                sys.modules.pop("core.plugin.plugin_registry", None)
+                sys.modules.pop("core.plugin.manager", None)
 
         self.assertTrue(r["saved"])
         self.assertEqual(r["changes"], 2)
@@ -262,6 +262,39 @@ class TestConfigApi(unittest.TestCase):
         host_now = dict(inst.ctx.plugin_mgr.get_plugin_config("kira-ai-plugin-noriflow-memory"))
         r = asyncio.run(inst.api_memory_config_put({"values": host_now}))
         self.assertFalse(r["saved"])
+
+    def test_import_previews_read_separate_source_history(self):
+        file_marker = {"source_path": self._tmp_config_dir.name, "summary_rows": 3}
+        host_marker = {"source": "host_db", "source_path": "host_db", "summary_rows": 7}
+        markers = {
+            "kira_memory_import_last_run": json.dumps(file_marker),
+            "kira_memory_host_import_last_run": json.dumps(host_marker),
+        }
+
+        async def get_kv(key):
+            return markers.get(key)
+
+        async def get_sessions(*, include_content):
+            return []
+
+        backend = types.SimpleNamespace(get_kv=get_kv)
+        inst = types.SimpleNamespace(
+            ctx=types.SimpleNamespace(session_mgr=types.SimpleNamespace(get_sessions=get_sessions)),
+            _pool_or_503=lambda: backend,
+            _plugin_data_dir=lambda: self._tmp_config_dir.name,
+        )
+        (Path(self._tmp_config_dir.name) / "chat_memory.json").write_text("{}", encoding="utf-8")
+
+        async def preview_both():
+            file_result = await self.mod.NoriflowMemoryPlugin.api_kira_memory_import_preview(
+                inst, source_path=self._tmp_config_dir.name,
+            )
+            host_result = await self.mod.NoriflowMemoryPlugin.api_kira_memory_import_host_preview(inst)
+            return file_result, host_result
+
+        file_result, host_result = asyncio.run(preview_both())
+        self.assertEqual(file_result["last_run"], file_marker)
+        self.assertEqual(host_result["last_run"], host_marker)
 
 
 if __name__ == "__main__":
