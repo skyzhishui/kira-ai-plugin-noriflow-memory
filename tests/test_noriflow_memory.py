@@ -2433,7 +2433,8 @@ class TestPluginTools(unittest.TestCase):
         inst._db.edges_exc = RuntimeError("edge unavailable")
         out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
         self.assertIn("【事实】", out)
-        self.assertNotIn("【关系】", out)
+        self.assertIn("【关系】", out)
+        self.assertIn("关系边暂不可查询", out)
 
     def test_56g_search_fact_alias_failure_keeps_snapshot_names(self):
         inst = self._inst()
@@ -2518,7 +2519,8 @@ class TestPluginTools(unittest.TestCase):
         out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
         self.assertIn("【事实】", out)
         self.assertNotIn("记忆检索暂时不可用", out)
-        self.assertNotIn("【关系】", out)
+        self.assertIn("【关系】", out)
+        self.assertIn("关系边暂不可查询", out)
 
     def test_56n2_search_fact_alias_db_unavailable_keeps_snapshot_edges(self):
         inst = self._inst()
