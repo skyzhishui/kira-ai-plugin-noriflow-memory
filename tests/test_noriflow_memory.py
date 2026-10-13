@@ -138,6 +138,11 @@ class FakeDB:
         self.summary_search_kwargs = None
         self.fact_search_rows = []        # memory_lookup fact 检索桩
         self.fact_search_kwargs = None
+        self.edges = []
+        self.alias_names = {}
+        self.edges_exc = None
+        self.alias_names_exc = None
+        self.edge_calls = []
 
     async def connect(self):
         self.connect_calls += 1
@@ -184,6 +189,40 @@ class FakeDB:
                 ("replaced", "dead", "pending_uncertain")
             ]
         return rows
+
+    async def fetch_active_edges(self, node_keys, bot_keys=""):
+        self.edge_calls.append(("edges", list(node_keys)))
+        if self.edges_exc is not None:
+            raise self.edges_exc
+        keys = {str(k) for k in (node_keys or []) if k}
+        keys.update(str(k) for k in (bot_keys or []) if k)
+        rows = [
+            dict(e) for e in self.edges
+            if e.get("status", "active") == "active" and (
+                f"{e.get('platform') or ''}:{e.get('subject_uid') or ''}" in keys
+                or f"{e.get('platform') or ''}:{e.get('object_uid') or ''}" in keys
+            )
+        ]
+        return sorted(
+            rows,
+            key=lambda e: (
+                int(e.get("evidence_count") or 0),
+                str(e.get("last_seen") or ""),
+            ),
+            reverse=True,
+        )[:64]
+
+    async def fetch_alias_names_by_owner(self, owners=None):
+        all_owners = owners is None
+        owners = list(owners or [])
+        self.edge_calls.append(("alias_names", owners))
+        if self.alias_names_exc is not None:
+            raise self.alias_names_exc
+        owner_set = set(owners)
+        return {
+            key: value for key, value in self.alias_names.items()
+            if all_owners or key in owner_set
+        }
 
     async def apply_fact_merge(self, **kwargs):
         self.applied_merges.append(kwargs)
@@ -2315,6 +2354,279 @@ class TestPluginTools(unittest.TestCase):
             embedding_service = EmbSvc()
 
         return Kernel()
+
+    def _fact_kernel(self, entries=None, qualifier=None):
+        class EmbSvc:
+            async def embed_one(self, text):
+                return [1.0]
+
+        class Kernel:
+            embedding_service = EmbSvc()
+
+            async def entity_hint_entries(self, sid, text):
+                return list(entries or [])
+
+            def _edge_time_qualifier(self, value):
+                if qualifier is not None:
+                    return qualifier
+                return ""
+
+        return Kernel()
+
+    def _relation_edge(self, subject="u2", object_="u3", platform="napcat"):
+        return {
+            "platform": platform,
+            "subject_uid": subject,
+            "object_uid": object_,
+            "subject_name": "旧名2",
+            "object_name": "旧名3",
+            "relation_label": "朋友",
+            "last_seen": datetime(2026, 10, 13, 12, 0),
+            "evidence_count": 2,
+        }
+
+    def test_56c_search_fact_attaches_relations_for_named_member(self):
+        inst = self._inst()
+        inst._memory_kernel = self._fact_kernel([("小李", "qq", "u2")])
+        inst._db.fact_search_rows = [{
+            "id": 1, "platform": "qq", "user_id": "u2", "score": 0.9,
+            "canonical_statement": "喜欢猫", "category": "preference",
+            "status": "active", "evidence_count": 2,
+        }]
+        inst._db.edges = [self._relation_edge(platform="qq")]
+        inst._db.alias_names = {("qq", "u2"): "小李", ("qq", "u3"): "小王"}
+        out = asyncio.run(inst.memory_search(
+            self._tool_event(), query="猫", target="fact", name="小李",
+        ))
+        self.assertIn("【事实】", out)
+        self.assertIn("【关系】", out)
+        self.assertIn("小李(u2)的朋友是小王(u3)", out)
+        self.assertEqual(inst._db.edge_calls[0], ("edges", ["qq:u2"]))
+        self.assertEqual(inst._db.edge_calls[1], ("alias_names", [("qq", "u2"), ("qq", "u3")]))
+
+    def test_56d_search_fact_without_name_attaches_triggerer_relations(self):
+        inst = self._inst()
+        inst._memory_kernel = self._fact_kernel()
+        inst._db.edges = [self._relation_edge(subject=self.ALLOWED_UID, object_="u3")]
+        out = asyncio.run(inst.memory_search(
+            self._tool_event(), query="猫", target="fact",
+        ))
+        self.assertIn("【关系】", out)
+        self.assertEqual(inst._db.edge_calls[0], ("edges", ["napcat:9900000002"]))
+
+    def test_56e_search_fact_with_only_relations_returns_relation_section(self):
+        inst = self._inst()
+        inst._memory_kernel = self._fact_kernel()
+        inst._db.edges = [self._relation_edge(subject=self.ALLOWED_UID, object_="u3")]
+        out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
+        self.assertTrue(out.startswith("【关系】"))
+        self.assertNotIn("没有找到相关事实", out)
+
+    def test_56f_search_fact_relation_lookup_fail_open(self):
+        inst = self._inst()
+        inst._memory_kernel = self._fact_kernel()
+        inst._db.fact_search_rows = [{
+            "id": 1, "platform": "napcat", "user_id": self.ALLOWED_UID,
+            "score": 0.9, "canonical_statement": "喜欢猫",
+            "category": "preference", "status": "active", "evidence_count": 1,
+        }]
+        inst._db.edges_exc = RuntimeError("edge unavailable")
+        out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
+        self.assertIn("【事实】", out)
+        self.assertNotIn("【关系】", out)
+
+    def test_56g_search_fact_alias_failure_keeps_snapshot_names(self):
+        inst = self._inst()
+        inst._memory_kernel = self._fact_kernel([("小李", "napcat", "u2")])
+        inst._db.edges = [self._relation_edge()]
+        inst._db.alias_names_exc = RuntimeError("aliases unavailable")
+        out = asyncio.run(inst.memory_search(
+            self._tool_event(), query="猫", target="fact", name="小李",
+        ))
+        self.assertIn("旧名2(u2)的朋友是旧名3(u3)", out)
+
+    def test_56h_search_fact_reuses_kernel_edge_time_qualifier(self):
+        inst = self._inst()
+        inst._memory_kernel = self._fact_kernel(qualifier="截至10月13日")
+        inst._db.edges = [self._relation_edge(subject=self.ALLOWED_UID)]
+        out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
+        self.assertIn("截至10月13日", out)
+
+    def test_56i_search_fact_malformed_edge_time_keeps_fact_results(self):
+        inst = self._inst()
+        inst._memory_kernel = self._fact_kernel()
+        inst._db.fact_search_rows = [{
+            "id": 1, "platform": "napcat", "user_id": self.ALLOWED_UID,
+            "score": 0.9, "canonical_statement": "喜欢猫",
+            "category": "preference", "status": "active", "evidence_count": 1,
+        }]
+        inst._db.edges = [self._relation_edge(subject=self.ALLOWED_UID)]
+        inst._memory_kernel._edge_time_qualifier = lambda value: (_ for _ in ()).throw(AttributeError("bad"))
+        out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
+        self.assertIn("【事实】", out)
+        self.assertIn("【关系】", out)
+        self.assertNotIn("截至", out)
+
+    def test_56j_search_category_relation_is_rejected(self):
+        inst = self._inst()
+        for target in ("fact", "summary"):
+            out = asyncio.run(inst.memory_search(self._tool_event(), query="关系", target=target, category="relation"))
+            self.assertIn("category 只能是", out)
+            self.assertNotIn("relation", out)
+
+    def test_56k_search_category_enum_has_no_relation(self):
+        tool = next(t for t in mod.register.tools if t["name"] == "memory_search")
+        enum = tool["params"]["properties"]["category"]["enum"]
+        self.assertNotIn("relation", enum)
+        self.assertEqual(set(enum), set(mod._ACTIVE_CATEGORIES))
+        self.assertNotIn("query", tool["params"].get("required", []))
+
+    def test_56l_search_fact_skips_relation_header_when_all_edges_fail_rendering(self):
+        inst = self._inst()
+        inst._memory_kernel = self._fact_kernel()
+        inst._db.edges = [self._relation_edge(subject=self.ALLOWED_UID)]
+        with unittest.mock.patch.object(mod, "relation_statement_line", side_effect=RuntimeError("bad edge")):
+            out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
+        self.assertNotIn("【关系】", out)
+
+    def test_56m_search_fact_limits_relation_edges_to_top_k(self):
+        inst = self._inst()
+        inst._memory_kernel = self._fact_kernel()
+        inst._db.edges = [self._relation_edge(subject=self.ALLOWED_UID, object_=f"u{i}") for i in range(3)]
+        out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact", top_k=2))
+        self.assertEqual(out.count("- 旧名2(9900000002)的朋友是"), 2)
+
+    def test_56n_search_fact_memory_db_unavailable_is_reported(self):
+        inst = self._inst()
+        inst._memory_kernel = self._fact_kernel()
+        inst._db.edges_exc = mod.MemoryDBUnavailable("db down")
+        out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
+        self.assertIn("记忆检索暂时不可用", out)
+
+    def test_56o_search_fact_with_no_facts_or_relations_reports_combined_empty(self):
+        inst = self._inst()
+        inst._memory_kernel = self._fact_kernel()
+        out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
+        self.assertEqual(out, "没有找到相关事实或关系。")
+
+    def test_56p_search_fact_recovers_platform_for_explicit_scope(self):
+        inst = self._inst(extra_cfg={"tool_scope_locked": False})
+        inst._memory_kernel = self._fact_kernel()
+        inst._db.fact_search_rows = [{
+            "id": 1, "platform": "napcat", "user_id": self.ALLOWED_UID,
+            "score": 0.9, "canonical_statement": "喜欢猫",
+            "category": "preference", "status": "active", "evidence_count": 1,
+        }]
+        inst._db.edges = [self._relation_edge(subject=self.ALLOWED_UID)]
+        out = asyncio.run(inst.memory_search(
+            self._tool_event(), query="猫", target="fact",
+            session_id="other-session", user_id=self.ALLOWED_UID,
+        ))
+        self.assertIn("【关系】", out)
+        self.assertEqual(inst._db.edge_calls[0], ("edges", ["napcat:" + self.ALLOWED_UID]))
+        self.assertEqual(inst._db.fact_search_kwargs["platform"], "")
+
+    def test_56q_search_fact_relation_anchor_does_not_use_last_fact_row_owner(self):
+        inst = self._inst()
+        inst._memory_kernel = self._fact_kernel()
+        inst._db.fact_search_rows = [
+            {"id": 1, "platform": "napcat", "user_id": self.ALLOWED_UID,
+             "score": 0.9, "canonical_statement": "事实1", "category": "stable",
+             "status": "active", "evidence_count": 1},
+            {"id": 2, "platform": "napcat", "user_id": "other",
+             "score": 0.8, "canonical_statement": "事实2", "category": "stable",
+             "status": "active", "evidence_count": 1},
+        ]
+        inst._db.edges = [self._relation_edge(subject=self.ALLOWED_UID)]
+        asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
+        self.assertEqual(inst._db.edge_calls[0], ("edges", ["napcat:" + self.ALLOWED_UID]))
+
+    def test_56r_search_fact_named_member_allows_empty_query(self):
+        inst = self._inst()
+        inst._memory_kernel = self._fact_kernel([("小李", "qq", "u2")])
+        inst._db.edges = [self._relation_edge(platform="qq")]
+        out = asyncio.run(inst.memory_search(
+            self._tool_event(), target="fact", name="小李",
+        ))
+        self.assertIn("【关系】", out)
+
+    def test_56s_search_fact_renders_bot_endpoint_with_bot_nickname(self):
+        inst = self._inst()
+        inst._bot_user_id = "bot01"
+        inst._bot_nickname = "Kira"
+        inst._memory_kernel = self._fact_kernel()
+        inst._db.edges = [self._relation_edge(subject="bot01", object_=self.ALLOWED_UID)]
+        out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
+        self.assertIn("Kira(bot01)", out)
+
+    def test_56t_search_fact_platform_recovery_without_session(self):
+        inst = self._inst()
+        inst._memory_kernel = self._fact_kernel()
+        inst._db.fact_search_rows = [{
+            "id": 1, "platform": "qq", "user_id": self.ALLOWED_UID,
+            "score": 1, "canonical_statement": "喜欢猫", "category": "stable",
+            "status": "active", "evidence_count": 1,
+        }]
+        inst._db.edges = [self._relation_edge(subject=self.ALLOWED_UID, platform="qq")]
+        out = asyncio.run(inst.memory_search(self._bare_event(), query="猫", target="fact"))
+        self.assertIn("【事实】", out)
+        self.assertIn("【关系】", out)
+        self.assertEqual(inst._db.edge_calls[0], ("edges", ["qq:" + self.ALLOWED_UID]))
+
+    def test_56u_search_fact_unknown_or_ambiguous_platform_is_explicit(self):
+        for platforms in ([], ["qq", "telegram"]):
+            with self.subTest(platforms=platforms):
+                inst = self._inst(extra_cfg={"tool_scope_locked": False})
+                inst._memory_kernel = self._fact_kernel()
+                inst._db.fact_search_rows = [{
+                    "id": i, "platform": p, "user_id": self.ALLOWED_UID,
+                    "score": 1, "canonical_statement": "喜欢猫", "category": "stable",
+                    "status": "active", "evidence_count": 1,
+                } for i, p in enumerate(platforms)]
+                out = asyncio.run(inst.memory_search(
+                    self._tool_event(), query="猫", target="fact", user_id=self.ALLOWED_UID,
+                ) if platforms else inst.memory_search(self._bare_event(), query="猫", target="fact"))
+                self.assertIn("平台", out)
+                self.assertIn("暂不可", out)
+                self.assertEqual(inst._db.edge_calls, [])
+
+    def test_56v_relation_fake_obeys_empty_scope_and_recent_edge_order(self):
+        db = FakeDB()
+        db.edges = [self._relation_edge(), self._relation_edge(object_="u4")]
+        db.edges[1]["last_seen"] += timedelta(days=1)
+        self.assertEqual(asyncio.run(db.fetch_active_edges([])), [])
+        self.assertEqual(asyncio.run(db.fetch_active_edges(["napcat:u2"]))[0]["object_uid"], "u4")
+        db.alias_names = {("napcat", "u2"): "小李"}
+        self.assertEqual(asyncio.run(db.fetch_alias_names_by_owner([])), {})
+        self.assertEqual(asyncio.run(db.fetch_alias_names_by_owner(None)), db.alias_names)
+
+    def test_56w_search_fact_bot_uid_on_other_platform_keeps_member_name(self):
+        inst = self._inst()
+        inst._bot_user_id = "bot01"
+        inst._bot_nickname = "Kira"
+        inst._memory_kernel = self._fact_kernel([("小李", "qq", "u2")])
+        inst._db.edges = [self._relation_edge(object_="bot01", platform="qq")]
+        out = asyncio.run(inst.memory_search(self._tool_event(), target="fact", name="小李"))
+        self.assertIn("旧名3(bot01)", out)
+        self.assertNotIn("Kira(bot01)", out)
+
+    def test_56x_search_fact_relation_top_k_clamping(self):
+        for top_k, count in ((-1, 1), (0, 5), (None, 5), ("bad", 5), (100, 10)):
+            with self.subTest(top_k=top_k):
+                inst = self._inst()
+                inst._memory_kernel = self._fact_kernel()
+                inst._db.edges = [self._relation_edge(subject=self.ALLOWED_UID, object_=str(i)) for i in range(12)]
+                out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact", top_k=top_k))
+                self.assertEqual(out.count("- "), count)
+
+    def test_56y_search_fact_one_alias_update_and_owner_dedup(self):
+        inst = self._inst()
+        inst._memory_kernel = self._fact_kernel([("小李", "qq", "u2")])
+        inst._db.edges = [self._relation_edge(platform="qq"), self._relation_edge(platform="qq")]
+        inst._db.alias_names = {("qq", "u2"): "新名2"}
+        out = asyncio.run(inst.memory_search(self._tool_event(), target="fact", name="小李"))
+        self.assertIn("新名2(u2)的朋友是旧名3(u3)", out)
+        self.assertEqual(inst._db.edge_calls[1], ("alias_names", [("qq", "u2"), ("qq", "u3")]))
 
     def test_55h_write_replaces_same_day_revert(self):
         # 同日改回旧说法回归锁：原语句当日已写入（行已消费，乐观锁

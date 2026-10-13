@@ -74,6 +74,7 @@ from .clients import FastLlmExit, KiraEmbeddingClient, KiraRerankClient
 from .config import LocalMemoryConfig
 from .contracts import PersonaCandidate
 from .db import MemoryDatabase, SQLiteMemoryDatabase, resolve_backend_name
+from .entity_edge import relation_statement_line
 from .envelope import HISTORY_BATCH_SEPARATOR, format_history_message
 from .kira_memory_import import (
     default_source_path,
@@ -86,7 +87,7 @@ from .kira_memory_import import (
     scan_source,
 )
 from .memory_encoder import MemoryEncoder
-from .memory_kernel import LocalMemoryKernel
+from .memory_kernel import LocalMemoryKernel, MemoryDBUnavailable
 from .merge_agent import FactMergeAgent
 from .persona_service import LocalPersonaService
 from .recall_log import RecallLogWriter
@@ -108,7 +109,7 @@ ALL_TOOLS = _LEGACY_TOOLS + _PARITY_TOOLS
 _ACTIVE_CATEGORIES = (
     "identity", "stable", "preference", "commitment", "interaction", "naming",
 )
-_SEARCH_CATEGORIES = _ACTIVE_CATEGORIES + ("relation",)
+_SEARCH_CATEGORIES = _ACTIVE_CATEGORIES
 _CATEGORY_HINTS = {
     "identity": "他是谁（职业/身份/自我定位）",
     "stable": "既成事实（住址、宠物、经历、习惯）",
@@ -116,7 +117,6 @@ _CATEGORY_HINTS = {
     "commitment": "带日期的约定（答应的事、约好的活动）",
     "interaction": "怎么和他相处（节奏、边界、忌讳）",
     "naming": "称呼偏好（想被怎么叫、反感什么称呼）",
-    "relation": "此人的人际关系（谁—关系→谁）",
 }
 _MAX_TOP_K = 10
 _MAX_STATEMENT_CHARS = 200
@@ -130,6 +130,8 @@ _MEMORY_TOOLS_GUIDANCE = (
     "跨会话记忆注意时间与当事人：别人的经历不等于当前用户的，同"
     "名不等于同一人。被问到某个具体人物（含群友代号/昵称）时，用 "
     "memory_search(target=\"fact\", name=称呼) 查该成员的事实结论，"
+    "结果中的【关系】小节就是该成员的确切关系边，直接据此回答谁和谁是什么"
+    "关系，不要根据事实簇臆测。"
     "用 memory_profile 查完整画像。memory_search 查对话与事实结论，"
     "memory_lookup 查归档/失效的记忆，memory_profile 按名字查"
     "成员画像，memory_write 仅在用户明确要求记住时调用，答应记"
@@ -1993,6 +1995,7 @@ class NoriflowMemoryPlugin(BasePlugin):
             "多轮对话合并计分出的人物结论，score 为确信度，仅返回生效"
             "中的簇，是「这个人怎样」的结论级材料）。查「我们聊过/发生"
             "过什么」用 summary；查「某人有什么特点/偏好/约定」用 fact。"
+            "查某个成员时，fact 结果会一并返回该成员的确切人际关系边。"
             "query 用简洁关键词，不要复述整句用户消息；第一次不够就换"
             "关键词再查。"
         ),
@@ -2001,14 +2004,17 @@ class NoriflowMemoryPlugin(BasePlugin):
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "检索关键词（简洁短语或实体名）",
+                    "description": (
+                        "检索关键词（简洁短语或实体名）；target=fact 且传 name 时可省略，"
+                        "将按成员称呼检索"
+                    ),
                 },
                 "target": {
                     "type": "string",
                     "enum": ["summary", "fact"],
                     "description": (
                         "检索目标，默认 summary。查某个具体人物"
-                        "的特点/偏好/约定/身份等结论时必须选 "
+                        "的特点/偏好/约定/身份或关系时必须选 "
                         "fact，并同时传 name（成员称呼）——"
                         "不传 name 时 fact 只查触发者本人"
                     ),
@@ -2030,15 +2036,14 @@ class NoriflowMemoryPlugin(BasePlugin):
                     "description": (
                         "仅 target=fact：成员称呼（支持历史昵称与"
                         "群内代号，如 xxy）。查某人的事实结论必传"
-                        "；category=relation 时必填（返回该成员的"
-                        "关系边）"
+                        "；查某人时其人际关系会随 fact 附带返回"
                     ),
                 },
                 "top_k": {"type": "number", "description": "返回条数上限，默认 5，最大 10"},
                 "session_id": {"type": "string", "description": "会话 ID（裸会话 ID；提供则按会话检索；不填默认当前会话）"},
                 "user_id": {"type": "string", "description": "用户 ID（提供则按用户跨会话检索）"},
             },
-            "required": ["query"],
+            "required": [],
         },
     )
     # The framework invokes tools as func(event, **args): the first parameter
@@ -2047,7 +2052,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         self,
         event,
         *_,
-        query: str,
+        query: str = "",
         target: str = "summary",
         category: str = "",
         name: str = "",
@@ -2069,7 +2074,7 @@ class NoriflowMemoryPlugin(BasePlugin):
             return "错误：target 只能是 summary 或 fact。"
         if category and category not in _SEARCH_CATEGORIES:
             return f"错误：category 只能是 {'/'.join(_SEARCH_CATEGORIES)}。"
-        if not query and not (category == "relation" and name):
+        if not query and not (target == "fact" and name):
             return "query 不能为空"
         sid = (session_id or "").strip()
         uid = (user_id or "").strip()
@@ -2095,16 +2100,23 @@ class NoriflowMemoryPlugin(BasePlugin):
         entity_sid = str(
             getattr(getattr(event, "session", None), "sid", "") or ""
         ) or sid
-        if target == "fact" or (target == "summary" and category == "relation"):
+        if target == "fact":
             # 批次事件（框架工具分发形态）_event_scope 取不到 uid；fact
             # 通道要求触发者锚定，回退 _trigger_user（与召回同款约定）。
             # 仅作用于事实路——summary 会话检索的 user_id 传参口径不变
+            trigger_uid, session_platform = self._trigger_user(event)
             if not uid:
-                uid, _ = self._trigger_user(event)
-            return await self._tool_search_facts(
-                kernel, query, top_k, category, name, sid, uid, plat,
-                entity_sid=entity_sid,
-            )
+                uid = trigger_uid
+            try:
+                return await self._tool_search_facts(
+                    kernel, query, top_k, category, name, sid, uid, plat,
+                    entity_sid=entity_sid,
+                    session_platform=session_platform,
+                    trigger_uid=trigger_uid,
+                )
+            except MemoryDBUnavailable:
+                logger.warning("memory_search 关系边查询命中不可用库", exc_info=True)
+                return "记忆检索暂时不可用，请稍后再试"
         # Asking-about-others recall: match the query against the entity
         # dictionary + persistent aliases; the keys then join the main search
         # path. Isolation posture follows summary_recall_session_scoped via
@@ -2160,6 +2172,18 @@ class NoriflowMemoryPlugin(BasePlugin):
             name = name[:23] + "…"
         return f"{name}（{uid}）" if name else f"（{uid}）"
 
+    def _format_edge_time(self, value: object) -> str:
+        """Format an edge timestamp through the kernel's configured timezone."""
+        helper = getattr(self._memory_kernel, "_edge_time_qualifier", None)
+        if callable(helper):
+            try:
+                return str(helper(value) or "")
+            except Exception:
+                logger.warning("关系边时间格式化失败（回退无时限）", exc_info=True)
+        else:
+            logger.debug("kernel 无关系边时间 helper（回退无时限）")
+        return ""
+
     async def _tool_search_facts(
         self,
         kernel,
@@ -2171,8 +2195,10 @@ class NoriflowMemoryPlugin(BasePlugin):
         uid: str,
         plat: str,
         entity_sid: str = "",
+        session_platform: str = "",
+        trigger_uid: str = "",
     ) -> str:
-        """The fact/relation channel of memory_search (aligned with nori _search_facts).
+        """The fact channel of memory_search with attached active relation edges.
 
         Scope lock: with a name, narrow to that member via entity resolution;
         without a name, anchor to the trigger user, and refuse retrieval when
@@ -2192,35 +2218,6 @@ class NoriflowMemoryPlugin(BasePlugin):
                 return hint
         elif not uid:
             return "错误：缺少用户定位，拒绝检索（作用域锁定）。"
-        if category == "relation":
-            if not name:
-                return "错误：category=relation 需要提供 name（成员名字）。"
-            if resolved is None:
-                return "错误：名字解析失败。"
-            r_plat, r_uid = resolved
-            try:
-                # fetch_active_edges 收 "platform:uid" 复合键列表——传裸值
-                # 会被逐字符展开、条件恒不命中（按成员查关系永远空）
-                edges = await db.fetch_active_edges([f"{r_plat}:{r_uid}"])
-            except Exception:
-                logger.warning("关系边检索失败", exc_info=True)
-                return "记忆检索暂时不可用，请稍后再试"
-            if query:
-                needle = query.strip()
-                edges = [
-                    e for e in edges
-                    if needle in str(e.get("relation_label") or "")
-                    or needle in str(e.get("statement") or "")
-                ]
-            if not edges:
-                return f"没有查到「{name}」的关系记录。"
-            lines = []
-            for e in edges[:top_k]:
-                lines.append(
-                    f"- {str(e.get('statement') or '')[:400]}"
-                    f"（{e.get('evidence_count')} 次证据）"
-                )
-            return "\n".join(lines)
         try:
             query_vec = await kernel.embedding_service.embed_one(query or name)
         except Exception:
@@ -2239,25 +2236,99 @@ class NoriflowMemoryPlugin(BasePlugin):
         except Exception:
             logger.warning("事实簇检索失败", exc_info=True)
             return "记忆检索暂时不可用，请稍后再试"
-        if not rows:
-            return "没有找到相关事实。"
-        lines = []
+        target_platform = resolved[0] if resolved else plat
+        target_uid = resolved[1] if resolved else uid
+        if not target_platform:
+            row_platforms = {
+                str(row.get("platform") or "") for row in rows
+                if str(row.get("user_id") or "") == target_uid and row.get("platform")
+            }
+            if len(row_platforms) == 1:
+                target_platform = next(iter(row_platforms))
+            elif not rows and target_uid == trigger_uid:
+                target_platform = session_platform
+        relation_scope_missing = not target_platform
+        fact_lines: list[str] = []
         for r in rows:
             # user_id 与 platform 同口径 .get 兜底（防缺列行 KeyError 带走
             # 整次检索）；缺 uid 不输出归属段（（空）占位无信息量）
-            uid = r.get("user_id") or ""
+            row_uid = r.get("user_id") or ""
             owner = (
-                f"{self._owner_label(r.get('platform') or plat, uid)} "
-                if uid
+                f"{self._owner_label(r.get('platform') or target_platform, row_uid)} "
+                if row_uid
                 else ""
             )
-            lines.append(
+            fact_lines.append(
                 f"- [簇{r['id']}] ({float(r['score']):.1f}分) "
                 f"{owner}"
                 f"{str(r['canonical_statement'] or '')[:400]}"
                 f"（{r['category']}，{r['status']}，证据{r['evidence_count']}次）"
             )
-        return "\n".join(lines)
+
+        edges: list[dict] = []
+        if not relation_scope_missing:
+            try:
+                edges = [
+                    dict(e) for e in await db.fetch_active_edges(
+                        [f"{target_platform}:{target_uid}"]
+                    )
+                ]
+            except MemoryDBUnavailable:
+                raise
+            except Exception:
+                logger.warning("memory_search 关系边查询失败（跳过关系小节）", exc_info=True)
+
+        if edges:
+            owners: set[tuple[str, str]] = {(target_platform, target_uid)}
+            for edge in edges:
+                eplat = str(edge.get("platform") or target_platform)
+                for side in ("subject", "object"):
+                    endpoint = str(edge.get(f"{side}_uid") or "")
+                    if endpoint:
+                        owners.add((eplat, endpoint))
+            try:
+                names = await db.fetch_alias_names_by_owner(sorted(owners)) or {}
+                for edge in edges:
+                    eplat = str(edge.get("platform") or target_platform)
+                    for side in ("subject", "object"):
+                        endpoint = str(edge.get(f"{side}_uid") or "")
+                        if names.get((eplat, endpoint)):
+                            edge[f"{side}_name"] = names[(eplat, endpoint)]
+            except MemoryDBUnavailable:
+                raise
+            except Exception:
+                logger.warning("memory_search 关系边规范名解析失败（回退快照名）", exc_info=True)
+
+        sections: list[str] = []
+        if fact_lines:
+            sections.append("【事实】\n" + "\n".join(fact_lines))
+        if edges:
+            relation_lines: list[str] = []
+            bot_uid: object = self._bot_user_id or getattr(kernel, "bot_id", "")
+            bot_uid_forms = getattr(kernel, "_bot_uid_forms_all", None)
+            if callable(bot_uid_forms):
+                try:
+                    bot_uid = bot_uid_forms(self._bot_user_id)
+                except Exception:
+                    logger.warning("关系边 bot 标识解析失败（回退主 uid）", exc_info=True)
+            for edge in edges[:top_k]:
+                try:
+                    relation_lines.append(
+                        "- " + str(relation_statement_line(
+                            edge,
+                            bot_uid=bot_uid,
+                            session_platform=session_platform or plat,
+                            bot_nickname=self._bot_nickname,
+                            time_qualifier=self._format_edge_time(edge.get("last_seen")),
+                        ))[:400]
+                    )
+                except Exception:
+                    logger.warning("memory_search 关系边渲染失败（跳过该边）", exc_info=True)
+            if relation_lines:
+                sections.append("【关系】\n" + "\n".join(relation_lines))
+        elif relation_scope_missing:
+            sections.append("【关系】\n- 关系边暂不可查询：缺少平台上下文。")
+        return "\n\n".join(sections) if sections else "没有找到相关事实或关系。"
 
     @register.tool(
         name="memory_write",
