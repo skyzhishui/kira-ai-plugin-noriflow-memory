@@ -488,7 +488,7 @@ class MemoryBackend(ABC):
         """Batch zero-LLM merge of edge rows (structural-key upsert)."""
 
     @abstractmethod
-    async def fetch_active_edges(self, node_keys: list, bot_keys=object) -> list[dict]:
+    async def fetch_active_edges(self, node_keys: list, bot_keys: object = "") -> list[dict]:
         """Injection candidate edges (active with an endpoint in the node set)."""
 
     @abstractmethod
