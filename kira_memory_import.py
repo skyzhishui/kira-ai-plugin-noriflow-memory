@@ -68,8 +68,9 @@ except ImportError:  # pragma: no cover - Python 3.10 takes the tomli branch
 from .db.base import fact_document_id
 from .envelope import format_history_message
 
-# kv marker key (_memory_local_kv): JSON snapshot of the latest import result
+# Per-source kv markers (_memory_local_kv): latest import result snapshots.
 KIRA_MEMORY_IMPORT_KV_KEY = "kira_memory_import_last_run"
+KIRA_HOST_MEMORY_IMPORT_KV_KEY = "kira_memory_host_import_last_run"
 
 # Session ids look like "{adapter}:{dm|gm}:{bare_id}"; non-session types
 # such as sm never map to memory entities (same whitelist as KiraAI
@@ -528,6 +529,10 @@ async def run_kira_memory_import(
             f"{source} 下没有 chat_memory.json 或 entities/，不像 KiraAI 记忆数据根"
         )
 
+    # Preserve a pre-split host marker before the file import reuses its slot.
+    # A failed copy must abort here, before either history can be overwritten.
+    await _preserve_legacy_host_marker(db)
+
     stats: dict[str, Any] = {
         "source_path": str(source),
         "sessions": 0, "chunks_total": 0,
@@ -796,7 +801,7 @@ async def run_host_db_import(
         **{k: v for k, v in stats.items() if k != "errors"},
     }
     try:
-        await db.set_kv(KIRA_MEMORY_IMPORT_KV_KEY, json.dumps(marker, ensure_ascii=False))
+        await db.set_kv(KIRA_HOST_MEMORY_IMPORT_KV_KEY, json.dumps(marker, ensure_ascii=False))
     except Exception as exc:
         stats["errors"].append(f"kv 标记写入失败: {exc}")
     return stats
@@ -820,10 +825,10 @@ async def _table_counts(db) -> dict[str, int]:
     return out
 
 
-async def read_last_run(db) -> Optional[dict]:
-    """Read the kv marker (shown on the admin page; None when absent)."""
+async def _read_last_run_key(db, key: str) -> Optional[dict]:
+    """Decode one import marker key, returning None for missing/invalid data."""
     try:
-        raw = await db.get_kv(KIRA_MEMORY_IMPORT_KV_KEY)
+        raw = await db.get_kv(key)
     except Exception:
         return None
     if not raw:
@@ -833,6 +838,40 @@ async def read_last_run(db) -> Optional[dict]:
         return data if isinstance(data, dict) else None
     except Exception:
         return None
+
+
+async def read_last_run(db) -> Optional[dict]:
+    """Read the file-source import marker shown on the admin page."""
+    data = await _read_last_run_key(db, KIRA_MEMORY_IMPORT_KV_KEY)
+    # Older releases stored host-db markers in the file-source slot. Do not
+    # surface that legacy value as the file import's own last run.
+    return None if data and data.get("source") == "host_db" else data
+
+
+async def read_host_last_run(db) -> Optional[dict]:
+    """Read the host-db marker, falling back to the old shared slot without writes."""
+    data = await _read_last_run_key(db, KIRA_HOST_MEMORY_IMPORT_KV_KEY)
+    if data is not None:
+        return data
+    legacy = await _read_last_run_key(db, KIRA_MEMORY_IMPORT_KV_KEY)
+    if not legacy or legacy.get("source") != "host_db":
+        return None
+    return legacy
+
+
+async def _preserve_legacy_host_marker(db) -> None:
+    """Copy old host history before a file import; a dedicated marker always wins."""
+    if await db.get_kv(KIRA_HOST_MEMORY_IMPORT_KV_KEY) is not None:
+        return
+    raw = await db.get_kv(KIRA_MEMORY_IMPORT_KV_KEY)
+    if not raw:
+        return
+    try:
+        legacy = json.loads(raw)
+    except (TypeError, ValueError):
+        return
+    if isinstance(legacy, dict) and legacy.get("source") == "host_db":
+        await db.set_kv(KIRA_HOST_MEMORY_IMPORT_KV_KEY, raw)
 
 
 # Pre-v1.16.1 marker key (module was kiraos_import.py; kept only for the

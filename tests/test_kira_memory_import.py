@@ -451,6 +451,11 @@ async def main_async() -> None:
     check("source_untouched", snap_before == snap_after,
           str(set(snap_before.items()) ^ set(snap_after.items())))
 
+    file_marker_before_host = await ki.read_last_run(db)
+    check("file_marker_before_host", file_marker_before_host is not None
+          and file_marker_before_host.get("source_path") != "host_db",
+          str(file_marker_before_host))
+
     # ---- 缺 chat_memory.json 且无 entities/ 的目录拒绝 ----
     bogus = Path(tmp.name) / "bogus"
     bogus.mkdir()
@@ -529,9 +534,37 @@ async def main_async() -> None:
     )
     check("host_rerun_idempotent", host_stats2["summary_rows"] == 0
           and host_stats2["summary_skipped"] == 1, str(host_stats2))
-    host_marker = await ki.read_last_run(db)
+    host_marker = await ki.read_host_last_run(db)
     check("host_marker_source", host_marker is not None
           and host_marker["source"] == "host_db", str(host_marker))
+    file_marker_after_host = await ki.read_last_run(db)
+    check("file_marker_preserved", file_marker_after_host == file_marker_before_host,
+          str(file_marker_after_host))
+
+    await ki.run_kira_memory_import(db, source_path=source, bot_uid="99999")
+    check("host_marker_preserved_after_file", await ki.read_host_last_run(db) == host_marker)
+
+    # Simulate an upgrade with the old shared slot holding a host marker.
+    async with db.pool.acquire() as marker_conn:
+        await marker_conn.execute(
+            "DELETE FROM _memory_local_kv WHERE key = $1",
+            ki.KIRA_HOST_MEMORY_IMPORT_KV_KEY,
+        )
+    await db.set_kv(ki.KIRA_MEMORY_IMPORT_KV_KEY, json.dumps(host_marker))
+    check("legacy_host_hidden_from_file", await ki.read_last_run(db) is None)
+    check("legacy_host_readable", await ki.read_host_last_run(db) == host_marker)
+    check("host_preview_read_only",
+          await db.get_kv(ki.KIRA_HOST_MEMORY_IMPORT_KV_KEY) is None)
+    # Remove any copy made by the reader so file-first migration is tested independently.
+    async with db.pool.acquire() as marker_conn:
+        await marker_conn.execute(
+            "DELETE FROM _memory_local_kv WHERE key = $1",
+            ki.KIRA_HOST_MEMORY_IMPORT_KV_KEY,
+        )
+    await ki.run_kira_memory_import(db, source_path=source, bot_uid="99999")
+    check("legacy_host_preserved_before_file", await ki.read_host_last_run(db) == host_marker)
+    check("file_marker_after_legacy_host",
+          (await ki.read_last_run(db) or {}).get("source_path") == str(source))
 
     await db.close()
     tmp.cleanup()

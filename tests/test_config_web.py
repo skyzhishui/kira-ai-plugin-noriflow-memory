@@ -263,6 +263,39 @@ class TestConfigApi(unittest.TestCase):
         r = asyncio.run(inst.api_memory_config_put({"values": host_now}))
         self.assertFalse(r["saved"])
 
+    def test_import_previews_read_separate_source_history(self):
+        file_marker = {"source_path": self._tmp_config_dir.name, "summary_rows": 3}
+        host_marker = {"source": "host_db", "source_path": "host_db", "summary_rows": 7}
+        markers = {
+            "kira_memory_import_last_run": json.dumps(file_marker),
+            "kira_memory_host_import_last_run": json.dumps(host_marker),
+        }
+
+        async def get_kv(key):
+            return markers.get(key)
+
+        async def get_sessions(*, include_content):
+            return []
+
+        backend = types.SimpleNamespace(get_kv=get_kv)
+        inst = types.SimpleNamespace(
+            ctx=types.SimpleNamespace(session_mgr=types.SimpleNamespace(get_sessions=get_sessions)),
+            _pool_or_503=lambda: backend,
+            _plugin_data_dir=lambda: self._tmp_config_dir.name,
+        )
+        (Path(self._tmp_config_dir.name) / "chat_memory.json").write_text("{}", encoding="utf-8")
+
+        async def preview_both():
+            file_result = await self.mod.NoriflowMemoryPlugin.api_kira_memory_import_preview(
+                inst, source_path=self._tmp_config_dir.name,
+            )
+            host_result = await self.mod.NoriflowMemoryPlugin.api_kira_memory_import_host_preview(inst)
+            return file_result, host_result
+
+        file_result, host_result = asyncio.run(preview_both())
+        self.assertEqual(file_result["last_run"], file_marker)
+        self.assertEqual(host_result["last_run"], host_marker)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

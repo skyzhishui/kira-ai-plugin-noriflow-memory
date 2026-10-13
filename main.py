@@ -78,6 +78,7 @@ from .envelope import HISTORY_BATCH_SEPARATOR, format_history_message
 from .kira_memory_import import (
     default_source_path,
     migrate_legacy_import_kv,
+    read_host_last_run,
     read_last_run,
     run_host_db_import,
     run_kira_memory_import,
@@ -3077,7 +3078,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         return {
             "source_path": "host_db",
             "preview": scan_host_sessions(sessions),
-            "last_run": await read_last_run(backend),
+            "last_run": await read_host_last_run(backend),
         }
 
     @register.api(method="POST", path="/memory/kira_memory/import_host")
