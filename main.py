@@ -2172,9 +2172,9 @@ class NoriflowMemoryPlugin(BasePlugin):
             name = name[:23] + "…"
         return f"{name}（{uid}）" if name else f"（{uid}）"
 
-    def _format_edge_time(self, value: object) -> str:
+    def _format_edge_time(self, kernel, value: object) -> str:
         """Format an edge timestamp through the kernel's configured timezone."""
-        helper = getattr(self._memory_kernel, "_edge_time_qualifier", None)
+        helper = getattr(kernel, "_edge_time_qualifier", None)
         if callable(helper):
             try:
                 return str(helper(value) or "")
@@ -2315,7 +2315,9 @@ class NoriflowMemoryPlugin(BasePlugin):
                             bot_uid=bot_uid,
                             session_platform=session_platform or plat,
                             bot_nickname=self._bot_nickname,
-                            time_qualifier=self._format_edge_time(edge.get("last_seen")),
+                            time_qualifier=self._format_edge_time(
+                                kernel, edge.get("last_seen")
+                            ),
                         ))[:400]
                     )
                 except Exception:

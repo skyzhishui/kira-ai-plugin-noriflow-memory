@@ -2452,6 +2452,15 @@ class TestPluginTools(unittest.TestCase):
         out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
         self.assertIn("截至10月13日", out)
 
+    def test_56aa_format_edge_time_uses_passed_kernel(self):
+        inst = self._inst()
+        inst._memory_kernel = self._fact_kernel(qualifier="self-kernel")
+        passed_kernel = self._fact_kernel(qualifier="passed-kernel")
+        self.assertEqual(
+            inst._format_edge_time(passed_kernel, datetime.now()),
+            "passed-kernel",
+        )
+
     def test_56i_search_fact_malformed_edge_time_keeps_fact_results(self):
         inst = self._inst()
         inst._memory_kernel = self._fact_kernel()
