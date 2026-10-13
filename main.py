@@ -87,7 +87,7 @@ from .kira_memory_import import (
     scan_source,
 )
 from .memory_encoder import MemoryEncoder
-from .memory_kernel import LocalMemoryKernel, MemoryDBUnavailable
+from .memory_kernel import LocalMemoryKernel
 from .merge_agent import FactMergeAgent
 from .persona_service import LocalPersonaService
 from .recall_log import RecallLogWriter
@@ -2107,16 +2107,12 @@ class NoriflowMemoryPlugin(BasePlugin):
             trigger_uid, session_platform = self._trigger_user(event)
             if not uid:
                 uid = trigger_uid
-            try:
-                return await self._tool_search_facts(
-                    kernel, query, top_k, category, name, sid, uid, plat,
-                    entity_sid=entity_sid,
-                    session_platform=session_platform,
-                    trigger_uid=trigger_uid,
-                )
-            except MemoryDBUnavailable:
-                logger.warning("memory_search 关系边查询命中不可用库", exc_info=True)
-                return "记忆检索暂时不可用，请稍后再试"
+            return await self._tool_search_facts(
+                kernel, query, top_k, category, name, sid, uid, plat,
+                entity_sid=entity_sid,
+                session_platform=session_platform,
+                trigger_uid=trigger_uid,
+            )
         # Asking-about-others recall: match the query against the entity
         # dictionary + persistent aliases; the keys then join the main search
         # path. Isolation posture follows summary_recall_session_scoped via
@@ -2238,14 +2234,21 @@ class NoriflowMemoryPlugin(BasePlugin):
             return "记忆检索暂时不可用，请稍后再试"
         target_platform = resolved[0] if resolved else plat
         target_uid = resolved[1] if resolved else uid
+        relation_scope_note = ""
         if not target_platform:
+            row_platforms = {
+                str(row.get("platform") or "") for row in rows
+                if str(row.get("user_id") or "") == target_uid and row.get("platform")
+            }
             if target_uid == trigger_uid and session_platform:
                 target_platform = session_platform
+                other_platforms = row_platforms - {session_platform}
+                if other_platforms:
+                    relation_scope_note = (
+                        f"关系边仅限当前会话平台 {session_platform}；"
+                        f"未查询事实涉及的其他平台：{'、'.join(sorted(other_platforms))}。"
+                    )
             else:
-                row_platforms = {
-                    str(row.get("platform") or "") for row in rows
-                    if str(row.get("user_id") or "") == target_uid and row.get("platform")
-                }
                 if len(row_platforms) == 1:
                     target_platform = next(iter(row_platforms))
         relation_scope_missing = not target_platform
@@ -2267,6 +2270,7 @@ class NoriflowMemoryPlugin(BasePlugin):
             )
 
         edges: list[dict] = []
+        relation_lookup_failed = False
         if not relation_scope_missing:
             try:
                 edges = [
@@ -2275,6 +2279,7 @@ class NoriflowMemoryPlugin(BasePlugin):
                     )
                 ]
             except Exception:
+                relation_lookup_failed = True
                 logger.warning("memory_search 关系边查询失败（跳过关系小节）", exc_info=True)
 
         if edges:
@@ -2327,6 +2332,10 @@ class NoriflowMemoryPlugin(BasePlugin):
                 sections.append("【关系】\n" + "\n".join(relation_lines))
         elif relation_scope_missing:
             sections.append("【关系】\n- 关系边暂不可查询：缺少平台上下文。")
+        elif relation_lookup_failed:
+            sections.append("关系边暂不可查询，请稍后再试。")
+        if relation_scope_note:
+            sections.append(relation_scope_note)
         return "\n\n".join(sections) if sections else "没有找到相关事实或关系。"
 
     @register.tool(

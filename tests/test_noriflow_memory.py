@@ -2513,7 +2513,8 @@ class TestPluginTools(unittest.TestCase):
             "score": 0.9, "canonical_statement": "喜欢猫",
             "category": "preference", "status": "active", "evidence_count": 1,
         }]
-        inst._db.edges_exc = mod.MemoryDBUnavailable("db down")
+        KEXC = sys.modules["noriflow_memory_pkg.memory_kernel"].MemoryDBUnavailable
+        inst._db.edges_exc = KEXC("db down")
         out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
         self.assertIn("【事实】", out)
         self.assertNotIn("记忆检索暂时不可用", out)
@@ -2523,7 +2524,8 @@ class TestPluginTools(unittest.TestCase):
         inst = self._inst()
         inst._memory_kernel = self._fact_kernel()
         inst._db.edges = [self._relation_edge(subject=self.ALLOWED_UID)]
-        inst._db.alias_names_exc = mod.MemoryDBUnavailable("db down")
+        KEXC = sys.modules["noriflow_memory_pkg.memory_kernel"].MemoryDBUnavailable
+        inst._db.alias_names_exc = KEXC("db down")
         out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
         self.assertIn("【关系】", out)
         self.assertIn("旧名2(9900000002)", out)
@@ -2610,7 +2612,7 @@ class TestPluginTools(unittest.TestCase):
         self.assertIn("【关系】", out)
         self.assertEqual(inst._db.edge_calls[0], ("edges", ["qq:" + self.ALLOWED_UID]))
 
-    def test_56u_search_fact_unknown_or_ambiguous_platform_is_explicit(self):
+    def test_56u_search_fact_uses_session_platform_and_marks_missing_context(self):
         inst = self._inst(extra_cfg={"tool_scope_locked": False})
         inst._memory_kernel = self._fact_kernel()
         inst._db.fact_search_rows = [{
@@ -2632,6 +2634,67 @@ class TestPluginTools(unittest.TestCase):
         self.assertIn("平台", out)
         self.assertIn("暂不可", out)
         self.assertEqual(bare._db.edge_calls, [])
+
+    def test_56ab_search_fact_empty_facts_relation_error_is_not_empty_result(self):
+        KEXC = sys.modules["noriflow_memory_pkg.memory_kernel"].MemoryDBUnavailable
+        for error in (RuntimeError("edge read failed"), KEXC("db down")):
+            with self.subTest(error=type(error).__name__):
+                inst = self._inst()
+                inst._memory_kernel = self._fact_kernel()
+                inst._db.edges_exc = error
+                out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
+                self.assertIn("关系边暂不可查询", out)
+                self.assertNotIn("没有找到", out)
+
+    def test_56ac_search_fact_cross_platform_rows_mark_relation_scope(self):
+        for has_edge in (False, True):
+            with self.subTest(has_edge=has_edge):
+                inst = self._inst(extra_cfg={"tool_scope_locked": False})
+                inst._memory_kernel = self._fact_kernel()
+                inst._db.fact_search_rows = [{
+                    "id": 1, "platform": "qq", "user_id": self.ALLOWED_UID,
+                    "score": 1, "canonical_statement": "喜欢猫", "category": "stable",
+                    "status": "active", "evidence_count": 1,
+                }]
+                inst._db.edges = [self._relation_edge(subject=self.ALLOWED_UID, platform="qq")]
+                if has_edge:
+                    inst._db.edges.append(self._relation_edge(subject=self.ALLOWED_UID))
+                out = asyncio.run(inst.memory_search(
+                    self._tool_event(), query="猫", target="fact", user_id=self.ALLOWED_UID,
+                ))
+                self.assertIn("关系边仅限当前会话平台 napcat", out)
+                self.assertIn("未查询事实涉及的其他平台：qq", out)
+                self.assertIn("【事实】", out)
+                self.assertEqual(inst._db.edge_calls[0], ("edges", ["napcat:" + self.ALLOWED_UID]))
+                self.assertEqual(inst._db.fact_search_kwargs["platform"], "")
+
+    def test_56ad_search_fact_multiple_platforms_without_session_are_marked(self):
+        inst = self._inst()
+        inst._memory_kernel = self._fact_kernel()
+        inst._db.fact_search_rows = [{
+            "id": i, "platform": p, "user_id": self.ALLOWED_UID,
+            "score": 1, "canonical_statement": "喜欢猫", "category": "stable",
+            "status": "active", "evidence_count": 1,
+        } for i, p in enumerate(("qq", "telegram"))]
+        out = asyncio.run(inst.memory_search(self._bare_event(), query="猫", target="fact"))
+        self.assertIn("【事实】", out)
+        self.assertIn("关系边暂不可查询：缺少平台上下文", out)
+        self.assertEqual(inst._db.edge_calls, [])
+
+    def test_56ae_search_fact_other_uid_multiple_platforms_are_marked(self):
+        inst = self._inst(extra_cfg={"tool_scope_locked": False})
+        inst._memory_kernel = self._fact_kernel()
+        inst._db.fact_search_rows = [{
+            "id": i, "platform": p, "user_id": "other",
+            "score": 1, "canonical_statement": "喜欢猫", "category": "stable",
+            "status": "active", "evidence_count": 1,
+        } for i, p in enumerate(("qq", "telegram"))]
+        out = asyncio.run(inst.memory_search(
+            self._tool_event(), query="猫", target="fact", user_id="other",
+        ))
+        self.assertIn("【事实】", out)
+        self.assertIn("关系边暂不可查询：缺少平台上下文", out)
+        self.assertEqual(inst._db.edge_calls, [])
 
     def test_56v_relation_fake_obeys_empty_scope_and_recent_edge_order(self):
         db = FakeDB()
