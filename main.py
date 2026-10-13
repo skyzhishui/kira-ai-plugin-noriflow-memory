@@ -2304,8 +2304,6 @@ class NoriflowMemoryPlugin(BasePlugin):
         sections: list[str] = []
         if fact_lines:
             sections.append("【事实】\n" + "\n".join(fact_lines))
-        elif relation_scope_missing:
-            sections.append("没有找到相关事实或关系。")
         if edges:
             relation_lines: list[str] = []
             bot_uid: object = self._bot_user_id or getattr(kernel, "bot_id", "")
@@ -2335,9 +2333,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         if relation_scope_missing:
             sections.append("【关系】\n- 关系边暂不可查询：缺少平台上下文。")
         elif relation_lookup_failed:
-            if not fact_lines:
-                sections.append("没有找到相关事实或关系。")
-            sections.append("关系边暂不可查询，请稍后再试。")
+            sections.append("【关系】\n- 关系边暂不可查询，请稍后再试。")
         if relation_scope_note and not relation_lookup_failed:
             sections.append(relation_scope_note)
         return "\n\n".join(sections) if sections else "没有找到相关事实或关系。"

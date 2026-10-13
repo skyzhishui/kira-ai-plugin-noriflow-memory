@@ -2644,7 +2644,7 @@ class TestPluginTools(unittest.TestCase):
                 inst._db.edges_exc = error
                 out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", target="fact"))
                 self.assertIn("关系边暂不可查询", out)
-                self.assertIn("没有找到相关事实或关系", out)
+                self.assertNotIn("没有找到相关事实或关系", out)
 
     def test_56ac_search_fact_cross_platform_rows_mark_relation_scope(self):
         for has_edge in (False, True):
@@ -2685,7 +2685,7 @@ class TestPluginTools(unittest.TestCase):
         inst = self._inst()
         inst._memory_kernel = self._fact_kernel()
         out = asyncio.run(inst.memory_search(self._bare_event(), query="猫", target="fact"))
-        self.assertIn("没有找到相关事实或关系", out)
+        self.assertNotIn("没有找到相关事实或关系", out)
         self.assertIn("关系边暂不可查询：缺少平台上下文", out)
         self.assertEqual(inst._db.edge_calls, [])
 
