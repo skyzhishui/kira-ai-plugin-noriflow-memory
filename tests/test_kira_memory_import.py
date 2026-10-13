@@ -148,6 +148,15 @@ def build_source(root: Path) -> None:
                 ],
             ],
         },
+        "seki:dm:only-notice": {
+            "title": "仅通知",
+            "description": "",
+            "memory": [[
+                {"role": "user", "content":
+                 "[Sep 11 2026 10:00 Fri] Notice [user_id: system_qzone_task] | 任务"},
+                {"role": "assistant", "content": "<msg />"},
+            ]],
+        },
         "seki:sm:system": {"title": "", "description": "", "memory": [[{"role": "user", "content": "x"}]]},
     }
     (root / "chat_memory.json").write_text(
@@ -318,9 +327,9 @@ async def main_async() -> None:
         db, source_path=source, bot_uid="99999", bot_nickname="Kira",
     )
     check("stats_sessions", stats["sessions"] == 2, str(stats))
-    check("stats_chunks_total", stats["chunks_total"] == 4, str(stats))
-    check("stats_notice_skipped", stats["system_notice_msgs_skipped"] == 2, str(stats))
-    check("stats_bot_only_skipped", stats["chunks_bot_only_skipped"] == 1, str(stats))
+    check("stats_chunks_total", stats["chunks_total"] == 5, str(stats))
+    check("stats_notice_skipped", stats["system_notice_msgs_skipped"] == 3, str(stats))
+    check("stats_bot_only_skipped", stats["chunks_bot_only_skipped"] == 2, str(stats))
     check("stats_summary_rows", stats["summary_rows"] == 3, str(stats))
     check("stats_fact_rows", stats["fact_rows"] == 4, str(stats))  # 2 user + 1 group + 1 self
     check("stats_aliases", stats["aliases_upserted"] == 3, str(stats))

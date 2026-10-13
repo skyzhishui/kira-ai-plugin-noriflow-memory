@@ -564,7 +564,8 @@ async def run_kira_memory_import(
                 mem = body.get("memory")
                 if not isinstance(mem, list):
                     continue
-                stats["sessions"] += 1
+                if any(_is_importable_chunk(chunk) for chunk in mem):
+                    stats["sessions"] += 1
                 session_platforms.append(parsed["platform"])
                 chat_rows.extend(build_chat_summary_rows(
                     sess, mem, file_mtime,
