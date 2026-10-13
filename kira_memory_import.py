@@ -710,9 +710,11 @@ def _host_session_fallback_time(session) -> datetime:
     else:
         raw = getattr(session, "updated_at", None) or getattr(session, "timestamp", None)
     if raw:
+        if isinstance(raw, datetime):
+            return _to_local_naive(raw)
         try:
             return _to_local_naive(datetime.fromtimestamp(float(raw), tz=timezone.utc))
-        except (TypeError, ValueError, OSError):
+        except (TypeError, ValueError, OSError, OverflowError):
             pass
     return datetime.now().replace(tzinfo=None)
 
@@ -770,7 +772,8 @@ async def run_host_db_import(
         content = _host_session_content(session)
         if not session_key or not content or not parse_kira_memory_session(session_key):
             continue
-        stats["sessions"] += 1
+        if any(_is_importable_chunk(chunk) for chunk in content):
+            stats["sessions"] += 1
         rows.extend(build_chat_summary_rows(
             session_key, content, _host_session_fallback_time(session),
             stats=stats, bot_nickname=bot_nickname,

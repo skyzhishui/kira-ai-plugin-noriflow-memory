@@ -457,6 +457,13 @@ async def main_async() -> None:
         check("missing_dir_rejected", True)
 
     # ---- 宿主数据库迁入（v3 会话入库；Session 对象与 record dict 两形态）----
+    fallback_dt = datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc)
+    fallback = ki._host_session_fallback_time({"updated_at": fallback_dt})
+    check("host_fallback_datetime", fallback == fallback_dt.astimezone().replace(tzinfo=None),
+          str(fallback))
+    overflow_fallback = ki._host_session_fallback_time({"updated_at": 10 ** 400})
+    check("host_fallback_overflow", isinstance(overflow_fallback, datetime),
+          str(overflow_fallback))
     host_sessions = [
         types.SimpleNamespace(
             sid="discord:dm:20001",
@@ -488,7 +495,7 @@ async def main_async() -> None:
         db, sessions=host_sessions, bot_nickname="Kira",
     )
     check("host_stats_source", host_stats["source"] == "host_db", str(host_stats))
-    check("host_stats_sessions", host_stats["sessions"] == 2, str(host_stats))
+    check("host_stats_sessions", host_stats["sessions"] == 1, str(host_stats))
     check("host_stats_summary_rows", host_stats["summary_rows"] == 1, str(host_stats))
     check("host_gm_bot_only_skipped", host_stats["chunks_bot_only_skipped"] == 1,
           str(host_stats))
