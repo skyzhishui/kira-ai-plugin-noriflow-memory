@@ -2689,6 +2689,23 @@ class TestPluginTools(unittest.TestCase):
         self.assertIn("关系边暂不可查询：缺少平台上下文", out)
         self.assertEqual(inst._db.edge_calls, [])
 
+    def test_56ag_relation_failure_does_not_append_platform_scope_note(self):
+        inst = self._inst(extra_cfg={"tool_scope_locked": False})
+        inst._memory_kernel = self._fact_kernel()
+        inst._db.fact_search_rows = [{
+            "id": 1, "platform": "qq", "user_id": self.ALLOWED_UID,
+            "score": 1, "canonical_statement": "喜欢猫", "category": "stable",
+            "status": "active", "evidence_count": 1,
+        }]
+        inst._db.edges_exc = RuntimeError("edge read failed")
+        out = asyncio.run(inst.memory_search(
+            self._tool_event(), query="猫", target="fact", user_id=self.ALLOWED_UID,
+        ))
+        self.assertIn("【事实】", out)
+        self.assertIn("关系边暂不可查询", out)
+        self.assertNotIn("关系边仅限当前会话平台", out)
+        self.assertNotIn("未查询事实涉及的其他平台", out)
+
     def test_56ae_search_fact_other_uid_multiple_platforms_are_marked(self):
         inst = self._inst(extra_cfg={"tool_scope_locked": False})
         inst._memory_kernel = self._fact_kernel()

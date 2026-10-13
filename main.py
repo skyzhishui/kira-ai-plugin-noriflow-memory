@@ -2338,7 +2338,7 @@ class NoriflowMemoryPlugin(BasePlugin):
             if not fact_lines:
                 sections.append("没有找到相关事实或关系。")
             sections.append("关系边暂不可查询，请稍后再试。")
-        if relation_scope_note:
+        if relation_scope_note and not relation_lookup_failed:
             sections.append(relation_scope_note)
         return "\n\n".join(sections) if sections else "没有找到相关事实或关系。"
 
