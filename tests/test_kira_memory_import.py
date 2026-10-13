@@ -473,17 +473,23 @@ async def main_async() -> None:
     overflow_fallback = ki._host_session_fallback_time({"updated_at": 10 ** 400})
     check("host_fallback_overflow", isinstance(overflow_fallback, datetime),
           str(overflow_fallback))
+    check("host_dict_sid_key", ki._host_session_key(
+        {"sid": "discord:dm:20002"}
+    ) == "discord:dm:20002")
+    check("host_dict_field_key", ki._host_session_key(
+        {"adapter_name": "discord", "session_type": "gm", "session_id": "30010"}
+    ) == "discord:gm:30010")
     host_sessions = [
-        types.SimpleNamespace(
-            sid="discord:dm:20001",
-            content=[[
+        {
+            "sid": "discord:dm:20001",
+            "content": [[
                 {"role": "user",
                  "content": "[Sep 12 2026 10:00 Sat] 我今天要加班",
                  "sender_id": "20001", "sender_name": "Alice"},
                 {"role": "assistant", "content": "<msg><text>辛苦了</text></msg>"},
             ]],
-            updated_at=1789200000,
-        ),
+            "updated_at": 1789200000,
+        },
         types.SimpleNamespace(
             sid="discord:gm:30009",
             content=[[

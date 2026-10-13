@@ -685,7 +685,13 @@ async def run_kira_memory_import(
 def _host_session_key(session) -> str:
     """Routing key of a host session snapshot (Session object or record dict)."""
     if isinstance(session, dict):
-        return str(session.get("session_key") or "")
+        sid = session.get("session_key") or session.get("sid")
+        if sid:
+            return str(sid)
+        adapter = str(session.get("adapter_name") or "")
+        stype = str(session.get("session_type") or "")
+        bare = str(session.get("session_id") or "")
+        return f"{adapter}:{stype}:{bare}" if adapter and stype and bare else ""
     sid = getattr(session, "sid", None)
     if sid:
         return str(sid)
