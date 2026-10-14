@@ -1220,6 +1220,13 @@ class TestMergeAgentCycle(unittest.TestCase):
             "读取失败时不得用空 fallback 覆盖既有跳过名单",
         )
 
+    def test_invalid_skip_state_self_heals_to_empty_object(self):
+        db = self.CycleDB()
+        db.kv["adjudicate_skip_state"] = "[]"
+        agent = self._agent(db)
+        asyncio.run(agent.run_cycle())
+        self.assertEqual(db.kv["adjudicate_skip_state"], "{}")
+
     def test_cycle_oversamples_pending_fetch(self):
         # P2-2b：归一化遍按 3 倍批量超采样拉取（配合跳过名单过滤，防
         # unsure 毒丸行 ORDER BY id 队首钉死）

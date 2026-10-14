@@ -1334,14 +1334,24 @@ class FactMergeAgent:
         self._skip_state_read_failed.discard(key)
         try:
             raw = await self._db.get_kv(key)
-            state = json.loads(raw) if raw else {}
-            if not isinstance(state, dict):
-                raise ValueError("skip state must be a JSON object")
-            return state
         except Exception:
             self._skip_state_read_failed.add(key)
             logger.warning("跳过名单读取失败（%s，按空处理）", key, exc_info=True)
             return {}
+        try:
+            state = json.loads(raw) if raw else {}
+        except Exception:
+            # The value is readable but corrupt; allow the caller's normal
+            # save path to self-heal it to an empty JSON object.
+            logger.warning("跳过名单内容损坏（%s，重置）", key, exc_info=True)
+            return {}
+        if not isinstance(state, dict):
+            # A readable JSON scalar/list is likewise data corruption, not a
+            # failed read.  Let the next save repair it instead of freezing
+            # the key in the read-failed guard forever.
+            logger.warning("跳过名单不是对象（%s，重置）", key)
+            return {}
+        return state
 
     async def _save_skip_state(self, key: str, state: dict[str, int]) -> None:
         """Persist the skip state (over-capacity is trimmed by half-FIFO;
