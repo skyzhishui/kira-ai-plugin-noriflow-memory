@@ -890,7 +890,8 @@ class SQLiteMemoryDatabase(MemoryBackend):
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 f"SELECT id, {text_col} AS text FROM {table} "  # noqa: S608
-                f"WHERE embedding IS NULL AND trim({text_col}) <> '' "
+                f"WHERE embedding IS NULL "
+                f"AND trim({text_col}, ' ' || char(9) || char(10) || char(13)) <> '' "
                 "ORDER BY id LIMIT $1",
                 limit,
             )

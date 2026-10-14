@@ -537,6 +537,56 @@ async def test_search_fact_clusters_blank_user_ids_fail_closed() -> None:
         tmp.cleanup()
 
 
+async def test_fetch_missing_embeddings_excludes_all_whitespace_rows() -> None:
+    """PR review：trim() 默认只剔 ASCII 空格——纯 \\t/\\n/\\r 文本行不会被
+    排除出补算窗口，永久无法获得向量且占死 id 升序队首。显式空白字符集
+    （SQLite：trim(X, ' '||char(9)||char(10)||char(13))）后全形态空白行
+    均被排除，正常行照常返回。pytest 收集项，直跑 main_async 不经过。"""
+    config_mod = _load("config")
+    _load("alias_store")
+    _load("entity_edge")
+    db_pkg = _load("db")
+    LocalMemoryConfig = config_mod.LocalMemoryConfig
+    SQLiteMemoryDatabase = db_pkg.SQLiteMemoryDatabase
+
+    tmp = tempfile.TemporaryDirectory(prefix="noriflow_ws_rows_")
+    try:
+        config = LocalMemoryConfig(
+            storage_backend="sqlite",
+            sqlite_path=str(Path(tmp.name) / "memory.sqlite3"),
+            embedding_dims=4,
+        )
+        db = SQLiteMemoryDatabase(config)
+        await db.connect()
+        try:
+            await db.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
+            occurred = datetime.now(_UTC).strftime("%Y-%m-%dT%H:%M:%S")
+            # 三行 embedding 均为 NULL：纯 \t\n\r、纯空格、正常文本
+            async with db.pool.acquire() as conn:
+                for doc_id, content in (
+                    ("ws-1", "\t\n\r \n"),
+                    ("ws-2", "   "),
+                    ("ok-1", "正常摘要内容"),
+                ):
+                    await conn.execute(
+                        "INSERT INTO memory_chat_summary "
+                        "(document_id, content, occurred_at) "
+                        "VALUES ($1, $2, $3)",
+                        doc_id, content, occurred,
+                    )
+            rows = await db.fetch_missing_embeddings(
+                "memory_chat_summary", limit=10
+            )
+            contents = [text for _, text in rows]
+            assert contents == ["正常摘要内容"], (
+                f"全形态空白行必须排除出补算窗口，只返回正常行，实际 {contents}"
+            )
+        finally:
+            await db.close()
+    finally:
+        tmp.cleanup()
+
+
 def main() -> None:
     logging.basicConfig(level=logging.WARNING)
     asyncio.run(main_async())

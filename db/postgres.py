@@ -890,7 +890,8 @@ class MemoryDatabase(MemoryBackend):
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 f"SELECT id, {text_col} AS text FROM {table} "  # noqa: S608 -- whitelist constant table/column names
-                f"WHERE embedding IS NULL AND trim({text_col}) <> '' "
+                f"WHERE embedding IS NULL "
+                f"AND btrim({text_col}, E' \\t\\n\\r') <> '' "
                 "ORDER BY id LIMIT $1",
                 limit,
             )
