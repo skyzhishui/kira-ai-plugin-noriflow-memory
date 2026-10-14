@@ -534,6 +534,9 @@ class FactMergeAgent:
         self._task: Optional[asyncio.Task] = None
         self._last_decay_at: Optional[datetime] = None
         self._last_summary_lifecycle_at: Optional[datetime] = None
+        # Never overwrite a persisted poison list with the empty fallback
+        # when its read failed transiently.
+        self._skip_state_read_failed: set[str] = set()
         # WebUI manual-trigger state: the inter-cycle wait doubles as a
         # kickable event so a manual request short-circuits the interval.
         # The loop stays the only runner — a kicked cycle can never
@@ -699,6 +702,8 @@ class FactMergeAgent:
             "reencoded": 0,
             "edges_audited": 0,
             "edges_superseded": 0,
+            "summaries_archived": 0,
+            "fact_alias": 0,
         }
 
         # 熔断拒绝期整周期跳过（peek 非消费式，不占恢复探测名额）：DB
@@ -1326,17 +1331,24 @@ class FactMergeAgent:
     async def _load_skip_state(self, key: str) -> dict[str, int]:
         """Load the poison-row skip state ({"<row id>": consecutive failure
         count}; a failed read is treated as empty)."""
+        self._skip_state_read_failed.discard(key)
         try:
             raw = await self._db.get_kv(key)
             state = json.loads(raw) if raw else {}
-            return state if isinstance(state, dict) else {}
+            if not isinstance(state, dict):
+                raise ValueError("skip state must be a JSON object")
+            return state
         except Exception:
+            self._skip_state_read_failed.add(key)
             logger.warning("跳过名单读取失败（%s，按空处理）", key, exc_info=True)
             return {}
 
     async def _save_skip_state(self, key: str, state: dict[str, int]) -> None:
         """Persist the skip state (over-capacity is trimmed by half-FIFO;
         failures are only logged)."""
+        if key in self._skip_state_read_failed:
+            logger.warning("跳过名单读取失败，跳过本次持久化以保留既有状态（%s）", key)
+            return
         try:
             if len(state) > _SKIP_STATE_MAX_ENTRIES:
                 state = dict(list(state.items())[_SKIP_STATE_MAX_ENTRIES // 2:])

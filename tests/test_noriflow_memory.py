@@ -1198,8 +1198,27 @@ class TestMergeAgentCycle(unittest.TestCase):
         agent = self._agent(db, breaker=breaker)
         stats = asyncio.run(agent.run_cycle())
         self.assertEqual(stats["facts"], 0)
+        self.assertEqual(stats["summaries_archived"], 0)
+        self.assertEqual(stats["fact_alias"], 0)
         self.assertEqual(db.pending_calls, [])
         self.assertEqual(db.unsummarized_calls, [])
+
+    def test_skip_state_read_failure_does_not_erase_persisted_state(self):
+        class ReadFailDB(self.CycleDB):
+            async def get_kv(self, key):
+                if key == "adjudicate_skip_state":
+                    raise RuntimeError("kv read unavailable")
+                return await super().get_kv(key)
+
+        db = ReadFailDB()
+        db.kv["adjudicate_skip_state"] = '{"17": 3}'
+        agent = self._agent(db)
+        asyncio.run(agent.run_cycle())
+        self.assertEqual(
+            db.kv["adjudicate_skip_state"],
+            '{"17": 3}',
+            "读取失败时不得用空 fallback 覆盖既有跳过名单",
+        )
 
     def test_cycle_oversamples_pending_fetch(self):
         # P2-2b：归一化遍按 3 倍批量超采样拉取（配合跳过名单过滤，防
