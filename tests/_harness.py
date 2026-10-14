@@ -32,8 +32,17 @@ PLUGIN_DIR = Path(__file__).resolve().parent.parent
 
 def install_core_stubs() -> None:
     """Install the core.* host stubs (idempotent: skipped when the package
-    stub already exists)."""
-    if "noriflow_memory_pkg" in sys.modules:
+    stub already exists).
+
+    The idempotency key mirrors plugin_env.install_host_stubs ("core.plugin")
+    so whichever stub installer runs first, the other treats the host stubs
+    as installed. The stub set must stay a superset of what any plugin module
+    lazily imports at runtime — clients.py imports ``core.provider``
+    (LLMRequest) inside FastLlmExit.run_structured, so it is stubbed here
+    too; a missing stub only blows up when _harness-booted files are
+    collected before plugin_env-booted ones in one pytest process.
+    """
+    if "core.plugin" in sys.modules:
         return
 
     def get_logger(*args, **kwargs):
@@ -159,6 +168,18 @@ def install_core_stubs() -> None:
     prompt_mod.Prompt = Prompt
     sys.modules["core.prompt_manager"] = prompt_mod
 
+    provider_mod = types.ModuleType("core.provider")
+
+    class LLMRequest:
+        def __init__(self, messages=None, tools=None, tool_funcs=None,
+                     tool_set=None, tool_choice=None):
+            self.messages = messages or []
+            self.tools = tools
+            self.tool_choice = tool_choice or ("auto" if tools else "none")
+
+    provider_mod.LLMRequest = LLMRequest
+    sys.modules["core.provider"] = provider_mod
+
     if sys.modules.get("fastapi") is None:
         # Leave the real package alone if it is already imported; otherwise
         # install a stub (this shadows an installed-but-unimported fastapi
@@ -186,8 +207,19 @@ def install_core_stubs() -> None:
 
 def load_module(mod_name: str):
     """Load a plugin submodule (db is a package directory, everything else a
-    single file; host stubs installed first)."""
+    single file; host stubs installed first).
+
+    Idempotent: once a submodule is loaded, subsequent calls return the SAME
+    module object. Re-execing the file for a second caller would create a
+    distinct class hierarchy (e.g. two ``MemoryDBUnavailable`` types), breaking
+    ``assertRaises`` and ``isinstance`` checks across test files collected in
+    one pytest process.
+    """
     install_core_stubs()
+    key = f"noriflow_memory_pkg.{mod_name}"
+    existing = sys.modules.get(key)
+    if existing is not None:
+        return existing
     target = PLUGIN_DIR / mod_name
     if target.is_dir():
         path = target / "__init__.py"
@@ -199,6 +231,6 @@ def load_module(mod_name: str):
         f"noriflow_memory_pkg.{mod_name}", path, **kwargs
     )
     mod = importlib.util.module_from_spec(spec)
-    sys.modules[f"noriflow_memory_pkg.{mod_name}"] = mod
+    sys.modules[key] = mod
     spec.loader.exec_module(mod)
     return mod
