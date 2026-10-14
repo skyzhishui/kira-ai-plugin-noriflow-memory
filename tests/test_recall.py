@@ -295,6 +295,64 @@ async def test_dedup_early_stop_at_top_k() -> None:
     print("PASS test_dedup_early_stop_at_top_k")
 
 
+async def test_write_dedup_skips_mismatched_vector_dims() -> None:
+    """M4 维度跳过：换 embedding 模型后同库新旧维度向量共存（SQLite 后端
+    无固定维度列）——维度不匹配的比对对不构成去重证据。原先 zip 静默截断
+    产生的无意义分数可能 ≥ 阈值假命中：读侧丢召回行、写侧静默丢摘要。"""
+    # 读侧守卫（len(unit) != len(kept_vec) -> continue）：3 维与 4 维同向
+    # "近重复"对必须双双保留（若仍 zip 截断比对，cosine=1.0 假命中会丢行）
+    a = _row("a", 0.9, _NOW - timedelta(days=10), _vec_str([1.0, 0.0, 0.0]))
+    b = _row("b", 0.8, _NOW - timedelta(days=11), _vec_str([1.0, 0.0, 0.0, 0.0]))
+    db = _CaptureDB(rows=[a, b])
+    items = await _make_kernel(db).search(query="猫", session_id="s1")
+    assert [i.id for i in items] == ["a", "b"], (
+        "维度不匹配 = 非重复，不得作为读侧去重证据"
+    )
+
+    # 写侧端到端（ingest 走 apply_write_dedup=True）：窗口比对用真
+    # SQLite 打分逻辑（fetch_recent_summary_scores 的 _cosine 维度过滤），
+    # 连接层用既有 _FetchSeqConn 桩喂同会话窗口行
+    inserted: list[str] = []
+
+    def _kernel_with_window(window_vec: list[float]) -> LocalMemoryKernel:
+        leg = _db.SQLiteMemoryDatabase.__new__(_db.SQLiteMemoryDatabase)
+        leg._pool = _ExecPool()
+        leg._pool.conn = _FetchSeqConn([
+            [{"id": 1, "content": "旧模型窗口摘要",
+              "embedding": list(window_vec)}],
+        ])
+
+        class _WindowDB:
+            async def fetch_recent_summary_scores(self, **kwargs):
+                return await leg.fetch_recent_summary_scores(**kwargs)
+
+            async def insert_chat_summary(self, **kwargs):
+                inserted.append(kwargs.get("document_id", ""))
+                return kwargs.get("document_id", "")
+
+        return _make_kernel(_WindowDB())
+
+    # 窗口内是旧模型 4 维向量；新批次经 _StubEmbedding 产出 1 维向量——
+    # 维度不匹配的窗口行不产生分数（best=0），摘要必须正常落库
+    doc_id = await _kernel_with_window([1.0, 0.0, 0.0, 0.0]).ingest(
+        "新模型批次摘要", "s1", "u1", platform="napcat",
+        apply_write_dedup=True,
+    )
+    assert doc_id and inserted == [doc_id], (
+        "维度不匹配不构成写侧去重证据，新批次必须正常落库"
+    )
+
+    # 对照组：窗口行同为 1 维且与新批次向量同向（cosine=1.0 ≥ 0.85）——
+    # 写入去重照常命中跳过（document_id 幂等返回但行不落库）
+    inserted.clear()
+    doc_id2 = await _kernel_with_window([0.5]).ingest(
+        "对照组摘要", "s1", "u1", platform="napcat",
+        apply_write_dedup=True,
+    )
+    assert doc_id2 and inserted == [], "同维度高相似对照须照常跳过写入"
+    print("PASS test_write_dedup_skips_mismatched_vector_dims")
+
+
 # ----------------------------------------------------------------------
 # Recency exclusion (batch-count anchored)
 # ----------------------------------------------------------------------
@@ -809,8 +867,8 @@ async def test_sql_assembly_blacklist_and_participants() -> None:
 
 def test_build_search_text() -> None:
     assert build_search_text("明日方舟") == "明日 日方 方舟"
-    assert build_search_text("玩原神 Game5 吗") == "玩原 原神 game5", (
-        "单字 CJK 不产 bigram，ASCII 词小写保留"
+    assert build_search_text("玩原神 Game5 吗") == "玩原 原神 吗 game5", (
+        "单字 CJK 产单字 token，ASCII 词小写保留"
     )
     assert build_search_text("") == ""
     assert build_search_text("ABC") == "abc"
@@ -1008,6 +1066,7 @@ async def test_rollout_text_and_recall_exclusion() -> None:
     kernel = _make_kernel(db, window_batches=10, timezone="UTC")
 
     text = await kernel.build_recent_rollout_text("s1")
+    kernel.commit_rollout_memo("s1")
     assert text.startswith("# 更早对话摘要"), "块标题"
     lines = [l for l in text.splitlines() if l.startswith("- ")]
     assert len(lines) == 3
@@ -1045,6 +1104,7 @@ async def test_rollout_budget_truncation_keeps_newest() -> None:
         recall_time_label_enabled=False,
     )
     text = await kernel.build_recent_rollout_text("s1")
+    kernel.commit_rollout_memo("s1")
     body = [l for l in text.splitlines() if l.startswith("- ")]
     assert len(body) == 1, "预算 1000 只容得下一批"
     assert body[0].startswith("- " + "A" * 900), "超预算丢弃更旧批次、保留最新桥接批"
@@ -1057,12 +1117,45 @@ async def test_rollout_memo_ttl_expiry() -> None:
     db = _RolloutDB(rollout_rows=[_rollout_row("a", "内容", 4)])
     kernel = _make_kernel(db, window_batches=10)
     await kernel.build_recent_rollout_text("s1")
+    kernel.commit_rollout_memo("s1")
     # wind the memo timestamp back past the TTL manually
     ids, _ = kernel._rollout_memo["s1"]
     kernel._rollout_memo["s1"] = (ids, time.monotonic() - 10000)
     await kernel.search(query="Q", session_id="s1")
     assert db.search_kwargs.get("exclude_document_ids") is None, "过期后不再排除"
     print("PASS test_rollout_memo_ttl_expiry")
+
+
+async def test_rollout_no_commit_keeps_row_recallable() -> None:
+    """L6 两阶段 memo 的 no-commit 可见性：build 只把 ids 暂存
+    _rollout_pending（recall 排除只读 _rollout_memo）——未 commit 时该批次
+    行必须仍可被 search 召回（prompt 组装被丢弃时不得双通道失踪），
+    commit 后才进入排除。一测锁两态。"""
+    db = _RolloutDB(
+        rows=[_leg_row(1, "bridge-batch", 0.9)],
+        rollout_rows=[_rollout_row("bridge-batch", "窗口外桥接批摘要", 4)],
+    )
+    kernel = _make_kernel(db, window_batches=10)
+
+    text = await kernel.build_recent_rollout_text("s1")
+    assert "窗口外桥接批摘要" in text, "build 须返回包含该批次行"
+
+    # 未 commit：pending 不泄漏进 recall 排除，行仍可被召回
+    items = await kernel.search(query="Q", session_id="s1")
+    assert db.search_kwargs.get("exclude_document_ids") is None, (
+        "build 后未 commit，pending ids 不得送进召回排除"
+    )
+    assert [i.id for i in items] == ["bridge-batch"], (
+        "未 commit 时该批次行必须仍可被 search 召回"
+    )
+
+    # commit 后：同一会话的 recall 才排除该行
+    kernel.commit_rollout_memo("s1")
+    await kernel.search(query="Q", session_id="s1")
+    assert db.search_kwargs.get("exclude_document_ids") == ["bridge-batch"], (
+        "commit 后才进入召回排除"
+    )
+    print("PASS test_rollout_no_commit_keeps_row_recallable")
 
 
 async def test_rollout_disabled_or_no_window() -> None:

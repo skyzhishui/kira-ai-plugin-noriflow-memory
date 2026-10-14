@@ -470,6 +470,73 @@ async def main_async() -> None:
     tmp.cleanup()
 
 
+async def test_search_fact_clusters_blank_user_ids_fail_closed() -> None:
+    """user_ids 真值但全空白（如 ["", ""]）→ SQL 常量假 "1 = 0" → 空结果
+    （fail-closed，绝不退化成返回全部行 = 跨用户暴露；PG 侧空 ANY 恒假
+    同语义）；对照组有效 uid 照常只返回该用户的簇行。pytest 收集项，
+    直跑 main_async 不经过。"""
+    config_mod = _load("config")
+    _load("alias_store")
+    _load("entity_edge")
+    db_pkg = _load("db")
+    LocalMemoryConfig = config_mod.LocalMemoryConfig
+    SQLiteMemoryDatabase = db_pkg.SQLiteMemoryDatabase
+
+    tmp = tempfile.TemporaryDirectory(prefix="noriflow_blank_uids_")
+    try:
+        config = LocalMemoryConfig(
+            storage_backend="sqlite",
+            sqlite_path=str(Path(tmp.name) / "memory.sqlite3"),
+            embedding_dims=4,
+        )
+        db = SQLiteMemoryDatabase(config)
+        await db.connect()
+        try:
+            await db.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
+            now = datetime.now(_UTC)
+            # 两个用户各建一个事实簇（upsert 原始事实 + apply create 成簇）
+            for uid, text in (("u1", "小明喜欢爬山"), ("u2", "小红喜欢游泳")):
+                fid = await db.upsert_persona_fact_raw_for_apply(
+                    document_id=f"doc-{uid}", platform="napcat",
+                    user_id=uid, related_user_ids=[], display_name="",
+                    category="stable", statement=text, confidence="high",
+                    session_id="s1", group_id="",
+                    evidence_key=f"s1|{now.strftime('%Y-%m-%d')}",
+                    occurred_at=now, embedding=_vec(1.0, 0.0, 0.0, 0.0),
+                )
+                out = await db.apply_fact_merge(
+                    action="create", fact_id=fid, start_score=3.0,
+                    score_cap=10.0, promote_threshold=10.0,
+                    recent_promote_threshold=4.0,
+                )
+                assert out.get("action") == "create", f"建簇失败: {out}"
+
+            qvec = _vec(1.0, 0.0, 0.0, 0.0)
+            # fail-closed：user_ids 真值但全空白 → 恒假条件 → 空，
+            # 绝不返回全部行（若跳过过滤会带出 u1+u2 两行）
+            rows = await db.search_fact_clusters(
+                query_vec=qvec, limit=10, platform="napcat",
+                user_ids=["", ""],
+            )
+            assert rows == [], (
+                f"全空白 user_ids 必须恒空（fail-closed），实际返回 {rows}"
+            )
+
+            # 对照组：有效 uid 只返回该用户的簇行（正常路径未被破坏，
+            # 证明空结果非环境问题）
+            rows_u1 = await db.search_fact_clusters(
+                query_vec=qvec, limit=10, platform="napcat",
+                user_ids=["u1"],
+            )
+            assert {r["user_id"] for r in rows_u1} == {"u1"} and len(rows_u1) == 1, (
+                f"有效 uid 须只返回该用户的簇行，实际 {rows_u1}"
+            )
+        finally:
+            await db.close()
+    finally:
+        tmp.cleanup()
+
+
 def main() -> None:
     logging.basicConfig(level=logging.WARNING)
     asyncio.run(main_async())
