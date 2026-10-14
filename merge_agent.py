@@ -302,9 +302,14 @@ class FactAdjudicator:
             cluster_id = (
                 item.get("cluster_id") if isinstance(item, dict) else None
             )
-            # bool 单独拦截置空（JSON true == 1 会错配成员校验）；其余按
-            # 基线 int() 归一宽度接受浮点/数字串（模型偶发输出 1.0 须落到候选 1）
+            # bool 置空（JSON true == 1 错配成员校验）；整值浮点（1.0）按
+            # 基线归一宽度落回真实 id，非整值（1.9）置空防 int() 静默
+            # 截断错配到错误簇
             if isinstance(cluster_id, bool):
+                cluster_id = None
+            elif (
+                isinstance(cluster_id, float) and not cluster_id.is_integer()
+            ):
                 cluster_id = None
             else:
                 try:
@@ -419,8 +424,10 @@ class RelationAuditor:
             return None
         for item in items:
             edge_id = item.get("id") if isinstance(item, dict) else None
-            # bool 单独拦截置空；其余按基线 int() 归一宽度（同 FactAdjudicator）
+            # bool 置空；整值浮点归一、非整值置空（同 FactAdjudicator）
             if isinstance(edge_id, bool):
+                edge_id = None
+            elif isinstance(edge_id, float) and not edge_id.is_integer():
                 edge_id = None
             else:
                 try:

@@ -4204,13 +4204,16 @@ class TestIdValidationBoolGuard(unittest.TestCase):
     def test_adjudicate_float_cluster_id_normalized(self):
         # PR review：isinstance(int) 严格校验误杀浮点 id——模型偶发输出
         # {"cluster_id": 1.0} 会被丢弃致 verdicts 覆盖不全、fact 永久顺延；
-        # 须按基线 int() 归一宽度落回候选 1（bool 拦截语义不变）
+        # 须按基线 int() 归一宽度落回候选 1（bool 拦截语义不变）。
+        # 次轮 review：非整值浮点（1.9）须置空丢弃——int() 会静默截断成 1
+        # 错配到错误簇
         ma = sys.modules["noriflow_memory_pkg.merge_agent"]
         adj = ma.FactAdjudicator(
             llm=self._llm({
                 "verdicts": [
                     {"cluster_id": 1.0, "verdict": "same"},
                     {"cluster_id": "2", "verdict": "same"},  # 数字串同宽归一
+                    {"cluster_id": 1.9, "verdict": "same"},  # 非整值：置空丢弃
                 ],
                 "unsure": False,
             }),
@@ -4223,7 +4226,7 @@ class TestIdValidationBoolGuard(unittest.TestCase):
         ]
         result = asyncio.run(adj.adjudicate(fact, candidates))
         self.assertEqual(result["verdicts"], [(1, "same"), (2, "same")])
-        self.assertEqual(result["dropped"], 0)
+        self.assertEqual(result["dropped"], 1)
 
     def test_audit_float_edge_id_normalized(self):
         # PR review 同款：关系边审计的 isinstance(int) 严格校验须回归到
