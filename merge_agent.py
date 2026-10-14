@@ -1,34 +1,48 @@
-"""Merge agent: four-pass scan + LLM four-way adjudication + scoring state
-machine orchestration (dev plan section 8).
+"""Merge agent: multi-pass maintenance cycle + LLM four-way adjudication +
+scoring state machine orchestration (dev plan section 8).
 
-One run_cycle runs per merge_interval_hours:
+One run_cycle runs per merge_interval_hours (passes in this order; each
+pass is stage-isolated — a transient DB failure inside one pass is
+logged, recorded to the circuit breaker, and only that pass is skipped,
+so the remaining passes still run and the poison-row skip state is
+persisted on every exit path):
 1. Normalization pass: raw table facts with flag=0 -> candidate clusters for
    the same (platform, user, category), using vector top-K (including
    tombstone clusters; scalar fallback when a fact has no vector) -> LLM
-   four-way adjudication (same/drift/correction/unrelated) -> single
+   four-way adjudication (same/drift/correction/unrelated; a verdict set
+   that does not cover every candidate is treated as unsure) -> single
    transaction disposition + flag flip;
 2. Decay pass: once per decay_interval_days (last-run time persisted in kv,
    survives restarts; the first run only initializes the timestamp, it does
    not decay);
 3. Promotion pass: active clusters reaching the threshold -> profiled +
    profile table upsert (recent uses a lower threshold);
-4. Encode-backfill pass: dialogue raw rows written into the summary table
+4. Summary-archive pass (011 lifecycle, off by default): once per
+   summary_lifecycle_interval_days, rows past the archive deadline and
+   outside the reinforce window are archived out of recall (original text
+   kept, recoverable);
+5. Encode-backfill pass: dialogue raw rows written into the summary table
    during the encode-degradation window (summarized=false, excluded from
    recall) are re-run through on-device encoding; summary is written back to
    the original row (status flipped, embedding recomputed), facts go through
    the normal fact raw table channel (evidence_key reuses the row's
    occurred_at);
-5. Relation pass: structural self-check (a zero-LLM sentinel, violations
+6. Relation pass: structural self-check (a zero-LLM sentinel, violations
    counted into logs) + semantic audit (gated by relation_audit_enabled,
    LLM incrementally audits active/pending edges by id watermark, edges
-   judged bad are superseded directly).
+   judged bad are superseded directly; a batch whose verdicts do not cover
+   every submitted edge goes through the same retry/skip accounting as a
+   failed batch — the watermark never advances past uncovered edges);
+7. Fact-code alias pass: "user<uid> (<code name>)" forms found in active
+   cluster statements are registered as uid aliases (zero LLM; the
+   retain channel's periodic backstop).
 
 Reliability:
 - LLM call budget is throttled by llm_budget_per_cycle, overshoot is carried
   over to the next cycle;
-- unsure verdicts / LLM failures / disposition errors never flip the flag
-  (reprocessed next cycle; idempotence is backed by evidence_key dedup plus
-  optimistic locking);
+- unsure / partial-coverage verdicts / LLM failures / disposition errors
+  never flip the flag (reprocessed next cycle; idempotence is backed by
+  evidence_key dedup plus optimistic locking);
 - Encode-backfill pass: encode or write failures do not flip status (rows
   stay summarized=false and retry next cycle; fact/edge idempotence keys
   prevent duplicate inserts), 3 consecutive ok=False results treat the LLM
@@ -58,8 +72,12 @@ from typing import Callable, Optional
 from .clients import FastLlmExit
 from .alias_store import AliasStore, build_fact_code_alias_rows, is_placeholder_name
 from .config import LocalMemoryConfig
-from .db import MemoryDatabase, fact_document_id
-from .entity_edge import EncodedRelation, edge_has_bot_endpoint
+from .db import MemoryDatabase, evidence_key, fact_document_id
+from .entity_edge import (
+    EncodedRelation,
+    edge_has_bot_endpoint,
+    resolve_bot_forms,
+)
 from .json_utils import safe_parse_llm_json
 from .memory_encoder import MemoryEncoder
 from .prompt_loader import PromptLoader
@@ -225,9 +243,12 @@ class FactAdjudicator:
                 search_cluster_candidates).
 
         Returns:
-            {"verdicts": [(cluster_id, verdict), ...], "unsure": bool};
-            None on LLM failure or unparseable output (the caller skips
-            this fact).
+            {"verdicts": [(cluster_id, verdict), ...], "unsure": bool,
+            "dropped": int}; "dropped" counts entries rejected by
+            validation (each dropped entry leaves its candidate
+            un-adjudicated — the caller's coverage check treats that as
+            unsure). None on LLM failure or unparseable output (the
+            caller skips this fact).
         """
         payload = {
             "new_fact": {
@@ -278,19 +299,36 @@ class FactAdjudicator:
         verdicts: list[tuple[int, str]] = []
         dropped = 0
         for item in raw_verdicts:
+            cluster_id = (
+                item.get("cluster_id") if isinstance(item, dict) else None
+            )
+            # bool 置空（JSON true == 1 错配成员校验）；整值浮点（1.0）按
+            # 基线归一宽度落回真实 id，非整值（1.9）置空防 int() 静默
+            # 截断错配到错误簇
+            if isinstance(cluster_id, bool):
+                cluster_id = None
+            elif (
+                isinstance(cluster_id, float) and not cluster_id.is_integer()
+            ):
+                cluster_id = None
+            else:
+                try:
+                    cluster_id = int(cluster_id)
+                except (TypeError, ValueError):
+                    cluster_id = None
             if (
-                not isinstance(item, dict)
-                or item.get("cluster_id") not in valid_ids
+                cluster_id is None
+                or cluster_id not in valid_ids
                 or item.get("verdict") not in _VALID_VERDICTS
             ):
                 dropped += 1
                 continue
-            verdicts.append((int(item["cluster_id"]), str(item["verdict"])))
+            verdicts.append((cluster_id, str(item["verdict"])))
         if dropped:
             logger.warning(
                 "事实裁定丢弃 %d 条非法条目（候选共 %d 条）", dropped, len(candidates)
             )
-        return {"verdicts": verdicts, "unsure": False}
+        return {"verdicts": verdicts, "unsure": False, "dropped": dropped}
 
 
 class RelationAuditor:
@@ -385,15 +423,26 @@ class RelationAuditor:
             logger.warning("关系边审计输出缺少 edges 数组（本批顺延下周期）")
             return None
         for item in items:
+            edge_id = item.get("id") if isinstance(item, dict) else None
+            # bool 置空；整值浮点归一、非整值置空（同 FactAdjudicator）
+            if isinstance(edge_id, bool):
+                edge_id = None
+            elif isinstance(edge_id, float) and not edge_id.is_integer():
+                edge_id = None
+            else:
+                try:
+                    edge_id = int(edge_id)
+                except (TypeError, ValueError):
+                    edge_id = None
             if (
-                not isinstance(item, dict)
-                or item.get("id") not in valid_ids
+                edge_id is None
+                or edge_id not in valid_ids
                 or item.get("verdict") not in _EDGE_VERDICTS
             ):
                 dropped += 1
                 continue
             verdicts.append(
-                (int(item["id"]), str(item["verdict"]), str(item.get("reason") or ""))
+                (edge_id, str(item["verdict"]), str(item.get("reason") or ""))
             )
         if dropped:
             logger.warning(
@@ -403,7 +452,9 @@ class RelationAuditor:
 
 
 class FactMergeAgent:
-    """Four-pass scan merge agent (a background asyncio task whose lifecycle
+    """Multi-pass merge agent — normalization / decay / promotion /
+    summary-archive / encode-backfill / relation-integrity+audit /
+    fact-code-alias passes (a background asyncio task whose lifecycle
     belongs to the plugin's initialize/terminate).
 
     Depends on FastLlmExit (LLM adjudication): do not start this agent when
@@ -483,6 +534,9 @@ class FactMergeAgent:
         self._task: Optional[asyncio.Task] = None
         self._last_decay_at: Optional[datetime] = None
         self._last_summary_lifecycle_at: Optional[datetime] = None
+        # Never overwrite a persisted poison list with the empty fallback
+        # when its read failed transiently.
+        self._skip_state_read_failed: set[str] = set()
         # WebUI manual-trigger state: the inter-cycle wait doubles as a
         # kickable event so a manual request short-circuits the interval.
         # The loop stays the only runner — a kicked cycle can never
@@ -492,16 +546,9 @@ class FactMergeAgent:
         self._last_cycle: Optional[dict] = None
 
     def _bot_forms(self) -> list[str]:
-        """Full-form bot uid set (provider first; degrades to the single form
-        self._bot_id)."""
-        if self._bot_forms_provider is not None:
-            try:
-                forms = [f for f in (self._bot_forms_provider() or []) if f]
-            except Exception:
-                forms = []
-            if forms:
-                return forms
-        return [self._bot_id] if self._bot_id else []
+        """Full-form bot uid set (shared entity_edge resolver: provider
+        first, degrades to the single form self._bot_id)."""
+        return resolve_bot_forms(self._bot_forms_provider, self._bot_id)
 
     def _alias_name_for(self, platform: str, uid: str) -> str:
         """Placeholder-name replacement source: the alias view's latest
@@ -625,11 +672,22 @@ class FactMergeAgent:
         return True
 
     async def run_cycle(self) -> dict:
-        """Run a single merge cycle (four-pass scan).
+        """Run a single merge cycle (multi-pass maintenance).
+
+        Per-stage isolation: every DB-touching stage (fact fetch, candidate
+        search, apply, decay, promote, summary-archive, encode-backfill,
+        relation passes) catches its own transient failures — the failure
+        is recorded to the circuit breaker through the same channel the
+        apply block uses, the stage logs a warning and is skipped, and the
+        cycle continues with the remaining stages (a fact-fetch failure
+        skips adjudication but still runs the decay/promote/reencode/
+        relation passes). The poison-row skip state is persisted on every
+        exit path (try/finally around the stage sequence).
 
         Returns:
             stats dict: facts/merged/created/replaced/skipped_unsure/
-            deferred/llm_calls/promoted/reencoded.
+            deferred/llm_calls/promoted/reencoded/edges_audited/
+            edges_superseded/summaries_archived/fact_alias.
         """
         cfg = self._config
         stats = {
@@ -644,6 +702,8 @@ class FactMergeAgent:
             "reencoded": 0,
             "edges_audited": 0,
             "edges_superseded": 0,
+            "summaries_archived": 0,
+            "fact_alias": 0,
         }
 
         # 熔断拒绝期整周期跳过（peek 非消费式，不占恢复探测名额）：DB
@@ -656,22 +716,17 @@ class FactMergeAgent:
             logger.warning("记忆库熔断中，跳过本合并周期")
             return stats
 
-        # 补编码遍预算保留：存在降级原文积压时预留 1/4 预算——归一化遍
+        # 补编码遍预算保留：存在可补编码的积压时预留 1/4 预算——归一化遍
         # 持续满载会把补编码遍饿死为恒 0（summarized=false 行不参与召回，
         # 无界期无法恢复）；无积压时不预留，预算全给归一化遍。预留上限
         # budget-1：极小预算（1-3）时归一化遍至少保 1 次调用，不被 floor(1)
         # 的预留吃成恒 0
         reserve = 0
-        if self._encoder is not None:
-            try:
-                backlog = await self._db.fetch_unsummarized_summaries(1)
-            except Exception:
-                backlog = []
-            if backlog:
-                reserve = min(
-                    max(1, cfg.llm_budget_per_cycle // 4),
-                    max(0, cfg.llm_budget_per_cycle - 1),
-                )
+        if self._encoder is not None and await self._reencode_backlog_exists():
+            reserve = min(
+                max(1, cfg.llm_budget_per_cycle // 4),
+                max(0, cfg.llm_budget_per_cycle - 1),
+            )
         budget = cfg.llm_budget_per_cycle - reserve
 
         # ---- 归一化遍 ----
@@ -679,144 +734,226 @@ class FactMergeAgent:
         # 重试上限的 unsure 毒丸行后再截回批量——防毒丸行占据队首使后续
         # 新事实永远进不了处理窗口
         skip_state = await self._load_skip_state(_ADJUD_SKIP_KV_KEY)
-        facts = await self._db.fetch_pending_facts(cfg.merge_batch_size * 3)
-        facts = [
-            f for f in facts
-            if skip_state.get(str(f["id"]), 0) < _ADJUD_MAX_ATTEMPTS
-        ][: cfg.merge_batch_size]
-        llm_seen_ok = False
-        for fact in facts:
-            # 预算耗尽在候选检索前短路：省掉无谓的 HNSW 候选查询；同时
-            # 不得走无裁定的建簇路径——本条可能存在候选簇，跳过检索直接
-            # create 等于盲目建簇，违反模块契约（顺延下周期重审）
-            if budget <= 0:
-                stats["deferred"] += 1
-                continue
-            candidates = await self._db.search_cluster_candidates(
-                platform=fact["platform"],
-                user_id=fact["user_id"],
-                category=fact["category"],
-                related_user_ids=fact.get("related_user_ids") or [],
-                embedding=fact["embedding"],
-                top_k=cfg.candidate_top_k,
-            )
-            verdicts: Optional[list[tuple[int, str]]] = None
-            if candidates:
-                budget -= 1
-                stats["llm_calls"] += 1
-                result = await self._adjudicator.adjudicate(fact, candidates)
-                if result is None or result["unsure"]:
-                    stats["skipped_unsure"] += 1
-                    # 差分计数：本周期裁定器已有有效输出（LLM 健康），
-                    # 该行对确定性输入仍反复 unsure 才计为毒丸尝试
-                    if llm_seen_ok:
-                        _bump_skip(skip_state, str(fact["id"]))
-                    continue
-                if not result["verdicts"]:
-                    # Parsed output carried zero valid entries (all dropped
-                    # by validation): the model produced nothing usable —
-                    # treat as unsure and defer. Never fall through to
-                    # _choose_action, which would blindly create a cluster.
-                    stats["skipped_unsure"] += 1
-                    if llm_seen_ok:
-                        _bump_skip(skip_state, str(fact["id"]))
-                    continue
-                llm_seen_ok = True
-                verdicts = result["verdicts"]
-
-            action, cluster_id = self._choose_action(fact, candidates, verdicts)
-            # 矛盾标记目标：correction/drift 裁定簇 + same 命中 replaced 簇的
-            # 继任簇（重申旧说法 = 推翻此前的更正，继任簇豁免证据地板出清）
-            contradict_ids = [
-                cid for cid, verdict in (verdicts or [])
-                if verdict in ("correction", "drift")
-            ]
-            contradict_ids.extend(
-                self._same_replaced_successors(candidates, verdicts)
-            )
+        try:
+            # Stage isolation: a failed fact fetch skips the normalization
+            # stage only; the later passes still run, and the skip state
+            # still persists in the finally below.
             try:
-                summary = await self._db.apply_fact_merge(
-                    fact_id=fact["id"],
-                    action=action,
-                    cluster_id=cluster_id,
-                    evidence_key=fact["evidence_key"],
-                    occurred_at=fact["occurred_at"],
-                    start_score=self._start_score(fact),
-                    score_cap=cfg.score_cap,
-                    promote_threshold=cfg.promote_threshold,
-                    recent_promote_threshold=cfg.recent_promote_threshold,
-                    contradict_cluster_ids=contradict_ids or None,
+                facts = await self._db.fetch_pending_facts(
+                    cfg.merge_batch_size * 3
                 )
             except Exception:
-                # 合并侧 DB 失败同样喂熔断器（learn merge-only failure modes;
-                # the periodic peek alone never records them）
                 await self._record_db_failure()
                 logger.warning(
-                    "事实合并处置失败（fact_id=%s，顺延下周期）",
-                    fact["id"],
+                    "待处理事实拉取失败（归一化遍跳过，其余各遍继续）",
                     exc_info=True,
                 )
-                continue
-            await self._record_db_success()
-            stats["facts"] += 1
-            skip_state.pop(str(fact["id"]), None)
-            # 复活簇登记回填待办（P2-9）：merge 复活 pending/dead 簇后，其
-            # 存量陈述未经关系回填（水位已推过）——登记待办让下轮增量回填
-            # 按id 精取补提取（backfill|{id} evidence_key 幂等，重复无害）
-            if (
-                summary.get("action") == "merge"
-                and cluster_id is not None
-                and any(
-                    c["id"] == cluster_id
-                    and c.get("status") in ("pending_uncertain", "dead")
-                    for c in candidates
-                )
-            ):
+                facts = []
+            facts = [
+                f for f in facts
+                if skip_state.get(str(f["id"]), 0) < _ADJUD_MAX_ATTEMPTS
+            ][: cfg.merge_batch_size]
+            llm_seen_ok = False
+            for fact in facts:
+                # 预算耗尽在候选检索前短路：省掉无谓的 HNSW 候选查询；同时
+                # 不得走无裁定的建簇路径——本条可能存在候选簇，跳过检索直接
+                # create 等于盲目建簇，违反模块契约（顺延下周期重审）
+                if budget <= 0:
+                    stats["deferred"] += 1
+                    continue
                 try:
-                    await mark_backfill_pending(self._db, [cluster_id])
+                    candidates = await self._db.search_cluster_candidates(
+                        platform=fact["platform"],
+                        user_id=fact["user_id"],
+                        category=fact["category"],
+                        related_user_ids=fact.get("related_user_ids") or [],
+                        embedding=fact["embedding"],
+                        top_k=cfg.candidate_top_k,
+                    )
                 except Exception:
+                    # Stage isolation: a transient candidate-search failure
+                    # defers this fact (flag not flipped, retried next
+                    # cycle) and moves on to the next fact.
+                    await self._record_db_failure()
                     logger.warning(
-                        "复活簇回填待办登记失败（cluster_id=%s）",
-                        cluster_id,
+                        "候选簇检索失败（fact_id=%s，顺延下周期）",
+                        fact["id"],
                         exc_info=True,
                     )
-            key = {"merge": "merged", "create": "created", "replace": "replaced"}.get(
-                summary.get("action", "")
-            )
-            if key is not None:
-                stats[key] += 1
-            logger.debug("事实处置: fact_id=%s -> %s", fact["id"], summary)
+                    continue
+                verdicts: Optional[list[tuple[int, str]]] = None
+                if candidates:
+                    budget -= 1
+                    stats["llm_calls"] += 1
+                    result = await self._adjudicator.adjudicate(fact, candidates)
+                    if result is None or result["unsure"]:
+                        stats["skipped_unsure"] += 1
+                        # 差分计数：本周期裁定器已有有效输出（LLM 健康），
+                        # 该行对确定性输入仍反复 unsure 才计为毒丸尝试
+                        if llm_seen_ok:
+                            _bump_skip(skip_state, str(fact["id"]))
+                        continue
+                    if not result["verdicts"]:
+                        # Parsed output carried zero valid entries (all dropped
+                        # by validation): the model produced nothing usable —
+                        # treat as unsure and defer. Never fall through to
+                        # _choose_action, which would blindly create a cluster.
+                        stats["skipped_unsure"] += 1
+                        if llm_seen_ok:
+                            _bump_skip(skip_state, str(fact["id"]))
+                        continue
+                    # 已解析出 ≥1 条有效 verdict 即 LLM 健康（模型确有
+                    # 输出，可能只是漏候选）；若等完整覆盖才置位，批内首条
+                    # fact 长期部分覆盖时 llm_seen_ok 恒假，毒丸计数永不
+                    # 累加，跳过名单防队首钉死的设计即失效
+                    llm_seen_ok = True
+                    covered_ids = {cid for cid, _ in result["verdicts"]}
+                    missing_ids = [
+                        c["id"] for c in candidates if c["id"] not in covered_ids
+                    ]
+                    if missing_ids:
+                        # Partial coverage: the un-adjudicated candidates
+                        # would be treated as unrelated by _choose_action,
+                        # taking the create path and duplicating a cluster
+                        # that should have merged (never blindly create).
+                        # Defer the whole fact to the next cycle instead.
+                        stats["skipped_unsure"] += 1
+                        logger.warning(
+                            "事实裁定覆盖不完整（fact_id=%s，缺失候选 %s，"
+                            "本条顺延下周期）",
+                            fact["id"],
+                            missing_ids,
+                        )
+                        if llm_seen_ok:
+                            _bump_skip(skip_state, str(fact["id"]))
+                        continue
+                    verdicts = result["verdicts"]
 
-        # ---- 衰减遍 + 晋档遍 ----
-        await self._maybe_decay()
-        stats["promoted"] = await self._db.promote_pass(
-            promote_threshold=cfg.promote_threshold,
-            recent_promote_threshold=cfg.recent_promote_threshold,
-        )
+                action, cluster_id = self._choose_action(fact, candidates, verdicts)
+                # 矛盾标记目标：correction/drift 裁定簇 + same 命中 replaced 簇的
+                # 继任簇（重申旧说法 = 推翻此前的更正，继任簇豁免证据地板出清）
+                contradict_ids = [
+                    cid for cid, verdict in (verdicts or [])
+                    if verdict in ("correction", "drift")
+                ]
+                contradict_ids.extend(
+                    self._same_replaced_successors(candidates, verdicts)
+                )
+                try:
+                    summary = await self._db.apply_fact_merge(
+                        fact_id=fact["id"],
+                        action=action,
+                        cluster_id=cluster_id,
+                        evidence_key=fact["evidence_key"],
+                        occurred_at=fact["occurred_at"],
+                        start_score=self._start_score(fact),
+                        score_cap=cfg.score_cap,
+                        promote_threshold=cfg.promote_threshold,
+                        recent_promote_threshold=cfg.recent_promote_threshold,
+                        contradict_cluster_ids=contradict_ids or None,
+                    )
+                except Exception:
+                    # 合并侧 DB 失败同样喂熔断器（learn merge-only failure modes;
+                    # the periodic peek alone never records them）
+                    await self._record_db_failure()
+                    logger.warning(
+                        "事实合并处置失败（fact_id=%s，顺延下周期）",
+                        fact["id"],
+                        exc_info=True,
+                    )
+                    continue
+                await self._record_db_success()
+                stats["facts"] += 1
+                skip_state.pop(str(fact["id"]), None)
+                # 复活簇登记回填待办（P2-9）：merge 复活 pending/dead 簇后，其
+                # 存量陈述未经关系回填（水位已推过）——登记待办让下轮增量回填
+                # 按id 精取补提取（backfill|{id} evidence_key 幂等，重复无害）
+                if (
+                    summary.get("action") == "merge"
+                    and cluster_id is not None
+                    and any(
+                        c["id"] == cluster_id
+                        and c.get("status") in ("pending_uncertain", "dead")
+                        for c in candidates
+                    )
+                ):
+                    try:
+                        await mark_backfill_pending(self._db, [cluster_id])
+                    except Exception:
+                        logger.warning(
+                            "复活簇回填待办登记失败（cluster_id=%s）",
+                            cluster_id,
+                            exc_info=True,
+                        )
+                key = {
+                    "merge": "merged", "create": "created", "replace": "replaced"
+                }.get(summary.get("action", ""))
+                if key is not None:
+                    stats[key] += 1
+                logger.debug("事实处置: fact_id=%s -> %s", fact["id"], summary)
 
-        # ---- 摘要归档遍（011 生命周期；周期/开关门控见方法内）----
-        # fail-open（与 _fact_code_alias_pass 同款）：归档遍是可选功能且
-        # 默认关闭，其异常不应中断本周期后续各遍（补编码/关系自检/语义
-        # 审计/别名回填）——失败仅告警，下周期重试
-        try:
-            stats["summaries_archived"] = await self._maybe_summary_lifecycle()
-        except Exception:
-            logger.warning("摘要归档遍失败（跳过，下周期重试）", exc_info=True)
-            stats["summaries_archived"] = 0
+            # ---- 衰减遍 + 晋档遍 ----
+            # Stage isolation: a decay/promote failure feeds the breaker
+            # and skips that pass only; the rest of the cycle continues.
+            try:
+                await self._maybe_decay()
+            except Exception:
+                await self._record_db_failure()
+                logger.warning("衰减遍失败（跳过，下周期重试）", exc_info=True)
+            try:
+                stats["promoted"] = await self._db.promote_pass(
+                    promote_threshold=cfg.promote_threshold,
+                    recent_promote_threshold=cfg.recent_promote_threshold,
+                )
+            except Exception:
+                await self._record_db_failure()
+                logger.warning("晋档遍失败（跳过，下周期重试）", exc_info=True)
+                stats["promoted"] = 0
 
-        # ---- 补编码遍（剩余预算 + 保留份额内处理降级原文行）----
-        stats["reencoded"] = await self._reencode_pass(budget + reserve)
-        await self._save_skip_state(_ADJUD_SKIP_KV_KEY, skip_state)
+            # ---- 摘要归档遍（011 生命周期；周期/开关门控见方法内）----
+            # fail-open（与 _fact_code_alias_pass 同款）：归档遍是可选功能且
+            # 默认关闭，其异常不应中断本周期后续各遍（补编码/关系自检/语义
+            # 审计/别名回填）——失败仅告警，下周期重试
+            try:
+                stats["summaries_archived"] = await self._maybe_summary_lifecycle()
+            except Exception:
+                logger.warning("摘要归档遍失败（跳过，下周期重试）", exc_info=True)
+                stats["summaries_archived"] = 0
 
-        # ---- 关系遍：结构自检（零 LLM）+ 语义审计（开关，LLM）----
-        await self._relation_integrity_check()
-        audited, superseded = await self._relation_audit_pass()
-        stats["edges_audited"] = audited
-        stats["edges_superseded"] = superseded
+            # ---- 补编码遍（剩余预算 + 保留份额内处理降级原文行）----
+            try:
+                stats["reencoded"] = await self._reencode_pass(budget + reserve)
+            except Exception:
+                await self._record_db_failure()
+                logger.warning("补编码遍失败（跳过，下周期重试）", exc_info=True)
+                stats["reencoded"] = 0
 
-        # ---- 事实代号别名回填遍（零 LLM；retain 通道的周期兜底）----
-        stats["fact_alias"] = await self._fact_code_alias_pass()
-        return stats
+            # ---- 关系遍：结构自检（零 LLM）+ 语义审计（开关，LLM）----
+            # 自检遍内部已对 DB 调用设守卫，外层同款包裹对齐 docstring
+            # 的 relation passes 阶段隔离契约（防御未来新增未守卫路径）
+            try:
+                await self._relation_integrity_check()
+            except Exception:
+                await self._record_db_failure()
+                logger.warning(
+                    "关系结构自检遍失败（跳过，下周期重试）", exc_info=True
+                )
+            try:
+                audited, superseded = await self._relation_audit_pass()
+            except Exception:
+                await self._record_db_failure()
+                logger.warning("关系语义审计遍失败（跳过，下周期重试）", exc_info=True)
+                audited, superseded = 0, 0
+            stats["edges_audited"] = audited
+            stats["edges_superseded"] = superseded
+
+            # ---- 事实代号别名回填遍（零 LLM；retain 通道的周期兜底）----
+            stats["fact_alias"] = await self._fact_code_alias_pass()
+            return stats
+        finally:
+            # Every exit path persists the adjudication skip state — a
+            # mid-cycle abort must not lose the poison-row accounting.
+            await self._save_skip_state(_ADJUD_SKIP_KV_KEY, skip_state)
 
     async def _fact_code_alias_pass(self) -> int:
         """Register "user<uid> (<code name>)" of active fact clusters as uid
@@ -1038,9 +1175,7 @@ class FactMergeAgent:
         # 00:00-07:59 会与 kernel 侧 naive 本地日期差一天，跨路径
         # 幂等键失配（同语句重复入库/簇重复计分）。列值仍写原 instant。
         occurred_local = self._to_local(row["occurred_at"])
-        evidence_key = (
-            f"{row['session_id']}|{occurred_local.strftime('%Y-%m-%d')}"
-        )
+        ev_key = evidence_key(row["session_id"], occurred_local)
         for fact, embedding in zip(facts, vectors):
             content_hash = hashlib.md5(fact.statement.encode()).hexdigest()[:12]
             uids = sorted(
@@ -1058,7 +1193,7 @@ class FactMergeAgent:
                 confidence=fact.confidence,
                 session_id=row["session_id"],
                 group_id=row["group_id"],
-                evidence_key=evidence_key,
+                evidence_key=ev_key,
                 occurred_at=row["occurred_at"],
                 embedding=embedding,
             )
@@ -1090,9 +1225,7 @@ class FactMergeAgent:
         if not relations:
             return
         occurred_local = self._to_local(row["occurred_at"])
-        evidence_key = (
-            f"{row['session_id']}|{occurred_local.strftime('%Y-%m-%d')}"
-        )
+        ev_key = evidence_key(row["session_id"], occurred_local)
         platform = row["platform"]
         bots = self._bot_forms()
 
@@ -1117,7 +1250,7 @@ class FactMergeAgent:
                     "statement": rel.statement,
                     "confidence": rel.confidence,
                     "occurred_at": row["occurred_at"],
-                    "evidence_key": evidence_key,
+                    "evidence_key": ev_key,
                     "is_bot_edge": edge_has_bot_endpoint(
                         rel.subject_user_id, rel.object_user_id, bots
                     ),
@@ -1174,20 +1307,58 @@ class FactMergeAgent:
         except Exception:
             pass
 
+    async def _reencode_backlog_exists(self) -> bool:
+        """Whether any re-encodable backlog row remains (skip-list filtered).
+
+        Oversamples the same id-ascending window _reencode_pass filters
+        (merge_batch_size * 3) and drops rows already at the retry cap, so
+        a backlog exhausted to poison rows no longer withholds the reserve
+        that the pass itself could not spend. A failed probe conservatively
+        reports no backlog (no reserve held).
+        """
+        try:
+            skip_state = await self._load_skip_state(_REENCODE_SKIP_KV_KEY)
+            rows = await self._db.fetch_unsummarized_summaries(
+                self._config.merge_batch_size * 3
+            )
+        except Exception:
+            return False
+        return any(
+            skip_state.get(str(r["id"]), 0) < _REENCODE_MAX_ATTEMPTS
+            for r in rows
+        )
+
     async def _load_skip_state(self, key: str) -> dict[str, int]:
         """Load the poison-row skip state ({"<row id>": consecutive failure
         count}; a failed read is treated as empty)."""
+        self._skip_state_read_failed.discard(key)
         try:
             raw = await self._db.get_kv(key)
-            state = json.loads(raw) if raw else {}
-            return state if isinstance(state, dict) else {}
         except Exception:
+            self._skip_state_read_failed.add(key)
             logger.warning("跳过名单读取失败（%s，按空处理）", key, exc_info=True)
             return {}
+        try:
+            state = json.loads(raw) if raw else {}
+        except Exception:
+            # The value is readable but corrupt; allow the caller's normal
+            # save path to self-heal it to an empty JSON object.
+            logger.warning("跳过名单内容损坏（%s，重置）", key, exc_info=True)
+            return {}
+        if not isinstance(state, dict):
+            # A readable JSON scalar/list is likewise data corruption, not a
+            # failed read.  Let the next save repair it instead of freezing
+            # the key in the read-failed guard forever.
+            logger.warning("跳过名单不是对象（%s，重置）", key)
+            return {}
+        return state
 
     async def _save_skip_state(self, key: str, state: dict[str, int]) -> None:
         """Persist the skip state (over-capacity is trimmed by half-FIFO;
         failures are only logged)."""
+        if key in self._skip_state_read_failed:
+            logger.warning("跳过名单读取失败，跳过本次持久化以保留既有状态（%s）", key)
+            return
         try:
             if len(state) > _SKIP_STATE_MAX_ENTRIES:
                 state = dict(list(state.items())[_SKIP_STATE_MAX_ENTRIES // 2:])
@@ -1253,11 +1424,11 @@ class FactMergeAgent:
         - drift / unrelated: create a new cluster with independent
           scoring;
         - no candidates (verdicts=None, no LLM call): creating a new
-          cluster is the only path. "Candidates exist but every verdict
-          was invalid" is intercepted by run_cycle as unsure (it never
-          reaches this method: empty verdicts arriving here would equal
-          blind cluster creation, violating the never-blindly-create
-          contract);
+          cluster is the only path. "Candidates exist but the verdict set
+          is empty or does not cover every candidate" is intercepted by
+          run_cycle as unsure (it never reaches this method: incomplete
+          verdicts arriving here would equal blind cluster creation,
+          violating the never-blindly-create contract);
         - a replaced cluster is never a disposition target (neither merge
           nor replace points at it): it has an explicit successor, and a
           same revival would coexist in contradiction with the new
@@ -1363,10 +1534,13 @@ class FactMergeAgent:
         when updated_at still matches the submitted snapshot; edges
         manually edited or given new evidence while the audit was in
         flight are skipped). The watermark only advances to the max id of
-        a judged batch; an LLM failure / unsure / disposition error stops
-        this pass, and the next cycle re-audits from the same batch (the
-        advanced part does not roll back). Poison-batch protection: the
-        same watermark batch failing/unsure for
+        a fully judged batch — a batch whose verdicts cover only part of
+        the submitted edges goes through the same retry/skip accounting
+        as a failed/unsure batch, so the watermark never advances past
+        UNCOVERED edges; an LLM failure / unsure / disposition error
+        stops this pass, and the next cycle re-audits from the same batch
+        (the advanced part does not roll back). Poison-batch protection:
+        the same watermark batch failing/unsure for
         _RELATION_AUDIT_MAX_BATCH_FAILS consecutive times skips the batch,
         advances the watermark, and logs a warning (a manual full
         re-audit means clearing that kv value). Same entry point for a
@@ -1439,6 +1613,51 @@ class FactMergeAgent:
                         watermark,
                     )
                 break
+
+            # Coverage check: every submitted edge must carry a verdict.
+            # Advancing the watermark past UNCOVERED edges would let them
+            # escape auditing forever (the watermark is monotonic), so a
+            # partially-covered batch reuses the poison-batch retry/skip
+            # accounting instead of silently escaping.
+            covered_ids = {eid for eid, _, _ in result["edges"]}
+            uncovered_ids = [
+                e["id"] for e in edges if e["id"] not in covered_ids
+            ]
+            if uncovered_ids:
+                logger.warning(
+                    "关系审计批覆盖不完整（水位 %d 起）：送审 %d 条仅覆盖 %d 条"
+                    "（缺失 %s）",
+                    watermark,
+                    len(edges),
+                    len(covered_ids),
+                    uncovered_ids,
+                )
+                skip = await self._bump_audit_batch_fail(watermark)
+                if skip:
+                    logger.warning(
+                        "关系审计批连续 %d 次失败/覆盖不全（水位 %d 起）——跳过该批"
+                        "并推水位；该批边未经完整审计，人工全量重审请清空 kv %s",
+                        _RELATION_AUDIT_MAX_BATCH_FAILS,
+                        watermark,
+                        _RELATION_AUDIT_KV_KEY,
+                    )
+                    watermark = max(e["id"] for e in edges)
+                    audited += len(covered_ids)
+                    try:
+                        await self._db.set_kv(
+                            _RELATION_AUDIT_KV_KEY, str(watermark)
+                        )
+                    except Exception:
+                        logger.warning(
+                            "关系审计水位持久化失败（跳批后）", exc_info=True
+                        )
+                else:
+                    logger.info(
+                        "关系边语义审计批覆盖不全（水位 %d 起，顺延下周期）",
+                        watermark,
+                    )
+                break
+
             await self._clear_audit_batch_fail()
             bad = [
                 (eid, reason)
@@ -1547,7 +1766,16 @@ class FactMergeAgent:
             anchor_profile_size=cfg.anchor_profile_size,
         )
         self._last_decay_at = now
-        await self._db.set_kv(_DECAY_KV_KEY, now.isoformat())
+        try:
+            await self._db.set_kv(_DECAY_KV_KEY, now.isoformat())
+        except Exception:
+            # The in-memory guard above already prevents in-process
+            # double-decay; only a restart before the kv write lands could
+            # re-run one decay early. Never abort the cycle for this.
+            logger.warning(
+                "衰减时间戳持久化失败（重启后可能提前重跑一次衰减）",
+                exc_info=True,
+            )
         logger.info("衰减遍完成: %s", stats)
 
     async def _maybe_summary_lifecycle(self) -> int:
@@ -1630,6 +1858,17 @@ class FactMergeAgent:
             batch_size=200,
         )
         self._last_summary_lifecycle_at = now
-        await self._db.set_kv(_SUMMARY_LIFECYCLE_KV_KEY, now.isoformat())
+        try:
+            await self._db.set_kv(
+                _SUMMARY_LIFECYCLE_KV_KEY, now.isoformat()
+            )
+        except Exception:
+            # Benign-archiving symmetry with the decay pass: the in-memory
+            # guard already prevents an in-process double-run; only a
+            # restart could re-run one archive pass early.
+            logger.warning(
+                "摘要归档遍时间戳持久化失败（重启后可能提前重跑一次归档）",
+                exc_info=True,
+            )
         logger.info("摘要归档遍完成: 归档 %d 行", total)
         return total

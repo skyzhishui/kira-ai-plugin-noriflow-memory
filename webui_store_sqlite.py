@@ -17,13 +17,9 @@ import json
 
 from fastapi import HTTPException
 
+from .db.base import _like_contains_pattern
 from .db.sqlite import _decode_rows
-from .webui_store import _ilike
-
-
-def _pool(backend):
-    """Pool resolution: take .pool from the backend object; bare pools (legacy callers/test stubs) passed through as-is."""
-    return backend.pool if hasattr(backend, "pool") else backend
+from .webui_store import _pool
 
 
 async def fetch_overview(backend) -> tuple[dict, list]:
@@ -63,7 +59,7 @@ async def fetch_users_data(backend, keyword: str, page: int, size: int) -> dict:
     params: list = []
     where = ""
     if keyword:
-        params.append(_ilike(keyword))
+        params.append(_like_contains_pattern(keyword))
         where = "WHERE c.user_id LIKE $1 ESCAPE '\\'"
     async with _pool(backend).acquire() as conn:
         total = await conn.fetchval(

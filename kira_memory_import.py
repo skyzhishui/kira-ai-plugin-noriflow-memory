@@ -65,7 +65,7 @@ try:
 except ImportError:  # pragma: no cover - Python 3.10 takes the tomli branch
     import tomli as tomllib
 
-from .db.base import fact_document_id
+from .db.base import evidence_key, fact_document_id, summary_document_id
 from .envelope import format_history_message
 
 # Per-source kv markers (_memory_local_kv): latest import result snapshots.
@@ -297,10 +297,7 @@ def build_chat_summary_rows(
                 if key not in participants:
                     participants.append(key)
         rows.append({
-            "document_id": (
-                f"{session_id}-"
-                f"{hashlib.md5(content_text.encode('utf-8')).hexdigest()[:12]}"
-            ),
+            "document_id": summary_document_id(session_id, content_text),
             "kind": "chat_summary",
             "platform": platform,
             "session_id": session_id,
@@ -489,7 +486,7 @@ def _toml_fact_row(
         "confidence": "high" if importance >= 7 else "medium",
         "session_id": session_id,
         "group_id": group_id,
-        "evidence_key": f"{session_id}|{occurred_at.strftime('%Y-%m-%d')}",
+        "evidence_key": evidence_key(session_id, occurred_at),
         "occurred_at": occurred_at,
         "embedding": None,
     }

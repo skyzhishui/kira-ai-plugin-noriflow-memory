@@ -9,7 +9,7 @@ Package layout (docs/plans/noriflow-dual-storage-backend-plan.md §3):
                 reimplementation);
 - factory.py    create_backend / resolve_backend_name assembly factory.
 
-This __init__ re-exports every public name of the former db.py so callers
+This __init__ re-exports the public names of the former db.py so callers
 (main / kernel / merge_agent / persona_service / relation_backfill /
 vector_ops / webui_store) and tests keep their ``from ..db import X``
 imports unchanged.
@@ -20,15 +20,15 @@ from .base import (
     FACT_CLUSTER_TABLE,
     FACT_RAW_TABLE,
     MemoryBackend,
-    _ensure_tz,
-    _like_contains_pattern,
-    _rrf_fuse,
+    PROFILE_DELETE_BY_CLUSTER_SQL,
+    PROFILE_UPSERT_SQL,
     build_search_text,
+    evidence_key,
     fact_document_id,
     parse_vector,
     sqlite_format_ts,
     sqlite_parse_ts,
-    vector_literal,
+    summary_document_id,
 )
 from .factory import create_backend, resolve_backend_name
 from .postgres import MemoryDatabase, supersede_backfill_edges_of
@@ -40,18 +40,18 @@ __all__ = [
     "MemoryBackend",
     "MemoryDatabase",
     "SQLiteMemoryDatabase",
-    "_ensure_tz",
-    "_like_contains_pattern",
-    "_rrf_fuse",
+    "PROFILE_DELETE_BY_CLUSTER_SQL",
+    "PROFILE_UPSERT_SQL",
     "build_search_text",
     "create_backend",
+    "evidence_key",
     "fact_document_id",
     "parse_vector",
     "resolve_backend_name",
     "sqlite_format_ts",
     "sqlite_parse_ts",
+    "summary_document_id",
     "supersede_backfill_edges_of",
-    "vector_literal",
 ]
 
 

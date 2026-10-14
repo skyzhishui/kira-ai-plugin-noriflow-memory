@@ -22,6 +22,7 @@ Differences from the upstream nori version (KiraAI host semantics):
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import TYPE_CHECKING, Any, Literal, get_args, get_origin
 
@@ -138,9 +139,11 @@ def _literal_options(annotation) -> list[str] | None:
 def _numeric_bounds(field) -> tuple[Any, Any]:
     """Extract (min, max) from pydantic numeric constraints, if any.
 
-    ``gt`` bounds are rounded up to the nearest representable exclusive
-    bound (int +1 / float tiny epsilon) so the frontend can use them as
-    inclusive ``min`` attributes.
+    ``gt``/``lt`` are EXCLUSIVE bounds: a value equal to the bound is
+    422-rejected by pydantic, so the inclusive HTML ``min``/``max`` must be
+    nudged strictly inside the valid range — ints by ±1, floats by one ULP
+    via ``math.nextafter`` (min = nextafter(gt, inf); max = nextafter(lt,
+    -inf)). Inclusive ``ge``/``le`` bounds pass through verbatim.
     """
     lo: Any = None
     hi: Any = None
@@ -154,14 +157,14 @@ def _numeric_bounds(field) -> tuple[Any, Any]:
         if ge is not None:
             candidate = ge
         elif gt is not None:
-            candidate = gt + 1 if is_int else gt
+            candidate = gt + 1 if is_int else math.nextafter(gt, math.inf)
         if candidate is not None and (lo is None or candidate > lo):
             lo = candidate
         candidate = None
         if le is not None:
             candidate = le
         elif lt is not None:
-            candidate = lt - 1 if is_int else lt
+            candidate = lt - 1 if is_int else math.nextafter(lt, -math.inf)
         if candidate is not None and (hi is None or candidate < hi):
             hi = candidate
     return lo, hi

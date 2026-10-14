@@ -73,7 +73,7 @@ _ENCODE_RESULT_SCHEMA = {
     "properties": {
         "summary": {
             "type": "string",
-            "description": "压缩后的对话摘要（仅覆盖本轮批次，含 ## 氛围摘要 小节，全文不超过 300 字）",
+            "description": "压缩后的对话摘要（仅覆盖本轮批次，首行为【话题】锚点行，全文不超过 300 字）",
         },
         "facts": {
             "type": "array",

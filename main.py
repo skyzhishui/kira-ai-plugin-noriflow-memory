@@ -1,4 +1,4 @@
-"""NoriFlow long-term memory plugin (KiraAI edition, PostgreSQL + pgvector).
+"""NoriFlow long-term memory plugin (KiraAI edition, PostgreSQL + pgvector / SQLite dual backend).
 
 Ported from nori-core nori_plugin_noriflow_memory. Difference from tool/label
 plugins: this is a service plugin whose core value is the automatic memory
@@ -19,14 +19,16 @@ pipeline:
 - Recall (recall): on @on.llm_request, vector-retrieve with the batch text as
   the query + rerank, injected as an independent Prompt; the user persona is
   deterministically assembled from the cluster table (no LLM) and injected too.
-- Active tools: memory_search / memory_write / memory_remove (enabled_tools
-  multi-select config controls which tools are enabled; the allowed_users user
-  whitelist and allowed_sessions session whitelist do code-level interception -
-  matched by trigger user or trigger session, any hit is allowed through, both
-  empty = all rejected; user entries support user_id or platform:user_id,
-  session entries support session_id, platform:session_id or a full sid
-  platform:type:session_id).
-- Maintenance: @register.page maintenance page + 22 @register.api endpoints
+- Active tools: memory_search / memory_write / memory_remove +
+  memory_profile / memory_lookup / memory_correct (all six are controlled
+  by the enabled_tools multi-select config; the latter three are
+  additionally gated by the memory_tools_enabled master switch; the
+  allowed_users user whitelist and allowed_sessions session whitelist do
+  code-level interception - matched by trigger user or trigger session,
+  any hit is allowed through, both empty = all rejected; user entries
+  support user_id or platform:user_id, session entries support session_id,
+  platform:session_id or a full sid platform:type:session_id).
+- Maintenance: @register.page maintenance page + 24 @register.api endpoints
   (overview/user/facts/cluster/persona/summary/graph/edge edit/backfill/re-
   encoding/import/settings browse and fix), data layer in webui_store.py.
 
@@ -45,6 +47,7 @@ WebUI plugin config.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
@@ -390,7 +393,6 @@ class _CachedLine:
 class _RetainState:
     """Retain snapshot of one conversation turn (frozen at the watermark when the turn completion signal arrives)."""
 
-    event_id: str
     session_id: str
     platform: str
     group_id: str
@@ -416,9 +418,12 @@ class NoriflowMemoryPlugin(BasePlugin):
         self._fast_llm: Optional[FastLlmExit] = None
         self._relation_controller: Optional[BackfillController] = None
         self._ready = False
-        # bot 身份（persona 名 + 首条消息的 self_id）
+        # bot 身份（persona 名 + 首条消息的 self_id 及其适配器平台）
         self._bot_nickname = "助手"
         self._bot_user_id = ""
+        # bot 所属适配器平台（与 _bot_user_id 同点一次性学习，传播给
+        # kernel.bot_platform 供 Kira 记忆迁入的全局事实归属）
+        self._bot_platform = ""
         # persona 昵称上次活读时间（monotonic；TTL 限频见 _refresh_bot_nickname）
         self._persona_checked_at = 0.0
         # 每会话滚动行缓存：sid -> OrderedDict[msg_key -> _CachedLine]（尾部最新）
@@ -427,6 +432,9 @@ class NoriflowMemoryPlugin(BasePlugin):
         self._consumed: dict[str, set[str]] = {}
         # bot 行序号（缓存键唯一性用，不参与查找）
         self._bot_seq = 0
+        # 无平台 message_id 的入站消息键序号（id(msg) 在 GC 后可被复用，
+        # 会导致新消息撞上已消费水位键而静默丢失——单调计数器杜绝复用）
+        self._anon_msg_seq = itertools.count()
         # bot 出站消息的平台 message_id 追踪（P3 场景 C 的引用 bot 判定：
         # Reply 元素只带平台消息 ID，而 bot 行缓存键是 bot#N 无法反查；
         # sid -> deque 有界，重启从零积累同滚动缓存语义）
@@ -886,10 +894,13 @@ class NoriflowMemoryPlugin(BasePlugin):
         in recall expansion - the "kira" placeholder never equals a real uid,
         so this deterministic defense is dead code before propagation. Fixed
         on first sight (KiraAI single-bot deployment; multi-account across
-        adapters is out of current scope).
+        adapters is out of current scope). Also propagates the learned
+        adapter platform (kernel.bot_platform) so the Kira-memory import can
+        attribute global facts to the right platform.
         """
         if self._memory_kernel is not None:
             self._memory_kernel.bot_id = bot_user_id
+            self._memory_kernel.bot_platform = self._bot_platform
         if self._merge_agent is not None:
             self._merge_agent.bot_id = bot_user_id
         logger.info("bot 平台 ID 已学习并传播: %s", bot_user_id)
@@ -988,8 +999,9 @@ class NoriflowMemoryPlugin(BasePlugin):
           effective for this turn only, not written back to history.
         """
         # enabled_tools 显式空列表 = 全部禁用（与 schema "取消选择即禁用"
-        # 语义一致）；键缺失/None 才回退全启用
-        configured = self.plugin_cfg.get("enabled_tools")
+        # 语义一致）；键缺失/None 才回退全启用（plugin_cfg 可能为 None，
+        # 与 451/1872/1876 处的 or {} 同口径）
+        configured = (self.plugin_cfg or {}).get("enabled_tools")
         if configured is None:
             configured = ALL_TOOLS
         disabled = set(ALL_TOOLS) - set(configured)
@@ -1046,6 +1058,11 @@ class NoriflowMemoryPlugin(BasePlugin):
                 entity_entries = []
 
         rollout_text = ""
+        # 动态块注入 user prompt 头部（宿主 assemble_prompt 将其排进最新一条
+        # user 消息、紧邻用户输入）：system prompt 与历史消息由此构成稳定
+        # 前缀可命中提示词缓存，随轮次变化的召回/画像块落在尾部不再打断
+        # 前缀缓存。persist=False：仅本轮生效，不写回会话历史。
+        inject_prompts: list[Prompt] = []
         if self._config.recent_rollout_enabled:
             try:
                 rollout_text = await kernel.build_recent_rollout_text(
@@ -1053,6 +1070,24 @@ class NoriflowMemoryPlugin(BasePlugin):
                 )
             except Exception:
                 logger.warning("滚动补回摘要获取失败（不阻断本轮）", exc_info=True)
+            else:
+                # 对齐 kernel 两阶段契约：先把补回块真正 append 进本轮
+                # prompt pieces，再 commit 排除 memo，最后跑 recall（recall
+                # 依据 memo 同轮排除已注入行）。append 与 commit 之间仅隔
+                # 纯内存 list.append——本轮装配若被丢弃，pending 不入 memo，
+                # 行保持 recall 可见，而非补回/召回两通道同时不可见一个
+                # TTL。hasattr 守卫兼容未实现两阶段的测试桩 kernel。
+                if rollout_text:
+                    inject_prompts.append(
+                        Prompt(
+                            content=rollout_text,
+                            name=f"{PLUGIN_ID}:rollout",
+                            source=PLUGIN_ID,
+                            persist=False,
+                        )
+                    )
+                if kernel is not None and hasattr(kernel, "commit_rollout_memo"):
+                    kernel.commit_rollout_memo(session.session_id)
 
         memory_text = ""
         query = self._build_recall_query(messages)
@@ -1104,20 +1139,8 @@ class NoriflowMemoryPlugin(BasePlugin):
         except Exception:
             logger.warning("用户画像获取失败（不阻断本轮）", exc_info=True)
 
-        # 动态块注入 user prompt 头部（宿主 assemble_prompt 将其排进最新一条
-        # user 消息、紧邻用户输入）：system prompt 与历史消息由此构成稳定
-        # 前缀可命中提示词缓存，随轮次变化的召回/画像块落在尾部不再打断
-        # 前缀缓存。persist=False：仅本轮生效，不写回会话历史。
-        inject_prompts: list[Prompt] = []
-        if rollout_text:
-            inject_prompts.append(
-                Prompt(
-                    content=rollout_text,
-                    name=f"{PLUGIN_ID}:rollout",
-                    source=PLUGIN_ID,
-                    persist=False,
-                )
-            )
+        # （rollout 块已在 recall 之前 append 进 inject_prompts——两阶段
+        # commit 契约要求，见上方；注入顺序 rollout → recall → profile 不变）
         if memory_text:
             inject_prompts.append(
                 Prompt(
@@ -1396,7 +1419,9 @@ class NoriflowMemoryPlugin(BasePlugin):
         """
         bucket = self._history.get(sid)
         if bucket is None and sid and ":" not in sid:
-            for key, candidate in self._history.items():
+            # LRU OrderedDict：最新活跃会话在尾部，倒序扫描让最近活跃者
+            # 胜出（正序首个命中是最久未活跃会话，与 docstring 相悖）
+            for key, candidate in reversed(list(self._history.items())):
                 if key.rsplit(":", 1)[-1] == sid:
                     bucket = candidate
                     break
@@ -1487,6 +1512,15 @@ class NoriflowMemoryPlugin(BasePlugin):
         if self_id and not self._bot_user_id:
             self._bot_user_id = self_id
             self._propagate_bot_identity(self_id)
+        # 平台学习与 uid 学习解耦：首条 self_id 消息可能尚无
+        # adapter_name，此后任何一条消息补学到平台即重传播——消除
+        # 「平台永久空串」窗口，Kira 迁入的全局事实归属不再依赖推断回退
+        if not self._bot_platform:
+            adapter = str(getattr(session, "adapter_name", "") or "")
+            if adapter:
+                self._bot_platform = adapter
+                if self._bot_user_id:
+                    self._propagate_bot_identity(self._bot_user_id)
         line = format_history_message(
             speaker_name=nickname or uid,
             content=text,
@@ -1496,7 +1530,10 @@ class NoriflowMemoryPlugin(BasePlugin):
         )
         self._append_history(
             session.sid,
-            str(getattr(msg, "message_id", "") or id(msg)),
+            str(
+                getattr(msg, "message_id", "")
+                or f"_anon{next(self._anon_msg_seq)}"
+            ),
             line,
             uid=uid,
             platform=str(getattr(session, "adapter_name", "") or ""),
@@ -1609,7 +1646,6 @@ class NoriflowMemoryPlugin(BasePlugin):
         await self._alias_upsert_batch(user_delta)
 
         state = _RetainState(
-            event_id=f"{sid}#{int(datetime.now().timestamp())}",
             session_id=bare,
             platform=adapter,
             group_id=bare if stype == "gm" else "",
@@ -2566,6 +2602,10 @@ class NoriflowMemoryPlugin(BasePlugin):
         except Exception:
             logger.warning("memory_remove 工具失败", exc_info=True)
             return "删除失败：记忆库暂时不可用，请稍后再试"
+        # 契约：True=已删除，False=查证不存在，None=DB 故障/熔断开启——
+        # None 须与"不存在"区分回报（否则用户会误以为 ID 写错了）
+        if removed is None:
+            return "记忆服务暂时不可用，请稍后再试"
         if removed:
             return "已删除"
         if scope_sid or scope_uid:
@@ -2734,11 +2774,12 @@ class NoriflowMemoryPlugin(BasePlugin):
             lines = []
             for r in rows:
                 marker = markers.get(str(r["status"]), "")
-                # user_id 与 platform 同口径 .get 兜底（见 memory_search）
-                uid = r.get("user_id") or ""
+                # user_id 与 platform 同口径 .get 兜底（见 memory_search）；
+                # 行内变量名 row_uid 防遮蔽函数级 uid 作用域锚点
+                row_uid = r.get("user_id") or ""
                 owner = (
-                    f"{self._owner_label(r.get('platform') or plat, uid)} "
-                    if uid
+                    f"{self._owner_label(r.get('platform') or plat, row_uid)} "
+                    if row_uid
                     else ""
                 )
                 lines.append(
@@ -3212,7 +3253,7 @@ class NoriflowMemoryPlugin(BasePlugin):
 
     @register.api(method="GET", path="/memory/config")
     async def api_memory_config_get(self):
-        pm = self.ctx.plugin_mgr
+        pm = getattr(self.ctx, "plugin_mgr", None)
         if pm is None or self._config is None:
             raise HTTPException(status_code=503, detail="配置端点未装配")
         host_values = pm.get_plugin_config(self._plugin_id()) or {}
@@ -3232,7 +3273,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         (restart_required) are returned as-is; they need a re-initialization
         or process restart to take effect.
         """
-        pm = self.ctx.plugin_mgr
+        pm = getattr(self.ctx, "plugin_mgr", None)
         if pm is None or self._config is None:
             raise HTTPException(status_code=503, detail="配置端点未装配")
         values = body.get("values") if isinstance(body, dict) else None

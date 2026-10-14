@@ -43,6 +43,8 @@ from .base import (
     FACT_CLUSTER_TABLE,
     FACT_RAW_TABLE,
     MemoryBackend,
+    PROFILE_DELETE_BY_CLUSTER_SQL,
+    PROFILE_UPSERT_SQL,
     _BACKFILL_TABLES,
     _BACKFILL_TEXT_COLUMNS,
     _MIGRATION_NAME_RE,
@@ -867,6 +869,11 @@ class MemoryDatabase(MemoryBackend):
         fact statement); this returns uniform (id, text) tuples so callers
         need not care.
 
+        Blank-text rows (empty/whitespace-only content) are excluded from
+        the scan: they can never receive a vector, and keeping them in the
+        id-ascending window would permanently occupy the batch head and
+        stall the backfill queue.
+
         Args:
             table: table name (whitelisted: summary/fact/cluster table).
             limit: batch size.
@@ -883,7 +890,9 @@ class MemoryDatabase(MemoryBackend):
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 f"SELECT id, {text_col} AS text FROM {table} "  # noqa: S608 -- whitelist constant table/column names
-                "WHERE embedding IS NULL ORDER BY id LIMIT $1",
+                f"WHERE embedding IS NULL "
+                f"AND btrim({text_col}, E' \\t\\n\\r') <> '' "
+                "ORDER BY id LIMIT $1",
                 limit,
             )
         return [(r["id"], r["text"]) for r in rows]
@@ -1415,24 +1424,19 @@ class MemoryDatabase(MemoryBackend):
                 # Atomic profile-entry switch: delete the old row; insert a
                 # new row if the new cluster meets the profile threshold
                 await conn.execute(
-                    "DELETE FROM memory_user_profile WHERE cluster_id = $1",
+                    PROFILE_DELETE_BY_CLUSTER_SQL,
                     cluster_id,
                 )
                 await conn.execute(
-                    """
-                    INSERT INTO memory_user_profile
-                        (platform, user_id, category, cluster_id, statement,
-                         score, related_user_ids)
-                    SELECT platform, user_id, category, id, canonical_statement,
-                           score, related_user_ids
-                    FROM memory_fact_cluster
-                    WHERE id = $1 AND status = 'profiled'
-                    ON CONFLICT (platform, user_id, category, cluster_id) DO UPDATE
-                    SET statement = EXCLUDED.statement,
-                        score = EXCLUDED.score,
-                        related_user_ids = EXCLUDED.related_user_ids,
-                        updated_at = now()
-                    """,
+                    PROFILE_UPSERT_SQL.format(
+                        source=(
+                            "SELECT platform, user_id, category, id, "
+                            "canonical_statement, score, related_user_ids "
+                            "FROM memory_fact_cluster "
+                            "WHERE id = $1 AND status = 'profiled'"
+                        ),
+                        updated_at="now()",
+                    ),
                     row["id"],
                 )
                 return {"action": "replace", "cluster_id": row["id"],
@@ -1663,8 +1667,19 @@ class MemoryDatabase(MemoryBackend):
         """
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                upserted_sql = (
+                    PROFILE_UPSERT_SQL.format(
+                        source=(
+                            "SELECT platform, user_id, category, id, "
+                            "canonical_statement, score, related_user_ids "
+                            "FROM promoted"
+                        ),
+                        updated_at="now()",
+                    )
+                    + " RETURNING cluster_id"
+                )
                 row = await conn.fetchrow(
-                    """
+                    f"""
                     WITH promoted AS (
                         UPDATE memory_fact_cluster c
                         SET status = 'profiled', updated_at = now()
@@ -1674,20 +1689,7 @@ class MemoryDatabase(MemoryBackend):
                         RETURNING c.id, c.platform, c.user_id, c.category,
                                   c.canonical_statement, c.score,
                                   c.related_user_ids
-                    ), upserted AS (
-                        INSERT INTO memory_user_profile
-                            (platform, user_id, category, cluster_id, statement,
-                             score, related_user_ids)
-                        SELECT platform, user_id, category, id,
-                               canonical_statement, score, related_user_ids
-                        FROM promoted
-                        ON CONFLICT (platform, user_id, category, cluster_id) DO UPDATE
-                        SET statement = EXCLUDED.statement,
-                            score = EXCLUDED.score,
-                            related_user_ids = EXCLUDED.related_user_ids,
-                            updated_at = now()
-                        RETURNING cluster_id
-                    )
+                    ), upserted AS ({upserted_sql})
                     SELECT (SELECT count(*) FROM promoted) AS promoted
                     """,
                     promote_threshold,
@@ -2887,6 +2889,10 @@ class MemoryDatabase(MemoryBackend):
         agent's candidate shape — by default only effective clusters
         (active/profiled) are returned; include_inactive opens tombstones/
         pending and carries status annotation.
+
+        The user_ids ownership filter is fail-closed: a truthy list always
+        applies — an all-blank list keeps the empty-array ANY condition
+        (matches nothing) instead of widening to other users' clusters.
         """
         # only_inactive (memory_lookup deep-dig path) narrows to
         # non-active statuses in SQL — active/profiled clusters never enter
@@ -2988,7 +2994,7 @@ class MemoryDatabase(MemoryBackend):
                     )
                     if row is not None:
                         await conn.execute(
-                            "DELETE FROM memory_user_profile WHERE cluster_id = $1",
+                            PROFILE_DELETE_BY_CLUSTER_SQL,
                             cluster_id,
                         )
                         return {"changed": True, "status": "dead", "replaced_by": None}

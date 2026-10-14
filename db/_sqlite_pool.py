@@ -169,6 +169,11 @@ class _SingleConnPool:
                 self._depth -= 1
             return
         async with self._lock:
+            # Re-check after the lock wait: close() may have run while this
+            # waiter was blocked on the lock — yielding the closed connection
+            # here would surface opaque aiosqlite errors at the use site.
+            if self._closed:
+                raise RuntimeError("SQLite 连接已关闭")
             self._owner = task
             self._depth = 1
             try:

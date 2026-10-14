@@ -54,6 +54,8 @@ from .base import (
     FACT_CLUSTER_TABLE,
     FACT_RAW_TABLE,
     MemoryBackend,
+    PROFILE_DELETE_BY_CLUSTER_SQL,
+    PROFILE_UPSERT_SQL,
     _MIGRATION_NAME_RE,
     _Params,
     _dedupe_keep_time,
@@ -874,7 +876,13 @@ class SQLiteMemoryDatabase(MemoryBackend):
         self, table: str, limit: int
     ) -> list[tuple[int, str]]:
         """Scan rows with embedding IS NULL in the given table (id
-        ascending, capped)."""
+        ascending, capped).
+
+        Blank-text rows (empty/whitespace-only content) are excluded: they
+        can never receive a vector, and leaving them in the id-ascending
+        window would permanently occupy the batch head and stall the
+        backfill queue.
+        """
         from .base import _BACKFILL_TABLES, _BACKFILL_TEXT_COLUMNS
 
         if table not in _BACKFILL_TABLES:
@@ -883,7 +891,9 @@ class SQLiteMemoryDatabase(MemoryBackend):
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 f"SELECT id, {text_col} AS text FROM {table} "  # noqa: S608
-                "WHERE embedding IS NULL ORDER BY id LIMIT $1",
+                f"WHERE embedding IS NULL "
+                f"AND trim({text_col}, ' ' || char(9) || char(10) || char(13)) <> '' "
+                "ORDER BY id LIMIT $1",
                 limit,
             )
         return [(int(r["id"]), r["text"]) for r in rows]
@@ -1361,23 +1371,15 @@ class SQLiteMemoryDatabase(MemoryBackend):
                 # Atomic profile-entry switch: delete the old row; insert a
                 # new row if the new cluster meets the profile threshold
                 await conn.execute(
-                    "DELETE FROM memory_user_profile WHERE cluster_id = $1",
+                    PROFILE_DELETE_BY_CLUSTER_SQL,
                     cluster_id,
                 )
                 if new_status == "profiled":
                     await conn.execute(
-                        """
-                        INSERT INTO memory_user_profile
-                            (platform, user_id, category, cluster_id,
-                             statement, score, related_user_ids,
-                             created_at, updated_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
-                        ON CONFLICT (platform, user_id, category, cluster_id)
-                        DO UPDATE SET statement = excluded.statement,
-                                      score = excluded.score,
-                                      related_user_ids = excluded.related_user_ids,
-                                      updated_at = excluded.updated_at
-                        """,
+                        PROFILE_UPSERT_SQL.format(
+                            source="VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                            updated_at="$8",
+                        ),
                         raw["platform"], raw["user_id"], raw["category"],
                         new_id, raw["statement"], new_score,
                         raw["related_user_ids"], now,
@@ -1642,18 +1644,10 @@ class SQLiteMemoryDatabase(MemoryBackend):
                         now, *ids,
                     )
                     await conn.executemany(
-                        """
-                        INSERT INTO memory_user_profile
-                            (platform, user_id, category, cluster_id,
-                             statement, score, related_user_ids,
-                             created_at, updated_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
-                        ON CONFLICT (platform, user_id, category, cluster_id)
-                        DO UPDATE SET statement = excluded.statement,
-                                      score = excluded.score,
-                                      related_user_ids = excluded.related_user_ids,
-                                      updated_at = excluded.updated_at
-                        """,
+                        PROFILE_UPSERT_SQL.format(
+                            source="VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                            updated_at="$8",
+                        ),
                         [
                             (
                                 r["platform"], r["user_id"], r["category"],
@@ -2598,6 +2592,11 @@ class SQLiteMemoryDatabase(MemoryBackend):
 
         SQLite leg mirrors search_chat_summaries' vector leg: SQL binds the
         row set (status/owner/category), Python cosine sorts and truncates.
+
+        The user_ids ownership filter is fail-closed (PG parity): a truthy
+        list always applies — an all-blank list emits a constant-false
+        condition (1 = 0) instead of skipping the filter, which would
+        expose other users' clusters.
         """
         # only_inactive (memory_lookup deep-dig path) narrows to
         # non-active statuses in SQL — active/profiled clusters never enter
@@ -2618,11 +2617,14 @@ class SQLiteMemoryDatabase(MemoryBackend):
         ]
         if platform:
             conds.append(f"platform = {p.add(platform)}")
-        uids = [u for u in (user_ids or []) if u]
-        if uids:
-            cond = _in_cond(p, "user_id", uids)
-            if cond:
-                conds.append(cond)
+        if user_ids:
+            uids = [u for u in user_ids if u]
+            cond = _in_cond(p, "user_id", uids) if uids else None
+            # Fail-closed ownership filter (PG semantics): a truthy
+            # user_ids list always applies; all-blank input emits a
+            # constant-false condition instead of skipping the filter
+            # (skipping would match every user's clusters).
+            conds.append(cond if cond else "1 = 0")
         if category:
             conds.append(f"category = {p.add(category)}")
         async with self.pool.acquire() as conn:
@@ -2711,7 +2713,7 @@ class SQLiteMemoryDatabase(MemoryBackend):
                         cluster_id, now,
                     )
                     await conn.execute(
-                        "DELETE FROM memory_user_profile WHERE cluster_id = $1",
+                        PROFILE_DELETE_BY_CLUSTER_SQL,
                         cluster_id,
                     )
                     return {"changed": True, "status": "dead", "replaced_by": None}
