@@ -470,6 +470,188 @@ async def main_async() -> None:
     tmp.cleanup()
 
 
+async def test_search_fact_clusters_blank_user_ids_fail_closed() -> None:
+    """user_ids 真值但全空白（如 ["", ""]）→ SQL 常量假 "1 = 0" → 空结果
+    （fail-closed，绝不退化成返回全部行 = 跨用户暴露；PG 侧空 ANY 恒假
+    同语义）；对照组有效 uid 照常只返回该用户的簇行。pytest 收集项，
+    直跑 main_async 不经过。"""
+    config_mod = _load("config")
+    _load("alias_store")
+    _load("entity_edge")
+    db_pkg = _load("db")
+    LocalMemoryConfig = config_mod.LocalMemoryConfig
+    SQLiteMemoryDatabase = db_pkg.SQLiteMemoryDatabase
+
+    tmp = tempfile.TemporaryDirectory(prefix="noriflow_blank_uids_")
+    try:
+        config = LocalMemoryConfig(
+            storage_backend="sqlite",
+            sqlite_path=str(Path(tmp.name) / "memory.sqlite3"),
+            embedding_dims=4,
+        )
+        db = SQLiteMemoryDatabase(config)
+        await db.connect()
+        try:
+            await db.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
+            now = datetime.now(_UTC)
+            # 两个用户各建一个事实簇（upsert 原始事实 + apply create 成簇）
+            for uid, text in (("u1", "小明喜欢爬山"), ("u2", "小红喜欢游泳")):
+                fid = await db.upsert_persona_fact_raw_for_apply(
+                    document_id=f"doc-{uid}", platform="napcat",
+                    user_id=uid, related_user_ids=[], display_name="",
+                    category="stable", statement=text, confidence="high",
+                    session_id="s1", group_id="",
+                    evidence_key=f"s1|{now.strftime('%Y-%m-%d')}",
+                    occurred_at=now, embedding=_vec(1.0, 0.0, 0.0, 0.0),
+                )
+                out = await db.apply_fact_merge(
+                    action="create", fact_id=fid, start_score=3.0,
+                    score_cap=10.0, promote_threshold=10.0,
+                    recent_promote_threshold=4.0,
+                )
+                assert out.get("action") == "create", f"建簇失败: {out}"
+
+            qvec = _vec(1.0, 0.0, 0.0, 0.0)
+            # fail-closed：user_ids 真值但全空白 → 恒假条件 → 空，
+            # 绝不返回全部行（若跳过过滤会带出 u1+u2 两行）
+            rows = await db.search_fact_clusters(
+                query_vec=qvec, limit=10, platform="napcat",
+                user_ids=["", ""],
+            )
+            assert rows == [], (
+                f"全空白 user_ids 必须恒空（fail-closed），实际返回 {rows}"
+            )
+
+            # 对照组：有效 uid 只返回该用户的簇行（正常路径未被破坏，
+            # 证明空结果非环境问题）
+            rows_u1 = await db.search_fact_clusters(
+                query_vec=qvec, limit=10, platform="napcat",
+                user_ids=["u1"],
+            )
+            assert {r["user_id"] for r in rows_u1} == {"u1"} and len(rows_u1) == 1, (
+                f"有效 uid 须只返回该用户的簇行，实际 {rows_u1}"
+            )
+        finally:
+            await db.close()
+    finally:
+        tmp.cleanup()
+
+
+async def test_fetch_missing_embeddings_excludes_all_whitespace_rows() -> None:
+    """PR review：trim() 默认只剔 ASCII 空格——纯 \\t/\\n/\\r 文本行不会被
+    排除出补算窗口，永久无法获得向量且占死 id 升序队首。显式空白字符集
+    （SQLite：trim(X, ' '||char(9)||char(10)||char(13))）后全形态空白行
+    均被排除，正常行照常返回。pytest 收集项，直跑 main_async 不经过。"""
+    config_mod = _load("config")
+    _load("alias_store")
+    _load("entity_edge")
+    db_pkg = _load("db")
+    LocalMemoryConfig = config_mod.LocalMemoryConfig
+    SQLiteMemoryDatabase = db_pkg.SQLiteMemoryDatabase
+
+    tmp = tempfile.TemporaryDirectory(prefix="noriflow_ws_rows_")
+    try:
+        config = LocalMemoryConfig(
+            storage_backend="sqlite",
+            sqlite_path=str(Path(tmp.name) / "memory.sqlite3"),
+            embedding_dims=4,
+        )
+        db = SQLiteMemoryDatabase(config)
+        await db.connect()
+        try:
+            await db.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
+            occurred = datetime.now(_UTC).strftime("%Y-%m-%dT%H:%M:%S")
+            # 三行 embedding 均为 NULL：纯 \t\n\r、纯空格、正常文本
+            async with db.pool.acquire() as conn:
+                for doc_id, content in (
+                    ("ws-1", "\t\n\r \n"),
+                    ("ws-2", "   "),
+                    ("ok-1", "正常摘要内容"),
+                ):
+                    await conn.execute(
+                        "INSERT INTO memory_chat_summary "
+                        "(document_id, content, occurred_at) "
+                        "VALUES ($1, $2, $3)",
+                        doc_id, content, occurred,
+                    )
+            rows = await db.fetch_missing_embeddings(
+                "memory_chat_summary", limit=10
+            )
+            contents = [text for _, text in rows]
+            assert contents == ["正常摘要内容"], (
+                f"全形态空白行必须排除出补算窗口，只返回正常行，实际 {contents}"
+            )
+        finally:
+            await db.close()
+    finally:
+        tmp.cleanup()
+
+
+async def test_cluster_status_op_drop_clears_profile_row() -> None:
+    """PR review（第 5 轮）暴露的盲区锁定：drop 分支此前无任何真库
+    覆盖——错插参数/NameError 均藏身于此。锁定 drop 完整语义：簇置
+    dead + 画像投影行清除 + changed 状态回传。pytest 收集项。"""
+    config_mod = _load("config")
+    _load("alias_store")
+    _load("entity_edge")
+    db_pkg = _load("db")
+    LocalMemoryConfig = config_mod.LocalMemoryConfig
+    SQLiteMemoryDatabase = db_pkg.SQLiteMemoryDatabase
+
+    tmp = tempfile.TemporaryDirectory(prefix="noriflow_drop_")
+    try:
+        config = LocalMemoryConfig(
+            storage_backend="sqlite",
+            sqlite_path=str(Path(tmp.name) / "memory.sqlite3"),
+            embedding_dims=4,
+        )
+        db = SQLiteMemoryDatabase(config)
+        await db.connect()
+        try:
+            await db.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
+            occurred = datetime.now(_UTC).strftime("%Y-%m-%dT%H:%M:%S")
+            async with db.pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO memory_fact_cluster "
+                    "(user_id, category, canonical_statement, score, "
+                    "status, occurred_at) "
+                    "VALUES ('u1', 'stable', '小明喜欢爬山', 8.0, "
+                    "'profiled', $1)",
+                    occurred,
+                )
+                cid = (await conn.fetchval(
+                    "SELECT id FROM memory_fact_cluster "
+                    "WHERE user_id = 'u1'"
+                ))
+                await conn.execute(
+                    "INSERT INTO memory_user_profile "
+                    "(platform, user_id, category, cluster_id, statement, "
+                    "score) VALUES ('napcat', 'u1', 'stable', $1, "
+                    "'小明喜欢爬山', 8.0)",
+                    cid,
+                )
+            result = await db.cluster_status_op(cid, "drop")
+            assert result == {
+                "changed": True, "status": "dead", "replaced_by": None
+            }, f"drop 须回传 changed/dead，实际 {result}"
+            async with db.pool.acquire() as conn:
+                status = await conn.fetchval(
+                    "SELECT status FROM memory_fact_cluster WHERE id = $1",
+                    cid,
+                )
+                profile_cnt = await conn.fetchval(
+                    "SELECT COUNT(*) FROM memory_user_profile "
+                    "WHERE cluster_id = $1",
+                    cid,
+                )
+            assert status == "dead", f"簇须置 dead，实际 {status}"
+            assert profile_cnt == 0, f"画像投影行须清除，剩余 {profile_cnt}"
+        finally:
+            await db.close()
+    finally:
+        tmp.cleanup()
+
+
 def main() -> None:
     logging.basicConfig(level=logging.WARNING)
     asyncio.run(main_async())

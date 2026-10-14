@@ -576,6 +576,7 @@ const KV_META = {
   relation_audit_fail_mark: { label: "审计跳批标记", kind: "raw" },
   _backend_migration_done: { label: "后端数据迁移", kind: "migration" },
   kira_memory_import_last_run: { label: "Kira 记忆数据迁入", kind: "kira_memory" },
+  kira_memory_host_import_last_run: { label: "Kira 宿主库迁入", kind: "kira_memory" },
 };
 
 function kvSkipSummary(raw) {
@@ -1266,6 +1267,14 @@ async function appendKiraMemoryImportCard() {
       ));
     }
   };
+  // 渲染期不请求：扫描与迁入均为用户显式触发的一次性动作。
+  const renderIdle = () => {
+    infoBox.replaceChildren(
+      line("点击「扫描」读取源目录（只读，一次性）；留空则使用默认源目录。"),
+      line("迁入方式：会话批次以「待提炼原文」入库，由后台合并管线逐步 LLM 提炼为摘要/事实/关系边（耗时取决于 LLM 预算，属正常现象）。", false),
+      line("安全边界：KiraAI 原始数据只读不改不删；全部写入走幂等键，重复执行自动去重、不产生重复记忆。", false),
+    );
+  };
 
   async function refresh(pathOverride) {
     runBtn.disabled = true;
@@ -1291,6 +1300,7 @@ async function appendKiraMemoryImportCard() {
       `将从 ${p} 只读迁入记忆数据到本插件。KiraAI 原始数据不会被修改或删除；重复执行按幂等键自动去重。导入的会话批次将由后台管线逐步提炼生效。确认执行？`,
       async () => {
         runBtn.disabled = true;
+        scanBtn.disabled = true;
         try {
           const r = await api("/memory/kira_memory/import", {
             method: "POST",
@@ -1299,11 +1309,17 @@ async function appendKiraMemoryImportCard() {
           });
           const s = r.stats || {};
           toast(`迁入完成：摘要 ${s.summary_rows || 0} 条、事实 ${s.fact_rows || 0} 条、别名 ${s.aliases_upserted || 0} 条（跳过重复：摘要 ${s.summary_skipped || 0}、事实 ${s.facts_skipped || 0}）`);
+          // 用本次结果就地更新，导入后不再全量重扫
+          infoBox.replaceChildren(
+            line(`本次迁入完成：摘要 ${s.summary_rows || 0} 条、事实 ${s.fact_rows || 0} 条、别名 ${s.aliases_upserted || 0} 条（跳过重复：摘要 ${s.summary_skipped || 0}、事实 ${s.facts_skipped || 0}）。`, true),
+            line("可再次点击「扫描」查看源目录当前可迁入计数。"),
+          );
         } catch (e) {
           toast(`迁入失败：${e.message}`, "danger");
+        } finally {
+          runBtn.disabled = false;
+          scanBtn.disabled = false;
         }
-        pathInput.value = "";
-        await refresh();
       });
   });
 
@@ -1316,7 +1332,95 @@ async function appendKiraMemoryImportCard() {
     infoBox,
     runBtn,
   ]));
-  await refresh();
+  renderIdle();
+}
+
+// ---------------- 宿主数据库迁入（v3 起 KiraAI 记忆入库，文件源不再更新） ----------------
+async function appendKiraMemoryHostImportCard() {
+  const infoBox = el("div", { class: "desc", style: "font-size:12px; line-height:1.9; margin:10px 0" });
+  const scanBtn = el("button", { class: "ghost" }, ["扫描宿主库"]);
+  const runBtn = el("button", {}, ["从宿主数据库迁入"]);
+
+  const line = (text, strong) =>
+    el("div", {}, strong ? [el("b", {}, [text])] : [text]);
+  const renderInfo = (d) => {
+    const p = d.preview || {};
+    infoBox.replaceChildren(
+      line("数据源：宿主数据库（KiraAI 会话表）", true),
+      line(`可迁入：${p.sessions} 个会话 / ${p.chunks} 个对话批次（${p.messages} 条消息）`),
+      line("适配 v3：KiraAI v3 起把会话上下文写入数据库、不再更新 chat_memory.json，此入口直接读取宿主当前会话，覆盖升级后新产生的记忆。仅迁入会话摘要（v3 无 entities/TOML 事实源）。", false),
+      line("安全边界：宿主数据只读；写入走幂等键，重复执行自动去重。", false),
+    );
+    if (d.last_run && d.last_run.source === "host_db") {
+      const r = d.last_run;
+      infoBox.appendChild(line(
+        `上次宿主库迁入：${fmtTime(r.finished_at)} — 实插摘要 ${r.summary_rows}`,
+        true,
+      ));
+    }
+  };
+
+  // 渲染期不请求：扫描与迁入均为用户显式触发的一次性动作，
+  // 避免切到设置栏即全量加载宿主会话（全表 + 全正文）。
+  const renderIdle = () => {
+    infoBox.replaceChildren(
+      line("数据源：宿主数据库（KiraAI 会话表）", true),
+      line("点击「扫描宿主库」读取宿主当前会话（只读，一次性）；迁入同样按需触发。"),
+      line("适配 v3：KiraAI v3 起把会话上下文写入数据库、不再更新 chat_memory.json，此入口直接读取宿主当前会话，覆盖升级后新产生的记忆。仅迁入会话摘要（v3 无 entities/TOML 事实源）。", false),
+      line("安全边界：宿主数据只读；写入走幂等键，重复执行自动去重。", false),
+    );
+  };
+
+  async function scan() {
+    scanBtn.disabled = true;
+    runBtn.disabled = true;
+    infoBox.replaceChildren(line("扫描中…"));
+    try {
+      const d = await api("/memory/kira_memory/import_host/preview");
+      renderInfo(d);
+    } catch (e) {
+      infoBox.replaceChildren(line(`扫描失败：${e.message}`));
+    } finally {
+      scanBtn.disabled = false;
+      runBtn.disabled = false;
+    }
+  }
+
+  scanBtn.addEventListener("click", scan);
+  runBtn.addEventListener("click", () => {
+    confirmModal("确认从宿主数据库迁入",
+      "将从宿主数据库（KiraAI 会话表）只读迁入当前会话摘要到本插件。宿主数据不会被修改或删除；重复执行按幂等键自动去重。确认执行？",
+      async () => {
+        runBtn.disabled = true;
+        scanBtn.disabled = true;
+        try {
+          const r = await api("/memory/kira_memory/import_host", { method: "POST" });
+          const s = r.stats || {};
+          toast(`迁入完成：摘要 ${s.summary_rows || 0} 条（跳过重复：${s.summary_skipped || 0}）`);
+          // 用本次结果就地更新，导入后不再全量重扫
+          infoBox.replaceChildren(
+            line(`本次迁入完成：实插摘要 ${s.summary_rows || 0} 条（跳过重复 ${s.summary_skipped || 0}）。`, true),
+            line("可再次点击「扫描宿主库」查看宿主当前可迁入计数。"),
+          );
+        } catch (e) {
+          toast(`迁入失败：${e.message}`, "danger");
+        } finally {
+          runBtn.disabled = false;
+          scanBtn.disabled = false;
+        }
+      });
+  });
+
+  $view.appendChild(el("div", { class: "card" }, [
+    el("h3", {}, ["宿主数据库迁入"]),
+    el("p", { class: "desc", style: "font-size:12px" }, [
+      "读取 KiraAI v3 数据库中的当前会话（升级后新产生的记忆不在 chat_memory.json 中），只读迁入会话摘要；写入幂等可重复执行。",
+    ]),
+    el("div", { style: "display:flex; gap:8px; align-items:center; flex-wrap:wrap" }, [scanBtn]),
+    infoBox,
+    runBtn,
+  ]));
+  renderIdle();
 }
 
 // ---------------- 设置（插件配置） ----------------
@@ -1380,6 +1484,7 @@ async function renderSettings() {
     ]),
   ]));
   await appendKiraMemoryImportCard();
+  await appendKiraMemoryHostImportCard();
   for (const g of d.groups) {
     $view.appendChild(el("div", { class: "card" }, [
       el("h3", {}, [g.label]),

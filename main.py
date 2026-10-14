@@ -1,4 +1,4 @@
-"""NoriFlow long-term memory plugin (KiraAI edition, PostgreSQL + pgvector).
+"""NoriFlow long-term memory plugin (KiraAI edition, PostgreSQL + pgvector / SQLite dual backend).
 
 Ported from nori-core nori_plugin_noriflow_memory. Difference from tool/label
 plugins: this is a service plugin whose core value is the automatic memory
@@ -19,14 +19,16 @@ pipeline:
 - Recall (recall): on @on.llm_request, vector-retrieve with the batch text as
   the query + rerank, injected as an independent Prompt; the user persona is
   deterministically assembled from the cluster table (no LLM) and injected too.
-- Active tools: memory_search / memory_write / memory_remove (enabled_tools
-  multi-select config controls which tools are enabled; the allowed_users user
-  whitelist and allowed_sessions session whitelist do code-level interception -
-  matched by trigger user or trigger session, any hit is allowed through, both
-  empty = all rejected; user entries support user_id or platform:user_id,
-  session entries support session_id, platform:session_id or a full sid
-  platform:type:session_id).
-- Maintenance: @register.page maintenance page + 22 @register.api endpoints
+- Active tools: memory_search / memory_write / memory_remove +
+  memory_profile / memory_lookup / memory_correct (all six are controlled
+  by the enabled_tools multi-select config; the latter three are
+  additionally gated by the memory_tools_enabled master switch; the
+  allowed_users user whitelist and allowed_sessions session whitelist do
+  code-level interception - matched by trigger user or trigger session,
+  any hit is allowed through, both empty = all rejected; user entries
+  support user_id or platform:user_id, session entries support session_id,
+  platform:session_id or a full sid platform:type:session_id).
+- Maintenance: @register.page maintenance page + 24 @register.api endpoints
   (overview/user/facts/cluster/persona/summary/graph/edge edit/backfill/re-
   encoding/import/settings browse and fix), data layer in webui_store.py.
 
@@ -45,6 +47,7 @@ WebUI plugin config.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
@@ -74,12 +77,16 @@ from .clients import FastLlmExit, KiraEmbeddingClient, KiraRerankClient
 from .config import LocalMemoryConfig
 from .contracts import PersonaCandidate
 from .db import MemoryDatabase, SQLiteMemoryDatabase, resolve_backend_name
+from .entity_edge import relation_statement_line
 from .envelope import HISTORY_BATCH_SEPARATOR, format_history_message
 from .kira_memory_import import (
     default_source_path,
     migrate_legacy_import_kv,
+    read_host_last_run,
     read_last_run,
+    run_host_db_import,
     run_kira_memory_import,
+    scan_host_sessions,
     scan_source,
 )
 from .memory_encoder import MemoryEncoder
@@ -105,7 +112,7 @@ ALL_TOOLS = _LEGACY_TOOLS + _PARITY_TOOLS
 _ACTIVE_CATEGORIES = (
     "identity", "stable", "preference", "commitment", "interaction", "naming",
 )
-_SEARCH_CATEGORIES = _ACTIVE_CATEGORIES + ("relation",)
+_SEARCH_CATEGORIES = _ACTIVE_CATEGORIES
 _CATEGORY_HINTS = {
     "identity": "他是谁（职业/身份/自我定位）",
     "stable": "既成事实（住址、宠物、经历、习惯）",
@@ -113,7 +120,6 @@ _CATEGORY_HINTS = {
     "commitment": "带日期的约定（答应的事、约好的活动）",
     "interaction": "怎么和他相处（节奏、边界、忌讳）",
     "naming": "称呼偏好（想被怎么叫、反感什么称呼）",
-    "relation": "此人的人际关系（谁—关系→谁）",
 }
 _MAX_TOP_K = 10
 _MAX_STATEMENT_CHARS = 200
@@ -127,6 +133,8 @@ _MEMORY_TOOLS_GUIDANCE = (
     "跨会话记忆注意时间与当事人：别人的经历不等于当前用户的，同"
     "名不等于同一人。被问到某个具体人物（含群友代号/昵称）时，用 "
     "memory_search(target=\"fact\", name=称呼) 查该成员的事实结论，"
+    "结果中的【关系】小节就是该成员的确切关系边，直接据此回答谁和谁是什么"
+    "关系，不要根据事实簇臆测。"
     "用 memory_profile 查完整画像。memory_search 查对话与事实结论，"
     "memory_lookup 查归档/失效的记忆，memory_profile 按名字查"
     "成员画像，memory_write 仅在用户明确要求记住时调用，答应记"
@@ -385,7 +393,6 @@ class _CachedLine:
 class _RetainState:
     """Retain snapshot of one conversation turn (frozen at the watermark when the turn completion signal arrives)."""
 
-    event_id: str
     session_id: str
     platform: str
     group_id: str
@@ -411,9 +418,12 @@ class NoriflowMemoryPlugin(BasePlugin):
         self._fast_llm: Optional[FastLlmExit] = None
         self._relation_controller: Optional[BackfillController] = None
         self._ready = False
-        # bot 身份（persona 名 + 首条消息的 self_id）
+        # bot 身份（persona 名 + 首条消息的 self_id 及其适配器平台）
         self._bot_nickname = "助手"
         self._bot_user_id = ""
+        # bot 所属适配器平台（与 _bot_user_id 同点一次性学习，传播给
+        # kernel.bot_platform 供 Kira 记忆迁入的全局事实归属）
+        self._bot_platform = ""
         # persona 昵称上次活读时间（monotonic；TTL 限频见 _refresh_bot_nickname）
         self._persona_checked_at = 0.0
         # 每会话滚动行缓存：sid -> OrderedDict[msg_key -> _CachedLine]（尾部最新）
@@ -422,6 +432,9 @@ class NoriflowMemoryPlugin(BasePlugin):
         self._consumed: dict[str, set[str]] = {}
         # bot 行序号（缓存键唯一性用，不参与查找）
         self._bot_seq = 0
+        # 无平台 message_id 的入站消息键序号（id(msg) 在 GC 后可被复用，
+        # 会导致新消息撞上已消费水位键而静默丢失——单调计数器杜绝复用）
+        self._anon_msg_seq = itertools.count()
         # bot 出站消息的平台 message_id 追踪（P3 场景 C 的引用 bot 判定：
         # Reply 元素只带平台消息 ID，而 bot 行缓存键是 bot#N 无法反查；
         # sid -> deque 有界，重启从零积累同滚动缓存语义）
@@ -881,10 +894,13 @@ class NoriflowMemoryPlugin(BasePlugin):
         in recall expansion - the "kira" placeholder never equals a real uid,
         so this deterministic defense is dead code before propagation. Fixed
         on first sight (KiraAI single-bot deployment; multi-account across
-        adapters is out of current scope).
+        adapters is out of current scope). Also propagates the learned
+        adapter platform (kernel.bot_platform) so the Kira-memory import can
+        attribute global facts to the right platform.
         """
         if self._memory_kernel is not None:
             self._memory_kernel.bot_id = bot_user_id
+            self._memory_kernel.bot_platform = self._bot_platform
         if self._merge_agent is not None:
             self._merge_agent.bot_id = bot_user_id
         logger.info("bot 平台 ID 已学习并传播: %s", bot_user_id)
@@ -983,8 +999,9 @@ class NoriflowMemoryPlugin(BasePlugin):
           effective for this turn only, not written back to history.
         """
         # enabled_tools 显式空列表 = 全部禁用（与 schema "取消选择即禁用"
-        # 语义一致）；键缺失/None 才回退全启用
-        configured = self.plugin_cfg.get("enabled_tools")
+        # 语义一致）；键缺失/None 才回退全启用（plugin_cfg 可能为 None，
+        # 与 451/1872/1876 处的 or {} 同口径）
+        configured = (self.plugin_cfg or {}).get("enabled_tools")
         if configured is None:
             configured = ALL_TOOLS
         disabled = set(ALL_TOOLS) - set(configured)
@@ -1041,6 +1058,11 @@ class NoriflowMemoryPlugin(BasePlugin):
                 entity_entries = []
 
         rollout_text = ""
+        # 动态块注入 user prompt 头部（宿主 assemble_prompt 将其排进最新一条
+        # user 消息、紧邻用户输入）：system prompt 与历史消息由此构成稳定
+        # 前缀可命中提示词缓存，随轮次变化的召回/画像块落在尾部不再打断
+        # 前缀缓存。persist=False：仅本轮生效，不写回会话历史。
+        inject_prompts: list[Prompt] = []
         if self._config.recent_rollout_enabled:
             try:
                 rollout_text = await kernel.build_recent_rollout_text(
@@ -1048,6 +1070,24 @@ class NoriflowMemoryPlugin(BasePlugin):
                 )
             except Exception:
                 logger.warning("滚动补回摘要获取失败（不阻断本轮）", exc_info=True)
+            else:
+                # 对齐 kernel 两阶段契约：先把补回块真正 append 进本轮
+                # prompt pieces，再 commit 排除 memo，最后跑 recall（recall
+                # 依据 memo 同轮排除已注入行）。append 与 commit 之间仅隔
+                # 纯内存 list.append——本轮装配若被丢弃，pending 不入 memo，
+                # 行保持 recall 可见，而非补回/召回两通道同时不可见一个
+                # TTL。hasattr 守卫兼容未实现两阶段的测试桩 kernel。
+                if rollout_text:
+                    inject_prompts.append(
+                        Prompt(
+                            content=rollout_text,
+                            name=f"{PLUGIN_ID}:rollout",
+                            source=PLUGIN_ID,
+                            persist=False,
+                        )
+                    )
+                if kernel is not None and hasattr(kernel, "commit_rollout_memo"):
+                    kernel.commit_rollout_memo(session.session_id)
 
         memory_text = ""
         query = self._build_recall_query(messages)
@@ -1099,20 +1139,8 @@ class NoriflowMemoryPlugin(BasePlugin):
         except Exception:
             logger.warning("用户画像获取失败（不阻断本轮）", exc_info=True)
 
-        # 动态块注入 user prompt 头部（宿主 assemble_prompt 将其排进最新一条
-        # user 消息、紧邻用户输入）：system prompt 与历史消息由此构成稳定
-        # 前缀可命中提示词缓存，随轮次变化的召回/画像块落在尾部不再打断
-        # 前缀缓存。persist=False：仅本轮生效，不写回会话历史。
-        inject_prompts: list[Prompt] = []
-        if rollout_text:
-            inject_prompts.append(
-                Prompt(
-                    content=rollout_text,
-                    name=f"{PLUGIN_ID}:rollout",
-                    source=PLUGIN_ID,
-                    persist=False,
-                )
-            )
+        # （rollout 块已在 recall 之前 append 进 inject_prompts——两阶段
+        # commit 契约要求，见上方；注入顺序 rollout → recall → profile 不变）
         if memory_text:
             inject_prompts.append(
                 Prompt(
@@ -1391,7 +1419,9 @@ class NoriflowMemoryPlugin(BasePlugin):
         """
         bucket = self._history.get(sid)
         if bucket is None and sid and ":" not in sid:
-            for key, candidate in self._history.items():
+            # LRU OrderedDict：最新活跃会话在尾部，倒序扫描让最近活跃者
+            # 胜出（正序首个命中是最久未活跃会话，与 docstring 相悖）
+            for key, candidate in reversed(list(self._history.items())):
                 if key.rsplit(":", 1)[-1] == sid:
                     bucket = candidate
                     break
@@ -1482,6 +1512,15 @@ class NoriflowMemoryPlugin(BasePlugin):
         if self_id and not self._bot_user_id:
             self._bot_user_id = self_id
             self._propagate_bot_identity(self_id)
+        # 平台学习与 uid 学习解耦：首条 self_id 消息可能尚无
+        # adapter_name，此后任何一条消息补学到平台即重传播——消除
+        # 「平台永久空串」窗口，Kira 迁入的全局事实归属不再依赖推断回退
+        if not self._bot_platform:
+            adapter = str(getattr(session, "adapter_name", "") or "")
+            if adapter:
+                self._bot_platform = adapter
+                if self._bot_user_id:
+                    self._propagate_bot_identity(self._bot_user_id)
         line = format_history_message(
             speaker_name=nickname or uid,
             content=text,
@@ -1491,7 +1530,10 @@ class NoriflowMemoryPlugin(BasePlugin):
         )
         self._append_history(
             session.sid,
-            str(getattr(msg, "message_id", "") or id(msg)),
+            str(
+                getattr(msg, "message_id", "")
+                or f"_anon{next(self._anon_msg_seq)}"
+            ),
             line,
             uid=uid,
             platform=str(getattr(session, "adapter_name", "") or ""),
@@ -1604,7 +1646,6 @@ class NoriflowMemoryPlugin(BasePlugin):
         await self._alias_upsert_batch(user_delta)
 
         state = _RetainState(
-            event_id=f"{sid}#{int(datetime.now().timestamp())}",
             session_id=bare,
             platform=adapter,
             group_id=bare if stype == "gm" else "",
@@ -1990,6 +2031,7 @@ class NoriflowMemoryPlugin(BasePlugin):
             "多轮对话合并计分出的人物结论，score 为确信度，仅返回生效"
             "中的簇，是「这个人怎样」的结论级材料）。查「我们聊过/发生"
             "过什么」用 summary；查「某人有什么特点/偏好/约定」用 fact。"
+            "查某个成员时，fact 结果会一并返回该成员的确切人际关系边。"
             "query 用简洁关键词，不要复述整句用户消息；第一次不够就换"
             "关键词再查。"
         ),
@@ -1998,14 +2040,17 @@ class NoriflowMemoryPlugin(BasePlugin):
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "检索关键词（简洁短语或实体名）",
+                    "description": (
+                        "检索关键词（简洁短语或实体名）；target=fact 且传 name 时可省略，"
+                        "将按成员称呼检索"
+                    ),
                 },
                 "target": {
                     "type": "string",
                     "enum": ["summary", "fact"],
                     "description": (
                         "检索目标，默认 summary。查某个具体人物"
-                        "的特点/偏好/约定/身份等结论时必须选 "
+                        "的特点/偏好/约定/身份或关系时必须选 "
                         "fact，并同时传 name（成员称呼）——"
                         "不传 name 时 fact 只查触发者本人"
                     ),
@@ -2027,15 +2072,14 @@ class NoriflowMemoryPlugin(BasePlugin):
                     "description": (
                         "仅 target=fact：成员称呼（支持历史昵称与"
                         "群内代号，如 xxy）。查某人的事实结论必传"
-                        "；category=relation 时必填（返回该成员的"
-                        "关系边）"
+                        "；查某人时其人际关系会随 fact 附带返回"
                     ),
                 },
                 "top_k": {"type": "number", "description": "返回条数上限，默认 5，最大 10"},
                 "session_id": {"type": "string", "description": "会话 ID（裸会话 ID；提供则按会话检索；不填默认当前会话）"},
                 "user_id": {"type": "string", "description": "用户 ID（提供则按用户跨会话检索）"},
             },
-            "required": ["query"],
+            "required": [],
         },
     )
     # The framework invokes tools as func(event, **args): the first parameter
@@ -2044,7 +2088,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         self,
         event,
         *_,
-        query: str,
+        query: str = "",
         target: str = "summary",
         category: str = "",
         name: str = "",
@@ -2066,7 +2110,7 @@ class NoriflowMemoryPlugin(BasePlugin):
             return "错误：target 只能是 summary 或 fact。"
         if category and category not in _SEARCH_CATEGORIES:
             return f"错误：category 只能是 {'/'.join(_SEARCH_CATEGORIES)}。"
-        if not query and not (category == "relation" and name):
+        if not query and not (target == "fact" and name):
             return "query 不能为空"
         sid = (session_id or "").strip()
         uid = (user_id or "").strip()
@@ -2092,15 +2136,18 @@ class NoriflowMemoryPlugin(BasePlugin):
         entity_sid = str(
             getattr(getattr(event, "session", None), "sid", "") or ""
         ) or sid
-        if target == "fact" or (target == "summary" and category == "relation"):
+        if target == "fact":
             # 批次事件（框架工具分发形态）_event_scope 取不到 uid；fact
             # 通道要求触发者锚定，回退 _trigger_user（与召回同款约定）。
             # 仅作用于事实路——summary 会话检索的 user_id 传参口径不变
+            trigger_uid, session_platform = self._trigger_user(event)
             if not uid:
-                uid, _ = self._trigger_user(event)
+                uid = trigger_uid
             return await self._tool_search_facts(
                 kernel, query, top_k, category, name, sid, uid, plat,
                 entity_sid=entity_sid,
+                session_platform=session_platform,
+                trigger_uid=trigger_uid,
             )
         # Asking-about-others recall: match the query against the entity
         # dictionary + persistent aliases; the keys then join the main search
@@ -2157,6 +2204,18 @@ class NoriflowMemoryPlugin(BasePlugin):
             name = name[:23] + "…"
         return f"{name}（{uid}）" if name else f"（{uid}）"
 
+    def _format_edge_time(self, kernel, value: object) -> str:
+        """Format an edge timestamp through the kernel's configured timezone."""
+        helper = getattr(kernel, "_edge_time_qualifier", None)
+        if callable(helper):
+            try:
+                return str(helper(value) or "")
+            except Exception:
+                logger.warning("关系边时间格式化失败（回退无时限）", exc_info=True)
+        else:
+            logger.debug("kernel 无关系边时间 helper（回退无时限）")
+        return ""
+
     async def _tool_search_facts(
         self,
         kernel,
@@ -2168,8 +2227,10 @@ class NoriflowMemoryPlugin(BasePlugin):
         uid: str,
         plat: str,
         entity_sid: str = "",
+        session_platform: str = "",
+        trigger_uid: str = "",
     ) -> str:
-        """The fact/relation channel of memory_search (aligned with nori _search_facts).
+        """The fact channel of memory_search with attached active relation edges.
 
         Scope lock: with a name, narrow to that member via entity resolution;
         without a name, anchor to the trigger user, and refuse retrieval when
@@ -2189,35 +2250,6 @@ class NoriflowMemoryPlugin(BasePlugin):
                 return hint
         elif not uid:
             return "错误：缺少用户定位，拒绝检索（作用域锁定）。"
-        if category == "relation":
-            if not name:
-                return "错误：category=relation 需要提供 name（成员名字）。"
-            if resolved is None:
-                return "错误：名字解析失败。"
-            r_plat, r_uid = resolved
-            try:
-                # fetch_active_edges 收 "platform:uid" 复合键列表——传裸值
-                # 会被逐字符展开、条件恒不命中（按成员查关系永远空）
-                edges = await db.fetch_active_edges([f"{r_plat}:{r_uid}"])
-            except Exception:
-                logger.warning("关系边检索失败", exc_info=True)
-                return "记忆检索暂时不可用，请稍后再试"
-            if query:
-                needle = query.strip()
-                edges = [
-                    e for e in edges
-                    if needle in str(e.get("relation_label") or "")
-                    or needle in str(e.get("statement") or "")
-                ]
-            if not edges:
-                return f"没有查到「{name}」的关系记录。"
-            lines = []
-            for e in edges[:top_k]:
-                lines.append(
-                    f"- {str(e.get('statement') or '')[:400]}"
-                    f"（{e.get('evidence_count')} 次证据）"
-                )
-            return "\n".join(lines)
         try:
             query_vec = await kernel.embedding_service.embed_one(query or name)
         except Exception:
@@ -2236,25 +2268,111 @@ class NoriflowMemoryPlugin(BasePlugin):
         except Exception:
             logger.warning("事实簇检索失败", exc_info=True)
             return "记忆检索暂时不可用，请稍后再试"
-        if not rows:
-            return "没有找到相关事实。"
-        lines = []
+        target_platform = resolved[0] if resolved else plat
+        target_uid = resolved[1] if resolved else uid
+        relation_scope_note = ""
+        if not target_platform:
+            row_platforms = {
+                str(row.get("platform") or "") for row in rows
+                if str(row.get("user_id") or "") == target_uid and row.get("platform")
+            }
+            if target_uid == trigger_uid and session_platform:
+                target_platform = session_platform
+                other_platforms = row_platforms - {session_platform}
+                if other_platforms:
+                    relation_scope_note = (
+                        f"关系边仅限当前会话平台 {session_platform}；"
+                        f"未查询事实涉及的其他平台：{'、'.join(sorted(other_platforms))}。"
+                    )
+            else:
+                if len(row_platforms) == 1:
+                    target_platform = next(iter(row_platforms))
+        relation_scope_missing = not target_platform
+        fact_lines: list[str] = []
         for r in rows:
             # user_id 与 platform 同口径 .get 兜底（防缺列行 KeyError 带走
             # 整次检索）；缺 uid 不输出归属段（（空）占位无信息量）
-            uid = r.get("user_id") or ""
+            row_uid = r.get("user_id") or ""
             owner = (
-                f"{self._owner_label(r.get('platform') or plat, uid)} "
-                if uid
+                f"{self._owner_label(r.get('platform') or target_platform, row_uid)} "
+                if row_uid
                 else ""
             )
-            lines.append(
+            fact_lines.append(
                 f"- [簇{r['id']}] ({float(r['score']):.1f}分) "
                 f"{owner}"
                 f"{str(r['canonical_statement'] or '')[:400]}"
                 f"（{r['category']}，{r['status']}，证据{r['evidence_count']}次）"
             )
-        return "\n".join(lines)
+
+        edges: list[dict] = []
+        relation_lookup_failed = False
+        if not relation_scope_missing:
+            try:
+                edges = [
+                    dict(e) for e in await db.fetch_active_edges(
+                        [f"{target_platform}:{target_uid}"]
+                    )
+                ]
+            except Exception:
+                relation_lookup_failed = True
+                logger.warning("memory_search 关系边查询失败（跳过关系小节）", exc_info=True)
+
+        if edges:
+            owners: set[tuple[str, str]] = {(target_platform, target_uid)}
+            for edge in edges:
+                eplat = str(edge.get("platform") or target_platform)
+                for side in ("subject", "object"):
+                    endpoint = str(edge.get(f"{side}_uid") or "")
+                    if endpoint:
+                        owners.add((eplat, endpoint))
+            try:
+                names = await db.fetch_alias_names_by_owner(sorted(owners)) or {}
+                for edge in edges:
+                    eplat = str(edge.get("platform") or target_platform)
+                    for side in ("subject", "object"):
+                        endpoint = str(edge.get(f"{side}_uid") or "")
+                        if names.get((eplat, endpoint)):
+                            edge[f"{side}_name"] = names[(eplat, endpoint)]
+            except Exception:
+                logger.warning("memory_search 关系边规范名解析失败（回退快照名）", exc_info=True)
+
+        sections: list[str] = []
+        if fact_lines:
+            sections.append("【事实】\n" + "\n".join(fact_lines))
+        if edges:
+            relation_lines: list[str] = []
+            bot_uid: object = self._bot_user_id or getattr(kernel, "bot_id", "")
+            bot_uid_forms = getattr(kernel, "_bot_uid_forms_all", None)
+            if callable(bot_uid_forms):
+                try:
+                    bot_uid = bot_uid_forms(bot_uid)
+                except Exception:
+                    logger.warning("关系边 bot 标识解析失败（回退主 uid）", exc_info=True)
+            for edge in edges[:top_k]:
+                try:
+                    relation_lines.append(
+                        "- " + str(relation_statement_line(
+                            edge,
+                            bot_uid=bot_uid,
+                            session_platform=session_platform or plat,
+                            bot_nickname=self._bot_nickname,
+                            time_qualifier=self._format_edge_time(
+                                kernel, edge.get("last_seen")
+                            ),
+                        ))[:400]
+                    )
+                except Exception:
+                    logger.warning("memory_search 关系边渲染失败（跳过该边）", exc_info=True)
+            if relation_lines:
+                sections.append("【关系】\n" + "\n".join(relation_lines))
+        if relation_scope_missing:
+            sections.append("【关系】\n- 关系边暂不可查询：缺少平台上下文。")
+        elif relation_lookup_failed:
+            sections.append("【关系】\n- 关系边暂不可查询，请稍后再试。")
+        if relation_scope_note and not relation_lookup_failed:
+            sections.append(relation_scope_note)
+        return "\n\n".join(sections) if sections else "没有找到相关事实或关系。"
 
     @register.tool(
         name="memory_write",
@@ -2484,6 +2602,10 @@ class NoriflowMemoryPlugin(BasePlugin):
         except Exception:
             logger.warning("memory_remove 工具失败", exc_info=True)
             return "删除失败：记忆库暂时不可用，请稍后再试"
+        # 契约：True=已删除，False=查证不存在，None=DB 故障/熔断开启——
+        # None 须与"不存在"区分回报（否则用户会误以为 ID 写错了）
+        if removed is None:
+            return "记忆服务暂时不可用，请稍后再试"
         if removed:
             return "已删除"
         if scope_sid or scope_uid:
@@ -2652,11 +2774,12 @@ class NoriflowMemoryPlugin(BasePlugin):
             lines = []
             for r in rows:
                 marker = markers.get(str(r["status"]), "")
-                # user_id 与 platform 同口径 .get 兜底（见 memory_search）
-                uid = r.get("user_id") or ""
+                # user_id 与 platform 同口径 .get 兜底（见 memory_search）；
+                # 行内变量名 row_uid 防遮蔽函数级 uid 作用域锚点
+                row_uid = r.get("user_id") or ""
                 owner = (
-                    f"{self._owner_label(r.get('platform') or plat, uid)} "
-                    if uid
+                    f"{self._owner_label(r.get('platform') or plat, row_uid)} "
+                    if row_uid
                     else ""
                 )
                 lines.append(
@@ -3064,6 +3187,50 @@ class NoriflowMemoryPlugin(BasePlugin):
         )
         return {"ok": True, "stats": stats}
 
+    @register.api(method="GET", path="/memory/kira_memory/import_host/preview")
+    async def api_kira_memory_import_host_preview(self):
+        """Preview the host-DB import source (KiraAI v3 keeps session memory in its database)."""
+        session_mgr = getattr(self.ctx, "session_mgr", None)
+        if session_mgr is None:
+            raise HTTPException(status_code=503, detail="宿主 session_mgr 不可用")
+        backend = self._pool_or_503()
+        sessions = await session_mgr.get_sessions(include_content=True)
+        return {
+            "source_path": "host_db",
+            "preview": scan_host_sessions(sessions),
+            "last_run": await read_host_last_run(backend),
+        }
+
+    @register.api(method="POST", path="/memory/kira_memory/import_host")
+    async def api_kira_memory_import_host_run(self):
+        """Import the host database's sessions (conversation summaries only).
+
+        v3 writes session context to the database and stops updating
+        data/memory/chat_memory.json, so this entry point covers memory
+        created after the upgrade; the file-based import stays for the
+        legacy v2 tree.
+        """
+        if getattr(self, "_kira_memory_import_running", False):
+            raise HTTPException(status_code=409, detail="已有一次迁入在执行中")
+        backend = self._pool_or_503()
+        session_mgr = getattr(self.ctx, "session_mgr", None)
+        if session_mgr is None:
+            raise HTTPException(status_code=503, detail="宿主 session_mgr 不可用")
+        _, _, bot_nickname = self._kira_memory_bot_identity()
+        self._kira_memory_import_running = True
+        try:
+            sessions = await session_mgr.get_sessions(include_content=True)
+            stats = await run_host_db_import(
+                backend, sessions=sessions, bot_nickname=bot_nickname,
+            )
+        finally:
+            self._kira_memory_import_running = False
+        logger.info(
+            "[WebUI] 宿主数据库记忆迁入完成: sessions=%s summary_rows=%s",
+            stats.get("sessions"), stats.get("summary_rows"),
+        )
+        return {"ok": True, "stats": stats}
+
     # ------------------------------------------------------------------
     #  设置栏（插件配置读写：真相源在宿主，运行时实例就地热更新）
     # ------------------------------------------------------------------
@@ -3086,7 +3253,7 @@ class NoriflowMemoryPlugin(BasePlugin):
 
     @register.api(method="GET", path="/memory/config")
     async def api_memory_config_get(self):
-        pm = self.ctx.plugin_mgr
+        pm = getattr(self.ctx, "plugin_mgr", None)
         if pm is None or self._config is None:
             raise HTTPException(status_code=503, detail="配置端点未装配")
         host_values = pm.get_plugin_config(self._plugin_id()) or {}
@@ -3106,7 +3273,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         (restart_required) are returned as-is; they need a re-initialization
         or process restart to take effect.
         """
-        pm = self.ctx.plugin_mgr
+        pm = getattr(self.ctx, "plugin_mgr", None)
         if pm is None or self._config is None:
             raise HTTPException(status_code=503, detail="配置端点未装配")
         values = body.get("values") if isinstance(body, dict) else None
@@ -3142,10 +3309,20 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 2) 宿主真相源同步：内存 dict（宿主配置页/下次 init_plugin 读）+ 磁盘
         merged_host = dict(host_values)
         merged_host.update(changed)
-        pm.plugin_configs[pid] = merged_host
+        # Do NOT use pm.update_plugin_config: it calls init_plugin and tears down
+        # the running plugin (pools/background tasks); sync the in-memory dict
+        # defensively instead, degrading to disk-only + warning if it is absent.
+        if isinstance(getattr(pm, "plugin_configs", None), dict):
+            pm.plugin_configs[pid] = merged_host
+        else:
+            logger.warning(
+                "宿主 PluginManager 未暴露 plugin_configs，内存配置未同步"
+                "（磁盘写入仍会执行，宿主重启后生效）"
+            )
         persistence_error = ""
         try:
-            from core.plugin.plugin_registry import PLUGIN_CONFIG_DIR
+            # v3: plugin_registry was removed; PLUGIN_CONFIG_DIR moved to core.plugin.manager
+            from core.plugin.manager import PLUGIN_CONFIG_DIR
 
             config_web.persist_host_config(
                 PLUGIN_CONFIG_DIR, pid, changed, host_values

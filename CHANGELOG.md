@@ -2,6 +2,91 @@
 
 ## Unreleased
 
+## v1.17.3 (2026-10-14)
+
+### fix: 全仓评审修复批（7 medium / 15 low 缺陷 + 键公式单源化 + 文档失真修正）
+
+全量评审 ~15k LOC 后分阶段修复，两轮对抗性复核（2 + 5 subagent）+ 独立
+收尾，测试 371 → 383 全绿：
+
+- **数据损坏（M1）**：`json_utils` 正则修复改为分阶段——先直接 `json.loads`
+  透传合法 JSON（含 `, }`、`: True` 等诱饵序列的字符串值原样保留），失败才
+  正则修复重试，json_repair 兜底；
+- **LLM 契约（M2/M3/L12）**：簇裁决与边审计部分覆盖时不再把未裁决项当
+  无关（杜绝重复簇 create）、水位不推进过未覆盖边；`true == 1` 布尔 ID
+  拒绝（adjudicate 与边审计双处）；
+- **周期健壮性（M5/L11/L3）**：合并周期六个 DB 阶段各自 try/except 喂
+  熔断 + 跳过续跑，`_save_skip_state` 进 finally；decay/lifecycle 时间戳
+  kv 写失败不中断不双重衰减；重编码预留探针尊重毒丸跳过名单；
+- **向量与召回（M4/L4/L5/L6/L7）**：近重去重维度不匹配跳过比对（换
+  embedding 模型后不再假命中丢行）；bot 排除双形态覆盖；召回 token 预算
+  计入时间标签；滚动补回改两阶段 memo（build 暂存、prompt 装配成功才
+  commit，宿主丢弃装配时不再双通道不可见）；写侧去重命中带告警；
+- **一致性（M7/L2）**：WebUI 摘要编辑的 SQLite FTS5 影子表同步并入同事务；
+  `search_fact_clusters` 全空白 user_ids 双后端统一 fail-closed（杜绝
+  跨用户暴露）；
+- **main.py（M6/L1/L8/L9/L10/L13/L14）**：enabled_tools None 守卫；
+  bot_platform 幽灵属性接线（捕获→传播→消费三点链路）；LRU 兜底取最近
+  活跃会话；匿名消息键改单调计数器（地址复用不再静默丢失）；记忆删除
+  DB 故障与不存在三态分文案；变量遮蔽与 config 端点防御式解引用；
+- **单源化收敛**：幂等键 `summary_document_id`/`evidence_key`、画像投影
+  SQL 模板、LIKE 转义、`resolve_bot_forms` 提为共享 helper，全仓内联
+  拷贝清零（字节级兼容由原锁定测试背书）；
+- **杂项**：SQLite 连接池关闭竞态、单字 CJK token 保留、FTS 空白行排除
+  出补算窗口、`_ilike` 未导入 NameError（PG 后端关键词搜索必崩）随 LIKE
+  去重顺带修复、recall 日志自动建目录、死代码清理（`_drain_reinforcement`
+  等）、docstring 幽灵队列/单后端声明等 11 处文档失真修正；
+- **测试**：测试基建幂等化（同进程双模块实例致 assertRaises 断裂），
+  新增 12 个锁定测试（含独立复核补齐的维度跳过 / rollout no-commit /
+  fail-closed 空白 user_ids）。
+
+### feat: fact 检索附带成员关系边
+
+- 移除 `memory_search` 的 `category=relation` 过滤维度，关系边随 `target=fact`
+  按成员自动返回，并以【事实】/【关系】分节呈现；
+- 复用现有关系行渲染、边时间限定、复合键查询与规范名查询能力；关系查询、别名
+  查询和单边渲染均按既有契约降级，事实查询数据库不可用时返回统一暂不可用提示；
+- 保持事实行格式与版本号不变，补充工具 guidance、schema 和回归覆盖。
+- 关系查询故障显式提示“关系边暂不可查询”，保留已返回事实；本人跨平台事实检索
+  附加关系查询的会话平台限定，避免将查询失败或范围限制误解为没有关系。
+
+## v1.17.2 (2026-10-13)
+
+### fix: 迁入预览改为按需触发（消除切设置栏的全量加载）
+
+- 维护页两张迁入卡片（文件源 / 宿主数据库）不再在渲染时自动扫描——此前
+  每次切到设置栏 tab 都会触发一次文件源全量读取与一次宿主会话全量加载
+  （`ctx.session_mgr.get_sessions(include_content=True)` = 全表 + 全正文），
+  对长期运行、会话持续增长的部署造成无谓延迟与内存峰值；
+- 扫描与迁入改为用户显式点击触发的一次性动作；宿主库「从宿主数据库迁入」
+  按钮初始即可点（导入接口自带加载、不依赖预览，省去一次无谓扫描）；
+- 导入完成后不再自动重扫，改用本次返回 stats 就地更新提示，使每次操作
+  仅发生一次全量加载；
+- 仅改插件侧 `web/index.html`；迁入 / 预览 API 行为不变。
+
+## v1.17.1 (2026-10-12)
+
+### fix: KiraAI v3.0.0 兼容（配置落盘 / 存量迁入 / 声明校准）
+
+对齐 KiraAI v3.0.0-rc.1：
+
+- **配置落盘修复**：维护页设置栏保存延迟 import 的 `PLUGIN_CONFIG_DIR`
+  由已删除的 `core.plugin.plugin_registry` 改到 `core.plugin.manager`——
+  此前该 import 抛错被兜底 except 吞掉，配置只热生效、不落盘，宿主重启
+  回退旧值；
+- **存量迁入新增宿主数据库源**：v3 起 KiraAI 会话入库（`chat_sessions`）、
+  不再更新 `data/memory/chat_memory.json`，文件式迁入无法覆盖升级后新
+  产生的记忆；新增「宿主数据库迁入」（经 `ctx.session_mgr.get_sessions`
+  读取，复用同一 chunk→summary 管线与幂等键，仅迁会话摘要），维护页新增
+  对应卡片；文件迁入保留为 v2 遗留存量通道。内部抽取
+  `build_chat_summary_rows` 供两源共用（消除重复的 chunk 组装逻辑）；
+- 两种迁入来源独立保存最近迁入记录，预览按来源读取；文件迁入覆盖旧共享
+  标记前保留其中的宿主库历史，预览读取不写入数据库；
+- **core_version 声明**：`>=2.31.0` → `>=3.0.0rc1`（`>=3.0.0` 会拒绝当前
+  rc.1 预发布版本）；
+- 宿主 `plugin_configs` 内存同步加存在性防御：宿主结构变化时降级为仅
+  落盘 + 告警，而非抛 AttributeError 中断保存。
+
 ### docs: README 口径修正 + 同源描述同步
 
 - mermaid「LLM 记忆工具」节点与功能简介补齐六件套口径

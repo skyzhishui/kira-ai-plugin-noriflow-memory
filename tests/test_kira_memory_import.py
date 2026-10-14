@@ -148,6 +148,15 @@ def build_source(root: Path) -> None:
                 ],
             ],
         },
+        "seki:dm:only-notice": {
+            "title": "仅通知",
+            "description": "",
+            "memory": [[
+                {"role": "user", "content":
+                 "[Sep 11 2026 10:00 Fri] Notice [user_id: system_qzone_task] | 任务"},
+                {"role": "assistant", "content": "<msg />"},
+            ]],
+        },
         "seki:sm:system": {"title": "", "description": "", "memory": [[{"role": "user", "content": "x"}]]},
     }
     (root / "chat_memory.json").write_text(
@@ -308,8 +317,8 @@ async def main_async() -> None:
     await db.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
 
     preview = ki.scan_source(source)
-    check("preview_counts", preview["sessions"] == 2 and preview["chunks"] == 4
-          and preview["messages"] == 8 and preview["toml_files"] == 4
+    check("preview_counts", preview["sessions"] == 2 and preview["chunks"] == 3
+          and preview["messages"] == 6 and preview["toml_files"] == 4
           and preview["profiles"] == 1 and preview["archive_files"] == 1,
           str(preview))
 
@@ -318,9 +327,9 @@ async def main_async() -> None:
         db, source_path=source, bot_uid="99999", bot_nickname="Kira",
     )
     check("stats_sessions", stats["sessions"] == 2, str(stats))
-    check("stats_chunks_total", stats["chunks_total"] == 4, str(stats))
-    check("stats_notice_skipped", stats["system_notice_msgs_skipped"] == 2, str(stats))
-    check("stats_bot_only_skipped", stats["chunks_bot_only_skipped"] == 1, str(stats))
+    check("stats_chunks_total", stats["chunks_total"] == 5, str(stats))
+    check("stats_notice_skipped", stats["system_notice_msgs_skipped"] == 3, str(stats))
+    check("stats_bot_only_skipped", stats["chunks_bot_only_skipped"] == 2, str(stats))
     check("stats_summary_rows", stats["summary_rows"] == 3, str(stats))
     check("stats_fact_rows", stats["fact_rows"] == 4, str(stats))  # 2 user + 1 group + 1 self
     check("stats_aliases", stats["aliases_upserted"] == 3, str(stats))
@@ -442,6 +451,11 @@ async def main_async() -> None:
     check("source_untouched", snap_before == snap_after,
           str(set(snap_before.items()) ^ set(snap_after.items())))
 
+    file_marker_before_host = await ki.read_last_run(db)
+    check("file_marker_before_host", file_marker_before_host is not None
+          and file_marker_before_host.get("source_path") != "host_db",
+          str(file_marker_before_host))
+
     # ---- 缺 chat_memory.json 且无 entities/ 的目录拒绝 ----
     bogus = Path(tmp.name) / "bogus"
     bogus.mkdir()
@@ -455,6 +469,102 @@ async def main_async() -> None:
         check("missing_dir_rejected", False, "no exception")
     except FileNotFoundError:
         check("missing_dir_rejected", True)
+
+    # ---- 宿主数据库迁入（v3 会话入库；Session 对象与 record dict 两形态）----
+    fallback_dt = datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc)
+    fallback = ki._host_session_fallback_time({"updated_at": fallback_dt})
+    check("host_fallback_datetime", fallback == fallback_dt.astimezone().replace(tzinfo=None),
+          str(fallback))
+    overflow_fallback = ki._host_session_fallback_time({"updated_at": 10 ** 400})
+    check("host_fallback_overflow", isinstance(overflow_fallback, datetime),
+          str(overflow_fallback))
+    check("host_dict_sid_key", ki._host_session_key(
+        {"sid": "discord:dm:20002"}
+    ) == "discord:dm:20002")
+    check("host_dict_field_key", ki._host_session_key(
+        {"adapter_name": "discord", "session_type": "gm", "session_id": "30010"}
+    ) == "discord:gm:30010")
+    host_sessions = [
+        {
+            "sid": "discord:dm:20001",
+            "content": [[
+                {"role": "user",
+                 "content": "[Sep 12 2026 10:00 Sat] 我今天要加班",
+                 "sender_id": "20001", "sender_name": "Alice"},
+                {"role": "assistant", "content": "<msg><text>辛苦了</text></msg>"},
+            ]],
+            "updated_at": 1789200000,
+        },
+        types.SimpleNamespace(
+            sid="discord:gm:30009",
+            content=[[
+                {"role": "user",
+                 "content": "[Sep 12 2026 11:00 Sat] Notice [user_id: system_qzone_task] | 任务"},
+                {"role": "assistant", "content": "<msg />"},
+            ]],
+            updated_at=1789200000,
+        ),
+        {"session_key": "discord:sm:sys",
+         "content": [[{"role": "user", "content": "x"}]]},
+    ]
+    host_preview = ki.scan_host_sessions(host_sessions)
+    check("host_preview_sessions", host_preview["sessions"] == 1, str(host_preview))
+    check("host_preview_chunks", host_preview["chunks"] == 1, str(host_preview))
+
+    host_stats = await ki.run_host_db_import(
+        db, sessions=host_sessions, bot_nickname="Kira",
+    )
+    check("host_stats_source", host_stats["source"] == "host_db", str(host_stats))
+    check("host_stats_sessions", host_stats["sessions"] == 1, str(host_stats))
+    check("host_stats_summary_rows", host_stats["summary_rows"] == 1, str(host_stats))
+    check("host_gm_bot_only_skipped", host_stats["chunks_bot_only_skipped"] == 1,
+          str(host_stats))
+    host_row = dict(await conn.fetchrow(
+        "SELECT * FROM memory_chat_summary WHERE session_id='20001'"))
+    check("host_row_platform", host_row["platform"] == "discord", str(host_row["platform"]))
+    check("host_row_user", host_row["user_id"] == "20001", str(host_row["user_id"]))
+    check("host_row_summarized_false", not host_row["summarized"], str(host_row["summarized"]))
+    check("host_row_content_envelope", 'uid="20001"' in host_row["content"],
+          host_row["content"][:120])
+    check("host_gm_notice_absent", await conn.fetchval(
+        "SELECT count(*) FROM memory_chat_summary WHERE session_id='30009'") == 0)
+
+    host_stats2 = await ki.run_host_db_import(
+        db, sessions=host_sessions, bot_nickname="Kira",
+    )
+    check("host_rerun_idempotent", host_stats2["summary_rows"] == 0
+          and host_stats2["summary_skipped"] == 1, str(host_stats2))
+    host_marker = await ki.read_host_last_run(db)
+    check("host_marker_source", host_marker is not None
+          and host_marker["source"] == "host_db", str(host_marker))
+    file_marker_after_host = await ki.read_last_run(db)
+    check("file_marker_preserved", file_marker_after_host == file_marker_before_host,
+          str(file_marker_after_host))
+
+    await ki.run_kira_memory_import(db, source_path=source, bot_uid="99999")
+    check("host_marker_preserved_after_file", await ki.read_host_last_run(db) == host_marker)
+
+    # Simulate an upgrade with the old shared slot holding a host marker.
+    async with db.pool.acquire() as marker_conn:
+        await marker_conn.execute(
+            "DELETE FROM _memory_local_kv WHERE key = $1",
+            ki.KIRA_HOST_MEMORY_IMPORT_KV_KEY,
+        )
+    await db.set_kv(ki.KIRA_MEMORY_IMPORT_KV_KEY, json.dumps(host_marker))
+    check("legacy_host_hidden_from_file", await ki.read_last_run(db) is None)
+    check("legacy_host_readable", await ki.read_host_last_run(db) == host_marker)
+    check("host_preview_read_only",
+          await db.get_kv(ki.KIRA_HOST_MEMORY_IMPORT_KV_KEY) is None)
+    # Remove any copy made by the reader so file-first migration is tested independently.
+    async with db.pool.acquire() as marker_conn:
+        await marker_conn.execute(
+            "DELETE FROM _memory_local_kv WHERE key = $1",
+            ki.KIRA_HOST_MEMORY_IMPORT_KV_KEY,
+        )
+    await ki.run_kira_memory_import(db, source_path=source, bot_uid="99999")
+    check("legacy_host_preserved_before_file", await ki.read_host_last_run(db) == host_marker)
+    check("file_marker_after_legacy_host",
+          (await ki.read_last_run(db) or {}).get("source_path") == str(source))
 
     await db.close()
     tmp.cleanup()

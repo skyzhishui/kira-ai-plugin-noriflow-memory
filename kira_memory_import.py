@@ -65,11 +65,12 @@ try:
 except ImportError:  # pragma: no cover - Python 3.10 takes the tomli branch
     import tomli as tomllib
 
-from .db.base import fact_document_id
+from .db.base import evidence_key, fact_document_id, summary_document_id
 from .envelope import format_history_message
 
-# kv marker key (_memory_local_kv): JSON snapshot of the latest import result
+# Per-source kv markers (_memory_local_kv): latest import result snapshots.
 KIRA_MEMORY_IMPORT_KV_KEY = "kira_memory_import_last_run"
+KIRA_HOST_MEMORY_IMPORT_KV_KEY = "kira_memory_host_import_last_run"
 
 # Session ids look like "{adapter}:{dm|gm}:{bare_id}"; non-session types
 # such as sm never map to memory entities (same whitelist as KiraAI
@@ -225,6 +226,92 @@ def chunk_occurred_at(chunk: list, fallback: datetime) -> datetime:
     return max(stamps) if stamps else fallback
 
 
+def _is_importable_chunk(chunk: list) -> bool:
+    """Whether a chunk yields a summary row (the write path's skip predicate)."""
+    if not isinstance(chunk, list):
+        return False
+    return any(
+        isinstance(m, dict)
+        and m.get("role") == "user"
+        and not is_system_notice(m)
+        and str(m.get("content") or "").strip()
+        for m in chunk
+    )
+
+
+def build_chat_summary_rows(
+    session_key: str,
+    content: list,
+    fallback_time: datetime,
+    *,
+    stats: dict,
+    bot_nickname: str = "",
+) -> list[dict]:
+    """Convert one session's chunk list into chat_summary rows.
+
+    Shared by the legacy chat_memory.json import and the host-DB import:
+    both feed the same KiraAI chunk shape (list of
+    {role, content, sender_id, sender_name}). System notices and batches
+    without user-side content are filtered as in the legacy path; ``stats``
+    is updated in place.
+    """
+    parsed = parse_kira_memory_session(session_key)
+    if not parsed or not isinstance(content, list):
+        return []
+    platform = parsed["platform"]
+    session_id = parsed["session_id"]
+    rows: list[dict] = []
+    for chunk in content:
+        if not isinstance(chunk, list):
+            continue
+        stats["chunks_total"] += 1
+        stats["system_notice_msgs_skipped"] += sum(
+            1 for m in chunk if is_system_notice(m)
+        )
+        if not _is_importable_chunk(chunk):
+            stats["chunks_bot_only_skipped"] += 1
+            continue
+        content_text = compose_chunk_content(chunk, bot_nickname)
+        if not content_text:
+            continue
+        occurred_at = chunk_occurred_at(chunk, fallback_time)
+        user_id = parsed["user_id"]
+        participants: list[str] = []
+        if not user_id:
+            for msg in chunk:
+                if (
+                    isinstance(msg, dict)
+                    and msg.get("role") == "user"
+                    and str(msg.get("sender_id") or "").strip()
+                ):
+                    user_id = str(msg["sender_id"]).strip()
+                    break
+        if user_id:
+            participants.append(f"{platform}:{user_id}")
+        for msg in chunk:
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            sid = str(msg.get("sender_id") or "").strip()
+            if sid:
+                key = f"{platform}:{sid}"
+                if key not in participants:
+                    participants.append(key)
+        rows.append({
+            "document_id": summary_document_id(session_id, content_text),
+            "kind": "chat_summary",
+            "platform": platform,
+            "session_id": session_id,
+            "group_id": parsed["group_id"],
+            "user_id": user_id,
+            "participants": participants,
+            "content": content_text,
+            "occurred_at": occurred_at,
+            "embedding": None,
+            "summarized": False,
+        })
+    return rows
+
+
 def scan_source(source_path: str | Path) -> dict:
     """Scan the source directory read-only and return preview counts (no
     writes at all; feeds the confirmation dialog)."""
@@ -252,11 +339,12 @@ def scan_source(source_path: str | Path) -> dict:
             mem = body.get("memory")
             if not isinstance(mem, list):
                 continue
+            importable = [c for c in mem if _is_importable_chunk(c)]
+            if not importable:
+                continue
             out["sessions"] += 1
-            out["chunks"] += len(mem)
-            out["messages"] += sum(
-                len(c) for c in mem if isinstance(c, list)
-            )
+            out["chunks"] += len(importable)
+            out["messages"] += sum(len(c) for c in importable)
 
     for toml_path, _ns, _p, _u in _iter_toml_files(source):
         out["toml_files"] += 1
@@ -398,7 +486,7 @@ def _toml_fact_row(
         "confidence": "high" if importance >= 7 else "medium",
         "session_id": session_id,
         "group_id": group_id,
-        "evidence_key": f"{session_id}|{occurred_at.strftime('%Y-%m-%d')}",
+        "evidence_key": evidence_key(session_id, occurred_at),
         "occurred_at": occurred_at,
         "embedding": None,
     }
@@ -438,6 +526,10 @@ async def run_kira_memory_import(
             f"{source} 下没有 chat_memory.json 或 entities/，不像 KiraAI 记忆数据根"
         )
 
+    # Preserve a pre-split host marker before the file import reuses its slot.
+    # A failed copy must abort here, before either history can be overwritten.
+    await _preserve_legacy_host_marker(db)
+
     stats: dict[str, Any] = {
         "source_path": str(source),
         "sessions": 0, "chunks_total": 0,
@@ -474,77 +566,13 @@ async def run_kira_memory_import(
                 mem = body.get("memory")
                 if not isinstance(mem, list):
                     continue
-                stats["sessions"] += 1
+                if any(_is_importable_chunk(chunk) for chunk in mem):
+                    stats["sessions"] += 1
                 session_platforms.append(parsed["platform"])
-                platform = parsed["platform"]
-                session_id = parsed["session_id"]
-                for chunk in mem:
-                    if not isinstance(chunk, list):
-                        continue
-                    stats["chunks_total"] += 1
-                    stats["system_notice_msgs_skipped"] += sum(
-                        1 for m in chunk if is_system_notice(m)
-                    )
-                    # Batches whose user-side content is entirely system
-                    # notices (or absent) are not imported: rows reduced to
-                    # bot replies (often empty-payload placeholders) hold no
-                    # long-term-memory value, and skipping them saves the
-                    # encode catch-up budget (a natural extension of the
-                    # system-notice filter, user decision 2026-09-12)
-                    if not any(
-                        isinstance(m, dict)
-                        and m.get("role") == "user"
-                        and not is_system_notice(m)
-                        and str(m.get("content") or "").strip()
-                        for m in chunk
-                    ):
-                        stats["chunks_bot_only_skipped"] += 1
-                        continue
-                    content = compose_chunk_content(chunk, bot_nickname)
-                    if not content:
-                        continue
-                    occurred_at = chunk_occurred_at(chunk, file_mtime)
-                    # Trigger: private chat = the peer user; group chat = the
-                    # first sender known inside the chunk (KiraAI chunks
-                    # often carry no sender metadata — leaving it empty
-                    # follows the bot_self-row precedent; never fabricate)
-                    user_id = parsed["user_id"]
-                    participants: list[str] = []
-                    if not user_id:
-                        for msg in chunk:
-                            if (
-                                isinstance(msg, dict)
-                                and msg.get("role") == "user"
-                                and str(msg.get("sender_id") or "").strip()
-                            ):
-                                user_id = str(msg["sender_id"]).strip()
-                                break
-                    if user_id:
-                        participants.append(f"{platform}:{user_id}")
-                    for msg in chunk:
-                        if not isinstance(msg, dict) or msg.get("role") != "user":
-                            continue
-                        sid = str(msg.get("sender_id") or "").strip()
-                        if sid:
-                            key = f"{platform}:{sid}"
-                            if key not in participants:
-                                participants.append(key)
-                    chat_rows.append({
-                        "document_id": (
-                            f"{session_id}-"
-                            f"{hashlib.md5(content.encode('utf-8')).hexdigest()[:12]}"
-                        ),
-                        "kind": "chat_summary",
-                        "platform": platform,
-                        "session_id": session_id,
-                        "group_id": parsed["group_id"],
-                        "user_id": user_id,
-                        "participants": participants,
-                        "content": content,
-                        "occurred_at": occurred_at,
-                        "embedding": None,
-                        "summarized": False,
-                    })
+                chat_rows.extend(build_chat_summary_rows(
+                    sess, mem, file_mtime,
+                    stats=stats, bot_nickname=bot_nickname,
+                ))
 
     # ---- 2. TOML memories -> fact table (extracted_flag=0, pending
     # normalization) ----
@@ -656,6 +684,126 @@ async def run_kira_memory_import(
     return stats
 
 
+def _host_session_key(session) -> str:
+    """Routing key of a host session snapshot (Session object or record dict)."""
+    if isinstance(session, dict):
+        sid = session.get("session_key") or session.get("sid")
+        if sid:
+            return str(sid)
+        adapter = str(session.get("adapter_name") or "")
+        stype = str(session.get("session_type") or "")
+        bare = str(session.get("session_id") or "")
+        return f"{adapter}:{stype}:{bare}" if adapter and stype and bare else ""
+    sid = getattr(session, "sid", None)
+    if sid:
+        return str(sid)
+    adapter = str(getattr(session, "adapter_name", "") or "")
+    stype = str(getattr(session, "session_type", "") or "")
+    bare = str(getattr(session, "session_id", "") or "")
+    return f"{adapter}:{stype}:{bare}" if adapter and stype and bare else ""
+
+
+def _host_session_content(session) -> list:
+    """Context chunks of a host session snapshot (same shape as the legacy memory field)."""
+    content = (
+        session.get("content") if isinstance(session, dict)
+        else getattr(session, "content", None)
+    )
+    return content if isinstance(content, list) else []
+
+
+def _host_session_fallback_time(session) -> datetime:
+    """Occurrence fallback for chunks without an embedded timestamp: session last update."""
+    if isinstance(session, dict):
+        raw = session.get("updated_at") or session.get("timestamp")
+    else:
+        raw = getattr(session, "updated_at", None) or getattr(session, "timestamp", None)
+    if raw:
+        if isinstance(raw, datetime):
+            return _to_local_naive(raw)
+        try:
+            return _to_local_naive(datetime.fromtimestamp(float(raw), tz=timezone.utc))
+        except (TypeError, ValueError, OSError, OverflowError):
+            pass
+    return datetime.now().replace(tzinfo=None)
+
+
+def scan_host_sessions(sessions: list) -> dict:
+    """Read-only preview counts for the host-DB import source.
+
+    Mirrors the write path (``_is_importable_chunk``): only sessions with at
+    least one importable batch are reported, and only importable batches are
+    counted, so the preview matches the rows actually written.
+    """
+    out = {"sessions": 0, "chunks": 0, "messages": 0}
+    for session in sessions or []:
+        key = _host_session_key(session)
+        content = _host_session_content(session)
+        if not key or not content or not parse_kira_memory_session(key):
+            continue
+        importable = [c for c in content if _is_importable_chunk(c)]
+        if not importable:
+            continue
+        out["sessions"] += 1
+        out["chunks"] += len(importable)
+        out["messages"] += sum(len(c) for c in importable)
+    return out
+
+
+async def run_host_db_import(
+    db,
+    *,
+    sessions: list,
+    bot_nickname: str = "",
+) -> dict:
+    """Import the host database's LLM sessions (KiraAI v3 chat_sessions).
+
+    v3 persists session context to the database and stops rewriting
+    data/memory/chat_memory.json, so the file-based importer cannot see
+    sessions created after the upgrade. This adapts host session snapshots
+    ("adapter:type:id" key + ``content`` in the same chunk shape as the
+    legacy ``memory`` field) into the shared summary pipeline. Only
+    summaries are imported: v3 has no entities/TOML fact source to mirror.
+    """
+    stats: dict[str, Any] = {
+        "source": "host_db",
+        "sessions": 0, "chunks_total": 0,
+        "system_notice_msgs_skipped": 0, "chunks_bot_only_skipped": 0,
+        "summary_rows": 0, "summary_skipped": 0,
+        "facts_total": 0, "fact_rows": 0, "facts_skipped": 0,
+        "aliases_upserted": 0, "profiles_read": 0,
+        "parse_errors": 0, "errors": [],
+    }
+    counts_before = await _table_counts(db)
+    rows: list[dict] = []
+    for session in sessions or []:
+        session_key = _host_session_key(session)
+        content = _host_session_content(session)
+        if not session_key or not content or not parse_kira_memory_session(session_key):
+            continue
+        if any(_is_importable_chunk(chunk) for chunk in content):
+            stats["sessions"] += 1
+        rows.extend(build_chat_summary_rows(
+            session_key, content, _host_session_fallback_time(session),
+            stats=stats, bot_nickname=bot_nickname,
+        ))
+    for row in rows:
+        await db.insert_chat_summary(**row)
+    counts_after = await _table_counts(db)
+    stats["summary_rows"] = max(0, counts_after["summary"] - counts_before["summary"])
+    stats["summary_skipped"] = max(0, len(rows) - stats["summary_rows"])
+    marker = {
+        "finished_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "source_path": "host_db",
+        **{k: v for k, v in stats.items() if k != "errors"},
+    }
+    try:
+        await db.set_kv(KIRA_HOST_MEMORY_IMPORT_KV_KEY, json.dumps(marker, ensure_ascii=False))
+    except Exception as exc:
+        stats["errors"].append(f"kv 标记写入失败: {exc}")
+    return stats
+
+
 async def _table_counts(db) -> dict[str, int]:
     """Row counts of the three target tables (idempotent keys silently
     skip => actually-inserted rows are measured by deltas)."""
@@ -674,10 +822,10 @@ async def _table_counts(db) -> dict[str, int]:
     return out
 
 
-async def read_last_run(db) -> Optional[dict]:
-    """Read the kv marker (shown on the admin page; None when absent)."""
+async def _read_last_run_key(db, key: str) -> Optional[dict]:
+    """Decode one import marker key, returning None for missing/invalid data."""
     try:
-        raw = await db.get_kv(KIRA_MEMORY_IMPORT_KV_KEY)
+        raw = await db.get_kv(key)
     except Exception:
         return None
     if not raw:
@@ -687,6 +835,40 @@ async def read_last_run(db) -> Optional[dict]:
         return data if isinstance(data, dict) else None
     except Exception:
         return None
+
+
+async def read_last_run(db) -> Optional[dict]:
+    """Read the file-source import marker shown on the admin page."""
+    data = await _read_last_run_key(db, KIRA_MEMORY_IMPORT_KV_KEY)
+    # Older releases stored host-db markers in the file-source slot. Do not
+    # surface that legacy value as the file import's own last run.
+    return None if data and data.get("source") == "host_db" else data
+
+
+async def read_host_last_run(db) -> Optional[dict]:
+    """Read the host-db marker, falling back to the old shared slot without writes."""
+    data = await _read_last_run_key(db, KIRA_HOST_MEMORY_IMPORT_KV_KEY)
+    if data is not None:
+        return data
+    legacy = await _read_last_run_key(db, KIRA_MEMORY_IMPORT_KV_KEY)
+    if not legacy or legacy.get("source") != "host_db":
+        return None
+    return legacy
+
+
+async def _preserve_legacy_host_marker(db) -> None:
+    """Copy old host history before a file import; a dedicated marker always wins."""
+    if await db.get_kv(KIRA_HOST_MEMORY_IMPORT_KV_KEY) is not None:
+        return
+    raw = await db.get_kv(KIRA_MEMORY_IMPORT_KV_KEY)
+    if not raw:
+        return
+    try:
+        legacy = json.loads(raw)
+    except (TypeError, ValueError):
+        return
+    if isinstance(legacy, dict) and legacy.get("source") == "host_db":
+        await db.set_kv(KIRA_HOST_MEMORY_IMPORT_KV_KEY, raw)
 
 
 # Pre-v1.16.1 marker key (module was kiraos_import.py; kept only for the

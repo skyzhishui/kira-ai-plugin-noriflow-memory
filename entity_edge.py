@@ -60,6 +60,28 @@ def bot_uid_set(bot_user_id: object) -> set[str]:
     return {u.strip() for u in items if str(u or "").strip()}
 
 
+def resolve_bot_forms(provider_forms, fallback_uid) -> list[str]:
+    """Resolve the bot uid's full-form set (provider-first fallback; shared by the retain
+    channel and the relation backfill).
+
+    Semantics (identical to the former per-module copies):
+    - provider_forms: bot uid full-form provider — a callable returning an iterable of forms
+      (called defensively: a provider error or empty/blank entries degrade to the fallback),
+      or a pre-computed iterable of forms, or None to skip the provider path;
+    - when the provider yields no non-empty forms, fall back to the single configured
+      fallback_uid; both empty yields an empty list.
+    """
+    if provider_forms is not None:
+        try:
+            raw = provider_forms() if callable(provider_forms) else provider_forms
+            forms = [f for f in (raw or []) if f]
+        except Exception:
+            forms = []
+        if forms:
+            return forms
+    return [fallback_uid] if fallback_uid else []
+
+
 @dataclass
 class EncodedRelation:
     """Structured relation triple (an element of the encoding pass relations array).

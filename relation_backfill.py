@@ -50,7 +50,7 @@ from typing import Awaitable, Callable, Optional
 
 from .alias_store import is_placeholder_name
 from .db import MemoryDatabase
-from .entity_edge import edge_has_bot_endpoint, parse_relation
+from .entity_edge import edge_has_bot_endpoint, parse_relation, resolve_bot_forms
 
 try:  # nori-core 宿主
     from nori_core.models_client.prompt import PromptLoader
@@ -264,15 +264,8 @@ class RelationBackfill:
         self._batch_size = max(1, int(batch_size))
 
     def _bot_forms(self) -> list[str]:
-        """Bot uid full-form set (provider preferred; degrades to single-form uid)."""
-        if self._bot_forms_provider is not None:
-            try:
-                forms = [f for f in (self._bot_forms_provider() or []) if f]
-            except Exception:
-                forms = []
-            if forms:
-                return forms
-        return [self._bot_user_id] if self._bot_user_id else []
+        """Bot uid full-form set (shared resolve_bot_forms: provider preferred; degrades to single-form uid)."""
+        return resolve_bot_forms(self._bot_forms_provider, self._bot_user_id)
 
     async def run(
         self,
