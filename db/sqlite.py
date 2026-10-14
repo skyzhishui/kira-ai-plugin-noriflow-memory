@@ -55,6 +55,7 @@ from .base import (
     FACT_RAW_TABLE,
     MemoryBackend,
     PROFILE_DELETE_BY_CLUSTER_SQL,
+    PROFILE_UPSERT_SQL,
     _MIGRATION_NAME_RE,
     _Params,
     _dedupe_keep_time,
@@ -2712,8 +2713,7 @@ class SQLiteMemoryDatabase(MemoryBackend):
                         cluster_id, now,
                     )
                     await conn.execute(
-    PROFILE_DELETE_BY_CLUSTER_SQL,
-    PROFILE_UPSERT_SQL,
+                        PROFILE_DELETE_BY_CLUSTER_SQL,
                         cluster_id,
                     )
                     return {"changed": True, "status": "dead", "replaced_by": None}

@@ -587,6 +587,71 @@ async def test_fetch_missing_embeddings_excludes_all_whitespace_rows() -> None:
         tmp.cleanup()
 
 
+async def test_cluster_status_op_drop_clears_profile_row() -> None:
+    """PR review（第 5 轮）暴露的盲区锁定：drop 分支此前无任何真库
+    覆盖——错插参数/NameError 均藏身于此。锁定 drop 完整语义：簇置
+    dead + 画像投影行清除 + changed 状态回传。pytest 收集项。"""
+    config_mod = _load("config")
+    _load("alias_store")
+    _load("entity_edge")
+    db_pkg = _load("db")
+    LocalMemoryConfig = config_mod.LocalMemoryConfig
+    SQLiteMemoryDatabase = db_pkg.SQLiteMemoryDatabase
+
+    tmp = tempfile.TemporaryDirectory(prefix="noriflow_drop_")
+    try:
+        config = LocalMemoryConfig(
+            storage_backend="sqlite",
+            sqlite_path=str(Path(tmp.name) / "memory.sqlite3"),
+            embedding_dims=4,
+        )
+        db = SQLiteMemoryDatabase(config)
+        await db.connect()
+        try:
+            await db.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
+            occurred = datetime.now(_UTC).strftime("%Y-%m-%dT%H:%M:%S")
+            async with db.pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO memory_fact_cluster "
+                    "(user_id, category, canonical_statement, score, "
+                    "status, occurred_at) "
+                    "VALUES ('u1', 'stable', '小明喜欢爬山', 8.0, "
+                    "'profiled', $1)",
+                    occurred,
+                )
+                cid = (await conn.fetchval(
+                    "SELECT id FROM memory_fact_cluster "
+                    "WHERE user_id = 'u1'"
+                ))
+                await conn.execute(
+                    "INSERT INTO memory_user_profile "
+                    "(platform, user_id, category, cluster_id, statement, "
+                    "score) VALUES ('napcat', 'u1', 'stable', $1, "
+                    "'小明喜欢爬山', 8.0)",
+                    cid,
+                )
+            result = await db.cluster_status_op(cid, "drop")
+            assert result == {
+                "changed": True, "status": "dead", "replaced_by": None
+            }, f"drop 须回传 changed/dead，实际 {result}"
+            async with db.pool.acquire() as conn:
+                status = await conn.fetchval(
+                    "SELECT status FROM memory_fact_cluster WHERE id = $1",
+                    cid,
+                )
+                profile_cnt = await conn.fetchval(
+                    "SELECT COUNT(*) FROM memory_user_profile "
+                    "WHERE cluster_id = $1",
+                    cid,
+                )
+            assert status == "dead", f"簇须置 dead，实际 {status}"
+            assert profile_cnt == 0, f"画像投影行须清除，剩余 {profile_cnt}"
+        finally:
+            await db.close()
+    finally:
+        tmp.cleanup()
+
+
 def main() -> None:
     logging.basicConfig(level=logging.WARNING)
     asyncio.run(main_async())
