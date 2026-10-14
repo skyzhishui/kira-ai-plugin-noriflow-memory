@@ -1375,18 +1375,10 @@ class SQLiteMemoryDatabase(MemoryBackend):
                 )
                 if new_status == "profiled":
                     await conn.execute(
-                        """
-                        INSERT INTO memory_user_profile
-                            (platform, user_id, category, cluster_id,
-                             statement, score, related_user_ids,
-                             created_at, updated_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
-                        ON CONFLICT (platform, user_id, category, cluster_id)
-                        DO UPDATE SET statement = excluded.statement,
-                                      score = excluded.score,
-                                      related_user_ids = excluded.related_user_ids,
-                                      updated_at = excluded.updated_at
-                        """,
+                        PROFILE_UPSERT_SQL.format(
+                            source="VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                            updated_at="$8",
+                        ),
                         raw["platform"], raw["user_id"], raw["category"],
                         new_id, raw["statement"], new_score,
                         raw["related_user_ids"], now,
@@ -1651,18 +1643,10 @@ class SQLiteMemoryDatabase(MemoryBackend):
                         now, *ids,
                     )
                     await conn.executemany(
-                        """
-                        INSERT INTO memory_user_profile
-                            (platform, user_id, category, cluster_id,
-                             statement, score, related_user_ids,
-                             created_at, updated_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
-                        ON CONFLICT (platform, user_id, category, cluster_id)
-                        DO UPDATE SET statement = excluded.statement,
-                                      score = excluded.score,
-                                      related_user_ids = excluded.related_user_ids,
-                                      updated_at = excluded.updated_at
-                        """,
+                        PROFILE_UPSERT_SQL.format(
+                            source="VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                            updated_at="$8",
+                        ),
                         [
                             (
                                 r["platform"], r["user_id"], r["category"],
@@ -2728,7 +2712,8 @@ class SQLiteMemoryDatabase(MemoryBackend):
                         cluster_id, now,
                     )
                     await conn.execute(
-                        PROFILE_DELETE_BY_CLUSTER_SQL,
+    PROFILE_DELETE_BY_CLUSTER_SQL,
+    PROFILE_UPSERT_SQL,
                         cluster_id,
                     )
                     return {"changed": True, "status": "dead", "replaced_by": None}
