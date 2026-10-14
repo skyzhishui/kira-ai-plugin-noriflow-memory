@@ -4201,6 +4201,49 @@ class TestIdValidationBoolGuard(unittest.TestCase):
         self.assertEqual(result["verdicts"], [(1, "same")])
         self.assertEqual(result["dropped"], 1)
 
+    def test_adjudicate_float_cluster_id_normalized(self):
+        # PR review：isinstance(int) 严格校验误杀浮点 id——模型偶发输出
+        # {"cluster_id": 1.0} 会被丢弃致 verdicts 覆盖不全、fact 永久顺延；
+        # 须按基线 int() 归一宽度落回候选 1（bool 拦截语义不变）
+        ma = sys.modules["noriflow_memory_pkg.merge_agent"]
+        adj = ma.FactAdjudicator(
+            llm=self._llm({
+                "verdicts": [
+                    {"cluster_id": 1.0, "verdict": "same"},
+                    {"cluster_id": "2", "verdict": "same"},  # 数字串同宽归一
+                ],
+                "unsure": False,
+            }),
+            prompt_dir=PLUGIN_DIR / "prompts",
+        )
+        fact = {"statement": "我爱猫", "category": "stable", "confidence": "high"}
+        candidates = [
+            {"id": 1, "canonical_statement": "我爱猫", "status": "active"},
+            {"id": 2, "canonical_statement": "我养猫", "status": "active"},
+        ]
+        result = asyncio.run(adj.adjudicate(fact, candidates))
+        self.assertEqual(result["verdicts"], [(1, "same"), (2, "same")])
+        self.assertEqual(result["dropped"], 0)
+
+    def test_audit_float_edge_id_normalized(self):
+        # PR review 同款：关系边审计的 isinstance(int) 严格校验须回归到
+        # int() 归一宽度——浮点/数字串 id 落回真实边号（bool 拦截不变）
+        ma = sys.modules["noriflow_memory_pkg.merge_agent"]
+        auditor = ma.RelationAuditor(
+            llm=self._llm({
+                "edges": [{"id": 10.0, "verdict": "bad", "reason": "互动描述"}],
+                "unsure": False,
+            }),
+            prompt_dir=PLUGIN_DIR / "prompts",
+        )
+        edges = [
+            {"id": 10, "subject_name": "", "subject_uid": "a",
+             "object_name": "", "object_uid": "b", "relation_label": "姐姐",
+             "statement": "s", "status": "active", "evidence_count": 2},
+        ]
+        result = asyncio.run(auditor.audit(edges))
+        self.assertEqual(result["edges"], [(10, "bad", "互动描述")])
+
     def test_audit_bool_edge_id_dropped(self):
         ma = sys.modules["noriflow_memory_pkg.merge_agent"]
         auditor = ma.RelationAuditor(

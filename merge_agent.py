@@ -302,12 +302,17 @@ class FactAdjudicator:
             cluster_id = (
                 item.get("cluster_id") if isinstance(item, dict) else None
             )
+            # bool 单独拦截置空（JSON true == 1 会错配成员校验）；其余按
+            # 基线 int() 归一宽度接受浮点/数字串（模型偶发输出 1.0 须落到候选 1）
+            if isinstance(cluster_id, bool):
+                cluster_id = None
+            else:
+                try:
+                    cluster_id = int(cluster_id)
+                except (TypeError, ValueError):
+                    cluster_id = None
             if (
-                not isinstance(item, dict)
-                # bool ids (JSON true) equal 0/1 and would pass the
-                # membership check — only real ints are valid ids
-                or isinstance(cluster_id, bool)
-                or not isinstance(cluster_id, int)
+                cluster_id is None
                 or cluster_id not in valid_ids
                 or item.get("verdict") not in _VALID_VERDICTS
             ):
@@ -414,12 +419,16 @@ class RelationAuditor:
             return None
         for item in items:
             edge_id = item.get("id") if isinstance(item, dict) else None
+            # bool 单独拦截置空；其余按基线 int() 归一宽度（同 FactAdjudicator）
+            if isinstance(edge_id, bool):
+                edge_id = None
+            else:
+                try:
+                    edge_id = int(edge_id)
+                except (TypeError, ValueError):
+                    edge_id = None
             if (
-                not isinstance(item, dict)
-                # bool ids (JSON true) equal 0/1 and would pass the
-                # membership check — only real ints are valid ids
-                or isinstance(edge_id, bool)
-                or not isinstance(edge_id, int)
+                edge_id is None
                 or edge_id not in valid_ids
                 or item.get("verdict") not in _EDGE_VERDICTS
             ):
@@ -781,6 +790,11 @@ class FactMergeAgent:
                         if llm_seen_ok:
                             _bump_skip(skip_state, str(fact["id"]))
                         continue
+                    # 已解析出 ≥1 条有效 verdict 即 LLM 健康（模型确有
+                    # 输出，可能只是漏候选）；若等完整覆盖才置位，批内首条
+                    # fact 长期部分覆盖时 llm_seen_ok 恒假，毒丸计数永不
+                    # 累加，跳过名单防队首钉死的设计即失效
+                    llm_seen_ok = True
                     covered_ids = {cid for cid, _ in result["verdicts"]}
                     missing_ids = [
                         c["id"] for c in candidates if c["id"] not in covered_ids
@@ -801,7 +815,6 @@ class FactMergeAgent:
                         if llm_seen_ok:
                             _bump_skip(skip_state, str(fact["id"]))
                         continue
-                    llm_seen_ok = True
                     verdicts = result["verdicts"]
 
                 action, cluster_id = self._choose_action(fact, candidates, verdicts)
