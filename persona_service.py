@@ -138,12 +138,6 @@ class LocalPersonaService:
         """
         return None
 
-    async def ensure_profile_exists(
-        self, user_id: str, platform: str = "", nickname: str = ""
-    ) -> None:
-        """No entity to create: an empty persona naturally returns empty text, no pre-creation needed."""
-        return None
-
     async def update_profile(
         self, user_id: str, profile: PersonProfile, platform: str = ""
     ) -> None:
