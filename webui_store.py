@@ -19,8 +19,14 @@ from typing import Optional
 from fastapi import HTTPException
 
 from .alias_store import is_placeholder_name
-from .db import build_search_text
+from .db import (
+    PROFILE_DELETE_BY_CLUSTER_SQL,
+    PROFILE_UPSERT_SQL,
+    build_search_text,
+)
+from .db.base import _like_contains_pattern
 from .relation_backfill import mark_backfill_pending
+from .time_labels import resolve_local_tz
 
 logger = get_logger("noriflow_memory.webui", "cyan")
 
@@ -38,18 +44,9 @@ _CLUSTER_STATUS_FILTER = frozenset({"active", "profiled", "pending_uncertain", "
 # ——upsert 墓碑保护，恢复走人工置回）
 _EDGE_STATUSES = frozenset({"active", "pending", "superseded"})
 
-# 画像投影 upsert（updated_at 由方言分支注入：PG now() / SQLite $8 参数）
-_PROFILE_UPSERT_SQL = """
-INSERT INTO memory_user_profile
-    (platform, user_id, category, cluster_id, statement,
-     score, related_user_ids)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
-ON CONFLICT (platform, user_id, category, cluster_id)
-DO UPDATE SET statement = excluded.statement,
-              score = excluded.score,
-              related_user_ids = excluded.related_user_ids,
-              updated_at = {updated_at}
-"""
+# {source} argument for the shared db.base PROFILE_UPSERT_SQL template
+# (updated_at stays dialect-injected: PG now() / SQLite $8 param).
+_PROFILE_VALUES_SOURCE = "VALUES ($1, $2, $3, $4, $5, $6, $7)"
 
 
 def _dialect(backend) -> str:
@@ -95,18 +92,24 @@ def _like_suffix(backend) -> str:
 
 
 def _escape_like(keyword: str) -> str:
-    """Escapes LIKE pattern metacharacters (\\ % _ become literals; the default escape is \\)."""
-    return keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
-def _ilike(keyword: str) -> str:
-    """ILIKE/LIKE pattern: metacharacters escaped, then wrapped with leading and trailing wildcards."""
-    return f"%{_escape_like(keyword)}%"
+    """Escape-only view of db.base._like_contains_pattern (\\ % _ become
+    literals): the evidence-key prefix filter builds its own ``...|%``
+    suffix, so it needs the escaping without the ``%...%`` contains wrap."""
+    return _like_contains_pattern(keyword)[1:-1]
 
 
 def _dt(value: Optional[datetime]) -> str:
-    """Datetime serialization (None -> empty string; converted to the server
-    local timezone before display).
+    """Datetime serialization (None -> empty string; converted to the
+    display timezone before display).
+
+    The display timezone is resolved through time_labels.resolve_local_tz,
+    the same resolver the recall time labels use, so admin-page times stay
+    consistent with user-visible labels. webui_store is a pure data-access
+    layer with no config or host handle, so the config-name and host tiers
+    of the chain are skipped ("" / None) and resolution lands on the same
+    terminal server-local source time_labels falls back to; honoring a
+    configured timezone here would require plumbing a config handle into
+    this layer (deliberately not invented here).
 
     asyncpg always returns UTC-aware timestamptz values, so a direct isoformat
     output is the UTC wall clock; the maintenance-page frontend truncates the
@@ -118,7 +121,7 @@ def _dt(value: Optional[datetime]) -> str:
     if not value:
         return ""
     if value.tzinfo is not None:
-        value = value.astimezone()
+        value = value.astimezone(resolve_local_tz(""))
     return value.isoformat(sep=" ", timespec="seconds")
 
 
@@ -202,7 +205,7 @@ async def fetch_facts(
     if extracted.strip() in ("0", "1"):
         add("extracted_flag = ${n}", int(extracted.strip()))
     if q.strip():
-        add(f"statement {like_op} ${{n}}{_like_suffix(backend)}", _ilike(q.strip()))
+        add(f"statement {like_op} ${{n}}{_like_suffix(backend)}", _like_contains_pattern(q.strip()))
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     async with _pool(backend).acquire() as conn:
@@ -289,7 +292,7 @@ async def fetch_clusters(
         # 而非剥离——含 _/% 的会话 ID 也能如实匹配）
         "session_evidence_prefix": _escape_like(session_id.strip()) + "|%",
         "q": q.strip(),
-        "q_pattern": _ilike(q.strip()) if q.strip() else "",
+        "q_pattern": _like_contains_pattern(q.strip()) if q.strip() else "",
     }
     data = await _impl(backend).fetch_clusters_data(backend, page, size, filters)
     return {
@@ -410,7 +413,9 @@ async def update_cluster(
                 if _dialect(backend) == "sqlite":
                     # SQLite：时间戳由 Python 供给
                     await conn.execute(
-                        _PROFILE_UPSERT_SQL.format(updated_at="$8"),
+                        PROFILE_UPSERT_SQL.format(
+                            source=_PROFILE_VALUES_SOURCE, updated_at="$8"
+                        ),
                         cur["platform"],
                         cur["user_id"],
                         cur["category"],
@@ -422,7 +427,9 @@ async def update_cluster(
                     )
                 else:
                     await conn.execute(
-                        _PROFILE_UPSERT_SQL.format(updated_at="now()"),
+                        PROFILE_UPSERT_SQL.format(
+                            source=_PROFILE_VALUES_SOURCE, updated_at="now()"
+                        ),
                         cur["platform"],
                         cur["user_id"],
                         cur["category"],
@@ -433,7 +440,7 @@ async def update_cluster(
                     )
             else:
                 await conn.execute(
-                    "DELETE FROM memory_user_profile WHERE cluster_id = $1",
+                    PROFILE_DELETE_BY_CLUSTER_SQL,
                     cluster_id,
                 )
 
@@ -548,7 +555,7 @@ async def fetch_summaries(
     if kind.strip() in ("chat_summary", "bot_self"):
         add("kind = ${n}", kind.strip())
     if q.strip():
-        add(f"content {like_op} ${{n}}{_like_suffix(backend)}", _ilike(q.strip()))
+        add(f"content {like_op} ${{n}}{_like_suffix(backend)}", _like_contains_pattern(q.strip()))
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     async with _pool(backend).acquire() as conn:
@@ -603,40 +610,42 @@ async def update_summary(backend, summary_id: int, body: dict) -> dict:
     body: the backfill job only scans rows where search_text IS NULL, so not
     recomputing would leave the old body's BM25 tokens (hybrid retrieval
     matches on stale content while the injected text is new). SQL is
-    dialect-independent; on the SQLite side the FTS5 shadow table is kept
-    consistent by the trigger-based backfill pass (when a new search_text is
-    set without going through this path, the backfill pass converges it).
+    dialect-independent; the main-row UPDATE and the SQLite-side FTS5
+    shadow DELETE+INSERT run in ONE transaction (same shape as
+    db/sqlite.update_chat_summary_encoded), so a crash between the two
+    writes rolls back both and cannot leave a stale BM25 shadow row.
     """
     content = str(body.get("content", "")).strip()
     if not content:
         raise HTTPException(status_code=422, detail="content 不能为空")
 
     async with _pool(backend).acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            UPDATE memory_chat_summary
-            SET content = $2, embedding = NULL, summarized = true,
-                search_text = $3
-            WHERE id = $1
-            RETURNING id, session_id
-            """,
-            summary_id,
-            content,
-            build_search_text(content),
-        )
-        if row is not None and _dialect(backend) == "sqlite":
-            # FTS5 影子表同步（BM25 路与新正文对齐）
-            await conn.execute(
-                "DELETE FROM memory_chat_summary_fts WHERE summary_id = $1",
-                int(row["id"]),
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                UPDATE memory_chat_summary
+                SET content = $2, embedding = NULL, summarized = true,
+                    search_text = $3
+                WHERE id = $1
+                RETURNING id, session_id
+                """,
+                summary_id,
+                content,
+                build_search_text(content),
             )
-            search_text = build_search_text(content)
-            if search_text:
+            if row is not None and _dialect(backend) == "sqlite":
+                # FTS5 影子表同步（BM25 路与新正文对齐）
                 await conn.execute(
-                    "INSERT INTO memory_chat_summary_fts"
-                    " (summary_id, text) VALUES ($1, $2)",
-                    int(row["id"]), search_text,
+                    "DELETE FROM memory_chat_summary_fts WHERE summary_id = $1",
+                    int(row["id"]),
                 )
+                search_text = build_search_text(content)
+                if search_text:
+                    await conn.execute(
+                        "INSERT INTO memory_chat_summary_fts"
+                        " (summary_id, text) VALUES ($1, $2)",
+                        int(row["id"]), search_text,
+                    )
     if row is None:
         raise HTTPException(status_code=404, detail="摘要不存在")
     logger.info(
@@ -648,22 +657,29 @@ async def update_summary(backend, summary_id: int, body: dict) -> dict:
 
 
 async def delete_summary(backend, summary_id: int) -> dict:
-    """Delete a summary (removes an erroneous or sensitive turn from the recall corpus)."""
+    """Delete a summary (removes an erroneous or sensitive turn from the recall corpus).
+
+    The main-row DELETE and the SQLite-side FTS5 shadow DELETE run in ONE
+    transaction (same shape as db/sqlite.delete_chat_summary), so a crash
+    between the two writes rolls back both and cannot leave a stale BM25
+    shadow row.
+    """
     async with _pool(backend).acquire() as conn:
         head_expr = (
             "substr(content, 1, 60)" if _dialect(backend) == "sqlite"
             else "left(content, 60)"
         )
-        row = await conn.fetchrow(
-            "DELETE FROM memory_chat_summary WHERE id = $1 "
-            f"RETURNING id, session_id, {head_expr} AS head",
-            summary_id,
-        )
-        if row is not None and _dialect(backend) == "sqlite":
-            await conn.execute(
-                "DELETE FROM memory_chat_summary_fts WHERE summary_id = $1",
-                int(row["id"]),
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "DELETE FROM memory_chat_summary WHERE id = $1 "
+                f"RETURNING id, session_id, {head_expr} AS head",
+                summary_id,
             )
+            if row is not None and _dialect(backend) == "sqlite":
+                await conn.execute(
+                    "DELETE FROM memory_chat_summary_fts WHERE summary_id = $1",
+                    int(row["id"]),
+                )
     if row is None:
         raise HTTPException(status_code=404, detail="摘要不存在")
     logger.info(
