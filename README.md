@@ -251,7 +251,7 @@ NORIFLOW_MEMORY_CONFIG=/path/to/config.json python tests/live_check.py
 
 ## 信息
 
-- 适用平台：KiraAI >= 2.31.0
+- 适用平台：KiraAI >= 3.0.0
 - 数据存储：PostgreSQL + pgvector（asyncpg 直连）或 SQLite，由 `storage_backend` 配置选择（默认 SQLite）
 
 ## 许可证
