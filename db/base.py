@@ -19,6 +19,7 @@ semantics; this layer lets exceptions propagate unchanged.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from abc import ABC, abstractmethod
@@ -42,6 +43,33 @@ _BACKFILL_TEXT_COLUMNS = {
 
 # Migration file names: three-digit version prefix (001_init.sql -> version=1)
 _MIGRATION_NAME_RE = re.compile(r"^(\d{3})_[a-z0-9_]+\.sql$")
+
+# Canonical profile-projection SQL: memory_user_profile is a projection of
+# profiled clusters, and the insert/upsert invariant (column list, conflict
+# target, DO UPDATE set list) must stay identical at every write site —
+# webui_store's edit path, both backends' apply_fact_merge replace path and
+# promote_pass. ``source`` is the value source ("VALUES ($1, ..., $7)" or a
+# cluster SELECT); ``updated_at`` is the dialect-specific timestamp
+# expression (PG now(), SQLite an $n param bound to a Python-supplied
+# timestamp). Use str.format(source=..., updated_at=...) — the SQL contains
+# no other braces.
+PROFILE_UPSERT_SQL = """
+INSERT INTO memory_user_profile
+    (platform, user_id, category, cluster_id, statement,
+     score, related_user_ids)
+{source}
+ON CONFLICT (platform, user_id, category, cluster_id) DO UPDATE
+SET statement = EXCLUDED.statement,
+    score = EXCLUDED.score,
+    related_user_ids = EXCLUDED.related_user_ids,
+    updated_at = {updated_at}
+"""
+
+# Canonical exact-match profile-row delete (drop / replace / maintenance
+# paths all clear the projection row by cluster_id).
+PROFILE_DELETE_BY_CLUSTER_SQL = (
+    "DELETE FROM memory_user_profile WHERE cluster_id = $1"
+)
 
 
 def fact_document_id(
@@ -71,6 +99,51 @@ def fact_document_id(
         The document_id prefix (caller appends "-{content_hash}").
     """
     return f"{'-'.join(uids)}@{session_id}|{occurred_at.strftime('%Y-%m-%d')}"
+
+
+def summary_document_id(session_id: str, content: str) -> str:
+    """Build the summary-table document_id (idempotency key)
+    "{session_id}-{md5(content)[:12]}".
+
+    Single source of truth for the plain chat-summary id formula (kernel
+    _build_document_id's chat_summary branch and kira_memory_import's
+    inline copy must stay byte-compatible with it); the key must never
+    change format — a different string would orphan every already-stored
+    summary row.
+
+    Args:
+        session_id: session the summary belongs to.
+        content: summary text body.
+
+    Returns:
+        The document_id string.
+    """
+    return (
+        f"{session_id}-"
+        f"{hashlib.md5(content.encode('utf-8')).hexdigest()[:12]}"
+    )
+
+
+def evidence_key(session_id: str, occurred_local: datetime) -> str:
+    """Build the fact evidence dedup key "{session_id}|{occurred_local date}".
+
+    Single source of truth for the evidence key (kernel._build_evidence_key
+    and merge_agent compute the same string); it must stay byte-compatible
+    with evidence_keys already stored in clusters.
+
+    The helper is pure: the caller localizes naive datetimes first
+    (kernel._to_local / merge_agent._to_local — strftime on a raw
+    aware-UTC value can be a day off).
+
+    Args:
+        session_id: source session of the extraction.
+        occurred_local: fact occurrence time (local timezone; only the
+            date part is used).
+
+    Returns:
+        The evidence-key string.
+    """
+    return f"{session_id}|{occurred_local.strftime('%Y-%m-%d')}"
 
 
 def vector_literal(vec: list[float] | None) -> str | None:
@@ -135,10 +208,13 @@ def parse_vector(value) -> list[float] | None:
     return None
 
 
-# BM25 pre-tokenization (plan A): CJK runs are split into bigrams (2-char
-# sliding window, no dictionary, deterministic); ASCII alphanumeric runs
-# keep whole words (lowercased). Write side and query side must share this
-# exact function — a tokenization mismatch silently defeats the BM25 path.
+# BM25 pre-tokenization (plan A): CJK runs become 2-char sliding-window
+# bigrams (no dictionary, deterministic); a length-1 CJK run yields the
+# character itself as one token (a bigram-only window would emit zero
+# tokens, making single-CJK-char names invisible to BM25). ASCII
+# alphanumeric runs keep whole words (lowercased). Write side and query
+# side must share this exact function — a tokenization mismatch silently
+# defeats the BM25 path.
 _CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
 _ASCII_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 
@@ -151,16 +227,25 @@ def build_search_text(text: str) -> str:
     SQLite (FTS5 shadow table) tokenize identically by construction, each
     engine is self-contained, and no cross-engine consistency issue exists.
 
+    CJK runs of length >= 2 become 2-char sliding-window bigrams; a
+    single-character CJK run (e.g. a one-char name) yields the character
+    itself as one token — a bigram-only window emits zero tokens for it,
+    which would make it invisible to BM25. ASCII alphanumeric runs keep
+    whole words (lowercased).
+
     Args:
         text: raw text (summary body / recall query).
 
     Returns:
-        Space-separated token string (CJK bigrams + ASCII words; empty text
-        yields an empty string).
+        Space-separated token string (CJK bigrams + single-CJK-char
+        tokens + ASCII words; empty text yields an empty string).
     """
     tokens: list[str] = []
     for run in _CJK_RUN_RE.findall(text or ""):
-        tokens.extend(run[i : i + 2] for i in range(len(run) - 1))
+        if len(run) == 1:
+            tokens.append(run)
+        else:
+            tokens.extend(run[i : i + 2] for i in range(len(run) - 1))
     tokens.extend(t.lower() for t in _ASCII_TOKEN_RE.findall(text or ""))
     return " ".join(tokens)
 
