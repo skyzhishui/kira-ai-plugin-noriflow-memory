@@ -1511,11 +1511,16 @@ class NoriflowMemoryPlugin(BasePlugin):
         self_id = str(getattr(msg, "self_id", "") or "")
         if self_id and not self._bot_user_id:
             self._bot_user_id = self_id
-            if not self._bot_platform:
-                self._bot_platform = str(
-                    getattr(session, "adapter_name", "") or ""
-                )
             self._propagate_bot_identity(self_id)
+        # 平台学习与 uid 学习解耦：首条 self_id 消息可能尚无
+        # adapter_name，此后任何一条消息补学到平台即重传播——消除
+        # 「平台永久空串」窗口，Kira 迁入的全局事实归属不再依赖推断回退
+        if not self._bot_platform:
+            adapter = str(getattr(session, "adapter_name", "") or "")
+            if adapter:
+                self._bot_platform = adapter
+                if self._bot_user_id:
+                    self._propagate_bot_identity(self._bot_user_id)
         line = format_history_message(
             speaker_name=nickname or uid,
             content=text,

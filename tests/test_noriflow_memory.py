@@ -1507,6 +1507,32 @@ class TestPluginLifecycle(unittest.TestCase):
         )))
         self.assertEqual(inst._memory_kernel.bot_id, "9900000001")
 
+    def test_69_bot_platform_retry_learn_after_empty_adapter(self):
+        # PR review：平台学习与 uid 学习解耦——首条 self_id 消息恰无
+        # adapter_name 时，平台此前会永久停留空串（uid 已定型不再进入
+        # 学习分支）；解耦后由后续任一消息补学平台并用已学 uid 重传播，
+        # Kira 迁入的全局事实归属不再依赖推断回退
+        inst, _ = _ready_plugin(mod)
+        no_adapter = FakeSession(sid="10086", adapter="")
+        asyncio.run(inst.observe_message(types.SimpleNamespace(
+            message=make_msg("u1", "你好", mid="q90", self_id="9900000001"),
+            session=no_adapter,
+        )))
+        self.assertEqual(inst._bot_user_id, "9900000001")
+        # 首条无 adapter：uid 已传播，平台仍为空
+        self.assertEqual(inst._bot_platform, "")
+        self.assertEqual(inst._memory_kernel.bot_platform, "")
+        # 后续消息（uid 已定型不覆盖）带 adapter_name：平台补学 + 重传播
+        with_adapter = FakeSession(sid="10086", adapter="onebot")
+        asyncio.run(inst.observe_message(types.SimpleNamespace(
+            message=make_msg("u2", "继续", mid="q91", self_id="other-bot"),
+            session=with_adapter,
+        )))
+        self.assertEqual(inst._bot_platform, "onebot")
+        self.assertEqual(inst._memory_kernel.bot_platform, "onebot")
+        # 重传播不回退 uid（uid 首见定型的语义保持）
+        self.assertEqual(inst._memory_kernel.bot_id, "9900000001")
+
     def test_46_persona_hot_switch_refreshes_nickname(self):
         # persona 热切换：宿主每次请求从 DB 活读且无变更事件，插件靠
         # TTL 限频活读刷新并传播（编码 prompt 的 bot 排除规则消费昵称，
