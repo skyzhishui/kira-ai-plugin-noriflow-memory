@@ -21,7 +21,7 @@ from __future__ import annotations
 import re
 import time
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Iterable, Optional
 
 try:  # kira host: route through the host logging manager so records reach
@@ -286,10 +286,12 @@ def build_alias_rows(
 
 
 def _to_epoch(ts: object) -> float:
-    """datetime/timestamp -> epoch seconds (naive treated as UTC; missing returns 0)."""
+    """datetime/timestamp -> epoch seconds (naive treated as LOCAL time, per the codebase-wide
+    naive=local policy — db.base._ensure_tz / kira_memory_import._to_local_naive — via
+    astimezone() attaching the local zone; missing returns 0)."""
     if isinstance(ts, datetime):
         if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
+            ts = ts.astimezone()
         return ts.timestamp()
     try:
         return float(ts)

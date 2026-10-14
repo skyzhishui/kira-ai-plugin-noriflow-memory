@@ -43,14 +43,16 @@ class RecallLogWriter:
         """Initialize.
 
         Args:
-            path: Log file path (the parent directory is ensured by the constructor side).
+            path: Log file path (the constructor best-effort ensures the
+                parent directory; a creation failure only logs a warning and
+                construction continues — fail-open, same design as the
+                write path).
         """
         self._path = Path(path)
-
-    @property
-    def path(self) -> Path:
-        """Log file path (for diagnostics)."""
-        return self._path
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            logger.warning("recall_log 父目录创建失败（fail-open，不影响召回）", exc_info=True)
 
     def write(self, event: dict) -> None:
         """Append one event (timestamp auto-added; any exception is swallowed and only logged as a warning).

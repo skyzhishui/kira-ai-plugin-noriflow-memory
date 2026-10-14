@@ -6,7 +6,8 @@ Design (see dev plan section 9.1):
   failure does not block the write (the in-row embedding is set to NULL; a
   row without a vector skips semantic retrieval but keeps scalar search);
 - backfill task: a plugin background asyncio periodic task scans rows with
-  embedding IS NULL in both tables and backfills;
+  embedding IS NULL in three tables (memory_chat_summary, memory_fact_raw,
+  memory_fact_cluster) plus a search_text tokenization pass and backfills;
 - server side: reuses the KiraAI provider system default_embedding (OpenAI
   compatible /v1/embeddings; dimension validated by plugin config embedding_dims).
 """
@@ -149,11 +150,13 @@ class EmbeddingService:
 
 
 class EmbeddingBackfillTask:
-    """Background embedding backfill task: periodically scans NULL-vector rows in both tables and backfills.
+    """Background embedding backfill task: periodically scans NULL-vector rows in three tables
+    (memory_chat_summary, memory_fact_raw, memory_fact_cluster) plus a search_text
+    tokenization pass, and backfills.
 
-    Lifecycle owned by the plugin (on_start starts it / on_stop stops it);
-    a single-batch failure only logs a warning and defers to the next cycle;
-    the task loop itself never exits.
+    Lifecycle owned by the plugin (initialize() in main.py starts it /
+    terminate() stops it); a single-batch failure only logs a warning and
+    defers to the next cycle; the task loop itself never exits.
     """
 
     def __init__(
