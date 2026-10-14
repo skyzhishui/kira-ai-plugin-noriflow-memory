@@ -904,7 +904,15 @@ class FactMergeAgent:
                 stats["reencoded"] = 0
 
             # ---- 关系遍：结构自检（零 LLM）+ 语义审计（开关，LLM）----
-            await self._relation_integrity_check()
+            # 自检遍内部已对 DB 调用设守卫，外层同款包裹对齐 docstring
+            # 的 relation passes 阶段隔离契约（防御未来新增未守卫路径）
+            try:
+                await self._relation_integrity_check()
+            except Exception:
+                await self._record_db_failure()
+                logger.warning(
+                    "关系结构自检遍失败（跳过，下周期重试）", exc_info=True
+                )
             try:
                 audited, superseded = await self._relation_audit_pass()
             except Exception:
