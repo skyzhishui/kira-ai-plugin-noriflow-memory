@@ -1058,6 +1058,11 @@ class NoriflowMemoryPlugin(BasePlugin):
                 entity_entries = []
 
         rollout_text = ""
+        # 动态块注入 user prompt 头部（宿主 assemble_prompt 将其排进最新一条
+        # user 消息、紧邻用户输入）：system prompt 与历史消息由此构成稳定
+        # 前缀可命中提示词缓存，随轮次变化的召回/画像块落在尾部不再打断
+        # 前缀缓存。persist=False：仅本轮生效，不写回会话历史。
+        inject_prompts: list[Prompt] = []
         if self._config.recent_rollout_enabled:
             try:
                 rollout_text = await kernel.build_recent_rollout_text(
@@ -1066,12 +1071,21 @@ class NoriflowMemoryPlugin(BasePlugin):
             except Exception:
                 logger.warning("滚动补回摘要获取失败（不阻断本轮）", exc_info=True)
             else:
-                # The rollout text is now committed to this turn's prompt:
-                # finalize the kernel-side exclusion memo BEFORE the recall
-                # search below (recall excludes the injected rollout rows
-                # in-turn). Success path only - a skipped/failed build
-                # leaves nothing to commit. hasattr guard keeps test stub
-                # kernels (pre-split contract) working.
+                # 对齐 kernel 两阶段契约：先把补回块真正 append 进本轮
+                # prompt pieces，再 commit 排除 memo，最后跑 recall（recall
+                # 依据 memo 同轮排除已注入行）。append 与 commit 之间仅隔
+                # 纯内存 list.append——本轮装配若被丢弃，pending 不入 memo，
+                # 行保持 recall 可见，而非补回/召回两通道同时不可见一个
+                # TTL。hasattr 守卫兼容未实现两阶段的测试桩 kernel。
+                if rollout_text:
+                    inject_prompts.append(
+                        Prompt(
+                            content=rollout_text,
+                            name=f"{PLUGIN_ID}:rollout",
+                            source=PLUGIN_ID,
+                            persist=False,
+                        )
+                    )
                 if kernel is not None and hasattr(kernel, "commit_rollout_memo"):
                     kernel.commit_rollout_memo(session.session_id)
 
@@ -1125,20 +1139,8 @@ class NoriflowMemoryPlugin(BasePlugin):
         except Exception:
             logger.warning("用户画像获取失败（不阻断本轮）", exc_info=True)
 
-        # 动态块注入 user prompt 头部（宿主 assemble_prompt 将其排进最新一条
-        # user 消息、紧邻用户输入）：system prompt 与历史消息由此构成稳定
-        # 前缀可命中提示词缓存，随轮次变化的召回/画像块落在尾部不再打断
-        # 前缀缓存。persist=False：仅本轮生效，不写回会话历史。
-        inject_prompts: list[Prompt] = []
-        if rollout_text:
-            inject_prompts.append(
-                Prompt(
-                    content=rollout_text,
-                    name=f"{PLUGIN_ID}:rollout",
-                    source=PLUGIN_ID,
-                    persist=False,
-                )
-            )
+        # （rollout 块已在 recall 之前 append 进 inject_prompts——两阶段
+        # commit 契约要求，见上方；注入顺序 rollout → recall → profile 不变）
         if memory_text:
             inject_prompts.append(
                 Prompt(
