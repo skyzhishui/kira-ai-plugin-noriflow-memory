@@ -1,4 +1,5 @@
-"""LocalMemoryKernel: local memory kernel based on PostgreSQL + pgvector.
+"""LocalMemoryKernel: local memory kernel based on a dual storage backend
+(PostgreSQL + pgvector / SQLite).
 
 Write path (M2):
 - ingest: summary/bot_self raw text written to memory_chat_summary (document_id
@@ -32,11 +33,13 @@ DB failure semantics: recall reads are guarded by the circuit breaker, on
 failure they log a warning and return empty (fail-open, does not block the
 injection path, aligned with hindsight backend behavior); the retain write
 path is the opposite - during circuit-open rejection or write execution
-failure it raises MemoryDBUnavailable, caught by the retain_encoded wrapper
-into a pending retry queue (the host has no retry mechanism; the in-plugin
-queue is the equivalent way to keep content loss-free); the merge agent
-(merge_agent) periodic task separately peeks the circuit state at cycle entry
-(skips the whole cycle during the rejection period, no burned LLM budget).
+failure it raises MemoryDBUnavailable, caught by main._do_retain which
+rolls back the message watermark, so the same batch of messages is
+re-encoded on the next signal round (the host has no retry mechanism; the
+watermark-rollback replay is the equivalent way to keep content loss-free);
+the merge agent (merge_agent) periodic task separately peeks the circuit
+state at cycle entry (skips the whole cycle during the rejection period,
+no burned LLM budget).
 """
 
 from __future__ import annotations
@@ -68,7 +71,13 @@ from .contracts import (
     MemoryItem,
     PersonaCandidate,
 )
-from .db import MemoryDatabase, fact_document_id, parse_vector
+from .db import (
+    MemoryDatabase,
+    evidence_key,
+    fact_document_id,
+    parse_vector,
+    summary_document_id,
+)
 from .entity_edge import (
     RELATION_HEADER,
     EncodedRelation,
@@ -218,7 +227,7 @@ class _EntityDirectory:
 
 
 class LocalMemoryKernel:
-    """Local memory kernel (PostgreSQL + pgvector).
+    """Local memory kernel (PostgreSQL + pgvector / SQLite dual backend).
 
     Responsibilities (ported from the nori-core noriflow plugin):
     - ingest: writes to memory_chat_summary (chat_summary / bot_self kinds)
@@ -281,6 +290,11 @@ class LocalMemoryKernel:
         self.circuit_breaker = circuit_breaker
         self.config = config
         self.bot_id = bot_id
+        # The platform (adapter name) the bot runs on, propagated by the
+        # plugin layer via plain attribute assignment
+        # (kernel.bot_platform = <adapter name>) once it learns the bot
+        # identity; empty string when unknown.
+        self.bot_platform: str = ""
         # bot uid 形态备忘（含平台 uid 副形态；make_recall_hints 学习式
         # 回填——写侧 is_bot_edge 与读侧场景 C 匹配共用，见 bot_uid_set）
         self._bot_uid_forms: set[str] = set()
@@ -307,11 +321,16 @@ class LocalMemoryKernel:
         self.persona_service = None
         self._local_tz_cache = None
         # 召回访问强化在飞任务（011 生命周期）：持引用防 GC 中途取消；
-        # 正常路径任务自清，_drain_reinforcement 供测试等待落定
+        # 正常路径任务自清（finally 中丢弃）
         self._reinforce_tasks: set = set()
         # 滚动补回去重 memo：{session_id: (已注入 document_id 列表, monotonic 时间)}
         # 同轮 recall/主动检索据此排除已注入行；TTL 覆盖单轮 pipeline 时长
         self._rollout_memo: dict[str, tuple[list[str], float]] = {}
+        # 两阶段提交的暂存区（build_recent_rollout_text 写入，commit_
+        # rollout_memo 落实）：构建与最终注入之间 prompt 装配可能被丢弃，
+        # 未落实的 id 不得进入 memo（否则既不出现在补回、又被 recall 排除，
+        # TTL 全程双不可见）
+        self._rollout_pending: dict[str, tuple[list[str], float]] = {}
         # 宿主窗口块数为 0 的一次性告警旗标（见 _derive_window_batches）
         self._window_zero_warned = False
 
@@ -388,9 +407,8 @@ class LocalMemoryKernel:
                 failure).
         """
         occurred_at = timestamp or datetime.now()
-        content_hash = hashlib.md5(content.encode()).hexdigest()[:12]
         document_id = self._build_document_id(
-            kind=kind, session_id=session_id, content_hash=content_hash
+            kind=kind, session_id=session_id, content=content
         )
         participants = self._build_participants(
             kind=kind,
@@ -436,10 +454,11 @@ class LocalMemoryKernel:
                 recent = []
             best = max((float(r["score"]) for r in recent), default=0.0)
             if best >= self.config.write_dedup_threshold:
-                logger.info(
-                    "写入侧近重去重: session=%s 跳过摘要写入"
-                    "（与最近批次 cosine=%.3f ≥ 阈值 %.2f）",
-                    session_id, best, self.config.write_dedup_threshold,
+                logger.warning(
+                    "写入侧近重去重命中: document_id=%s session=%s 跳过摘要写入"
+                    "（与最近 %d 批最高 cosine=%.3f ≥ 阈值 %.2f）",
+                    document_id, session_id, self.config.write_dedup_window,
+                    best, self.config.write_dedup_threshold,
                 )
                 return document_id
 
@@ -599,11 +618,11 @@ class LocalMemoryKernel:
 
         # 通道顺序（facts -> relations -> summary，summary 殿后——失败方向
         # 安全，对齐合并 agent 补编码遍的写入顺序）：summary 落库前任何失败
-        # 上抛 → retain_encoded 包装层入 pending 队列，DB 恢复后从零重放，
-        # 无半提交残留；若 summary 先行，facts/relations 失败入队后重编码
-        # 产出不同摘要文本会落成第二行（document_id 含内容哈希，文本漂移
-        # 即重复行）——facts/relations 幂等键则保证重试不重复（同语句
-        # ON CONFLICT 跳过/合并）。
+        # 上抛 → 调用方（_do_retain）回滚消息水位线，本批下轮信号从零
+        # 重编码重放，无半提交残留；若 summary 先行，facts/relations 失败
+        # 回滚水位线后重编码产出不同摘要文本会落成第二行（document_id
+        # 含内容哈希，文本漂移即重复行）——facts/relations 幂等键则保证
+        # 重试不重复（同语句 ON CONFLICT 跳过/合并）。
         if facts:
             doc_ids.extend(
                 await self._ingest_facts(
@@ -913,8 +932,9 @@ class LocalMemoryKernel:
         transition, all in the same statement, see db.upsert_entity_edge);
         any failure (including circuit-open) raises
         MemoryDBUnavailable - this method sits after facts and before
-        summary in retain_encoded; once the caller enqueues to the pending
-        queue, the DB replays from scratch on recovery without half-commit;
+        summary in retain_encoded; the caller (main._do_retain) catches it,
+        rolls back its message watermark, and the whole batch is re-encoded
+        on the next signal round without half-commit;
         evidence_key idempotency guarantees retries do not repeat counting.
         document_id is not persisted (the edge table uses an auto-increment
         primary key), it only serves the return value / log observability.
@@ -932,8 +952,9 @@ class LocalMemoryKernel:
             List of edge idempotent keys (for observability).
 
         Raises:
-            MemoryDBUnavailable: batch write failure (caller enqueues to the
-                pending queue for replay).
+            MemoryDBUnavailable: batch write failure (the caller rolls back
+                its message watermark and the whole batch is re-encoded on
+                the next signal round).
         """
         occurred_at = self._to_local(timestamp or datetime.now())
         evidence_key = self._build_evidence_key(session_id, occurred_at)
@@ -1294,6 +1315,17 @@ class LocalMemoryKernel:
                     if norm > 0:
                         unit = [x / norm for x in vec]
                         for kept_vec in kept_unit_vecs:
+                            # Dimension-mismatched vectors are treated as
+                            # non-duplicates: the SQLite backend enforces no
+                            # fixed vector dimension, so legacy rows stored
+                            # under a different embedding model can carry a
+                            # different length; zip() would silently
+                            # truncate and produce a meaningless score whose
+                            # spurious >=threshold hits drop recall rows
+                            # (same contract as db.sqlite._cosine returning
+                            # None on length mismatch).
+                            if len(unit) != len(kept_vec):
+                                continue
                             cosine = sum(a * b for a, b in zip(unit, kept_vec))
                             if cosine >= sim_threshold:
                                 is_dup = True
@@ -1638,15 +1670,20 @@ class LocalMemoryKernel:
             content = item.content.strip()
             if not content:
                 continue
-            cost = len(content)
+            label = self._relative_time_label(item.timestamp) if label_enabled else ""
+            # Budget on the rendered line: the time label (15-25 chars in
+            # "both" mode) is part of what the model actually sees, so
+            # costing only the bare content systematically overshoots
+            # recall_max_tokens.
+            line = f"- {content}（{label}）" if label else f"- {content}"
+            cost = len(line)
             if appended > 0 and used + cost > budget:
                 logger.info(
                     "token 预算截断: 保留 %d 条（预算 %d）", appended, budget
                 )
                 truncated = True
                 break
-            label = self._relative_time_label(item.timestamp) if label_enabled else ""
-            lines.append(f"- {content}（{label}）" if label else f"- {content}")
+            lines.append(line)
             injected.append({"id": item.id, "label": label})
             # debug 注入明细：id + 每条截断 100 字
             previews.append(f"{item.id}:{content[:100]}")
@@ -1921,7 +1958,13 @@ class LocalMemoryKernel:
         )
         if not rows:
             return [], []
-        bot_id = self.bot_id.strip()
+        # Dual-form bot exclusion (bot_uid_set semantics, same source as
+        # _bot_uid_forms_all): the bot may appear in participants under its
+        # session-id form (bot_id) or its platform-uid form (learned memo,
+        # see RecallHints.bot_user_id) - excluding only one form lets the
+        # other leak bot keys into the expansion group and effectively
+        # cancel the user filter for this session.
+        bot_forms = self._bot_uid_forms_all()
         keys: list[str] = []
         uids: list[str] = []
         for r in rows:
@@ -1929,11 +1972,11 @@ class LocalMemoryKernel:
                 k = key.strip() if isinstance(key, str) else ""
                 if not k or k in keys:
                     continue
-                if bot_id and k.endswith(f":{bot_id}"):
+                if any(k.endswith(f":{form}") for form in bot_forms):
                     continue
                 keys.append(k)
             uid = (r.get("user_id") or "").strip()
-            if uid and uid not in uids and uid != bot_id:
+            if uid and uid not in uids and uid not in bot_forms:
                 uids.append(uid)
         return keys, uids
 
@@ -1983,11 +2026,17 @@ class LocalMemoryKernel:
         N batches for the llm_request to inject as a standalone Prompt
         (timeline placed before the memory-recall block).
 
-        Dedup contract: after a successful injection, memoize these
-        document_ids (session-level + TTL),
-        so the same round's recall / planner active recall exclude these rows
-        via the search() row exclusion,
-        avoiding a double-presented "injection block + recall block".
+        Dedup contract (two-phase commit): this method only STAGES the
+        injected document_ids into _rollout_pending; the caller must call
+        commit_rollout_memo(session_id) once the rollout text has actually
+        been appended into the final prompt pieces and BEFORE the recall
+        search runs. Commit moves the staged ids into the live
+        _rollout_memo (session-level + TTL), which the same round's
+        recall / planner active recall then exclude via the search() row
+        exclusion, avoiding a double-presented "injection block + recall
+        block". If prompt assembly is discarded, nothing is committed and
+        the rows stay recall-visible (writing the memo at build time would
+        have made them invisible in both channels for a full TTL).
 
         Args:
             session_id: Session ID (bare id; same-numbered sessions across
@@ -2055,19 +2104,55 @@ class LocalMemoryKernel:
         if len(lines) == 1:
             return ""
 
-        self._rollout_memo[session_id] = (injected_ids, time.monotonic())
-        if len(self._rollout_memo) > self._ROLLOUT_MEMO_MAX_SESSIONS:
-            now_m = time.monotonic()
-            self._rollout_memo = {
-                k: v
-                for k, v in self._rollout_memo.items()
-                if now_m - v[1] <= self._ROLLOUT_MEMO_TTL_SECONDS
-            }
+        # Stage only (two-phase commit): the ids enter the live memo when
+        # the caller commits after actually using the text (see
+        # commit_rollout_memo).
+        self._rollout_pending[session_id] = (injected_ids, time.monotonic())
+        if len(self._rollout_pending) > self._ROLLOUT_MEMO_MAX_SESSIONS:
+            self._rollout_pending = self._prune_rollout_memo(
+                self._rollout_pending
+            )
         logger.debug(
             "滚动补回: session=%s | 注入 %d 批（跳过窗口内 %d 批）",
             session_id, len(injected_ids), skip_batches,
         )
         return "\n".join(lines)
+
+    @classmethod
+    def _prune_rollout_memo(
+        cls, memo: dict[str, tuple[list[str], float]]
+    ) -> dict[str, tuple[list[str], float]]:
+        """Drop TTL-expired entries from a rollout memo/pending dict
+        (capacity bounding for both phases)."""
+        now_m = time.monotonic()
+        return {
+            k: v
+            for k, v in memo.items()
+            if now_m - v[1] <= cls._ROLLOUT_MEMO_TTL_SECONDS
+        }
+
+    def commit_rollout_memo(self, session_id: str) -> None:
+        """Two-phase commit of the rolling-fill-back dedup memo.
+
+        build_recent_rollout_text only stages the injected document_ids in
+        _rollout_pending; this method moves the staged entry into the live
+        _rollout_memo, preserving the build-time monotonic timestamp (the
+        same TTL semantics as a single-phase write). The caller (plugin
+        layer) must invoke this right after the rollout text has been
+        appended into the final prompt pieces and BEFORE the recall search
+        runs - if prompt assembly is discarded, the ids never enter the
+        memo and the rows stay recall-visible instead of being invisible
+        in both the rollout and recall channels for a full TTL.
+
+        A no-op when there is no pending entry for the session; a second
+        build before commit overwrites the pending entry.
+        """
+        entry = self._rollout_pending.pop(session_id, None)
+        if entry is None:
+            return
+        self._rollout_memo[session_id] = entry
+        if len(self._rollout_memo) > self._ROLLOUT_MEMO_MAX_SESSIONS:
+            self._rollout_memo = self._prune_rollout_memo(self._rollout_memo)
 
     def _local_tz(self):
         """Local timezone (plugin config timezone > host locale.TZ > server
@@ -2195,13 +2280,6 @@ class LocalMemoryKernel:
             # 放弃异步派发，强化是尽力而为语义
             return
         self._reinforce_tasks.add(task)
-
-    async def _drain_reinforcement(self) -> None:
-        """Wait for in-flight reinforcement tasks to settle (test hook: ensures
-        the writes have happened before assertions)."""
-        pending = [t for t in self._reinforce_tasks if not t.done()]
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
 
     def _log_search(
         self,
@@ -2432,21 +2510,27 @@ class LocalMemoryKernel:
         return participants
 
     @staticmethod
-    def _build_document_id(kind: str, session_id: str, content_hash: str) -> str:
+    def _build_document_id(kind: str, session_id: str, content: str) -> str:
         """Build the summary-table document_id (idempotent key, strategy aligned
         with the hindsight plugin).
+
+        The chat_summary branch delegates to db.summary_document_id (single
+        source of truth); all branch outputs are byte-identical to the
+        historical inline formulas - the id must never drift, a different
+        string would orphan every already-stored summary row.
 
         Args:
             kind: Memory kind (chat_summary / bot_self / others).
             session_id: Session ID.
-            content_hash: content MD5 hash (first 12 characters).
+            content: Memory content body (hashed into the id).
 
         Returns:
             The document_id string.
         """
+        content_hash = hashlib.md5(content.encode()).hexdigest()[:12]
         if kind == "chat_summary":
             # session_id 已含 bot_id（如 group-{gid}-{bot_id}），无需重复
-            return f"{session_id}-{content_hash}"
+            return summary_document_id(session_id, content)
         if kind == "bot_self":
             return f"bot-self-{content_hash}"
         return f"{kind}-{session_id}-{content_hash}"
@@ -2459,14 +2543,20 @@ class LocalMemoryKernel:
         history windows) naturally land on the same key,
         deduped by the M4 merge agent's evidence_keys.
 
+        Delegates to db.evidence_key (single source of truth); the caller is
+        responsible for local-timezone normalization first
+        (kernel._to_local / merge_agent._to_local - strftime on a raw
+        aware-UTC value can be a day off from the other path).
+
         Args:
             session_id: Source session ID of the extraction.
-            occurred_at: Fact occurrence time.
+            occurred_at: Fact occurrence time (already localized; only the
+                date part is used).
 
         Returns:
             The evidence-key string.
         """
-        return f"{session_id}|{occurred_at.strftime('%Y-%m-%d')}"
+        return evidence_key(session_id, occurred_at)
 
     async def forget_summary(
         self,
@@ -2474,7 +2564,7 @@ class LocalMemoryKernel:
         *,
         scope_session_id: str = "",
         scope_user_id: str = "",
-    ) -> bool:
+    ) -> Optional[bool]:
         """Delete a summary memory by idempotent key (the kernel entry of the
         memory_remove maintenance tool).
 
@@ -2486,14 +2576,20 @@ class LocalMemoryKernel:
                 user-ownership qualifier (passed down to the DAL).
 
         Returns:
-            Whether a row was deleted; False when circuit-open or the
-            execution failed.
+            True when a row was verified deleted; False when the id is
+            verified absent (no matching row under the given scope);
+            None when the DB was unavailable (circuit-open rejection or
+            the delete execution failed) - a temporary-unavailable signal,
+            callers must not report it as "not found".
         """
-        return bool(await self._guarded_call(
+        deleted = await self._guarded_call(
             lambda: self.db.delete_chat_summary(
                 document_id,
                 scope_session_id=scope_session_id,
                 scope_user_id=scope_user_id,
             ),
             description=f"删除摘要 {document_id}",
-        ))
+        )
+        if deleted is None:
+            return None
+        return bool(deleted)
