@@ -477,6 +477,9 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 已回灌表行的时间戳（仅由恢复写入）：补恢复的幂等判据——半途失败
         # 后重试不得把同一行再合并一遍
         self._retain_restored_ts: dict[str, datetime] = {}
+        # 在途回合处理器计数：terminate 需等它们收尾（在途 handler 的停机
+        # 快照写必须完成后才能关连接池，否则该轮既没编码也没表行备份）
+        self._retain_handler_active = 0
         # 攒批空闲巡检协程句柄（initialize 创建 / terminate 取消）
         self._retain_sweep_task: Optional[asyncio.Task] = None
 
@@ -788,6 +791,17 @@ class NoriflowMemoryPlugin(BasePlugin):
                 # 任务归属的事件循环已关闭（跨 loop 收口场景）：无法取消，
                 # 直接丢弃句柄——协程随旧 loop 一同销毁，不影响收口
                 logger.warning("retain 攒批巡检任务取消失败（事件循环已关闭）: %s", exc)
+        # 等在途回合处理器收尾（最多 5s）：它们可能正在写停机快照或已被
+        # 停机标志挡下——不等就关连接池，那次写入会跑在已关闭的池上（数据
+        # 不落库），该轮消息既没编码也没表行备份，重启无法恢复
+        deadline = time.time() + 5.0
+        while self._retain_handler_active > 0 and time.time() < deadline:
+            await asyncio.sleep(0.05)
+        if self._retain_handler_active > 0:
+            logger.warning(
+                "terminate: %d 个在途回合处理器未收尾（继续停机）",
+                self._retain_handler_active,
+            )
         # 未满批的攒批：停机前强制编码（表行快照已落库，重启也能恢复；
         # 此处编码让数据在停机前落库，避免重启前存在未编码窗口）
         for sid in list(self._retain_pending):
@@ -1662,6 +1676,21 @@ class NoriflowMemoryPlugin(BasePlugin):
             self._append_history(session.sid, f"bot#{self._bot_seq}", line, is_bot=True)
 
     async def _on_session_memory_updated(self, event) -> None:
+        """回合完成信号入口：登记在途计数（terminate 需等它收尾）。
+
+        在途 handler 可能正卡在 await（别名 upsert / 快照写）上；terminate
+        若不等它就关连接池，它后续的停机快照写会跑在已关闭的池上（数据不
+        落库）——这一轮既没编码也没表行备份，重启无法恢复。
+        """
+        if not self._ready:
+            return
+        self._retain_handler_active += 1
+        try:
+            await self._on_session_memory_updated_impl(event)
+        finally:
+            self._retain_handler_active -= 1
+
+    async def _on_session_memory_updated_impl(self, event) -> None:
         """Round-end signal -> take one unconsumed increment batch and encode it.
 
         The host emits this exactly once after every conversation round
@@ -1754,7 +1783,13 @@ class NoriflowMemoryPlugin(BasePlugin):
                 self._retain_pending[sid] = state
             self._retain_pending_at[sid] = time.time()
             try:
-                await self._save_retain_pending(sid)
+                # 有界等待：停机路径上 terminate 可能已推进到 db.close()，
+                # 无界 await（内部还含 _ensure_retain_restored 的锁 + fetch）
+                # 会把回合完成信号拖死在 DB I/O 上。超时只损失表行备份，
+                # 内存 pending 仍会被 terminate 的 force 冲刷编码
+                await asyncio.wait_for(
+                    self._save_retain_pending(sid), timeout=5.0
+                )
             except Exception:
                 logger.warning(
                     "停机期间 retain pending 快照保存失败（本轮可能丢失）: session=%s",
@@ -1942,10 +1977,12 @@ class NoriflowMemoryPlugin(BasePlugin):
         flush_idle_s + min(300s, flush_idle_s)。
         """
         idle_s = self._retain_flush_idle_s()
-        now = time.time()
         # 补恢复：恢复曾失败时表里还有未回灌的崩溃备份行——先回灌，
         # 本轮巡检才能把它们按龄冲刷落库（否则一直躺在表里直到下次重启）
         await self._ensure_retain_restored()
+        # 取时必须在恢复之后：补恢复含 DB fetch 的 await 点，提前取时会把
+        # 恢复耗时从「龄期」里扣掉，让刚超龄的批次被误判为未超龄、推迟一轮
+        now = time.time()
         for sid, state in list(self._retain_pending.items()):
             updated_at = self._retain_pending_at.get(sid, now)
             if now - updated_at <= idle_s:
@@ -1965,7 +2002,9 @@ class NoriflowMemoryPlugin(BasePlugin):
         不终止循环；CancelledError 原样上抛配合 terminate 的取消收口。
         """
         while True:
-            await asyncio.sleep(min(300.0, self._retain_flush_idle_s()))
+            # 下限 5s：flush_idle_s 误配成 0 会被钳到 1.0，无下限时巡检
+            # 退化成 1Hz 空转；上限仍是 300s，落库延迟上界基本不变
+            await asyncio.sleep(max(5.0, min(300.0, self._retain_flush_idle_s())))
             try:
                 await self._sweep_retain_pending()
             except asyncio.CancelledError:
@@ -2236,13 +2275,28 @@ class NoriflowMemoryPlugin(BasePlugin):
         return [str(line) for line in raw]
 
     @staticmethod
+    def _parse_retain_ts(raw: Any) -> datetime:
+        """时间戳兜底解析：缺失/非法一律回退当前时间。
+
+        直接 `payload["timestamp"]` 会在字段缺失时抛 KeyError，整行未编码
+        内容被逐行 except 当坏行跳过（永不恢复）——回退当前时间只是让排序
+        略有偏差，比丢整批内容好。
+        """
+        if raw:
+            try:
+                return datetime.fromisoformat(str(raw))
+            except ValueError:
+                pass
+        return datetime.now()
+
+    @staticmethod
     def _retain_state_from_payload(payload: dict[str, Any]) -> _RetainState:
         state = _RetainState(
             session_id=str(payload.get("session_id", "")),
             platform=str(payload.get("platform", "")),
             group_id=str(payload.get("group_id", "")),
             user_id=str(payload.get("user_id", "")),
-            timestamp=datetime.fromisoformat(str(payload["timestamp"])),
+            timestamp=NoriflowMemoryPlugin._parse_retain_ts(payload.get("timestamp")),
             # 参与者只接受可迭代二元组：脏行里若是字符串，tuple(item) 不抛
             # 异常而是拆成单字符元组（参与者信息静默损坏），长度不足 2 时
             # 下游解包还可能炸——统一走兜底解析
@@ -2263,8 +2317,12 @@ class NoriflowMemoryPlugin(BasePlugin):
                 payload.get("bot_lines", [])
             ),
         )
-        # 脏行的 0/负数轮数会改变攒批节奏（门控 rounds < interval）——钳到 >=1
-        state._retain_rounds = max(int(payload.get("rounds", 1) or 1), 1)
+        # 脏行的 0/负数轮数会改变攒批节奏（门控 rounds < interval）——钳到 >=1；
+        # 非数字脏值也不能抛（ValueError 会让整行被当坏行跳过 → 内容不恢复）
+        try:
+            state._retain_rounds = max(int(payload.get("rounds", 1) or 1), 1)
+        except (TypeError, ValueError):
+            state._retain_rounds = 1
         # 内容锚点：恢复时保留批次链的最早时间（缺失则退回 timestamp）
         first_raw = payload.get("first_ts")
         if first_raw:
@@ -2310,6 +2368,12 @@ class NoriflowMemoryPlugin(BasePlugin):
                 return
             payload = json.dumps(self._retain_payload(state), ensure_ascii=False)
             now = datetime.now(timezone.utc)
+            # 先登记本次写入时间戳：编码成功路径的条件删除会读它——否则
+            # 「SQL 已执行、尚未登记」的窗口里删除会拿到旧/None cutoff，
+            # 刚写入的行删不掉（重启后被重放编码）
+            registered = self._retain_row_ts.get(sid)
+            if registered is None or now > registered:
+                self._retain_row_ts[sid] = now
             if getattr(self, "_backend_name", "postgres") == "sqlite":
                 await conn.execute(
                     "INSERT INTO memory_retain_pending(session_key,payload,updated_at) "
@@ -2329,10 +2393,22 @@ class NoriflowMemoryPlugin(BasePlugin):
                     "WHERE EXCLUDED.updated_at > memory_retain_pending.updated_at",
                     sid, payload, now,
                 )
-        # 登记行时间戳只前进不后退（并发保存乱序时不得让 cutoff 回退）
+        # 登记行时间戳只前进不后退（并发保存乱序时不得让 cutoff 回退；
+        # 已在 SQL 前登记过，这里只做兜底）
         registered = self._retain_row_ts.get(sid)
         if registered is None or now > registered:
             self._retain_row_ts[sid] = now
+        # 写后复查：写入窗口内同会话编码可能已完成（剩余快照变空），此时
+        # 本行装的是「已编码内容」——用刚写入的 now 做条件删除，避免残留
+        # 行在会话不再活跃时不自愈（重启后被重放编码）
+        try:
+            if self._pending_snapshot_for_row(sid) is None:
+                await self._delete_retain_pending(sid, now)
+        except Exception:
+            logger.warning(
+                "retain pending 快照写后复查失败（可能残留行）: session=%s", sid,
+                exc_info=True,
+            )
 
     async def _delete_retain_pending(self, sid: str, cutoff: Optional[datetime] = None) -> None:
         """删除攒批表行（条件删除：只删不晚于 cutoff 的行）。

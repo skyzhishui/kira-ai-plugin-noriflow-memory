@@ -1905,5 +1905,179 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertEqual(ok_state.batch_lines, ["有效内容"])
 
 
+    def test_ee1_missing_timestamp_does_not_drop_row(self):
+        """EE1：payload 缺 timestamp 不得抛 KeyError（整行内容会被跳过）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        state = inst._retain_state_from_payload(
+            {
+                "session_id": "10086",
+                "platform": "napcat",
+                "group_id": "",
+                "user_id": "u1",
+                # 无 timestamp
+                "participants": [["napcat", "u1"]],
+                "history_lines": [],
+                "batch_lines": ["内容"],
+                "bot_lines": [],
+                "rounds": 1,
+            }
+        )
+        self.assertEqual(state.batch_lines, ["内容"], "整行内容不得因缺时间戳被丢")
+        self.assertIsInstance(state.timestamp, datetime)
+
+    def test_ee2_row_ts_registered_before_sql(self):
+        """EE2：写入失败也要登记行时间戳（登记窗口内条件删除拿不到 cutoff）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        sid = "napcat:dm:10086"
+
+        class _BoomConn:
+            async def execute(self, sql, *args):
+                raise RuntimeError("写入失败（测试注入）")
+
+        class _BoomAcquire:
+            async def __aenter__(self):
+                return _BoomConn()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class _BoomPool:
+            def acquire(self):
+                return _BoomAcquire()
+
+        async def scenario():
+            inst._retain_pending[sid] = inst._retain_state_from_payload(
+                {
+                    "session_id": "10086",
+                    "platform": "napcat",
+                    "group_id": "",
+                    "user_id": "u1",
+                    "timestamp": datetime.now().isoformat(),
+                    "participants": [["napcat", "u1"]],
+                    "history_lines": [],
+                    "batch_lines": ["行"],
+                    "bot_lines": [],
+                    "rounds": 1,
+                }
+            )
+            inst._db = types.SimpleNamespace(pool=_BoomPool())
+            with self.assertRaises(RuntimeError):
+                await inst._save_retain_pending(sid)
+            return inst._retain_row_ts.get(sid)
+
+        ts = asyncio.run(scenario())
+        self.assertIsNotNone(ts, "写入失败也须登记行时间戳（cutoff 依据）")
+
+    def test_ee3_non_numeric_rounds_does_not_drop_row(self):
+        """EE3：脏 rounds 非数字不得抛 ValueError（整行内容会被跳过）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        state = inst._retain_state_from_payload(
+            {
+                "session_id": "10086",
+                "platform": "napcat",
+                "group_id": "",
+                "user_id": "u1",
+                "timestamp": datetime.now().isoformat(),
+                "participants": [["napcat", "u1"]],
+                "history_lines": [],
+                "batch_lines": ["内容"],
+                "bot_lines": [],
+                "rounds": "abc",
+            }
+        )
+        self.assertEqual(state.batch_lines, ["内容"])
+        self.assertEqual(int(getattr(state, "_retain_rounds", 0)), 1)
+
+    def test_ee4_terminate_waits_for_inflight_handler(self):
+        """EE4：terminate 须等在途回合处理器收尾（否则停机快照写落在已关闭池上）。"""
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+        release = asyncio.Event()
+        order: list[str] = []
+
+        async def slow_impl(event):
+            await release.wait()
+            order.append("handler_done")
+
+        inst._on_session_memory_updated_impl = slow_impl
+
+        async def scenario():
+            handler = asyncio.create_task(
+                ctx.event_bus.fire("session_memory_updated", {"session": dm.sid})
+            )
+            await asyncio.sleep(0)  # 让 handler 进入等待
+            terminate = asyncio.create_task(inst.terminate())
+            await asyncio.sleep(0.1)
+            self.assertFalse(
+                terminate.done(), "terminate 不得在在途 handler 收尾前完成"
+            )
+            release.set()
+            await asyncio.gather(handler, terminate, return_exceptions=True)
+            order.append("terminate_done")
+
+        asyncio.run(scenario())
+        self.assertEqual(
+            order[:2], ["handler_done", "terminate_done"], "terminate 须等 handler 收尾"
+        )
+
+    def test_ee5_post_write_recheck_deletes_stale_row(self):
+        """EE5：写入窗口内编码完成 → 写后复查应删掉装有已编码内容的残留行。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        sid = "napcat:dm:10086"
+        waiting = asyncio.Event()
+        release = asyncio.Event()
+        holder: dict = {}
+
+        class _SlowConn:
+            async def execute(self, sql, *args):
+                if sql.lstrip().upper().startswith("INSERT"):
+                    waiting.set()
+                    await release.wait()
+                holder["sqls"].append(("execute", sql, args))
+
+        class _SlowAcquire:
+            async def __aenter__(self):
+                return _SlowConn()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class _SlowPool:
+            def acquire(self):
+                return _SlowAcquire()
+
+        async def scenario():
+            inst._retain_pending[sid] = inst._retain_state_from_payload(
+                {
+                    "session_id": "10086",
+                    "platform": "napcat",
+                    "group_id": "",
+                    "user_id": "u1",
+                    "timestamp": datetime.now().isoformat(),
+                    "participants": [["napcat", "u1"]],
+                    "history_lines": [],
+                    "batch_lines": ["行"],
+                    "bot_lines": [],
+                    "rounds": 1,
+                }
+            )
+            holder["sqls"] = []
+            inst._db = types.SimpleNamespace(pool=_SlowPool())
+            task = asyncio.create_task(inst._save_retain_pending(sid))
+            await waiting.wait()
+            # 写入窗口内同会话编码完成：未编码数据清空
+            inst._retain_pending.clear()
+            inst._retain_inflight.clear()
+            release.set()
+            await task
+            return holder["sqls"]
+
+        sqls = asyncio.run(scenario())
+        deletes = [
+            sql for kind, sql, args in sqls if sql.lstrip().upper().startswith("DELETE")
+        ]
+        self.assertTrue(deletes, "写后复查发现无未编码数据时须删掉残留行")
+
+
 if __name__ == "__main__":
     unittest.main()
