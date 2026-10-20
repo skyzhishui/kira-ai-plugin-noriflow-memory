@@ -600,6 +600,16 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 所有回合只写 pending 不编码，巡检也被 _flush_pending_batch 的
         # 门控挡死，等于静默「记忆下线」到下次停机。
         self._retain_stopping = False
+        # 先等旧代 handler 收尾（此时 generation 尚未递增，旧 handler 的
+        # finally 仍会递减计数）：否则旧 handler（可能正卡在别名 upsert /
+        # 快照写的 await 上）会在下面的恢复**之后**才写 pending/表行，把刚
+        # 恢复的数据覆盖掉。
+        handler_deadline = time.monotonic() + 5.0
+        while (
+            self._retain_handler_active > 0
+            and time.monotonic() < handler_deadline
+        ):
+            await asyncio.sleep(0.05)
         # 在途 handler 计数一并复位：terminate 等待超时后它可能残留非零
         # （handler 真卡住时的极端情形），下次停机会白等满 5s。代数同时
         # 递增——旧代 handler 收尾时不再把新代计数减成负数
@@ -2239,7 +2249,17 @@ class NoriflowMemoryPlugin(BasePlugin):
                     exc_info=True,
                 )
                 if durable:
-                    await self._reseat_pending_batch(sid, state)
+                    try:
+                        await self._reseat_pending_batch(sid, state)
+                    except Exception:
+                        # 回座异常（脏数据 / 时钟异常）不得冒出任务（变成没人
+                        # retrieve 的任务异常）；批次仍在在途登记 + 表行快照里，
+                        # 可由后续恢复重放
+                        logger.warning(
+                            "retain 失败回座异常（批次可能丢失）: session=%s",
+                            sid,
+                            exc_info=True,
+                        )
                 elif sid:
                     self._rollback_consumed(sid, delta_keys or set())
                 return
@@ -2333,7 +2353,9 @@ class NoriflowMemoryPlugin(BasePlugin):
             session_id=new.session_id, platform=new.platform,
             group_id=new.group_id, user_id=old.user_id or new.user_id,
             timestamp=new.timestamp, participants=participants,
-            history_lines=old.history_lines,
+            # 拷一份：直接引用旧批次的列表，后续对旧 state 的原地修改会
+            # 悄悄改到已合并的批次（历史窗口失真）
+            history_lines=list(old.history_lines),
             batch_lines=old.batch_lines + new.batch_lines,
             bot_lines=old.bot_lines + new.bot_lines,
         )

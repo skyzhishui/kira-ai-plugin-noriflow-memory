@@ -2801,5 +2801,113 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
 
+    def test_tt1_reassembly_waits_for_old_handler_before_restore(self):
+        """TT1：重新装配必须先等旧代 handler 收尾（否则它会覆盖刚恢复的数据）。"""
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+        observed: dict = {}
+        handler_done: dict = {}
+        release = asyncio.Event()
+
+        async def scenario():
+            # 模拟旧代 handler 卡在 await（尚未收尾）
+            async def slow_handler(event):
+                await release.wait()
+                handler_done["v"] = True
+
+            inst._on_session_memory_updated_impl = slow_handler
+            handler = asyncio.create_task(
+                ctx.event_bus.fire("session_memory_updated", {"session": dm.sid})
+            )
+            await asyncio.sleep(0)
+            self.assertEqual(inst._retain_handler_active, 1, "旧 handler 应在途")
+
+            original = inst._restore_retain_pending
+
+            async def checking_restore():
+                # 判据用 handler 的**实际收尾**，不用计数（计数会被装配期
+                # 复位，旧实现同样会「看起来」已归零 → 假阳性）
+                observed["old_handler_done"] = bool(handler_done.get("v"))
+                await original()
+
+            inst._restore_retain_pending = checking_restore
+            # 装配在等旧 handler（最多 5s）→ 期间放行旧 handler
+            task = asyncio.create_task(
+                inst._initialize_services(inst._db, inst._config)
+            )
+            await asyncio.sleep(0.1)
+            release.set()
+            await asyncio.gather(handler, task, return_exceptions=True)
+            return observed
+
+        observed = asyncio.run(scenario())
+        self.assertTrue(
+            observed.get("old_handler_done"),
+            "恢复之前必须等旧代 handler 收尾（否则它会覆盖刚恢复的数据）",
+        )
+
+    def test_tt2_reseat_failure_does_not_escape_task(self):
+        """TT2：失败回座抛异常不得冒出任务（要变成没人 retrieve 的任务异常）。"""
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+        kernel = inst._memory_kernel
+
+        async def failing_encode(**kwargs):
+            raise RuntimeError("编码失败（测试注入）")
+
+        async def failing_reseat(sid, state):
+            raise TypeError("回座失败（测试注入）")
+
+        kernel.retain_encoded = failing_encode
+        inst._reseat_pending_batch = failing_reseat
+
+        async def scenario():
+            results = []
+            # 5 轮（= interval）才会冲刷并真正走编码失败 → 回座路径
+            for i in range(5):
+                await _turn(inst, ctx, dm, f"第{i + 1}句", mid=f"tt2{i + 1}")
+                results += await asyncio.gather(
+                    *inst._retain_tasks, return_exceptions=True
+                )
+            results += await asyncio.gather(
+                *inst._retain_tasks, return_exceptions=True
+            )
+            return results
+
+        results = asyncio.run(scenario())
+        self.assertTrue(
+            results, "用例必须真的触发编码任务（否则断言空跑）"
+        )
+        self.assertFalse(
+            [r for r in results if isinstance(r, BaseException)],
+            "失败回座异常不得冒出编码任务（否则是没人 retrieve 的任务异常）",
+        )
+
+    def test_tt3_merge_copies_history_lines(self):
+        """TT3：合并批次必须拷贝历史行（原地修改旧 state 不得影响已合并批次）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        base = {
+            "session_id": "10086",
+            "platform": "napcat",
+            "group_id": "",
+            "user_id": "u1",
+            "timestamp": datetime.now().isoformat(),
+            "participants": [["napcat", "u1"]],
+            "history_lines": ["历史行1"],
+            "batch_lines": ["行1"],
+            "bot_lines": [],
+            "rounds": 1,
+        }
+        older = inst._retain_state_from_payload(base)
+        newer = inst._retain_state_from_payload({**base, "batch_lines": ["行2"]})
+        merged = inst._merge_retain_states(older, newer)
+        older.history_lines.append("事后追加")
+        self.assertEqual(
+            merged.history_lines,
+            ["历史行1"],
+            "合并后的历史窗口必须与旧批次解耦（不得被原地修改牵连）",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
