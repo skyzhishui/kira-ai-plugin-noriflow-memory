@@ -689,6 +689,15 @@ class NoriflowMemoryPlugin(BasePlugin):
             self._merge_agent.start()
 
         self._ready = True
+        # 先恢复在途攒批快照（读表回灌内存 pending），再订阅回合完成信号：
+        # 恢复过程有 await 点（conn.fetch）。若此时信号处理器已生效，恢复
+        # 期间到达的回合会开新批并 UPSERT 新表行，随后恢复循环用读到的
+        # 旧表行无条件覆盖内存 pending——该回合批次从主真源消失；随后旧
+        # 批次编码成功时的条件删除还会把新表行一并删掉，回合消息既不在
+        # pending 也没被编码落库。
+        # 订阅前到达的回合不丢：其增量仍在滚动缓存里未消费，下个回合的
+        # 增量会带上它（增量按水位线取，不按回合切分）。
+        await self._restore_retain_pending()
         # 订阅核心回合完成信号（核心在每轮对话全部发送结束后恰好发出一次，
         # 含完整 chunk）；retain 由该信号触发，替代按发送段 debounce 的旧机制
         bus = getattr(self.ctx, "event_bus", None)
@@ -701,7 +710,6 @@ class NoriflowMemoryPlugin(BasePlugin):
                 self._mem_handler = None
         else:
             logger.warning("ctx.event_bus 不可用：回合完成信号无法订阅，自动 retain 不触发")
-        await self._restore_retain_pending()
         self._retain_sweep_task = asyncio.create_task(self._retain_sweep_loop())
         if not self._allowed_user_ids() and not self._allowed_session_ids():
             # fail-closed: both whitelists empty keeps the proactive tools
@@ -2174,7 +2182,14 @@ class NoriflowMemoryPlugin(BasePlugin):
                     logger.warning("retain pending 快照行损坏（跳过该行）", exc_info=True)
                     continue
                 sid = str(row["session_key"])
-                self._retain_pending[sid] = state
+                existing = self._retain_pending.get(sid)
+                if existing is None:
+                    self._retain_pending[sid] = state
+                else:
+                    # 恢复不得覆盖内存里已有的批次（恢复期间到达的回合可能
+                    # 已开新批）：按时间序合并——旧=恢复行（攒批前快照），
+                    # 新=内存批次，轮数相加，两边内容都不丢
+                    self._retain_pending[sid] = self._merge_retain_states(state, existing)
                 # 保留表行的真实龄期（不重置超时钟）：重启后仍按原时间戳
                 # 参与巡检超龄判定
                 self._retain_pending_at[sid] = now - self._row_age_seconds(row)

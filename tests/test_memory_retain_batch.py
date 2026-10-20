@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import time
 import types
@@ -903,6 +904,88 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
             self.assertIsNotNone(inst._retain_pending.get(sid))
 
         asyncio.run(scenario())
+
+
+    def test_q1_restore_precedes_signal_subscription(self):
+        """Q1：快照恢复必须先于回合完成信号订阅（恢复期间的回合不被覆盖）。"""
+        ctx = FakeCtx()
+        observed: list[int] = []
+        original = mod.NoriflowMemoryPlugin._restore_retain_pending
+
+        async def observing_restore(self):
+            # 恢复进行中：此时信号处理器应尚未订阅
+            observed.append(len(ctx.event_bus.subs.get("session_memory_updated", [])))
+            await original(self)
+
+        mod.NoriflowMemoryPlugin._restore_retain_pending = observing_restore
+        try:
+            _ready_plugin(mod, cfg=_cfg(private=5), ctx=ctx)
+        finally:
+            mod.NoriflowMemoryPlugin._restore_retain_pending = original
+
+        self.assertEqual(
+            observed, [0], "快照恢复期间不得已订阅回合完成信号（恢复会覆盖内存 pending）"
+        )
+        self.assertTrue(
+            ctx.event_bus.subs.get("session_memory_updated"), "恢复完成后必须订阅信号"
+        )
+
+    def test_q1_restore_merges_with_existing_pending(self):
+        """Q1：恢复不得覆盖内存里已有的批次（恢复期间到达的回合已开新批）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        sid = "napcat:dm:10086"
+        restored = {
+            "session_id": "10086",
+            "platform": "napcat",
+            "group_id": "",
+            "user_id": "u1",
+            "timestamp": datetime.now().isoformat(),
+            "participants": [["napcat", "u1"]],
+            "history_lines": [],
+            "batch_lines": ["恢复行"],
+            "bot_lines": [],
+            "rounds": 2,
+        }
+
+        class _StubConn:
+            async def fetch(self, sql, *args):
+                return [
+                    {
+                        "session_key": sid,
+                        "payload": json.dumps(restored),
+                        "updated_at": datetime.now(timezone.utc).isoformat(
+                            timespec="microseconds"
+                        ),
+                    }
+                ]
+
+        class _StubAcquire:
+            async def __aenter__(self):
+                return _StubConn()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class _StubPool:
+            def acquire(self):
+                return _StubAcquire()
+
+        async def scenario():
+            # 模拟恢复期间到达的回合已开新批
+            inst._retain_pending[sid] = inst._retain_state_from_payload(
+                {**restored, "batch_lines": ["内存行"], "rounds": 1}
+            )
+            inst._db = types.SimpleNamespace(pool=_StubPool())
+            await inst._restore_retain_pending()
+            return inst._retain_pending[sid]
+
+        merged = asyncio.run(scenario())
+        lines = "\n".join(merged.batch_lines)
+        self.assertIn("恢复行", lines, "恢复批次内容不得丢失")
+        self.assertIn("内存行", lines, "内存批次内容不得被覆盖")
+        self.assertEqual(
+            int(getattr(merged, "_retain_rounds", 0)), 3, "两批次轮数应相加"
+        )
 
 
 if __name__ == "__main__":
