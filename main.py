@@ -1925,7 +1925,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 「最新批次」的位置），不排序就会把较新批次当作 old：其历史窗口
         # （已含旧批次的行）与批次内容重复，同一段对话既进历史又进内容，
         # 且批次行时间序倒置。
-        states.sort(key=self._state_first_ts)
+        states.sort(key=self._state_sort_key)
         merged = states[0]
         for nxt in states[1:]:
             merged = self._merge_retain_states(merged, nxt)
@@ -2059,7 +2059,17 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 成功路径：摘除在途登记；同会话仍有未编码数据（新轮次攒批）时
         # 改写表行为剩余数据的快照，全部编码完毕才删行。
         self._drop_inflight(sid, state)
-        remaining = self._pending_snapshot_for_row(sid)
+        try:
+            remaining = self._pending_snapshot_for_row(sid)
+        except Exception:
+            # 合并失败（脏行 / 时区混用等）时保守保留表行：删了会丢未编码
+            # 内容，留行重启还能重放；也不让异常冒出任务（"Task exception
+            # was never retrieved"）
+            logger.warning(
+                "retain pending 快照合并失败（保留表行待重放）: session=%s", sid,
+                exc_info=True,
+            )
+            return
         if remaining is None:
             # 条件删除（cutoff = 本批快照行写入时间戳）：判定与删除之间的
             # await 窗口内并发新回合写入的更新行不受影响，不会被误删。
@@ -2095,7 +2105,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         current = self._retain_pending.get(sid)
         if current is None or current is state:
             merged = state
-        elif self._state_first_ts(state) <= self._state_first_ts(current):
+        elif self._state_sort_key(state) <= self._state_sort_key(current):
             # 不同对象按内容锚点定先后（较旧在前，其历史窗口作为合并后的历史窗口）
             merged = self._merge_retain_states(state, current)
         else:
@@ -2153,6 +2163,20 @@ class NoriflowMemoryPlugin(BasePlugin):
             return value
         return state.timestamp
 
+    @classmethod
+    def _state_sort_key(cls, state: _RetainState) -> datetime:
+        """批次锚点的比较键（统一为 aware UTC）。
+
+        恢复行（ISO 带时区）与内存新批次（naive datetime.now()）混在一起
+        时，直接比较/排序会抛 TypeError，毒死快照链路。这里只用于**比较**，
+        不改写锚点本身（naive 一律按 UTC 解释：生产路径的锚点全是 naive，
+        口径一致，先后关系不受影响）。
+        """
+        value = cls._state_first_ts(state)
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
     def _retain_payload(self, state: _RetainState) -> dict[str, Any]:
         return {
             "session_id": state.session_id, "platform": state.platform,
@@ -2181,7 +2205,8 @@ class NoriflowMemoryPlugin(BasePlugin):
             batch_lines=[str(line) for line in payload.get("batch_lines", [])],
             bot_lines=[str(line) for line in payload.get("bot_lines", [])],
         )
-        state._retain_rounds = int(payload.get("rounds", 1) or 1)
+        # 脏行的 0/负数轮数会改变攒批节奏（门控 rounds < interval）——钳到 >=1
+        state._retain_rounds = max(int(payload.get("rounds", 1) or 1), 1)
         # 内容锚点：恢复时保留批次链的最早时间（缺失则退回 timestamp）
         first_raw = payload.get("first_ts")
         if first_raw:

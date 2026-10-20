@@ -1646,5 +1646,99 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
 
+    def test_bb1_snapshot_merge_failure_keeps_row(self):
+        """BB1：成功路径的快照合并异常不得冒出任务，且须保守保留表行。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        sid = "napcat:dm:10086"
+
+        async def scenario():
+            inst._retain_pending[sid] = inst._retain_state_from_payload(
+                {
+                    "session_id": "10086",
+                    "platform": "napcat",
+                    "group_id": "",
+                    "user_id": "u1",
+                    "timestamp": datetime.now().isoformat(),
+                    "participants": [["napcat", "u1"]],
+                    "history_lines": [],
+                    "batch_lines": ["批次行"],
+                    "bot_lines": [],
+                    "rounds": 1,
+                }
+            )
+            await inst._save_retain_pending(sid)
+
+            def boom(sid):
+                raise TypeError("合并失败（测试注入）")
+
+            inst._pending_snapshot_for_row = boom
+            # 不抛异常（异常会变成 "Task exception was never retrieved"）
+            await inst._do_retain(inst._retain_pending[sid], sid, set(), True)
+
+        asyncio.run(scenario())
+        deletes = [
+            s for s in _pending_sqls(inst) if s.lstrip().startswith("DELETE")
+        ]
+        self.assertEqual(deletes, [], "合并失败时不得删表行（删了会丢未编码内容）")
+
+    def test_bb2_dirty_rounds_is_clamped(self):
+        """BB2：脏行的 0/负数轮数须钳到 >=1（不改变攒批节奏）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        for raw in (0, -3):
+            state = inst._retain_state_from_payload(
+                {
+                    "session_id": "10086",
+                    "platform": "napcat",
+                    "group_id": "",
+                    "user_id": "u1",
+                    "timestamp": datetime.now().isoformat(),
+                    "participants": [["napcat", "u1"]],
+                    "history_lines": [],
+                    "batch_lines": ["行"],
+                    "bot_lines": [],
+                    "rounds": raw,
+                }
+            )
+            self.assertGreaterEqual(
+                int(getattr(state, "_retain_rounds", 0)), 1, "轮数须钳到 >=1"
+            )
+
+    def test_bb3_mixed_timezone_anchors_are_comparable(self):
+        """BB3：naive 与 aware 锚点混用时比较/排序不得抛 TypeError。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        sid = "napcat:dm:10086"
+        naive = datetime.now()
+        aware = datetime.now(timezone.utc)
+
+        def _mk(ts, first_ts, line):
+            return inst._retain_state_from_payload(
+                {
+                    "session_id": "10086",
+                    "platform": "napcat",
+                    "group_id": "",
+                    "user_id": "u1",
+                    "timestamp": ts.isoformat(),
+                    "first_ts": first_ts.isoformat(),
+                    "participants": [["napcat", "u1"]],
+                    "history_lines": [],
+                    "batch_lines": [line],
+                    "bot_lines": [],
+                    "rounds": 1,
+                }
+            )
+
+        older_naive = _mk(naive, naive, "naive 批")
+        newer_aware = _mk(aware, aware, "aware 批")
+
+        async def scenario():
+            inst._retain_inflight[sid] = [newer_aware]
+            inst._retain_pending[sid] = older_naive
+            return inst._pending_snapshot_for_row(sid)
+
+        merged = asyncio.run(scenario())
+        self.assertIsNotNone(merged, "混合时区不得让快照链路抛异常")
+        self.assertEqual(len(merged.batch_lines), 2, "两批内容都在")
+
+
 if __name__ == "__main__":
     unittest.main()
