@@ -25,6 +25,7 @@ from __future__ import annotations
 from core.logging_manager import get_logger
 
 from datetime import datetime, timezone
+import time
 from typing import Optional
 
 from .config import LocalMemoryConfig
@@ -182,6 +183,20 @@ class LocalPersonaService:
         return self._parse_profile(user_id, markdown)
 
     async def build_profile_text(
+        self, user_id: str, session_id: str = "", platform: str = ""
+    ) -> str:
+        started = time.perf_counter()
+        try:
+            return await self._build_profile_text_impl(
+                user_id=user_id, session_id=session_id, platform=platform
+            )
+        finally:
+            logger.debug(
+                "build_profile_text 耗时 %.3f ms",
+                (time.perf_counter() - started) * 1000,
+            )
+
+    async def _build_profile_text_impl(
         self, user_id: str, session_id: str = "", platform: str = ""
     ) -> str:
         """Build single-user persona injection text (triple format, verbatim-aligned with hindsight).

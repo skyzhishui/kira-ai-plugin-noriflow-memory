@@ -59,6 +59,9 @@ _CONFIG_GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
         "embedding_model", "embedding_dims", "encode_input_max_chars",
         "backfill_interval_seconds", "backfill_batch_size",
     )),
+    ("retain", "写入触发", (
+        "retain_interval_group", "retain_interval_private", "flush_idle_s",
+    )),
     ("merge", "合并 agent", (
         "merge_interval_hours", "merge_batch_size", "candidate_top_k",
         "llm_budget_per_cycle",

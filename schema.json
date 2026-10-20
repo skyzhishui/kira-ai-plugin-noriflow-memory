@@ -121,6 +121,24 @@
     "default": 30000,
     "hint": "超长对话文本送编码 LLM 前截断保底（0 = 不截断）：防用户粘贴超长文本导致编码必败、降级原文入库后补编码遍反复失败的毒丸行阻塞。"
   },
+  "retain_interval_group": {
+    "type": "integer",
+    "name": "群聊 retain 触发间隔",
+    "default": 1,
+    "hint": "群聊每隔多少个回合触发一次 retain。"
+  },
+  "retain_interval_private": {
+    "type": "integer",
+    "name": "私聊 retain 触发间隔",
+    "default": 5,
+    "hint": "私聊每隔多少个回合触发一次 retain。"
+  },
+  "flush_idle_s": {
+    "type": "float",
+    "name": "空闲 flush 延迟（秒）",
+    "default": 1800.0,
+    "hint": "会话空闲达到此时长后 flush。"
+  },
   "backfill_interval_seconds": {
     "type": "float",
     "name": "向量补算周期（秒）",

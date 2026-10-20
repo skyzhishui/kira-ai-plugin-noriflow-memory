@@ -51,7 +51,7 @@ import itertools
 import json
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import time
 from typing import Any, Optional
@@ -259,6 +259,9 @@ def _build_config(raw: dict) -> LocalMemoryConfig:
         embedding_model=_cfg_str(raw, "embedding_model"),
         embedding_dims=_cfg_int(raw, "embedding_dims", 1024),
         encode_input_max_chars=_cfg_int(raw, "encode_input_max_chars", 30000),
+        retain_interval_group=_cfg_int(raw, "retain_interval_group", 1),
+        retain_interval_private=_cfg_int(raw, "retain_interval_private", 5),
+        flush_idle_s=_cfg_float(raw, "flush_idle_s", 1800.0),
         backfill_interval_seconds=_cfg_float(raw, "backfill_interval_seconds", 300.0),
         backfill_batch_size=_cfg_int(raw, "backfill_batch_size", 64),
         merge_interval_hours=_cfg_float(raw, "merge_interval_hours", 6.0),
@@ -444,6 +447,17 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 已启动写入任务
         self._retain_tasks: set[asyncio.Task] = set()
         self._retain_semaphore = asyncio.Semaphore(2)
+        # retain 攒批（私聊 N 轮合并编码）状态：
+        # _retain_pending = 内存主真源（未编码的当前批次，sid -> 状态）
+        # _retain_pending_at = 每批最后追加时间（巡检超龄判据，wall clock）
+        # _retain_inflight = 已弹出、编码在途的批次（sid -> [状态]）：表行快照
+        #   需把它一起写入，否则崩溃瞬间在途内容永久丢失
+        self._retain_pending: dict[str, _RetainState] = {}
+        self._retain_pending_at: dict[str, float] = {}
+        self._retain_inflight: dict[str, list[_RetainState]] = {}
+        self._retain_stopping = False
+        # 攒批空闲巡检协程句柄（initialize 创建 / terminate 取消）
+        self._retain_sweep_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
     #  生命周期
@@ -518,6 +532,12 @@ class NoriflowMemoryPlugin(BasePlugin):
         self, db: MemoryDatabase, config: LocalMemoryConfig
     ) -> None:
         """Assemble services and background tasks (second half of initialize; exceptions are cleaned up uniformly by the caller)."""
+        # Retain cadence/idle flush values are kept on the shared runtime config
+        # so the host maintenance/config path can update them without changing
+        # the retain implementation in this P1 wiring pass.
+        self._retain_interval_group = config.retain_interval_group
+        self._retain_interval_private = config.retain_interval_private
+        self._flush_idle_s = config.flush_idle_s
         # bot 身份：persona 名（先取，供 kernel/合并 agent 构造使用；
         # 消息 self_id 随首条消息回填）
         try:
@@ -681,6 +701,8 @@ class NoriflowMemoryPlugin(BasePlugin):
                 self._mem_handler = None
         else:
             logger.warning("ctx.event_bus 不可用：回合完成信号无法订阅，自动 retain 不触发")
+        await self._restore_retain_pending()
+        self._retain_sweep_task = asyncio.create_task(self._retain_sweep_loop())
         if not self._allowed_user_ids() and not self._allowed_session_ids():
             # fail-closed: both whitelists empty keeps the proactive tools
             # rejected for every caller
@@ -714,6 +736,7 @@ class NoriflowMemoryPlugin(BasePlugin):
     async def terminate(self) -> None:
         """Cleanup: unsubscribe turn signal -> flush in-flight retain -> stop background tasks -> close pools."""
         self._ready = False
+        self._retain_stopping = True
         if self._mem_handler is not None:
             bus = getattr(self.ctx, "event_bus", None)
             if bus is not None:
@@ -722,16 +745,30 @@ class NoriflowMemoryPlugin(BasePlugin):
                 except (ValueError, KeyError):
                     pass
             self._mem_handler = None
-        self._consumed.clear()
-
+        # 攒批巡检先停：防 flush 期间巡检再投新任务
+        if self._retain_sweep_task is not None:
+            sweep = self._retain_sweep_task
+            self._retain_sweep_task = None
+            try:
+                sweep.cancel()
+                await asyncio.gather(sweep, return_exceptions=True)
+            except RuntimeError as exc:
+                # 任务归属的事件循环已关闭（跨 loop 收口场景）：无法取消，
+                # 直接丢弃句柄——协程随旧 loop 一同销毁，不影响收口
+                logger.warning("retain 攒批巡检任务取消失败（事件循环已关闭）: %s", exc)
+        # 未满批的攒批：停机前强制编码（表行快照已落库，重启也能恢复；
+        # 此处编码让数据在停机前落库，避免重启前存在未编码窗口）
+        for sid in list(self._retain_pending):
+            self._flush_pending_batch(sid)
         if self._retain_tasks:
             done, pending = await asyncio.wait(self._retain_tasks, timeout=10.0)
             if pending:
                 logger.warning("terminate: %d 个 retain 任务超时未完成，取消", len(pending))
                 for task in pending:
                     task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
+            await asyncio.gather(*pending, return_exceptions=True)
         self._retain_tasks.clear()
+        self._consumed.clear()
 
         # 两个 stop 各自兜底：任一失败不能跳过其后的 db.close()（池泄漏）
         if self._merge_agent is not None:
@@ -761,6 +798,9 @@ class NoriflowMemoryPlugin(BasePlugin):
             self._db = None
         self._memory_kernel = None
         self._persona_service = None
+        self._retain_pending.clear()
+        self._retain_pending_at.clear()
+        self._retain_stopping = False
 
     # ------------------------------------------------------------------
     #  装配辅助
@@ -1656,9 +1696,157 @@ class NoriflowMemoryPlugin(BasePlugin):
             batch_lines=[v.line for _, v in user_delta],
             bot_lines=[v.line for _, v in delta if v.is_bot],
         )
-        task = asyncio.create_task(self._do_retain(state, sid, delta_keys))
+        # P2: coalesce private-chat turns (and persist the frozen snapshot).
+        # 攒批门控（活读配置）：群聊 retain_interval_group、私聊
+        # retain_interval_private；间隔 <=1 走原逐轮路径（群聊默认 1，
+        # 行为与改动前零变化：不写 pending 表，编码失败回滚水位线）。
+        interval = self._retain_interval_for(stype)
+        if interval <= 1:
+            self._spawn_retain_task(sid, state, delta_keys=delta_keys, durable=False)
+            return
+
+        # 攒批路径：内存 pending 为主真源，DB 表行为重启恢复备份。
+        # 取出即转移真源——水位线不回滚（回滚会让下一轮信号重取已入批的
+        # 行造成双份）；未编码数据的保管责任移交攒批缓存/表行。
+        pending = self._retain_pending.get(sid)
+        if pending is not None:
+            state = self._merge_retain_states(pending, state)
+        else:
+            state._retain_rounds = 1
+        self._retain_pending[sid] = state
+        self._retain_pending_at[sid] = time.time()
+        try:
+            await self._save_retain_pending(sid)
+        except Exception:
+            # 快照落库失败不阻断攒批（内存为主真源，下轮追加自愈）
+            logger.warning("retain pending 快照保存失败（保留内存快照）", exc_info=True)
+        if int(getattr(state, "_retain_rounds", 1)) < interval:
+            return
+        self._flush_pending_batch(sid)
+
+    # ------------------------------------------------------------------
+    #  retain 攒批（私聊 N 轮合并编码）
+    # ------------------------------------------------------------------
+
+    def _retain_interval_for(self, stype: str) -> int:
+        """攒批间隔（活读配置）：群聊 retain_interval_group / 私聊
+        retain_interval_private；<=1 表示逐轮编码（现状默认路径）。"""
+        cfg = self._config
+        raw = (
+            getattr(cfg, "retain_interval_group", 1)
+            if stype == "gm"
+            else getattr(cfg, "retain_interval_private", 5)
+        )
+        try:
+            return max(int(raw or 1), 1)
+        except (TypeError, ValueError):
+            return 1
+
+    def _retain_flush_idle_s(self) -> float:
+        """攒批空闲 flush 阈值（活读配置，秒）：会话攒不满间隔时由巡检
+        强制编码落库，防末批长期滞留不进记忆。"""
+        try:
+            return max(float(getattr(self._config, "flush_idle_s", 1800.0) or 1800.0), 1.0)
+        except (TypeError, ValueError):
+            return 1800.0
+
+    def _spawn_retain_task(
+        self,
+        sid: str,
+        state: _RetainState,
+        *,
+        delta_keys: set[str],
+        durable: bool,
+    ) -> asyncio.Task:
+        """创建并追踪 retain 编码任务（逐轮与攒批共用同一收口）。"""
+        task = asyncio.create_task(self._do_retain(state, sid, delta_keys, durable))
+        task._retain_sid = sid  # type: ignore[attr-defined]
         self._retain_tasks.add(task)
         task.add_done_callback(self._retain_tasks.discard)
+        return task
+
+    def _flush_pending_batch(self, sid: str) -> None:
+        """弹出攒批批次并调度合并编码（到点 / 巡检超龄 / 会话逐出共用入口）。
+
+        弹出即从内存 pending 移除，后续同会话新轮次开新批次（与在途编码
+        无共享可变状态）；在途批次登记进 _retain_inflight，表行快照会把
+        在途批次一并写入（崩溃恢复不丢在途内容）。
+        """
+        state = self._retain_pending.pop(sid, None)
+        if state is None:
+            return
+        self._retain_pending_at.pop(sid, None)
+        task = asyncio.create_task(self._do_retain(state, sid, set(), True))
+        task._retain_sid = sid  # type: ignore[attr-defined]
+        self._retain_tasks.add(task)
+        task.add_done_callback(self._retain_tasks.discard)
+        self._retain_inflight.setdefault(sid, []).append(state)
+
+    def _drop_inflight(self, sid: str, state: _RetainState) -> None:
+        """摘除在途批次登记（成功/失败路径共用，幂等）。"""
+        states = self._retain_inflight.get(sid)
+        if not states:
+            return
+        try:
+            states.remove(state)
+        except ValueError:
+            pass
+        if not states:
+            self._retain_inflight.pop(sid, None)
+
+    def _pending_snapshot_for_row(self, sid: str) -> Optional[_RetainState]:
+        """表行快照 = 在途批次 ∪ 当前 pending（合并为单批）。
+
+        崩溃恢复要求：任意时刻崩溃，表行都要能恢复全部未编码数据——
+        在途批次（已编码但可能未完成）也必须在内，否则崩溃瞬间在途
+        内容永久丢失。
+        """
+        states = list(self._retain_inflight.get(sid, []))
+        current = self._retain_pending.get(sid)
+        if current is not None:
+            states.append(current)
+        if not states:
+            return None
+        merged = states[0]
+        for nxt in states[1:]:
+            merged = self._merge_retain_states(merged, nxt)
+        return merged
+
+    async def _sweep_retain_pending(self) -> None:
+        """巡检单轮：超龄的攒批会话强制编码（攒不满间隔的末批不滞留）。
+
+        判据 = 内存 pending 的最后追加时间距今超过 flush_idle_s（活读）；
+        巡检周期取 min(300s, flush_idle_s)，故实际落库延迟上界约
+        flush_idle_s + min(300s, flush_idle_s)。
+        """
+        idle_s = self._retain_flush_idle_s()
+        now = time.time()
+        for sid, state in list(self._retain_pending.items()):
+            updated_at = self._retain_pending_at.get(sid, now)
+            if now - updated_at <= idle_s:
+                continue
+            logger.info(
+                "retain 攒批空闲超龄 flush: session=%s rounds=%d age=%.0fs",
+                state.session_id,
+                int(getattr(state, "_retain_rounds", 1)),
+                now - updated_at,
+            )
+            self._flush_pending_batch(sid)
+
+    async def _retain_sweep_loop(self) -> None:
+        """攒批巡检协程主循环（initialize 创建 / terminate 取消）。
+
+        单轮异常全捕获（含 DB 不可达）：巡检是自愈型后台任务，单轮失败
+        不终止循环；CancelledError 原样上抛配合 terminate 的取消收口。
+        """
+        while True:
+            await asyncio.sleep(min(300.0, self._retain_flush_idle_s()))
+            try:
+                await self._sweep_retain_pending()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("retain 攒批巡检失败（下轮重试）", exc_info=True)
 
     def _prune_consumed(self, sid: str) -> None:
         """The watermark keeps only keys still in the cache (message keys are never reused, evicted ones can be safely dropped)."""
@@ -1678,14 +1866,22 @@ class NoriflowMemoryPlugin(BasePlugin):
             consumed.difference_update(delta_keys)
 
     async def _do_retain(
-        self, state: _RetainState, sid: str = "", delta_keys: Optional[set[str]] = None
+        self, state: _RetainState, sid: str = "", delta_keys: Optional[set[str]] = None,
+        durable: bool = True,
     ) -> None:
-        """Assemble the encoding input and write (Semaphore rate-limited; on failure roll back the watermark, exceptions only logged)."""
+        """Assemble the encoding input and write (Semaphore rate-limited).
+
+        durable=False（逐轮路径，间隔<=1）：失败回滚水位线，下轮信号重取
+        重编——与改动前逐字等价。
+        durable=True（攒批路径）：失败不碰水位线（真源已移交攒批缓存/表
+        行），改为失败回座——批次合并回内存 pending 并重写表行快照，待下
+        一触发点（到点/巡检超龄/停机 flush）重试，消息不因失败丢失。
+        """
         # persona 昵称活读（TTL 限频）：编码 prompt 的 bot 排除规则消费
         await self._refresh_bot_nickname()
         kernel = self._memory_kernel
         if kernel is None:
-            if sid:
+            if sid and not durable:
                 self._rollback_consumed(sid, delta_keys or set())
             return
         parts: list[str] = []
@@ -1714,11 +1910,193 @@ class NoriflowMemoryPlugin(BasePlugin):
                 )
             except Exception:
                 logger.warning(
-                    "异步 retain 失败（水位线已回滚，本轮消息待下轮信号重编码）",
+                    "异步 retain 失败（pending 快照保留，后续恢复/巡检重试）"
+                    if durable
+                    else "异步 retain 失败（水位线已回滚，本轮消息待下轮信号重编码）",
                     exc_info=True,
                 )
-                if sid:
+                if durable:
+                    await self._reseat_pending_batch(sid, state)
+                elif sid:
                     self._rollback_consumed(sid, delta_keys or set())
+                return
+        if not durable:
+            return
+        # 成功路径：摘除在途登记；同会话仍有未编码数据（新轮次攒批）时
+        # 改写表行为剩余数据的快照，全部编码完毕才删行。
+        self._drop_inflight(sid, state)
+        remaining = self._pending_snapshot_for_row(sid)
+        if remaining is None:
+            await self._delete_retain_pending(sid)
+        else:
+            try:
+                await self._save_retain_pending(sid)
+            except Exception:
+                logger.warning("retain pending 快照刷新失败（重启恢复时重放）", exc_info=True)
+
+    async def _reseat_pending_batch(self, sid: str, state: _RetainState) -> None:
+        """失败回座：批次合并回内存 pending（同步，无 await 点）+ 重写表行。
+
+        缓存 miss（无新代）：原批次放回（保留其 updated_at 供巡检按龄重试
+        语义由 _retain_pending_at 承担）；已有新代：失败批次前置合并（保持
+        时间序），轮数相加。
+        """
+        current = self._retain_pending.get(sid)
+        if current is None:
+            self._retain_pending[sid] = state
+        else:
+            self._retain_pending[sid] = self._merge_retain_states(state, current)
+        self._retain_pending_at[sid] = time.time()
+        self._drop_inflight(sid, state)
+        try:
+            await self._save_retain_pending(sid)
+        except Exception:
+            logger.warning("retain pending 失败回座快照保存失败（内存保留）", exc_info=True)
+
+    @staticmethod
+    def _merge_retain_states(old: _RetainState, new: _RetainState) -> _RetainState:
+        """合并两个批次为单批（攒批主路径）。
+
+        历史窗口取较旧批次（old）的 history_lines——它正是「攒批之前」的
+        快照，等价于 nori 侧 exclude_ids 机制回退到攒批前的历史窗口；
+        批次内容按时间序拼接（old 在前），轮数相加。
+        """
+        participants = list(old.participants)
+        seen = set(participants)
+        for participant in new.participants:
+            if participant not in seen:
+                seen.add(participant)
+                participants.append(participant)
+        state = _RetainState(
+            session_id=new.session_id, platform=new.platform,
+            group_id=new.group_id, user_id=old.user_id or new.user_id,
+            timestamp=new.timestamp, participants=participants,
+            history_lines=old.history_lines or new.history_lines,
+            batch_lines=old.batch_lines + new.batch_lines,
+            bot_lines=old.bot_lines + new.bot_lines,
+        )
+        state._retain_rounds = int(getattr(old, "_retain_rounds", 1)) + int(
+            getattr(new, "_retain_rounds", 1)
+        )
+        return state
+
+    def _retain_payload(self, state: _RetainState) -> dict[str, Any]:
+        return {
+            "session_id": state.session_id, "platform": state.platform,
+            "group_id": state.group_id, "user_id": state.user_id,
+            "timestamp": state.timestamp.isoformat(),
+            "participants": state.participants,
+            "history_lines": state.history_lines,
+            "batch_lines": state.batch_lines, "bot_lines": state.bot_lines,
+            "rounds": int(getattr(state, "_retain_rounds", 1)),
+        }
+
+    @staticmethod
+    def _retain_state_from_payload(payload: dict[str, Any]) -> _RetainState:
+        state = _RetainState(
+            session_id=str(payload.get("session_id", "")),
+            platform=str(payload.get("platform", "")),
+            group_id=str(payload.get("group_id", "")),
+            user_id=str(payload.get("user_id", "")),
+            timestamp=datetime.fromisoformat(str(payload["timestamp"])),
+            participants=[tuple(item) for item in payload.get("participants", [])],
+            history_lines=list(payload.get("history_lines", [])),
+            batch_lines=list(payload.get("batch_lines", [])),
+            bot_lines=list(payload.get("bot_lines", [])),
+        )
+        state._retain_rounds = int(payload.get("rounds", 1) or 1)
+        return state
+
+    async def _save_retain_pending(self, sid: str) -> None:
+        """把该会话「全部未编码数据」的合并快照写入表（重启恢复备份）。
+
+        快照 = 在途批次 ∪ 当前 pending（见 _pending_snapshot_for_row）——
+        崩溃恢复时能恢复全部未编码数据，包括编码在途的批次。
+        """
+        if self._db is None:
+            raise RuntimeError("memory db unavailable")
+        state = self._pending_snapshot_for_row(sid)
+        if state is None:
+            return
+        payload = json.dumps(self._retain_payload(state), ensure_ascii=False)
+        async with self._db.pool.acquire() as conn:
+            if getattr(self, "_backend_name", "postgres") == "sqlite":
+                await conn.execute(
+                    "INSERT INTO memory_retain_pending(session_key,payload,updated_at) "
+                    "VALUES ($1,$2,$3) ON CONFLICT(session_key) DO UPDATE SET "
+                    "payload=excluded.payload, updated_at=excluded.updated_at",
+                    sid, payload, datetime.now(timezone.utc).isoformat(),
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO memory_retain_pending(session_key,payload,updated_at) "
+                    "VALUES ($1,$2::jsonb,now()) ON CONFLICT(session_key) DO UPDATE SET "
+                    "payload=EXCLUDED.payload, updated_at=now()", sid, payload,
+                )
+
+    async def _delete_retain_pending(self, sid: str) -> None:
+        if self._db is None:
+            return
+        async with self._db.pool.acquire() as conn:
+            await conn.execute("DELETE FROM memory_retain_pending WHERE session_key=$1", sid)
+
+    async def _restore_retain_pending(self) -> None:
+        """读表回灌内存 pending（重启恢复，轮数延续）。
+
+        回灌只恢复状态，不立即编码：未满批的批次按原轮数续攒（到点或
+        巡检超龄才编码），避免重启把半批内容提前落库。坏行（非法 JSON
+        / 缺字段）跳过不阻断其余行恢复。
+        """
+        if self._db is None:
+            return
+        try:
+            async with self._db.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT session_key,payload,updated_at FROM memory_retain_pending "
+                    "ORDER BY updated_at ASC"
+                )
+            now = time.time()
+            for row in rows:
+                try:
+                    raw = row["payload"]
+                    if isinstance(raw, str):
+                        raw = json.loads(raw)
+                    if not isinstance(raw, dict):
+                        continue
+                    state = self._retain_state_from_payload(raw)
+                except Exception:
+                    logger.warning("retain pending 快照行损坏（跳过该行）", exc_info=True)
+                    continue
+                sid = str(row["session_key"])
+                self._retain_pending[sid] = state
+                # 保留表行的真实龄期（不重置超时钟）：重启后仍按原时间戳
+                # 参与巡检超龄判定
+                self._retain_pending_at[sid] = now - self._row_age_seconds(row)
+            if rows:
+                logger.info("恢复 %d 个 retain pending 快照", len(rows))
+        except Exception:
+            logger.warning("retain pending 快照恢复失败（后续回合重试）", exc_info=True)
+
+    @staticmethod
+    def _row_age_seconds(row: Any) -> float:
+        """表行 updated_at 距今的秒数（PG 返回 datetime / SQLite 返回 ISO 字符串）。"""
+        value = None
+        try:
+            value = row["updated_at"]
+        except (KeyError, IndexError, TypeError):
+            return 0.0
+        if value is None:
+            return 0.0
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            try:
+                dt = datetime.fromisoformat(str(value))
+            except ValueError:
+                return 0.0
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max((datetime.now(timezone.utc) - dt).total_seconds(), 0.0)
 
     # ------------------------------------------------------------------
     #  行缓存辅助
@@ -1754,6 +2132,11 @@ class NoriflowMemoryPlugin(BasePlugin):
             # 旧消息全部按未消费增量整批重编（幂等键吸收大部分重复）
             evicted_sid, _ = self._history.popitem(last=False)
             self._consumed.pop(evicted_sid, None)
+            # 攒批联动：会话逐出会丢行缓存与水位线，但攒批批次是自包含
+            # 快照（history/batch/bot 行都在状态里），不依赖缓存存活——
+            # 立即调度编码，避免该批次在表行里长期滞留到巡检超时
+            if evicted_sid in self._retain_pending:
+                self._flush_pending_batch(evicted_sid)
             logger.warning(
                 "会话缓存超上限（%d），逐出最久未活跃会话 %r"
                 "（其再次活跃时旧增量将整批重编码）",

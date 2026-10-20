@@ -1497,6 +1497,43 @@ class LocalMemoryKernel:
         per_user: bool = False,
         hints: Optional[RecallHints] = None,
     ) -> str:
+        started = time.perf_counter()
+        try:
+            return await self._build_injection_text_impl(
+                query=query,
+                session_id=session_id,
+                top_k=top_k,
+                user_id=user_id,
+                platform=platform,
+                bot_id=bot_id,
+                cross_session=cross_session,
+                exclude_person_facts=exclude_person_facts,
+                scope=scope,
+                user_ids=user_ids,
+                per_user=per_user,
+                hints=hints,
+            )
+        finally:
+            logger.debug(
+                "build_injection_text 耗时 %.3f ms",
+                (time.perf_counter() - started) * 1000,
+            )
+
+    async def _build_injection_text_impl(
+        self,
+        query: str,
+        session_id: str,
+        top_k: int = 3,
+        user_id: str = "",
+        platform: str = "",
+        bot_id: str = "",
+        cross_session: bool = False,
+        exclude_person_facts: bool = False,
+        scope: str = "session",
+        user_ids: Optional[list[str]] = None,
+        per_user: bool = False,
+        hints: Optional[RecallHints] = None,
+    ) -> str:
         """Build the memory text to inject into the LLM.
 
         Returned format (time labels plus the attribution/tense preamble are

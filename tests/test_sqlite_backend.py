@@ -122,7 +122,7 @@ async def main_async() -> None:
     db = SQLiteMemoryDatabase(config)
     await db.connect()
     applied = await db.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
-    check("migrations_applied", applied == [1, 11, 12], str(applied))
+    check("migrations_applied", applied == [1, 11, 12, 13], str(applied))
     applied_again = await db.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
     check("migrations_idempotent", applied_again == [])
 
