@@ -1346,5 +1346,109 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertFalse(inst._retain_stopping, "装配期必须复位停机标志")
 
 
+    def test_y1_concurrent_restore_retry_is_serialized(self):
+        """Y1：并发补恢复必须串行（否则同一批表行被合并两遍：内容翻倍 + 轮数虚高）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        calls = {"n": 0}
+        release = asyncio.Event()
+
+        async def slow_restore():
+            calls["n"] += 1
+            await release.wait()
+            inst._retain_restore_failed = False
+
+        inst._restore_retain_pending = slow_restore
+        inst._retain_restore_failed = True
+
+        async def scenario():
+            t1 = asyncio.create_task(inst._ensure_retain_restored())
+            t2 = asyncio.create_task(inst._ensure_retain_restored())
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(t1, t2)
+
+        asyncio.run(scenario())
+        self.assertEqual(calls["n"], 1, "并发补恢复必须串行（只补一次）")
+
+    def test_y2_nickname_refresh_failure_does_not_leak_inflight(self):
+        """Y2：昵称刷新失败不得让 durable 批次的在途登记泄漏（批次须回座）。"""
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+
+        async def boom():
+            raise RuntimeError("昵称刷新失败（测试注入）")
+
+        inst._refresh_bot_nickname = boom
+
+        async def scenario():
+            for i in range(3):
+                await _turn(inst, ctx, dm, f"第{i + 1}句", mid=f"y2{i + 1}")
+                await asyncio.gather(*inst._retain_tasks)
+            await asyncio.gather(*inst._retain_tasks)
+            state = inst._retain_pending[dm.sid]
+            inst._retain_inflight[dm.sid] = [state]
+            await inst._do_retain(state, dm.sid, set(), True)
+
+        asyncio.run(scenario())
+        self.assertNotIn(dm.sid, inst._retain_inflight, "在途登记不得泄漏")
+        self.assertIn(dm.sid, inst._retain_pending, "批次不得丢失（须回座）")
+
+    def test_y3_restore_retry_does_not_double_merge(self):
+        """Y3：半途失败的补恢复不得把同一行再合并一遍（内容翻倍 + 轮数虚高）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        sid = "napcat:dm:10086"
+        ts = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        payload = {
+            "session_id": "10086",
+            "platform": "napcat",
+            "group_id": "",
+            "user_id": "u1",
+            "timestamp": datetime.now().isoformat(),
+            "participants": [["napcat", "u1"]],
+            "history_lines": [],
+            "batch_lines": ["崩溃备份内容"],
+            "bot_lines": [],
+            "rounds": 1,
+        }
+
+        class _StubConn:
+            async def fetch(self, sql, *args):
+                return [
+                    {"session_key": sid, "payload": json.dumps(payload), "updated_at": ts}
+                ]
+
+        class _StubAcquire:
+            async def __aenter__(self):
+                return _StubConn()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class _StubPool:
+            def acquire(self):
+                return _StubAcquire()
+
+        async def scenario():
+            inst._db = types.SimpleNamespace(pool=_StubPool())
+            await inst._restore_retain_pending()
+            first = inst._retain_pending[sid]
+            # 补恢复再跑一次（半途失败后的重试路径）
+            await inst._restore_retain_pending()
+            return first, inst._retain_pending[sid]
+
+        first, second = asyncio.run(scenario())
+        self.assertEqual(len(first.batch_lines), 1, "首次回灌内容")
+        self.assertEqual(
+            second.batch_lines,
+            first.batch_lines,
+            "补恢复不得把同一行再合并一遍（内容翻倍）",
+        )
+        self.assertEqual(
+            int(getattr(second, "_retain_rounds", 0)),
+            int(getattr(first, "_retain_rounds", 0)),
+            "补恢复不得让轮数虚高（会提前落库）",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

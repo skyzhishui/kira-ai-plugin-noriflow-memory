@@ -471,6 +471,12 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 快照恢复是否失败过（初始化时 DB 抖动 → 表里的崩溃备份行没回灌）：
         # 后续保存前必须补恢复，否则新快照 UPSERT 会覆盖旧行（永久丢失）
         self._retain_restore_failed = False
+        # 补恢复串行锁：_restore_retain_pending 内有 conn.fetch 的 await 点，
+        # 并发进入会让两个协程把同一批表行各合并一次（内容翻倍 + 轮数虚高）
+        self._retain_restore_lock = asyncio.Lock()
+        # 已回灌表行的时间戳（仅由恢复写入）：补恢复的幂等判据——半途失败
+        # 后重试不得把同一行再合并一遍
+        self._retain_restored_ts: dict[str, datetime] = {}
         # 攒批空闲巡检协程句柄（initialize 创建 / terminate 取消）
         self._retain_sweep_task: Optional[asyncio.Task] = None
 
@@ -831,6 +837,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 在下次 initialize 后被并进快照行（行删不掉 + 重启恢复重复编码）
         self._retain_inflight.clear()
         self._retain_row_ts.clear()
+        self._retain_restored_ts.clear()
         self._retain_stopping = False
 
     # ------------------------------------------------------------------
@@ -1984,8 +1991,14 @@ class NoriflowMemoryPlugin(BasePlugin):
         行），改为失败回座——批次合并回内存 pending 并重写表行快照，待下
         一触发点（到点/巡检超龄/停机 flush）重试，消息不因失败丢失。
         """
-        # persona 昵称活读（TTL 限频）：编码 prompt 的 bot 排除规则消费
-        await self._refresh_bot_nickname()
+        # persona 昵称活读（TTL 限频）：编码 prompt 的 bot 排除规则消费。
+        # 该 await 在编码 try 之外：异常逃逸会让 durable 批次的在途登记永久
+        # 残留（本轮不再被编码、之后每次快照都把它并进去、重启后重复入库）
+        # ——就地兜住，昵称刷新失败不影响批次归属。
+        try:
+            await self._refresh_bot_nickname()
+        except Exception:
+            logger.warning("刷新 bot 昵称失败（不影响 retain 编码）", exc_info=True)
         kernel = self._memory_kernel
         if kernel is None:
             if not durable:
@@ -2276,12 +2289,19 @@ class NoriflowMemoryPlugin(BasePlugin):
         """
         if not self._retain_restore_failed:
             return
-        logger.warning("retain pending 快照恢复曾失败，补恢复中")
-        try:
-            await self._restore_retain_pending()
-        except Exception:
-            self._retain_restore_failed = True
-            logger.warning("retain pending 快照补恢复失败", exc_info=True)
+        # 补恢复必须串行：_restore_retain_pending 内有 conn.fetch 的 await 点，
+        # 并发进入会各自把同一批表行合并进 pending（内容翻倍 + 轮数虚高，
+        # 直接提前落库 + 多编码一遍）
+        async with self._retain_restore_lock:
+            # 双检：等锁期间可能已被别的协程补恢复成功
+            if not self._retain_restore_failed:
+                return
+            logger.warning("retain pending 快照恢复曾失败，补恢复中")
+            try:
+                await self._restore_retain_pending()
+            except Exception:
+                self._retain_restore_failed = True
+                logger.warning("retain pending 快照补恢复失败", exc_info=True)
 
     async def _restore_retain_pending(self) -> None:
         """读表回灌内存 pending（重启恢复，轮数延续）。
@@ -2311,6 +2331,13 @@ class NoriflowMemoryPlugin(BasePlugin):
                     logger.warning("retain pending 快照行损坏（跳过该行）", exc_info=True)
                     continue
                 sid = str(row["session_key"])
+                row_ts = self._row_timestamp(row)
+                if row_ts is not None and row_ts == self._retain_restored_ts.get(sid):
+                    # 幂等：该行已由恢复回灌过——半途失败的补恢复不得重复
+                    # 合并，否则同批内容翻倍、轮数虚高导致提前落库 + 多编码
+                    # 一遍。（判据用**仅由恢复写入**的登记，不能用
+                    # _retain_row_ts：保存路径也会写它，会误跳过正常恢复）
+                    continue
                 existing = self._retain_pending.get(sid)
                 if existing is None:
                     self._retain_pending[sid] = state
@@ -2326,6 +2353,8 @@ class NoriflowMemoryPlugin(BasePlugin):
                 row_ts = self._row_timestamp(row)
                 if row_ts is not None:
                     self._retain_row_ts[sid] = row_ts
+                    # 恢复登记（幂等判据）：该行已回灌过
+                    self._retain_restored_ts[sid] = row_ts
             if rows:
                 logger.info("恢复 %d 个 retain pending 快照", len(rows))
             self._retain_restore_failed = False
