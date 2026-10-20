@@ -1865,5 +1865,45 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
 
+    def test_dd1_scalar_container_payload_is_handled(self):
+        """DD1：payload 的容器字段是标量时不得逐字符迭代/抛异常（整行不该被跳过）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        state = inst._retain_state_from_payload(
+            {
+                "session_id": "10086",
+                "platform": "napcat",
+                "group_id": "",
+                "user_id": "u1",
+                "timestamp": datetime.now().isoformat(),
+                # 容器是标量：字符串会被逐字符迭代，int 不可迭代
+                "participants": "u1",
+                "history_lines": "abc",
+                "batch_lines": 123,
+                "bot_lines": None,
+                "rounds": 1,
+            }
+        )
+        self.assertEqual(state.participants, [], "标量容器按空处理（不得拆成字符）")
+        self.assertEqual(state.history_lines, [], "标量字符串不得逐字符迭代")
+        self.assertEqual(state.batch_lines, [])
+        self.assertEqual(state.bot_lines, [])
+        # 整行未被跳过：批次内容字段仍可承载有效数据
+        ok_state = inst._retain_state_from_payload(
+            {
+                "session_id": "10086",
+                "platform": "napcat",
+                "group_id": "",
+                "user_id": "u1",
+                "timestamp": datetime.now().isoformat(),
+                "participants": [["napcat", "u1"]],
+                "history_lines": [],
+                "batch_lines": ["有效内容"],
+                "bot_lines": [],
+                "rounds": 1,
+            }
+        )
+        self.assertEqual(ok_state.batch_lines, ["有效内容"])
+
+
 if __name__ == "__main__":
     unittest.main()

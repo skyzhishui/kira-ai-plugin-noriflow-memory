@@ -2203,11 +2203,17 @@ class NoriflowMemoryPlugin(BasePlugin):
     def _retain_participants_from_payload(raw: Any) -> list[tuple[str, str]]:
         """参与者兜底解析：只接受可迭代二元组，其余降级为 (str(item), "")。
 
-        字符串也是 iterable，tuple("u1") 会得到 ('u','1')——参与者信息静默
-        损坏且下游解包可能炸；这里显式区分「序列」与「标量」。
+        两层都要兜：
+        - **容器**：raw 本身若是标量字符串（"u1"），逐字符迭代会产出
+          ("u","")、("1","") 这类静默损坏的参与者；若是 int 等不可迭代值，
+          直接 TypeError 会让整行被当坏行跳过（该行未编码内容不恢复）。
+          非序列一律按空处理——丢参与者信息好过丢整批内容。
+        - **元素**：字符串也是 iterable，tuple("u1") 会得到 ('u','1')。
         """
+        if not isinstance(raw, (list, tuple)):
+            return []
         result: list[tuple[str, str]] = []
-        for item in raw or []:
+        for item in raw:
             if isinstance(item, (list, tuple)):
                 if len(item) >= 2:
                     result.append((str(item[0]), str(item[1])))
@@ -2218,6 +2224,16 @@ class NoriflowMemoryPlugin(BasePlugin):
             else:
                 result.append((str(item), ""))
         return result
+
+    @staticmethod
+    def _retain_lines_from_payload(raw: Any) -> list[str]:
+        """行内容兜底解析：非序列按空处理，元素统一转 str。
+
+        标量字符串会被逐字符迭代（"abc" → ['a','b','c']），属静默损坏。
+        """
+        if not isinstance(raw, (list, tuple)):
+            return []
+        return [str(line) for line in raw]
 
     @staticmethod
     def _retain_state_from_payload(payload: dict[str, Any]) -> _RetainState:
@@ -2235,10 +2251,17 @@ class NoriflowMemoryPlugin(BasePlugin):
             ),
             # 行内容统一转 str：脏行含非字符串时，"\n".join 会在编码 try 之外
             # 抛 TypeError——durable 批次的在途登记永远摘不掉（表行删不掉、
-            # 重启重复编码）。一行脏数据不该毒死整条链路。
-            history_lines=[str(line) for line in payload.get("history_lines", [])],
-            batch_lines=[str(line) for line in payload.get("batch_lines", [])],
-            bot_lines=[str(line) for line in payload.get("bot_lines", [])],
+            # 重启重复编码）。一行脏数据不该毒死整条链路；容器非序列时按空
+            # 处理（标量字符串会被逐字符迭代，属静默损坏）。
+            history_lines=NoriflowMemoryPlugin._retain_lines_from_payload(
+                payload.get("history_lines", [])
+            ),
+            batch_lines=NoriflowMemoryPlugin._retain_lines_from_payload(
+                payload.get("batch_lines", [])
+            ),
+            bot_lines=NoriflowMemoryPlugin._retain_lines_from_payload(
+                payload.get("bot_lines", [])
+            ),
         )
         # 脏行的 0/负数轮数会改变攒批节奏（门控 rounds < interval）——钳到 >=1
         state._retain_rounds = max(int(payload.get("rounds", 1) or 1), 1)
