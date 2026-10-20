@@ -207,10 +207,19 @@ def _cfg_int(raw: dict, key: str, default: int) -> int:
 def _cfg_float(raw: dict, key: str, default: float) -> float:
     try:
         value = raw.get(key)
-        return default if value in (None, "") else float(value)
+        if value in (None, ""):
+            return default
+        value = float(value)
     except (TypeError, ValueError):
         logger.warning("配置项 %s 非法（期望数值），使用默认 %s", key, default)
         return default
+    if not math.isfinite(value):
+        # NaN/±inf 必须在此拦下：LocalMemoryConfig 的 gt/ge 约束对 NaN 判
+        # 失败 → ValidationError → 装配失败 → 整个记忆功能下线（一次配置
+        # 页手滑就是一次静默下线）。统一回退默认值。
+        logger.warning("配置项 %s 非有限值（%r），使用默认 %s", key, value, default)
+        return default
+    return value
 
 
 def _cfg_bool(raw: dict, key: str, default: bool) -> bool:
@@ -1938,10 +1947,9 @@ class NoriflowMemoryPlugin(BasePlugin):
         if state is None:
             return
         self._retain_pending_at.pop(sid, None)
-        task = asyncio.create_task(self._do_retain(state, sid, set(), True))
-        task._retain_sid = sid  # type: ignore[attr-defined]
-        self._retain_tasks.add(task)
-        task.add_done_callback(self._retain_tasks.discard)
+        # 复用统一的任务创建入口（与逐轮路径同一收口集合，避免两处逻辑
+        # 将来不同步）；在途登记紧随其后（其间无 await，顺序安全）
+        self._spawn_retain_task(sid, state, delta_keys=set(), durable=True)
         self._retain_inflight.setdefault(sid, []).append(state)
 
     def _drop_inflight(self, sid: str, state: _RetainState) -> None:
@@ -2273,7 +2281,8 @@ class NoriflowMemoryPlugin(BasePlugin):
                 elif len(item) == 1:
                     result.append((str(item[0]), ""))
                 else:
-                    result.append(("", ""))
+                    # 空项直接跳过：("", "") 会污染下游参与者列表（画像/prompt）
+                    continue
             else:
                 result.append((str(item), ""))
         return result

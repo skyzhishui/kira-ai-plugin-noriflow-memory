@@ -2210,5 +2210,52 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertEqual(inst._retain_flush_idle_s(), 60.0)
 
 
+    def test_hh1_nan_config_value_does_not_break_assembly(self):
+        """HH1：NaN/±inf 配置值不得让装配失败（LocalMemoryConfig 的 gt/ge 判失败→记忆下线）。"""
+        cfg = mod._build_config(
+            {
+                "dsn": DSN,
+                "flush_idle_s": float("nan"),
+                "backfill_interval_seconds": float("inf"),
+                "merge_interval_hours": float("-inf"),
+            }
+        )
+        self.assertEqual(cfg.flush_idle_s, 1800.0)
+        self.assertEqual(cfg.backfill_interval_seconds, 300.0)
+        self.assertEqual(cfg.merge_interval_hours, 6.0)
+        # 字符串形态同样拦下
+        cfg2 = mod._build_config({"dsn": DSN, "flush_idle_s": "nan"})
+        self.assertEqual(cfg2.flush_idle_s, 1800.0)
+
+    def test_hh2_empty_participant_is_skipped(self):
+        """HH2：空参与者项直接跳过（("", "") 会污染下游参与者列表）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        state = inst._retain_state_from_payload(
+            {
+                "session_id": "10086",
+                "platform": "napcat",
+                "group_id": "",
+                "user_id": "u1",
+                "timestamp": datetime.now().isoformat(),
+                "participants": [[], ["napcat", "u1"]],
+                "history_lines": [],
+                "batch_lines": ["行"],
+                "bot_lines": [],
+                "rounds": 1,
+            }
+        )
+        self.assertEqual(state.participants, [("napcat", "u1")], "空参与者须跳过")
+
+    def test_hh3_flush_reuses_task_spawn_helper(self):
+        """HH3：攒批冲刷须复用统一的任务创建入口（与逐轮路径同一收口集合）。"""
+        import inspect
+
+        src = inspect.getsource(mod.NoriflowMemoryPlugin._flush_pending_batch)
+        self.assertIn("_spawn_retain_task", src, "须复用统一的任务创建入口")
+        self.assertNotIn(
+            "asyncio.create_task", src, "不得再手搓一套建任务逻辑（两处易不同步）"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
