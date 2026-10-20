@@ -1759,13 +1759,21 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 行为与改动前零变化：不写 pending 表，编码失败回滚水位线）。
         interval = self._retain_interval_for(stype)
         if interval <= 1:
-            # 攒批残留（热切换把 interval 调小、或重启恢复的批次）先冲刷：
-            # 否则它不会被回合推进，只能等巡检超龄才落库（延迟上界约
-            # flush_idle_s + min(300s, flush_idle_s)），且同一段对话会同时
-            # 出现在新回合的 history 快照与后续批次内容里
-            if sid in self._retain_pending:
-                self._flush_pending_batch(sid)
-            self._spawn_retain_task(sid, state, delta_keys=delta_keys, durable=False)
+            # 攒批残留（热切换把 interval 调小、或重启恢复的批次）与本轮
+            # **合并为一批**编码（不是分别编码）：残留内容不丢，也不会与
+            # 本轮的 history 窗口重复——本轮 state 的 history 是用
+            # _history_snapshot 生成的，其中已含残留批次的行；若残留单独
+            # 异步编码，同一段对话会既进残留批次的 batch_lines、又进本轮的
+            # history 窗口（被编码两次）。合并后历史窗口取残留批次的历史
+            # （攒批前快照），内容按时间序拼接。
+            residual = self._retain_pending.pop(sid, None)
+            durable = False
+            if residual is not None:
+                state = self._merge_retain_states(residual, state)
+                # 残留内容并入本轮后，失败时按攒批语义回座（内容不丢）；
+                # 无残留时保持逐轮路径的既有契约（失败回滚水位线）
+                durable = True
+            self._spawn_retain_task(sid, state, delta_keys=delta_keys, durable=durable)
             return
 
         # 攒批路径：内存 pending 为主真源，DB 表行为重启恢复备份。
@@ -2185,12 +2193,16 @@ class NoriflowMemoryPlugin(BasePlugin):
                 sid,
             )
             return
-        state = self._pending_snapshot_for_row(sid)
-        if state is None:
-            return
-        payload = json.dumps(self._retain_payload(state), ensure_ascii=False)
-        now = datetime.now(timezone.utc)
         async with self._db.pool.acquire() as conn:
+            # 取连接**之后**再取快照与时间戳：等待连接期间同会话的编码可能
+            # 已完成（批次已摘除、表行已删），早先算好的 payload 会把已编码
+            # 内容又写成一行——重启后被恢复并重放编码（且该行在会话不再活跃
+            # 时不自愈）。此刻无未编码数据则直接不写。
+            state = self._pending_snapshot_for_row(sid)
+            if state is None:
+                return
+            payload = json.dumps(self._retain_payload(state), ensure_ascii=False)
+            now = datetime.now(timezone.utc)
             if getattr(self, "_backend_name", "postgres") == "sqlite":
                 await conn.execute(
                     "INSERT INTO memory_retain_pending(session_key,payload,updated_at) "

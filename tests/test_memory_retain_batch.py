@@ -829,8 +829,13 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         ]
         self.assertGreaterEqual(len(inserts), 2, "停机后那一轮应尽力落表行")
 
-    def test_n3_interval_switch_flushes_residual_batch(self):
-        """N3：interval 调小（热切换）时，残留批次应先冲刷再走逐轮路径。"""
+    def test_n3_interval_switch_merges_residual_batch(self):
+        """N3/X1：interval 调小（热切换）时，残留批次与本轮**合并为一批**编码。
+
+        残留内容不丢，且不与本轮的 history 窗口重复——本轮 state 的 history
+        是用 _history_snapshot 生成的，其中已含残留批次的行；若残留单独
+        异步编码，同一段对话会被编码两次。
+        """
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         captured: list[str] = []
@@ -849,10 +854,73 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
             await asyncio.gather(*inst._retain_tasks)
 
         asyncio.run(scenario())
-        self.assertEqual(len(captured), 2, "残留批次应被冲刷 + 逐轮编码一次")
-        self.assertIn("残留第1句", captured[0], "冲刷的应是残留批次")
-        self.assertIn("切换后一轮", captured[1], "逐轮路径编码本轮")
-        self.assertNotIn(dm.sid, inst._retain_pending, "冲刷后不得残留 pending")
+        self.assertEqual(len(captured), 1, "残留批次与本轮应合并为一次编码")
+        text = captured[0]
+        for i in range(3):
+            self.assertEqual(
+                text.count(f"残留第{i + 1}句"),
+                1,
+                "残留内容不得在历史窗口与批次内容中重复",
+            )
+        self.assertEqual(text.count("切换后一轮"), 1)
+        self.assertNotIn(dm.sid, inst._retain_pending, "编码后不得残留 pending")
+
+    def test_x2_save_skips_stale_row_after_encode_completed(self):
+        """X2：等待连接期间编码完成 → 保存不得把已编码内容写成残留行。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        sid = "napcat:dm:10086"
+        waiting = asyncio.Event()
+        release = asyncio.Event()
+
+        holder: dict = {}
+
+        class _SlowAcquire:
+            async def __aenter__(self):
+                waiting.set()
+                await release.wait()
+                return holder["conn"]
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class _SlowPool:
+            def acquire(self):
+                return _SlowAcquire()
+
+        async def scenario():
+            inst._retain_pending[sid] = inst._retain_state_from_payload(
+                {
+                    "session_id": "10086",
+                    "platform": "napcat",
+                    "group_id": "",
+                    "user_id": "u1",
+                    "timestamp": datetime.now().isoformat(),
+                    "participants": [["napcat", "u1"]],
+                    "history_lines": [],
+                    "batch_lines": ["待编码内容"],
+                    "bot_lines": [],
+                    "rounds": 1,
+                }
+            )
+            original_pool = inst._db.pool
+            holder["conn"] = original_pool.conn
+            inst._db.pool = _SlowPool()
+            try:
+                task = asyncio.create_task(inst._save_retain_pending(sid))
+                await waiting.wait()
+                # 等待连接期间编码完成：未编码数据清空
+                inst._retain_pending.clear()
+                inst._retain_inflight.clear()
+                release.set()
+                await task
+            finally:
+                inst._db.pool = original_pool
+
+        asyncio.run(scenario())
+        inserts = [
+            s for s in _pending_sqls(inst) if s.lstrip().startswith("INSERT")
+        ]
+        self.assertEqual(inserts, [], "无未编码数据时不得写残留行")
 
 
     def test_p1_snapshot_write_does_not_block_turn_signal(self):
