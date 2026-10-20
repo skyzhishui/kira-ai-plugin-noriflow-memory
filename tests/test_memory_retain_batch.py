@@ -494,8 +494,8 @@ class TestRetainBatchSQLiteBackend(unittest.TestCase):
                 self.assertIsNotNone(restored, "回灌应恢复 pending")
                 self.assertEqual(int(getattr(restored, "_retain_rounds", 0)), 2)
 
-                # 删行
-                await inst._delete_retain_pending(sid)
+                # 删行（cutoff = 本行写入时间戳；无 cutoff 时按 P2 语义跳过）
+                await inst._delete_retain_pending(sid, inst._retain_row_ts.get(sid))
                 async with db.pool.acquire() as conn:
                     rows = await conn.fetch(
                         "SELECT session_key FROM memory_retain_pending"
@@ -839,6 +839,70 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertIn("残留第1句", captured[0], "冲刷的应是残留批次")
         self.assertIn("切换后一轮", captured[1], "逐轮路径编码本轮")
         self.assertNotIn(dm.sid, inst._retain_pending, "冲刷后不得残留 pending")
+
+
+    def test_p1_snapshot_write_does_not_block_turn_signal(self):
+        """P1：快照写入不得阻塞回合完成信号（DB 变慢时主链路不被拖住）。"""
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+        original_save = inst._save_retain_pending
+        slow = {"release": asyncio.Event()}
+
+        async def slow_save(sid):
+            await slow["release"].wait()
+            await original_save(sid)
+
+        inst._save_retain_pending = slow_save
+
+        async def scenario():
+            await inst.observe_message(
+                types.SimpleNamespace(
+                    message=make_msg("u1", "慢 DB 的一轮", mid="slow1"), session=dm
+                )
+            )
+            started = time.perf_counter()
+            await ctx.event_bus.fire("session_memory_updated", {"session": dm.sid})
+            elapsed = time.perf_counter() - started
+            slow["release"].set()
+            await asyncio.gather(*inst._retain_tasks)
+            return elapsed
+
+        elapsed = asyncio.run(scenario())
+        self.assertLess(
+            elapsed, 0.2, "回合完成信号不应等待快照写入（快照走后台任务）"
+        )
+
+    def test_p2_delete_without_cutoff_keeps_row(self):
+        """P2：缺少行时间戳时跳过删除（留行比误删新快照安全）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        sid = "napcat:dm:10086"
+
+        async def scenario():
+            inst._retain_pending[sid] = inst._retain_state_from_payload(
+                {
+                    "session_id": "10086",
+                    "platform": "napcat",
+                    "group_id": "",
+                    "user_id": "u1",
+                    "timestamp": datetime.now().isoformat(),
+                    "participants": [["napcat", "u1"]],
+                    "history_lines": [],
+                    "batch_lines": ["批次行"],
+                    "bot_lines": [],
+                    "rounds": 1,
+                }
+            )
+            await inst._save_retain_pending(sid)
+            # 无 cutoff：不得删除
+            await inst._delete_retain_pending(sid)
+            self.assertEqual(
+                inst._retain_row_ts.get(sid) is not None,
+                True,
+                "跳过删除时不得清掉行时间戳",
+            )
+            self.assertIsNotNone(inst._retain_pending.get(sid))
+
+        asyncio.run(scenario())
 
 
 if __name__ == "__main__":

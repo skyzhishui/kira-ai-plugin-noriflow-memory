@@ -1731,11 +1731,10 @@ class NoriflowMemoryPlugin(BasePlugin):
             state._retain_rounds = 1
         self._retain_pending[sid] = state
         self._retain_pending_at[sid] = time.time()
-        try:
-            await self._save_retain_pending(sid)
-        except Exception:
-            # 快照落库失败不阻断攒批（内存为主真源，下轮追加自愈）
-            logger.warning("retain pending 快照保存失败（保留内存快照）", exc_info=True)
+        # 快照写入放后台任务：快照是崩溃恢复备份，不是主链路——DB 变慢或
+        # 不可达时不应把回合完成信号拖住（原逐轮路径也是 fire-and-forget；
+        # 写失败只记 warning，内存 pending 是主真源，下轮追加自愈）
+        self._spawn_pending_save(sid)
         if int(getattr(state, "_retain_rounds", 1)) < interval:
             return
         self._flush_pending_batch(sid)
@@ -1780,6 +1779,23 @@ class NoriflowMemoryPlugin(BasePlugin):
         self._retain_tasks.add(task)
         task.add_done_callback(self._retain_tasks.discard)
         return task
+
+    def _spawn_pending_save(self, sid: str) -> None:
+        """后台写攒批快照（不阻塞回合完成信号）。
+
+        与编码任务同一收口集合（terminate 统一等待/取消）。
+        """
+        task = asyncio.create_task(self._save_retain_pending_guarded(sid))
+        task._retain_sid = sid  # type: ignore[attr-defined]
+        self._retain_tasks.add(task)
+        task.add_done_callback(self._retain_tasks.discard)
+
+    async def _save_retain_pending_guarded(self, sid: str) -> None:
+        """快照写入的兜底包装：失败只记 warning（内存 pending 是主真源）。"""
+        try:
+            await self._save_retain_pending(sid)
+        except Exception:
+            logger.warning("retain pending 快照保存失败（保留内存快照）", exc_info=True)
 
     def _flush_pending_batch(self, sid: str, *, force: bool = False) -> None:
         """弹出攒批批次并调度合并编码（到点 / 巡检超龄 / 会话逐出共用入口）。
@@ -2101,7 +2117,15 @@ class NoriflowMemoryPlugin(BasePlugin):
         """
         if self._db is None:
             return
-        limit = cutoff or datetime.now(timezone.utc)
+        if cutoff is None:
+            # 无 cutoff 不删：退回 now 会在「判定无剩余数据」与删除之间的
+            # await 窗口内把并发写入的新快照行一并删掉（重启备份丢失）——
+            # 留行比误删安全（残留行重启后重放编码，写入幂等键吸收）
+            logger.warning(
+                "retain pending 快照删除跳过（缺少行时间戳）: session=%s", sid
+            )
+            return
+        limit = cutoff
         async with self._db.pool.acquire() as conn:
             if getattr(self, "_backend_name", "postgres") == "sqlite":
                 await conn.execute(
