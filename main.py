@@ -574,6 +574,9 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 所有回合只写 pending 不编码，巡检也被 _flush_pending_batch 的
         # 门控挡死，等于静默「记忆下线」到下次停机。
         self._retain_stopping = False
+        # 在途 handler 计数一并复位：terminate 等待超时后它可能残留非零
+        # （handler 真卡住时的极端情形），下次停机会白等满 5s
+        self._retain_handler_active = 0
         # 攒批间隔/空闲 flush 阈值不另存实例属性：宿主配置页保存时是就地改
         # 同一 LocalMemoryConfig 实例（setattr(self._config, ...)），攒批门控
         # 与巡检阈值一律活读 self._config —— 存一份启动期快照既是死代码，

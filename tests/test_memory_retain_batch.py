@@ -2394,5 +2394,13 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
 
+    def test_mm1_initialize_resets_handler_counter(self):
+        """MM1：装配期须复位在途 handler 计数（terminate 超时残留会让下次停机白等 5s）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        inst._retain_handler_active = 3
+        asyncio.run(inst._initialize_services(inst._db, inst._config))
+        self.assertEqual(inst._retain_handler_active, 0, "装配期必须复位在途计数")
+
+
 if __name__ == "__main__":
     unittest.main()
