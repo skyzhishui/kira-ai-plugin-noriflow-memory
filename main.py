@@ -2110,6 +2110,22 @@ class NoriflowMemoryPlugin(BasePlugin):
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+            # 取消的编码任务**不会**走 _do_retain 的失败回座（CancelledError
+            # 不经 except 分支）→ 批次只留在 _retain_inflight：既不进 pending，
+            # 巡检与后续回合也不会再调度它，本进程内永不编码（内容靠表行撑到
+            # 下次重启，重启后还会重复编码）。按失败语义回座：合并回 pending
+            # 并标 _retain_failed（内容不丢、可重试）。
+            for sid, states in list(self._retain_inflight.items()):
+                for st in list(states):
+                    try:
+                        await self._reseat_pending_batch(sid, st)
+                    except Exception:
+                        logger.warning(
+                            "取消的编码批次回座失败（内存 pending 保留）: session=%s",
+                            sid,
+                            exc_info=True,
+                        )
+            self._retain_inflight.clear()
             self._retain_tasks.clear()
 
     async def _retain_sweep_loop(self) -> None:
@@ -2553,6 +2569,9 @@ class NoriflowMemoryPlugin(BasePlugin):
         registered = self._retain_row_ts.get(sid)
         if registered is None or now > registered:
             self._retain_row_ts[sid] = now
+        # 注意：这里**不**登记 _retain_restored_ts —— 那是「已回灌」的幂等
+        # 判据，注册后重启恢复会把该行也跳过（内存已空 → 内容丢失）。
+        # 「表行是内存 pending 的旧快照」由恢复侧按内容判定（见 _restore）。
         # 写后复查：写入窗口内同会话编码可能已完成（剩余快照变空），此时
         # 本行装的是「已编码内容」——用刚写入的 now 做条件删除，避免残留
         # 行在会话不再活跃时不自愈（重启后被重放编码）
@@ -2666,6 +2685,17 @@ class NoriflowMemoryPlugin(BasePlugin):
                     existing = self._retain_pending.get(sid)
                     if existing is None:
                         self._retain_pending[sid] = state
+                    elif (
+                        self._state_sort_key(state) == self._state_sort_key(existing)
+                        and int(getattr(existing, "_retain_rounds", 1))
+                        >= int(getattr(state, "_retain_rounds", 1))
+                    ):
+                        # 表行是内存 pending 的**旧快照**（同一批：内容锚点相同，
+                        # 且内存轮数不少于表行）——表行就是本进程每轮写下的
+                        # pending 镜像，重新装配时再合并一遍会让同批内容翻倍
+                        # （batch_lines 与 rounds 一起翻倍 → 提前编码 + 记忆
+                        # 重复）。内存已是超集，跳过合并。
+                        logger.debug("retain pending 回灌跳过旧快照: session=%s", sid)
                     else:
                         # 恢复不得覆盖内存里已有的批次（恢复期间到达的回合
                         # 可能已开新批），但**先后必须按内容锚点判定**——补恢复

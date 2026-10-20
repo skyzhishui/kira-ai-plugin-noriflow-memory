@@ -2701,5 +2701,105 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertTrue(old_sweep.cancelled() or old_sweep.done())
 
 
+    def test_ss1_restore_skips_stale_snapshot_of_same_batch(self):
+        """SS1：表行是内存 pending 的旧快照时不得重复合并（内容/轮数翻倍）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        sid = "napcat:dm:10086"
+        base = datetime.now(timezone.utc)
+
+        def _payload(ts, line, rounds):
+            return {
+                "session_id": "10086",
+                "platform": "napcat",
+                "group_id": "",
+                "user_id": "u1",
+                "timestamp": ts,
+                "first_ts": ts,
+                "participants": [["napcat", "u1"]],
+                "history_lines": [],
+                "batch_lines": [line],
+                "bot_lines": [],
+                "rounds": rounds,
+            }
+
+        ts = base.isoformat()
+
+        class _StubConn:
+            async def fetch(self, sql, *args):
+                return [
+                    {
+                        "session_key": sid,
+                        # 表行 = 内存 pending 的旧快照（1 轮 vs 内存 2 轮）
+                        "payload": json.dumps(_payload(ts, "第1句", 1)),
+                        "updated_at": ts,
+                    }
+                ]
+
+        class _StubAcquire:
+            async def __aenter__(self):
+                return _StubConn()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class _StubPool:
+            def acquire(self):
+                return _StubAcquire()
+
+        async def scenario():
+            inst._db = types.SimpleNamespace(pool=_StubPool())
+            # 内存 pending：同一批但已有 2 轮
+            inst._retain_pending[sid] = inst._retain_state_from_payload(
+                _payload(ts, "第1句", 2)
+            )
+            inst._retain_pending[sid].batch_lines = ["第1句", "第2句"]
+            await inst._restore_retain_pending()
+            return inst._retain_pending[sid]
+
+        merged = asyncio.run(scenario())
+        self.assertEqual(
+            merged.batch_lines, ["第1句", "第2句"], "旧快照不得重复合并（内容翻倍）"
+        )
+        self.assertEqual(
+            int(getattr(merged, "_retain_rounds", 0)), 2, "轮数不得虚高（会提前编码）"
+        )
+
+    def test_ss2_cancelled_encode_batch_is_reseated(self):
+        """SS2：取消的编码任务必须按失败语义回座（否则本进程内永不编码）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        sid = "napcat:dm:10086"
+
+        async def scenario():
+            state = inst._retain_state_from_payload(
+                {
+                    "session_id": "10086",
+                    "platform": "napcat",
+                    "group_id": "",
+                    "user_id": "u1",
+                    "timestamp": datetime.now().isoformat(),
+                    "participants": [["napcat", "u1"]],
+                    "history_lines": [],
+                    "batch_lines": ["在途内容"],
+                    "bot_lines": [],
+                    "rounds": 1,
+                }
+            )
+            inst._retain_inflight[sid] = [state]
+            # 一个永不结束的编码任务（模拟 LLM 长耗时）
+            task = asyncio.create_task(asyncio.sleep(3600))
+            inst._retain_tasks.add(task)
+            await inst._stop_retain_backgrounds(task_timeout=0.05)
+            return state
+
+        state = asyncio.run(scenario())
+        self.assertNotIn(sid, inst._retain_inflight, "在途登记须清空")
+        pending = inst._retain_pending.get(sid)
+        self.assertIsNotNone(pending, "被取消的批次必须回座到 pending（可重试）")
+        self.assertIn("在途内容", "\n".join(pending.batch_lines))
+        self.assertTrue(
+            getattr(pending, "_retain_failed", False), "回座批次须标记失败（不与新轮次混批）"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
