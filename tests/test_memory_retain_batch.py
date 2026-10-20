@@ -1087,5 +1087,89 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertEqual(merged.history_lines, ["前置上下文"], "历史窗口取较旧批次")
 
 
+    def test_t1_failed_flag_lands_on_kept_pending_object(self):
+        """T1：失败标记必须落在真正留在 pending 槽的对象上（合并会生成新对象）。"""
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+        sid = dm.sid
+        base = datetime.now(timezone.utc)
+
+        def _mk(offset_min, history, batch):
+            stamp = (base + timedelta(minutes=offset_min)).isoformat()
+            return inst._retain_state_from_payload(
+                {
+                    "session_id": "10086",
+                    "platform": "napcat",
+                    "group_id": "",
+                    "user_id": "u1",
+                    "timestamp": stamp,
+                    "first_ts": stamp,
+                    "participants": [["napcat", "u1"]],
+                    "history_lines": history,
+                    "batch_lines": batch,
+                    "bot_lines": [],
+                    "rounds": 1,
+                }
+            )
+
+        failed = _mk(0, ["前置上下文"], ["失败批内容"])
+        pending = _mk(10, ["前置上下文", "失败批内容"], ["新批次内容"])
+        captured: list[str] = []
+
+        async def scenario():
+            _spy_encode(inst, captured)
+            # pending 槽已有较新批次；失败批次回座会与之合并（生成新对象）
+            inst._retain_pending[sid] = pending
+            await inst._reseat_pending_batch(sid, failed)
+            kept = inst._retain_pending[sid]
+            self.assertTrue(
+                getattr(kept, "_retain_failed", False),
+                "失败标记必须落在留在 pending 槽的对象上",
+            )
+            # 下一轮触发：失败批次不得与新轮次混批
+            await _turn(inst, ctx, dm, "新轮次内容", mid="t1n")
+            await asyncio.gather(*inst._retain_tasks)
+            await asyncio.gather(*inst._retain_tasks)
+
+        asyncio.run(scenario())
+        self.assertEqual(len(captured), 1, "失败批次应单独编码一次")
+        self.assertIn("失败批内容", captured[0])
+        self.assertIn("新批次内容", captured[0], "合并后的批次内容应一起编码")
+        self.assertNotIn("新轮次内容", captured[0], "新轮次不得混进失败批次")
+
+    def test_t3_out_of_range_config_is_clamped(self):
+        """T3：越界配置值须钳到合法区间（否则 Pydantic 校验失败→记忆整体下线）。"""
+        cfg = mod._build_config(
+            {
+                "dsn": DSN,
+                "retain_interval_group": 0,
+                "retain_interval_private": 0,
+                "flush_idle_s": 0,
+            }
+        )
+        self.assertEqual(cfg.retain_interval_group, 1)
+        self.assertEqual(cfg.retain_interval_private, 1)
+        self.assertEqual(cfg.flush_idle_s, 1.0)
+
+        cfg_neg = mod._build_config(
+            {
+                "dsn": DSN,
+                "retain_interval_group": -5,
+                "retain_interval_private": -1,
+                "flush_idle_s": -100.0,
+            }
+        )
+        self.assertEqual(cfg_neg.retain_interval_group, 1)
+        self.assertEqual(cfg_neg.retain_interval_private, 1)
+        self.assertEqual(cfg_neg.flush_idle_s, 1.0)
+
+    def test_t2_durable_default_is_false(self):
+        """T2：_do_retain 的 durable 默认值须为 False（未显式传参走改动前语义）。"""
+        import inspect
+
+        sig = inspect.signature(mod.NoriflowMemoryPlugin._do_retain)
+        self.assertIs(sig.parameters["durable"].default, False)
+
+
 if __name__ == "__main__":
     unittest.main()

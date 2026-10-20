@@ -248,7 +248,12 @@ def _cfg_strlist(raw: dict, key: str, default: Optional[list[str]] = None) -> li
 
 
 def _build_config(raw: dict) -> LocalMemoryConfig:
-    """Plugin config dict -> LocalMemoryConfig (per-field tolerant, invalid values fall back to defaults)."""
+    """Plugin config dict -> LocalMemoryConfig (per-field tolerant, invalid values fall back to defaults).
+
+    越界值（如 interval=0 / flush_idle_s=0）在此**钳到合法区间**：LocalMemoryConfig
+    的 ge/gt 约束会让 0 触发 ValidationError → 构造失败 → 插件整体不可用
+    （一次配置页手滑就是一次静默的「记忆下线」）。
+    """
     return LocalMemoryConfig(
         storage_backend=_cfg_str(raw, "storage_backend"),
         sqlite_path=_cfg_str(raw, "sqlite_path"),
@@ -259,9 +264,9 @@ def _build_config(raw: dict) -> LocalMemoryConfig:
         embedding_model=_cfg_str(raw, "embedding_model"),
         embedding_dims=_cfg_int(raw, "embedding_dims", 1024),
         encode_input_max_chars=_cfg_int(raw, "encode_input_max_chars", 30000),
-        retain_interval_group=_cfg_int(raw, "retain_interval_group", 1),
-        retain_interval_private=_cfg_int(raw, "retain_interval_private", 5),
-        flush_idle_s=_cfg_float(raw, "flush_idle_s", 1800.0),
+        retain_interval_group=max(_cfg_int(raw, "retain_interval_group", 1), 1),
+        retain_interval_private=max(_cfg_int(raw, "retain_interval_private", 5), 1),
+        flush_idle_s=max(_cfg_float(raw, "flush_idle_s", 1800.0), 1.0),
         backfill_interval_seconds=_cfg_float(raw, "backfill_interval_seconds", 300.0),
         backfill_batch_size=_cfg_int(raw, "backfill_batch_size", 64),
         merge_interval_hours=_cfg_float(raw, "merge_interval_hours", 6.0),
@@ -1931,7 +1936,7 @@ class NoriflowMemoryPlugin(BasePlugin):
 
     async def _do_retain(
         self, state: _RetainState, sid: str = "", delta_keys: Optional[set[str]] = None,
-        durable: bool = True,
+        durable: bool = False,
     ) -> None:
         """Assemble the encoding input and write (Semaphore rate-limited).
 
@@ -2025,16 +2030,18 @@ class NoriflowMemoryPlugin(BasePlugin):
         触发时单独冲刷重试。
         """
         current = self._retain_pending.get(sid)
-        if current is None:
-            self._retain_pending[sid] = state
-        elif current is not state:
-            # 同一对象不得合并（否则轮数与批次行翻倍）；不同对象按内容
-            # 锚点定先后（较旧在前，其历史窗口作为合并后的历史窗口）
-            if self._state_first_ts(state) <= self._state_first_ts(current):
-                self._retain_pending[sid] = self._merge_retain_states(state, current)
-            else:
-                self._retain_pending[sid] = self._merge_retain_states(current, state)
-        state._retain_failed = True
+        if current is None or current is state:
+            merged = state
+        elif self._state_first_ts(state) <= self._state_first_ts(current):
+            # 不同对象按内容锚点定先后（较旧在前，其历史窗口作为合并后的历史窗口）
+            merged = self._merge_retain_states(state, current)
+        else:
+            merged = self._merge_retain_states(current, state)
+        # 标记必须落在真正留在 pending 槽的对象上：合并会生成**新对象**，
+        # 给被丢弃的 state 打标会让下一轮守卫读不到标记（失败批被混进新
+        # 轮次），正是本方法要避免的交错/历史窗口失真
+        merged._retain_failed = True
+        self._retain_pending[sid] = merged
         self._retain_pending_at[sid] = time.time()
         self._drop_inflight(sid, state)
         try:
