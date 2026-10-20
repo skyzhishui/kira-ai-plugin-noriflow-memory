@@ -810,6 +810,10 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 等在途回合处理器收尾（最多 5s）：它们可能正在写停机快照或已被
         # 停机标志挡下——不等就关连接池，那次写入会跑在已关闭的池上（数据
         # 不落库），该轮消息既没编码也没表行备份，重启无法恢复
+        # 预算取 5s 而非 db_command_timeout+余量：宿主 kira 用户单元
+        # TimeoutStopSec=10s——等 60s+ 只会被 SIGKILL 抢先（收口更糟）。
+        # 根治方式是让 handler 自身不被慢 DB 拖住（别名 upsert 2s + 停机
+        # 快照写 3s ⇒ handler ≤5s），所以 5s 的等待足以覆盖它。
         deadline = time.time() + 5.0
         while self._retain_handler_active > 0 and time.time() < deadline:
             await asyncio.sleep(0.05)
@@ -823,7 +827,10 @@ class NoriflowMemoryPlugin(BasePlugin):
         for sid in list(self._retain_pending):
             self._flush_pending_batch(sid, force=True)
         if self._retain_tasks:
-            done, pending = await asyncio.wait(self._retain_tasks, timeout=10.0)
+            # 4s：与上面的 handler 等待（5s）合计 ≤ 9s，留出余量给宿主
+            # kira 用户单元的 TimeoutStopSec=10s——超时会 SIGKILL，收口反而
+            # 更糟（未完成的编码任务被砍，其内容仍在表行快照里可恢复）
+            done, pending = await asyncio.wait(self._retain_tasks, timeout=4.0)
             if pending:
                 logger.warning("terminate: %d 个 retain 任务超时未完成，取消", len(pending))
                 for task in pending:
@@ -1767,8 +1774,16 @@ class NoriflowMemoryPlugin(BasePlugin):
         delta_keys = {k for k, _ in delta}
         consumed.update(delta_keys)
         self._prune_consumed(sid)
-        # Persistent alias layer batch upsert (fail-open, independent of retain)
-        await self._alias_upsert_batch(user_delta)
+        # Persistent alias layer batch upsert (fail-open, independent of retain).
+        # 有界等待：这是**旁路**写入（别名层），不该把回合处理链拖住——
+        # 无界等待时慢 DB 会让 handler 卡到 db_command_timeout（默认 60s），
+        # 停机收口（宿主 kira 单元 TimeoutStopSec=10s）必然切在它前面：
+        # 水位线已推进、批次还没进 pending，这一轮静默丢失。超时按 fail-open
+        # 跳过（别名层可有缺口，回落原始文本即可）。
+        try:
+            await asyncio.wait_for(self._alias_upsert_batch(user_delta), timeout=2.0)
+        except (asyncio.TimeoutError, Exception):
+            logger.warning("别名层 upsert 未完成（旁路写入，跳过）", exc_info=True)
 
         state = _RetainState(
             session_id=bare,
@@ -1806,7 +1821,7 @@ class NoriflowMemoryPlugin(BasePlugin):
                 # 会把回合完成信号拖死在 DB I/O 上。超时只损失表行备份，
                 # 内存 pending 仍会被 terminate 的 force 冲刷编码
                 await asyncio.wait_for(
-                    self._save_retain_pending(sid), timeout=5.0
+                    self._save_retain_pending(sid), timeout=3.0
                 )
             except Exception:
                 logger.warning(
@@ -1883,7 +1898,9 @@ class NoriflowMemoryPlugin(BasePlugin):
         )
         try:
             return max(int(raw or 1), 1)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError：int(float('inf')) 一类脏值——不接住会在这行之后
+            # 抛出（水位线已推进、批次还没进 pending），整轮对话静默丢失
             return 1
 
     def _retain_flush_idle_s(self) -> float:
@@ -2350,7 +2367,9 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 非数字脏值也不能抛（ValueError 会让整行被当坏行跳过 → 内容不恢复）
         try:
             state._retain_rounds = max(int(payload.get("rounds", 1) or 1), 1)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError：rounds=Infinity 一类脏值——不接住会让整行被
+            # 当坏行跳过（该行未编码内容永不恢复）
             state._retain_rounds = 1
         # 失败标记（回座待重试）：恢复后仍按「不与新轮次混批」处理
         state._retain_failed = bool(payload.get("failed", False))

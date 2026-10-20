@@ -2280,5 +2280,54 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertEqual(inst._retain_flush_idle_s(), 1800.0)
 
 
+    def test_jj1_infinite_interval_does_not_drop_turn(self):
+        """JJ1：热切换把间隔设成 inf 时 int() 抛 OverflowError，不得吞掉整轮对话。"""
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+        inst._config.retain_interval_private = float("inf")
+
+        async def scenario():
+            await _turn(inst, ctx, dm, "脏间隔的一轮", mid="jj1m")
+            await asyncio.gather(*inst._retain_tasks)
+            await asyncio.gather(*inst._retain_tasks)
+            return inst._db.inserted_summaries
+
+        summaries = asyncio.run(scenario())
+        self.assertEqual(
+            len(summaries), 1, "脏间隔回退为逐轮路径后该轮必须被编码（不得静默丢失）"
+        )
+
+    def test_jj3_infinite_rounds_does_not_drop_row(self):
+        """JJ3：脏行 rounds=Infinity 不得让整行被当坏行跳过。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        state = inst._retain_state_from_payload(
+            {
+                "session_id": "10086",
+                "platform": "napcat",
+                "group_id": "",
+                "user_id": "u1",
+                "timestamp": datetime.now().isoformat(),
+                "participants": [["napcat", "u1"]],
+                "history_lines": [],
+                "batch_lines": ["内容"],
+                "bot_lines": [],
+                "rounds": float("inf"),
+            }
+        )
+        self.assertEqual(state.batch_lines, ["内容"], "整行内容不得被丢弃")
+        self.assertEqual(int(getattr(state, "_retain_rounds", 0)), 1)
+
+    def test_jj2_alias_upsert_is_bounded(self):
+        """JJ2：别名 upsert 不得把 handler 拖到 DB 超时（停机收口会切掉那一轮）。"""
+        import inspect
+
+        src = inspect.getsource(mod.NoriflowMemoryPlugin._on_session_memory_updated_impl)
+        self.assertRegex(
+            src,
+            r"wait_for\(\s*self\._alias_upsert_batch",
+            "别名 upsert 必须有界等待（否则慢 DB 会把 handler 拖到 DB 超时）",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
