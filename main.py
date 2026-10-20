@@ -429,6 +429,11 @@ class _CachedLine:
     timestamp: Optional[datetime] = None
 
 
+# 攒批巡检：间隔读取失败时的回退周期（秒）。模块常量便于测试 patch
+# （断言「读取失败后巡检仍继续」时需要把回退周期调小，否则测试要等 300s）
+RETAIN_SWEEP_FALLBACK_INTERVAL_S = 300.0
+
+
 @dataclass
 class _RetainState:
     """Retain snapshot of one conversation turn (frozen at the watermark when the turn completion signal arrives)."""
@@ -600,6 +605,12 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 递增——旧代 handler 收尾时不再把新代计数减成负数
         self._retain_handler_generation += 1
         self._retain_handler_active = 0
+        # 重新装配：**先**收掉旧巡检协程与旧代编码任务（必须在恢复之前）——
+        # 否则旧巡检在恢复的 await 点期间仍可运行（_retain_stopping 已复位为
+        # False，旧巡检不受门控），可能 _flush_pending_batch 把批次弹出并派发
+        # 编码，随后恢复又把该批次的表行内容合并回 pending（同一批内容既在途
+        # 又回座 → 重复编码 + 轮数虚高）。
+        await self._stop_retain_backgrounds()
         # 攒批间隔/空闲 flush 阈值不另存实例属性：宿主配置页保存时是就地改
         # 同一 LocalMemoryConfig 实例（setattr(self._config, ...)），攒批门控
         # 与巡检阈值一律活读 self._config —— 存一份启动期快照既是死代码，
@@ -763,7 +774,10 @@ class NoriflowMemoryPlugin(BasePlugin):
         # pending 也没被编码落库。
         # 订阅前到达的回合不丢：其增量仍在滚动缓存里未消费，下个回合的
         # 增量会带上它（增量按水位线取，不按回合切分）。
-        await self._restore_retain_pending()
+        # 恢复持锁：与巡检侧的 _ensure_retain_restored 串行，避免同一行被
+        # 两个协程各合并一次（内容翻倍 + 轮数虚高）
+        async with self._retain_restore_lock:
+            await self._restore_retain_pending()
         # 订阅核心回合完成信号（核心在每轮对话全部发送结束后恰好发出一次，
         # 含完整 chunk）；retain 由该信号触发，替代按发送段 debounce 的旧机制
         bus = getattr(self.ctx, "event_bus", None)
@@ -776,15 +790,6 @@ class NoriflowMemoryPlugin(BasePlugin):
                 self._mem_handler = None
         else:
             logger.warning("ctx.event_bus 不可用：回合完成信号无法订阅，自动 retain 不触发")
-        # 重新装配时先收掉旧巡检协程：直接覆盖句柄会让旧协程泄漏到下次停机
-        if self._retain_sweep_task is not None:
-            old_sweep = self._retain_sweep_task
-            self._retain_sweep_task = None
-            old_sweep.cancel()
-            try:
-                await asyncio.gather(old_sweep, return_exceptions=True)
-            except RuntimeError:
-                logger.warning("旧攒批巡检任务取消失败（事件循环已关闭）")
         self._retain_sweep_task = asyncio.create_task(self._retain_sweep_loop())
         if not self._allowed_user_ids() and not self._allowed_session_ids():
             # fail-closed: both whitelists empty keeps the proactive tools
@@ -2083,6 +2088,30 @@ class NoriflowMemoryPlugin(BasePlugin):
             )
             self._flush_pending_batch(sid)
 
+    async def _stop_retain_backgrounds(self, task_timeout: float = 5.0) -> None:
+        """收口攒批后台：取消巡检协程 + 等待旧代编码任务（重新装配/停机共用）。
+
+        旧代任务必须等完（或超时取消）再继续：它们持有旧批次的在途登记，
+        新一轮恢复若与之交错，同一批内容会既在途又回座（重复编码 + 轮数虚高）。
+        """
+        if self._retain_sweep_task is not None:
+            old_sweep = self._retain_sweep_task
+            self._retain_sweep_task = None
+            old_sweep.cancel()
+            try:
+                await asyncio.gather(old_sweep, return_exceptions=True)
+            except RuntimeError:
+                logger.warning("旧攒批巡检任务取消失败（事件循环已关闭）")
+        if self._retain_tasks:
+            done, pending = await asyncio.wait(
+                self._retain_tasks, timeout=task_timeout
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            self._retain_tasks.clear()
+
     async def _retain_sweep_loop(self) -> None:
         """攒批巡检协程主循环（initialize 创建 / terminate 取消）。
 
@@ -2101,9 +2130,11 @@ class NoriflowMemoryPlugin(BasePlugin):
                 raise
             except Exception:
                 logger.warning(
-                    "retain 攒批巡检间隔读取失败（回退 300s）", exc_info=True
+                    "retain 攒批巡检间隔读取失败（回退 %ss）",
+                    RETAIN_SWEEP_FALLBACK_INTERVAL_S,
+                    exc_info=True,
                 )
-                interval = 300.0
+                interval = RETAIN_SWEEP_FALLBACK_INTERVAL_S
             await asyncio.sleep(interval)
             try:
                 await self._sweep_retain_pending()

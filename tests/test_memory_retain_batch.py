@@ -2637,33 +2637,68 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
     def test_qq1_sweep_survives_interval_read_failure(self):
-        """QQ1：间隔读取抛异常时巡检仍继续（自愈），不退出循环。"""
+        """QQ1/RR2：间隔读取抛异常时巡检**继续下一轮**（自愈），不退出循环。
+
+        断言必须覆盖「失败后仍在跑」——只断言读到 1 次的话，即使循环在首轮
+        后 break，用例照样通过（这是评审指出的空锁）。
+        """
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
-        calls = {"n": 0}
+        state = {"n": 0}
+        original_fallback = mod.RETAIN_SWEEP_FALLBACK_INTERVAL_S
+        # 回退周期调小：首轮读取失败后不至于要等 300s 才进入下一轮
+        mod.RETAIN_SWEEP_FALLBACK_INTERVAL_S = 0.01
 
         async def scenario():
-            original = inst._retain_flush_idle_s
-
-            def boom():
-                calls["n"] += 1
-                if calls["n"] == 1:
+            def flaky():
+                state["n"] += 1
+                if state["n"] == 1:
                     raise RuntimeError("间隔读取失败（测试注入）")
-                return original()
+                return 5.0
 
-            inst._retain_flush_idle_s = boom
-            # 让巡检跑两轮（第二轮起间隔读取正常）
-            inst._retain_flush_idle_s = boom
+            inst._retain_flush_idle_s = flaky
             task = asyncio.create_task(inst._retain_sweep_loop())
-            await asyncio.sleep(0.2)
+            for _ in range(300):
+                await asyncio.sleep(0.01)
+                if state["n"] >= 2:
+                    break
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
-            return calls["n"]
+            return state["n"]
 
-        n = asyncio.run(scenario())
-        self.assertGreaterEqual(n, 1, "间隔读取失败不得让巡检协程退出")
+        try:
+            n = asyncio.run(scenario())
+        finally:
+            mod.RETAIN_SWEEP_FALLBACK_INTERVAL_S = original_fallback
+        self.assertGreaterEqual(n, 2, "间隔读取失败后巡检必须继续下一轮（自愈）")
+
+    def test_rr1_old_sweep_cancelled_before_restore(self):
+        """RR1：重新装配必须**先**取消旧巡检（恢复期间旧巡检仍在跑会与恢复交错）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        observed: dict = {}
+
+        async def scenario():
+            old_sweep = asyncio.create_task(asyncio.sleep(3600))
+            inst._retain_sweep_task = old_sweep
+            await asyncio.sleep(0)
+            original = inst._restore_retain_pending
+
+            async def checking_restore():
+                observed["sweep_cancelled"] = old_sweep.cancelled() or old_sweep.done()
+                await original()
+
+            inst._restore_retain_pending = checking_restore
+            await inst._initialize_services(inst._db, inst._config)
+            return old_sweep
+
+        old_sweep = asyncio.run(scenario())
+        self.assertTrue(
+            observed.get("sweep_cancelled"),
+            "恢复之前必须先取消旧巡检协程（否则旧巡检会与恢复交错，重复编码）",
+        )
+        self.assertTrue(old_sweep.cancelled() or old_sweep.done())
 
 
 if __name__ == "__main__":
