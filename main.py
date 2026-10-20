@@ -1722,10 +1722,29 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 内容锚点：新批次链的最早一轮 = 本轮
         state._retain_first_ts = state.timestamp
         # P2: coalesce private-chat turns (and persist the frozen snapshot).
-        # 停机门控：terminate 期间不再写表/派任务——收口的 asyncio.wait 只
+        # 停机门控：terminate 期间不再派新任务——收口的 asyncio.wait 只
         # 覆盖调用瞬间的任务集合，之后新建的任务不会被等待，而随后
-        # db.close() 会让它们跑在已关闭的连接池上（数据不落库 + 未捕获异常）
+        # db.close() 会让它们跑在已关闭的连接池上（数据不落库 + 未捕获异常）。
+        # 但本轮增量此刻已写入水位线（消费在首个 await 之前完成），直接
+        # return 会静默吞掉这一轮：滚动缓存随进程退出丢失，又没进表行。
+        # 因此停机分支仍保留批次（内存 pending，terminate 的 force 冲刷
+        # 会编码它）并尽力落表行（重启可恢复）。
         if self._retain_stopping:
+            existing = self._retain_pending.get(sid)
+            if existing is None:
+                state._retain_rounds = 1
+                self._retain_pending[sid] = state
+            elif existing is not state:
+                state = self._merge_retain_states(existing, state)
+                self._retain_pending[sid] = state
+            self._retain_pending_at[sid] = time.time()
+            try:
+                await self._save_retain_pending(sid)
+            except Exception:
+                logger.warning(
+                    "停机期间 retain pending 快照保存失败（本轮可能丢失）: session=%s",
+                    sid,
+                )
             return
         # 攒批门控（活读配置）：群聊 retain_interval_group、私聊
         # retain_interval_private；间隔 <=1 走原逐轮路径（群聊默认 1，

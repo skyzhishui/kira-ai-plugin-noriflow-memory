@@ -799,8 +799,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
             asyncio.run(scenario())
 
-    def test_n2_stopping_blocks_new_writes_and_tasks(self):
-        """N2：停机标志置位后不得再写 pending 表或派发新任务。"""
+    def test_n2_stopping_blocks_new_tasks_but_keeps_round(self):
+        """N2/U1：停机标志置位后不得派发新任务，但本轮内容不得被静默吞掉。"""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
 
@@ -815,19 +815,19 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
         before, after = asyncio.run(scenario())
         self.assertEqual(after, before, "停机后不得派发新 retain 任务")
-        # 停机前的残留批次仍可在（合法状态），但停机后那一轮不得被并入
+        # 停机后那一轮的增量已入水位线——必须被保留（内存 pending / 表行），
+        # 不能因为门控直接 return 就静默丢弃
         pending = inst._retain_pending.get(dm.sid)
-        if pending is not None:
-            self.assertNotIn(
-                "停机后一轮",
-                "\n".join(pending.batch_lines),
-                "停机后不得再攒批",
-            )
-            self.assertEqual(int(getattr(pending, "_retain_rounds", 0)), 1)
+        self.assertIsNotNone(pending, "停机后本轮批次不得丢失")
+        self.assertIn(
+            "停机后一轮",
+            "\n".join(pending.batch_lines),
+            "停机后那一轮必须保留在批次里",
+        )
         inserts = [
             s for s in _pending_sqls(inst) if s.lstrip().startswith("INSERT")
         ]
-        self.assertLessEqual(len(inserts), 1, "停机后不得再写 pending 表")
+        self.assertGreaterEqual(len(inserts), 2, "停机后那一轮应尽力落表行")
 
     def test_n3_interval_switch_flushes_residual_batch(self):
         """N3：interval 调小（热切换）时，残留批次应先冲刷再走逐轮路径。"""
