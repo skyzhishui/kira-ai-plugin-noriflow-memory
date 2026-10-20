@@ -2505,5 +2505,122 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertIsNotNone(inst._retain_sweep_task, "新巡检协程须正常建立")
 
 
+    def test_pp1_restore_merge_uses_anchor_order(self):
+        """PP1：恢复合并必须按内容锚点定先后（硬编码「恢复行更旧」会致内容重复）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        sid = "napcat:dm:10086"
+        base = datetime.now(timezone.utc)
+        # 构造「恢复行反而更新」的情形：内存 pending 的内容更早
+        older_ts = (base - timedelta(hours=1)).isoformat()
+        newer_ts = base.isoformat()
+
+        def _payload(ts, line):
+            return {
+                "session_id": "10086",
+                "platform": "napcat",
+                "group_id": "",
+                "user_id": "u1",
+                "timestamp": ts,
+                "first_ts": ts,
+                "participants": [["napcat", "u1"]],
+                "history_lines": [],
+                "batch_lines": [line],
+                "bot_lines": [],
+                "rounds": 1,
+            }
+
+        class _StubConn:
+            async def fetch(self, sql, *args):
+                return [
+                    {
+                        "session_key": sid,
+                        "payload": json.dumps(_payload(newer_ts, "恢复行")),
+                        "updated_at": newer_ts,
+                    }
+                ]
+
+        class _StubAcquire:
+            async def __aenter__(self):
+                return _StubConn()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class _StubPool:
+            def acquire(self):
+                return _StubAcquire()
+
+        async def scenario():
+            inst._db = types.SimpleNamespace(pool=_StubPool())
+            inst._retain_pending[sid] = inst._retain_state_from_payload(
+                _payload(older_ts, "内存行")
+            )
+            await inst._restore_retain_pending()
+            return inst._retain_pending[sid]
+
+        merged = asyncio.run(scenario())
+        self.assertEqual(
+            merged.batch_lines,
+            ["内存行", "恢复行"],
+            "较旧批次必须在前（否则历史窗口取到较新批次 → 内容重复）",
+        )
+
+    def test_pp2_restore_age_uses_row_timestamp(self):
+        """PP2：恢复龄期须由行时间戳换算（两套时钟错位会让龄期偏旧）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        sid = "napcat:dm:10086"
+        row_ts = datetime.now(timezone.utc) - timedelta(seconds=120)
+        payload = {
+            "session_id": "10086",
+            "platform": "napcat",
+            "group_id": "",
+            "user_id": "u1",
+            "timestamp": datetime.now().isoformat(),
+            "participants": [["napcat", "u1"]],
+            "history_lines": [],
+            "batch_lines": ["行"],
+            "bot_lines": [],
+            "rounds": 1,
+        }
+
+        class _StubConn:
+            async def fetch(self, sql, *args):
+                return [
+                    {
+                        "session_key": sid,
+                        "payload": json.dumps(payload),
+                        "updated_at": row_ts.isoformat(timespec="microseconds"),
+                    }
+                ]
+
+        class _StubAcquire:
+            async def __aenter__(self):
+                return _StubConn()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class _StubPool:
+            def acquire(self):
+                return _StubAcquire()
+
+        async def scenario():
+            inst._db = types.SimpleNamespace(pool=_StubPool())
+            await inst._restore_retain_pending()
+            return inst._retain_pending_at.get(sid)
+
+        restored_at = asyncio.run(scenario())
+        self.assertIsNotNone(restored_at)
+        age = time.time() - restored_at
+        self.assertAlmostEqual(age, 120.0, delta=2.0, msg="龄期须等于行时间戳的年龄")
+        # 龄期必须由**已解析的行时间戳**换算（不用 now - _row_age_seconds：
+        # 那是两套时钟错位 + 循环耗时，偏旧会让巡检提前冲刷）
+        import inspect
+
+        src = inspect.getsource(mod.NoriflowMemoryPlugin._restore_retain_pending)
+        self.assertIn("row_ts.timestamp()", src, "龄期须由行时间戳换算")
+        self.assertNotIn("self._row_age_seconds(row)", src, "不得用两套时钟换算龄期")
+
+
 if __name__ == "__main__":
     unittest.main()

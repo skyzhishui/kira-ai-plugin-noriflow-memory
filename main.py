@@ -2625,16 +2625,27 @@ class NoriflowMemoryPlugin(BasePlugin):
                         self._retain_pending[sid] = state
                     else:
                         # 恢复不得覆盖内存里已有的批次（恢复期间到达的回合
-                        # 可能已开新批）：按时间序合并——旧=恢复行（攒批前快照），
-                        # 新=内存批次，轮数相加，两边内容都不丢
-                        self._retain_pending[sid] = self._merge_retain_states(
-                            state, existing
-                        )
+                        # 可能已开新批），但**先后必须按内容锚点判定**——补恢复
+                        # 走 _ensure_retain_restored，与内存 pending 的先后并
+                        # 无保证（时钟回拨 / 乱序行都可能让恢复行反而更新）：
+                        # 硬编码「恢复行更旧」会让历史窗口取到较新批次，同一段
+                        # 对话既进历史又进批次内容（被编码两遍）。与
+                        # _reseat_pending_batch / _pending_snapshot_for_row 同口径。
+                        if self._state_sort_key(state) <= self._state_sort_key(existing):
+                            merged_state = self._merge_retain_states(state, existing)
+                        else:
+                            merged_state = self._merge_retain_states(existing, state)
+                        self._retain_pending[sid] = merged_state
                     # 保留表行的真实龄期（不重置超时钟）：重启后仍按原时间戳
                     # 参与巡检超龄判定；但内存已有更晚批次时取较晚者——否则
                     # 旧行的龄期会让合并后的新批次被巡检提前冲刷（违背
                     # 「续攒」语义）
-                    restored_at = now - self._row_age_seconds(row)
+                    # 龄期用已解析的行时间戳换算：now 取自循环外，而
+                    # _row_age_seconds 内部又读一次 datetime.now()，两套时钟
+                    # 错位 + 循环耗时会让后处理的行龄期偏旧（巡检可能提前冲刷）
+                    restored_at = (
+                        row_ts.timestamp() if row_ts is not None else time.time()
+                    )
                     existing_at = self._retain_pending_at.get(sid)
                     self._retain_pending_at[sid] = (
                         restored_at
