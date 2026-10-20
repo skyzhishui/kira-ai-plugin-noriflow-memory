@@ -49,6 +49,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import math
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1882,6 +1883,11 @@ class NoriflowMemoryPlugin(BasePlugin):
             value = float(getattr(self._config, "flush_idle_s", 1800.0))
         except (TypeError, ValueError):
             return 1800.0
+        if math.isnan(value) or math.isinf(value):
+            # NaN/±inf（宿主 setattr 热切换可绕过 Pydantic 校验）：NaN 会让
+            # `now - updated_at <= idle_s` 恒为 False → 巡检把全部批次误判
+            # 超龄提前冲刷；±inf 则永不超龄。统一回退默认值。
+            return 1800.0
         return max(value, 1.0)
 
     def _spawn_retain_task(
@@ -2500,6 +2506,9 @@ class NoriflowMemoryPlugin(BasePlugin):
                 )
             now = time.time()
             for row in rows:
+                # 整段行处理都在 try 内：合并 / 龄期计算 / 键读取任一抛异常，
+                # 只跳过**这一行**——放到 try 外会中断整个恢复循环，排在它
+                # 后面的表行永远回灌不了（且每次重试都会在同一行再炸）
                 try:
                     raw = row["payload"]
                     if isinstance(raw, str):
@@ -2507,43 +2516,47 @@ class NoriflowMemoryPlugin(BasePlugin):
                     if not isinstance(raw, dict):
                         continue
                     state = self._retain_state_from_payload(raw)
+                    sid = str(row["session_key"])
+                    row_ts = self._row_timestamp(row)
+                    if row_ts is not None and row_ts == self._retain_restored_ts.get(sid):
+                        # 幂等：该行已由恢复回灌过——半途失败的补恢复不得重复
+                        # 合并，否则同批内容翻倍、轮数虚高导致提前落库 + 多编码
+                        # 一遍。（判据用**仅由恢复写入**的登记，不能用
+                        # _retain_row_ts：保存路径也会写它，会误跳过正常恢复）
+                        continue
+                    existing = self._retain_pending.get(sid)
+                    if existing is None:
+                        self._retain_pending[sid] = state
+                    else:
+                        # 恢复不得覆盖内存里已有的批次（恢复期间到达的回合
+                        # 可能已开新批）：按时间序合并——旧=恢复行（攒批前快照），
+                        # 新=内存批次，轮数相加，两边内容都不丢
+                        self._retain_pending[sid] = self._merge_retain_states(
+                            state, existing
+                        )
+                    # 保留表行的真实龄期（不重置超时钟）：重启后仍按原时间戳
+                    # 参与巡检超龄判定；但内存已有更晚批次时取较晚者——否则
+                    # 旧行的龄期会让合并后的新批次被巡检提前冲刷（违背
+                    # 「续攒」语义）
+                    restored_at = now - self._row_age_seconds(row)
+                    existing_at = self._retain_pending_at.get(sid)
+                    self._retain_pending_at[sid] = (
+                        restored_at
+                        if existing_at is None
+                        else max(existing_at, restored_at)
+                    )
+                    # 登记行时间戳（条件删除的 cutoff 依据）：只前进不后退——
+                    # 补恢复期间并发保存写入的更晚行不能被旧行拉回（cutoff
+                    # 回退会让后续条件删除删不掉更新行，只能留行等重启重放）
+                    if row_ts is not None:
+                        registered = self._retain_row_ts.get(sid)
+                        if registered is None or row_ts > registered:
+                            self._retain_row_ts[sid] = row_ts
+                        # 恢复登记（幂等判据）：该行已回灌过
+                        self._retain_restored_ts[sid] = row_ts
                 except Exception:
                     logger.warning("retain pending 快照行损坏（跳过该行）", exc_info=True)
                     continue
-                sid = str(row["session_key"])
-                row_ts = self._row_timestamp(row)
-                if row_ts is not None and row_ts == self._retain_restored_ts.get(sid):
-                    # 幂等：该行已由恢复回灌过——半途失败的补恢复不得重复
-                    # 合并，否则同批内容翻倍、轮数虚高导致提前落库 + 多编码
-                    # 一遍。（判据用**仅由恢复写入**的登记，不能用
-                    # _retain_row_ts：保存路径也会写它，会误跳过正常恢复）
-                    continue
-                existing = self._retain_pending.get(sid)
-                if existing is None:
-                    self._retain_pending[sid] = state
-                else:
-                    # 恢复不得覆盖内存里已有的批次（恢复期间到达的回合可能
-                    # 已开新批）：按时间序合并——旧=恢复行（攒批前快照），
-                    # 新=内存批次，轮数相加，两边内容都不丢
-                    self._retain_pending[sid] = self._merge_retain_states(state, existing)
-                # 保留表行的真实龄期（不重置超时钟）：重启后仍按原时间戳
-                # 参与巡检超龄判定；但内存已有更晚批次时取较晚者——否则旧行
-                # 的龄期会让合并后的新批次被巡检提前冲刷（违背「续攒」语义）
-                restored_at = now - self._row_age_seconds(row)
-                existing_at = self._retain_pending_at.get(sid)
-                self._retain_pending_at[sid] = (
-                    restored_at if existing_at is None else max(existing_at, restored_at)
-                )
-                # 登记行时间戳（条件删除的 cutoff 依据）：只前进不后退——
-                # 补恢复期间并发保存写入的更晚行不能被旧行拉回（cutoff 回退
-                # 会让后续条件删除删不掉更新行，只能留行等重启重放）
-                row_ts = self._row_timestamp(row)
-                if row_ts is not None:
-                    registered = self._retain_row_ts.get(sid)
-                    if registered is None or row_ts > registered:
-                        self._retain_row_ts[sid] = row_ts
-                    # 恢复登记（幂等判据）：该行已回灌过
-                    self._retain_restored_ts[sid] = row_ts
             if rows:
                 logger.info("恢复 %d 个 retain pending 快照", len(rows))
             self._retain_restore_failed = False

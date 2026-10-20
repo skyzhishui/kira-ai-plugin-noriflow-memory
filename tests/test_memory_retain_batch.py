@@ -2146,5 +2146,69 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertFalse(inst._retain_payload(plain).get("failed"))
 
 
+    def test_gg1_broken_row_does_not_abort_restore_loop(self):
+        """GG1：一行坏掉只跳过自己，不得中断整轮恢复（后面的行永远回灌不了）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        good_sid = "napcat:dm:good"
+        good_payload = {
+            "session_id": "good",
+            "platform": "napcat",
+            "group_id": "",
+            "user_id": "u1",
+            "timestamp": datetime.now().isoformat(),
+            "participants": [["napcat", "u1"]],
+            "history_lines": [],
+            "batch_lines": ["好行内容"],
+            "bot_lines": [],
+            "rounds": 1,
+        }
+
+        class _BadKey:
+            def __str__(self):
+                raise RuntimeError("坏键（测试注入）")
+
+        class _StubConn:
+            async def fetch(self, sql, *args):
+                return [
+                    # 坏行：取 session_key 时抛异常（合并/龄期计算同样可能抛）
+                    {"session_key": _BadKey(), "payload": json.dumps(good_payload),
+                     "updated_at": datetime.now(timezone.utc).isoformat()},
+                    {"session_key": good_sid, "payload": json.dumps(good_payload),
+                     "updated_at": datetime.now(timezone.utc).isoformat()},
+                ]
+
+        class _StubAcquire:
+            async def __aenter__(self):
+                return _StubConn()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class _StubPool:
+            def acquire(self):
+                return _StubAcquire()
+
+        async def scenario():
+            inst._db = types.SimpleNamespace(pool=_StubPool())
+            await inst._restore_retain_pending()
+            return inst._retain_pending.get(good_sid)
+
+        pending = asyncio.run(scenario())
+        self.assertIsNotNone(pending, "坏行不得中断整轮恢复（后面的行仍须回灌）")
+        self.assertIn("好行内容", pending.batch_lines)
+
+    def test_gg2_nan_flush_idle_falls_back_to_default(self):
+        """GG2：NaN/±inf 的空闲阈值须回退默认值（NaN 会让巡检把全部批次提前冲刷）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5, flush_idle_s=1800.0))
+        inst._config.flush_idle_s = float("nan")
+        self.assertEqual(inst._retain_flush_idle_s(), 1800.0)
+        inst._config.flush_idle_s = float("inf")
+        self.assertEqual(inst._retain_flush_idle_s(), 1800.0)
+        inst._config.flush_idle_s = float("-inf")
+        self.assertEqual(inst._retain_flush_idle_s(), 1800.0)
+        inst._config.flush_idle_s = 60
+        self.assertEqual(inst._retain_flush_idle_s(), 60.0)
+
+
 if __name__ == "__main__":
     unittest.main()
