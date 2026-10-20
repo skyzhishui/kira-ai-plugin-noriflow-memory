@@ -2402,5 +2402,62 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertEqual(inst._retain_handler_active, 0, "装配期必须复位在途计数")
 
 
+    def test_nn1_snapshot_timestamp_never_goes_backwards(self):
+        """NN1：快照写入时间戳必须单调（墙钟回拨/同微秒不得让 UPSERT 守卫丢弃写入）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        sid = "napcat:dm:10086"
+        future = datetime.now(timezone.utc) + timedelta(hours=1)
+
+        async def scenario():
+            inst._retain_pending[sid] = inst._retain_state_from_payload(
+                {
+                    "session_id": "10086",
+                    "platform": "napcat",
+                    "group_id": "",
+                    "user_id": "u1",
+                    "timestamp": datetime.now().isoformat(),
+                    "participants": [["napcat", "u1"]],
+                    "history_lines": [],
+                    "batch_lines": ["行"],
+                    "bot_lines": [],
+                    "rounds": 1,
+                }
+            )
+            # 模拟「已登记的时间戳在未来」（墙钟回拨后写过一次）
+            inst._retain_row_ts[sid] = future
+            await inst._save_retain_pending(sid)
+            return inst._retain_row_ts.get(sid)
+
+        ts = asyncio.run(scenario())
+        self.assertIsNotNone(ts)
+        self.assertGreater(ts, future, "写入时间戳必须单调前进（不得被墙钟回拨拉回）")
+
+    def test_nn2_stale_handler_does_not_corrupt_new_generation_count(self):
+        """NN2：旧代 handler 收尾不得把新代计数减成负数（否则 terminate 误判无在途）。"""
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+        release = asyncio.Event()
+
+        async def slow_impl(event):
+            await release.wait()
+
+        inst._on_session_memory_updated_impl = slow_impl
+
+        async def scenario():
+            handler = asyncio.create_task(
+                ctx.event_bus.fire("session_memory_updated", {"session": dm.sid})
+            )
+            await asyncio.sleep(0)
+            # 重新装配（计数复位 + 代数递增），随后旧 handler 才收尾
+            await inst._initialize_services(inst._db, inst._config)
+            release.set()
+            await handler
+            return inst._retain_handler_active
+
+        active = asyncio.run(scenario())
+        self.assertGreaterEqual(active, 0, "在途 handler 计数不得为负")
+        self.assertEqual(active, 0, "旧代 handler 收尾后新代计数应为 0")
+
+
 if __name__ == "__main__":
     unittest.main()

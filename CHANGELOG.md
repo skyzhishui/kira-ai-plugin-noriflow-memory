@@ -28,10 +28,10 @@ kira 侧按「回合完成信号 + 滚动行缓存水位线 + PG/SQLite 双后�
 - **耗时观测**：`build_injection_text` / `build_profile_text` 增加计时包装
   （DEBUG 落盘；超过 500ms 升级 WARNING 作慢查询哨兵，与上游 nori 口径一致）。
 
-测试：新增 `tests/test_memory_retain_batch.py`（75 例：门控等价性/批次内容
+测试：新增 `tests/test_memory_retain_batch.py`（77 例：门控等价性/批次内容
 正确性/表行生命周期/失败回座/水位线语义/恢复续攒/巡检/逐出联动/停机收口/
-SQLite 真实往返 + 并发/生命周期/恢复幂等/脏数据防御回归）；全量 465 passed
-（基线 390 + 新增 75），SQLite 迁移脚本 108/108。
+SQLite 真实往返 + 并发/生命周期/恢复幂等/脏数据防御回归）；全量 467 passed
+（基线 390 + 新增 77），SQLite 迁移脚本 108/108。
 
 ## v1.17.3 (2026-10-14)
 

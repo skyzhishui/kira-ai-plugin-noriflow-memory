@@ -52,7 +52,7 @@ import json
 import math
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
 from typing import Any, Optional
@@ -493,6 +493,8 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 在途回合处理器计数：terminate 需等它们收尾（在途 handler 的停机
         # 快照写必须完成后才能关连接池，否则该轮既没编码也没表行备份）
         self._retain_handler_active = 0
+        # 计数代数：装配期递增，旧代 handler 收尾时不再影响新代计数
+        self._retain_handler_generation = 0
         # 攒批空闲巡检协程句柄（initialize 创建 / terminate 取消）
         self._retain_sweep_task: Optional[asyncio.Task] = None
 
@@ -575,7 +577,9 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 门控挡死，等于静默「记忆下线」到下次停机。
         self._retain_stopping = False
         # 在途 handler 计数一并复位：terminate 等待超时后它可能残留非零
-        # （handler 真卡住时的极端情形），下次停机会白等满 5s
+        # （handler 真卡住时的极端情形），下次停机会白等满 5s。代数同时
+        # 递增——旧代 handler 收尾时不再把新代计数减成负数
+        self._retain_handler_generation += 1
         self._retain_handler_active = 0
         # 攒批间隔/空闲 flush 阈值不另存实例属性：宿主配置页保存时是就地改
         # 同一 LocalMemoryConfig 实例（setattr(self._config, ...)），攒批门控
@@ -1714,11 +1718,17 @@ class NoriflowMemoryPlugin(BasePlugin):
         # （直接 return 会让这一轮既不编码也不进表行）
         if not self._ready and not self._retain_stopping:
             return
+        generation = self._retain_handler_generation
         self._retain_handler_active += 1
         try:
             await self._on_session_memory_updated_impl(event)
         finally:
-            self._retain_handler_active -= 1
+            # 只有同代 handler 才递减：terminate 超时遗留的旧 handler 可能在
+            # 重新装配（计数被复位）之后才收尾，无条件减会把计数打成负数——
+            # 下一个 handler 只加到 0，下次 terminate 会误判「无在途 handler」
+            # 而在 handler 还活着时关连接池
+            if generation == self._retain_handler_generation:
+                self._retain_handler_active -= 1
 
     async def _on_session_memory_updated_impl(self, event) -> None:
         """Round-end signal -> take one unconsumed increment batch and encode it.
@@ -2440,8 +2450,14 @@ class NoriflowMemoryPlugin(BasePlugin):
             # 「SQL 已执行、尚未登记」的窗口里删除会拿到旧/None cutoff，
             # 刚写入的行删不掉（重启后被重放编码）
             registered = self._retain_row_ts.get(sid)
-            if registered is None or now > registered:
-                self._retain_row_ts[sid] = now
+            if registered is not None and now <= registered:
+                # 墙钟回拨（NTP 校正/手动改表）或两次保存撞在同一微秒：UPSERT
+                # 的时间戳守卫（excluded.updated_at > 表内 updated_at）会**静默
+                # 丢弃**本次写入 → 最新一批未编码内容失去重启备份（内存主真源
+                # 一崩就没了）。钳到 registered 之后，保证本次快照一定落库
+                # （cutoff 仍只前进不后退）。
+                now = registered + timedelta(microseconds=1)
+            self._retain_row_ts[sid] = now
             if getattr(self, "_backend_name", "postgres") == "sqlite":
                 await conn.execute(
                     "INSERT INTO memory_retain_pending(session_key,payload,updated_at) "
