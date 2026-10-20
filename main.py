@@ -759,7 +759,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 未满批的攒批：停机前强制编码（表行快照已落库，重启也能恢复；
         # 此处编码让数据在停机前落库，避免重启前存在未编码窗口）
         for sid in list(self._retain_pending):
-            self._flush_pending_batch(sid)
+            self._flush_pending_batch(sid, force=True)
         if self._retain_tasks:
             done, pending = await asyncio.wait(self._retain_tasks, timeout=10.0)
             if pending:
@@ -1702,11 +1702,22 @@ class NoriflowMemoryPlugin(BasePlugin):
             bot_lines=[v.line for _, v in delta if v.is_bot],
         )
         # P2: coalesce private-chat turns (and persist the frozen snapshot).
+        # 停机门控：terminate 期间不再写表/派任务——收口的 asyncio.wait 只
+        # 覆盖调用瞬间的任务集合，之后新建的任务不会被等待，而随后
+        # db.close() 会让它们跑在已关闭的连接池上（数据不落库 + 未捕获异常）
+        if self._retain_stopping:
+            return
         # 攒批门控（活读配置）：群聊 retain_interval_group、私聊
         # retain_interval_private；间隔 <=1 走原逐轮路径（群聊默认 1，
         # 行为与改动前零变化：不写 pending 表，编码失败回滚水位线）。
         interval = self._retain_interval_for(stype)
         if interval <= 1:
+            # 攒批残留（热切换把 interval 调小、或重启恢复的批次）先冲刷：
+            # 否则它不会被回合推进，只能等巡检超龄才落库（延迟上界约
+            # flush_idle_s + min(300s, flush_idle_s)），且同一段对话会同时
+            # 出现在新回合的 history 快照与后续批次内容里
+            if sid in self._retain_pending:
+                self._flush_pending_batch(sid)
             self._spawn_retain_task(sid, state, delta_keys=delta_keys, durable=False)
             return
 
@@ -1770,13 +1781,18 @@ class NoriflowMemoryPlugin(BasePlugin):
         task.add_done_callback(self._retain_tasks.discard)
         return task
 
-    def _flush_pending_batch(self, sid: str) -> None:
+    def _flush_pending_batch(self, sid: str, *, force: bool = False) -> None:
         """弹出攒批批次并调度合并编码（到点 / 巡检超龄 / 会话逐出共用入口）。
 
         弹出即从内存 pending 移除，后续同会话新轮次开新批次（与在途编码
         无共享可变状态）；在途批次登记进 _retain_inflight，表行快照会把
         在途批次一并写入（崩溃恢复不丢在途内容）。
+
+        force=True 仅供 terminate 自身的收口冲刷使用（此时停机标志已置位）；
+        停机期间巡检/回合侧的新冲刷一律跳过（收口只等已登记的任务）。
         """
+        if self._retain_stopping and not force:
+            return
         state = self._retain_pending.pop(sid, None)
         if state is None:
             return
@@ -2054,17 +2070,25 @@ class NoriflowMemoryPlugin(BasePlugin):
                 await conn.execute(
                     "INSERT INTO memory_retain_pending(session_key,payload,updated_at) "
                     "VALUES ($1,$2,$3) ON CONFLICT(session_key) DO UPDATE SET "
-                    "payload=excluded.payload, updated_at=excluded.updated_at",
+                    "payload=excluded.payload, updated_at=excluded.updated_at "
+                    # 时间戳守卫：同一 sid 的保存可能并发（回合保存 / 成功刷新 /
+                    # 失败回座），后算出的快照可能先执行——无守卫时更旧的
+                    # payload 会覆盖更新的行（重启备份丢最新内容 + cutoff 回退）
+                    "WHERE excluded.updated_at > memory_retain_pending.updated_at",
                     sid, payload, now.isoformat(timespec="microseconds"),
                 )
             else:
                 await conn.execute(
                     "INSERT INTO memory_retain_pending(session_key,payload,updated_at) "
                     "VALUES ($1,$2::jsonb,$3) ON CONFLICT(session_key) DO UPDATE SET "
-                    "payload=EXCLUDED.payload, updated_at=EXCLUDED.updated_at",
+                    "payload=EXCLUDED.payload, updated_at=EXCLUDED.updated_at "
+                    "WHERE EXCLUDED.updated_at > memory_retain_pending.updated_at",
                     sid, payload, now,
                 )
-        self._retain_row_ts[sid] = now
+        # 登记行时间戳只前进不后退（并发保存乱序时不得让 cutoff 回退）
+        registered = self._retain_row_ts.get(sid)
+        if registered is None or now > registered:
+            self._retain_row_ts[sid] = now
 
     async def _delete_retain_pending(self, sid: str, cutoff: Optional[datetime] = None) -> None:
         """删除攒批表行（条件删除：只删不晚于 cutoff 的行）。

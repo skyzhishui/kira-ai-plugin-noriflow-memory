@@ -715,5 +715,131 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         asyncio.run(scenario())
 
 
+    def test_n1_older_snapshot_does_not_overwrite_newer_row(self):
+        """N1：UPSERT 时间戳守卫——更旧的快照不得覆盖更新的行。"""
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="noriflow_batch_sqlite_") as tmp:
+            db_path = str(Path(tmp) / "memory.sqlite3")
+            config = mod.LocalMemoryConfig(
+                storage_backend="sqlite",
+                sqlite_path=db_path,
+                embedding_dims=4,
+                retain_interval_private=5,
+            )
+            db = mod.SQLiteMemoryDatabase(config)
+
+            async def scenario():
+                await db.connect()
+                await db.apply_migrations(
+                    Path(__file__).resolve().parent.parent / "migrations_sqlite"
+                )
+                inst = mod.NoriflowMemoryPlugin(FakeCtx(), {"dsn": DSN})
+                inst._db, inst._backend_name, inst._config = db, "sqlite", config
+                sid = "napcat:dm:10086"
+                inst._retain_pending[sid] = inst._retain_state_from_payload(
+                    {
+                        "session_id": "10086",
+                        "platform": "napcat",
+                        "group_id": "",
+                        "user_id": "u1",
+                        "timestamp": datetime.now().isoformat(),
+                        "participants": [["napcat", "u1"]],
+                        "history_lines": [],
+                        "batch_lines": ["新内容"],
+                        "bot_lines": [],
+                        "rounds": 2,
+                    }
+                )
+                await inst._save_retain_pending(sid)
+                async with db.pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT payload,updated_at FROM memory_retain_pending "
+                        "WHERE session_key=$1",
+                        sid,
+                    )
+                self.assertEqual(len(rows), 1)
+                newer_payload = rows[0]["payload"]
+                newer_ts = rows[0]["updated_at"]
+                # 模拟乱序：更旧的快照后到（时间戳更早）
+                older = (
+                    datetime.now(timezone.utc) - timedelta(minutes=5)
+                ).isoformat(timespec="microseconds")
+                async with db.pool.acquire() as conn:
+                    await conn.execute(
+                        "INSERT INTO memory_retain_pending(session_key,payload,updated_at) "
+                        "VALUES ($1,$2,$3) ON CONFLICT(session_key) DO UPDATE SET "
+                        "payload=excluded.payload, updated_at=excluded.updated_at "
+                        "WHERE excluded.updated_at > memory_retain_pending.updated_at",
+                        sid, json.dumps({"batch_lines": ["旧内容"]}), older,
+                    )
+                async with db.pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT payload,updated_at FROM memory_retain_pending "
+                        "WHERE session_key=$1",
+                        sid,
+                    )
+                self.assertEqual(rows[0]["payload"], newer_payload, "更旧快照不得覆盖")
+                self.assertEqual(rows[0]["updated_at"], newer_ts, "时间戳不得回退")
+                await db.close()
+
+            asyncio.run(scenario())
+
+    def test_n2_stopping_blocks_new_writes_and_tasks(self):
+        """N2：停机标志置位后不得再写 pending 表或派发新任务。"""
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+
+        async def scenario():
+            await _turn(inst, ctx, dm, "停机前一轮", mid="stop1")
+            await asyncio.gather(*inst._retain_tasks)
+            inst._retain_stopping = True
+            tasks_before = len(inst._retain_tasks)
+            await _turn(inst, ctx, dm, "停机后一轮", mid="stop2")
+            await asyncio.gather(*inst._retain_tasks)
+            return tasks_before, len(inst._retain_tasks)
+
+        before, after = asyncio.run(scenario())
+        self.assertEqual(after, before, "停机后不得派发新 retain 任务")
+        # 停机前的残留批次仍可在（合法状态），但停机后那一轮不得被并入
+        pending = inst._retain_pending.get(dm.sid)
+        if pending is not None:
+            self.assertNotIn(
+                "停机后一轮",
+                "\n".join(pending.batch_lines),
+                "停机后不得再攒批",
+            )
+            self.assertEqual(int(getattr(pending, "_retain_rounds", 0)), 1)
+        inserts = [
+            s for s in _pending_sqls(inst) if s.lstrip().startswith("INSERT")
+        ]
+        self.assertLessEqual(len(inserts), 1, "停机后不得再写 pending 表")
+
+    def test_n3_interval_switch_flushes_residual_batch(self):
+        """N3：interval 调小（热切换）时，残留批次应先冲刷再走逐轮路径。"""
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+        captured: list[str] = []
+
+        async def scenario():
+            _spy_encode(inst, captured)
+            for i in range(3):
+                await _turn(inst, ctx, dm, f"残留第{i + 1}句", mid=f"res{i + 1}")
+                await asyncio.gather(*inst._retain_tasks)
+            await asyncio.gather(*inst._retain_tasks)
+            self.assertEqual(captured, [], "3 轮未满批不应编码")
+            # 热切换：interval 5 -> 1（宿主配置页就地改同一 config 实例）
+            inst._config.retain_interval_private = 1
+            await _turn(inst, ctx, dm, "切换后一轮", mid="sw1")
+            await asyncio.gather(*inst._retain_tasks)
+            await asyncio.gather(*inst._retain_tasks)
+
+        asyncio.run(scenario())
+        self.assertEqual(len(captured), 2, "残留批次应被冲刷 + 逐轮编码一次")
+        self.assertIn("残留第1句", captured[0], "冲刷的应是残留批次")
+        self.assertIn("切换后一轮", captured[1], "逐轮路径编码本轮")
+        self.assertNotIn(dm.sid, inst._retain_pending, "冲刷后不得残留 pending")
+
+
 if __name__ == "__main__":
     unittest.main()
