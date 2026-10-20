@@ -405,6 +405,11 @@ class _RetainState:
     history_lines: list[str]
     batch_lines: list[str]
     bot_lines: list[str] = field(default_factory=list)
+    # 内容锚点：该批次链最早一轮的时间戳（合并时取 min）。与 timestamp
+    # （最新一轮）区分——失败回座会把较旧批次放进 pending 槽，批次之间的
+    # 真实先后必须按内容锚点判定，否则较新批次会被当作 old 合并：其历史
+    # 窗口（含旧批次行）与批次内容重复，且批次行时间序倒置。
+    _retain_first_ts: Optional[datetime] = None
 
 
 class NoriflowMemoryPlugin(BasePlugin):
@@ -1709,6 +1714,8 @@ class NoriflowMemoryPlugin(BasePlugin):
             batch_lines=[v.line for _, v in user_delta],
             bot_lines=[v.line for _, v in delta if v.is_bot],
         )
+        # 内容锚点：新批次链的最早一轮 = 本轮
+        state._retain_first_ts = state.timestamp
         # P2: coalesce private-chat turns (and persist the frozen snapshot).
         # 停机门控：terminate 期间不再写表/派任务——收口的 asyncio.wait 只
         # 覆盖调用瞬间的任务集合，之后新建的任务不会被等待，而随后
@@ -1733,6 +1740,12 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 取出即转移真源——水位线不回滚（回滚会让下一轮信号重取已入批的
         # 行造成双份）；未编码数据的保管责任移交攒批缓存/表行。
         pending = self._retain_pending.get(sid)
+        if pending is not None and getattr(pending, "_retain_failed", False):
+            # 失败回座的批次不与新轮次混批：单独冲刷（重试），新轮次另开
+            # 批次——混合链（失败批 + 新轮次）会与在途批次交错，表行快照
+            # 的合并顺序与历史窗口都会失真
+            self._flush_pending_batch(sid)
+            pending = None
         if pending is not None:
             state = self._merge_retain_states(pending, state)
         else:
@@ -1852,6 +1865,12 @@ class NoriflowMemoryPlugin(BasePlugin):
             states.append(current)
         if not states:
             return None
+        # 按内容锚点（批次链最早一轮的时间）排序再折叠：列表顺序不等于
+        # 时间序——失败回座会把较旧批次放进 pending 槽（pending 槽本是
+        # 「最新批次」的位置），不排序就会把较新批次当作 old：其历史窗口
+        # （已含旧批次的行）与批次内容重复，同一段对话既进历史又进内容，
+        # 且批次行时间序倒置。
+        states.sort(key=self._state_first_ts)
         merged = states[0]
         for nxt in states[1:]:
             merged = self._merge_retain_states(merged, nxt)
@@ -1997,16 +2016,25 @@ class NoriflowMemoryPlugin(BasePlugin):
         """失败回座：批次合并回内存 pending（同步，无 await 点）+ 重写表行。
 
         缓存 miss（无新代）：原批次放回（保留其 updated_at 供巡检按龄重试
-        语义由 _retain_pending_at 承担）；已有新代：失败批次前置合并（保持
-        时间序），轮数相加。
+        语义由 _retain_pending_at 承担）；已有新代：按**内容锚点**定先后
+        合并（失败批次通常更旧，但不绝对——不能在途批次可能更晚），轮数
+        相加。
+
+        回座批次打 _retain_failed 标记：它不得与后续新轮次混批（混合链会
+        与在途批次交错，表行快照的合并顺序与历史窗口都会失真）——下一轮
+        触发时单独冲刷重试。
         """
         current = self._retain_pending.get(sid)
         if current is None:
             self._retain_pending[sid] = state
         elif current is not state:
-            # 同一对象不得合并（否则轮数与批次行翻倍）；不同对象时失败批
-            # 前置合并（保持时间序）
-            self._retain_pending[sid] = self._merge_retain_states(state, current)
+            # 同一对象不得合并（否则轮数与批次行翻倍）；不同对象按内容
+            # 锚点定先后（较旧在前，其历史窗口作为合并后的历史窗口）
+            if self._state_first_ts(state) <= self._state_first_ts(current):
+                self._retain_pending[sid] = self._merge_retain_states(state, current)
+            else:
+                self._retain_pending[sid] = self._merge_retain_states(current, state)
+        state._retain_failed = True
         self._retain_pending_at[sid] = time.time()
         self._drop_inflight(sid, state)
         try:
@@ -2043,13 +2071,24 @@ class NoriflowMemoryPlugin(BasePlugin):
         state._retain_rounds = int(getattr(old, "_retain_rounds", 1)) + int(
             getattr(new, "_retain_rounds", 1)
         )
+        # 内容锚点取两批最早者（old 已是较早的一方）
+        state._retain_first_ts = NoriflowMemoryPlugin._state_first_ts(old)
         return state
+
+    @staticmethod
+    def _state_first_ts(state: _RetainState) -> datetime:
+        """批次的内容锚点（最早一轮的时间戳）；缺失时退回 timestamp。"""
+        value = getattr(state, "_retain_first_ts", None)
+        if isinstance(value, datetime):
+            return value
+        return state.timestamp
 
     def _retain_payload(self, state: _RetainState) -> dict[str, Any]:
         return {
             "session_id": state.session_id, "platform": state.platform,
             "group_id": state.group_id, "user_id": state.user_id,
             "timestamp": state.timestamp.isoformat(),
+            "first_ts": self._state_first_ts(state).isoformat(),
             "participants": state.participants,
             "history_lines": state.history_lines,
             "batch_lines": state.batch_lines, "bot_lines": state.bot_lines,
@@ -2070,6 +2109,15 @@ class NoriflowMemoryPlugin(BasePlugin):
             bot_lines=list(payload.get("bot_lines", [])),
         )
         state._retain_rounds = int(payload.get("rounds", 1) or 1)
+        # 内容锚点：恢复时保留批次链的最早时间（缺失则退回 timestamp）
+        first_raw = payload.get("first_ts")
+        if first_raw:
+            try:
+                state._retain_first_ts = datetime.fromisoformat(str(first_raw))
+            except ValueError:
+                state._retain_first_ts = state.timestamp
+        else:
+            state._retain_first_ts = state.timestamp
         return state
 
     async def _save_retain_pending(self, sid: str) -> None:

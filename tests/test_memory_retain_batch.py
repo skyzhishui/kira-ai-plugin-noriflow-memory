@@ -229,8 +229,10 @@ class TestRetainBatchPersistence(unittest.TestCase):
         )
         # 下一轮触发重试并成功
         state["fail"] = False
+        captured: list[str] = []
 
         async def retry():
+            _spy_encode(inst, captured)
             await _turn(inst, ctx, dm, "重试一轮", mid="retry1")
             await asyncio.gather(*inst._retain_tasks)
             await asyncio.gather(*inst._retain_tasks)
@@ -238,7 +240,18 @@ class TestRetainBatchPersistence(unittest.TestCase):
 
         summaries = asyncio.run(retry())
         self.assertEqual(len(summaries), 1, "回座批次应在下一触发点重试编码")
-        self.assertIsNone(inst._retain_pending.get(sid), "成功后清空内存 pending")
+        self.assertEqual(len(captured), 1, "失败批次应单独编码一次")
+        self.assertIn("第5句", captured[0], "重试编码的是失败批次内容")
+        self.assertNotIn(
+            "重试一轮",
+            captured[0],
+            "失败批次不得与新轮次混批（混合链会与在途批次交错）",
+        )
+        pending = inst._retain_pending.get(sid)
+        self.assertIsNotNone(pending, "新轮次另开批次")
+        self.assertEqual(
+            int(getattr(pending, "_retain_rounds", 0)), 1, "新轮次为独立批次"
+        )
 
     def test_batch_failure_does_not_roll_back_watermark(self):
         """攒批路径失败不回滚水位线（真源已移交攒批缓存/表行）。"""
@@ -986,6 +999,92 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertEqual(
             int(getattr(merged, "_retain_rounds", 0)), 3, "两批次轮数应相加"
         )
+
+
+    def test_s1_snapshot_merges_chronologically_after_older_reseat(self):
+        """S1：较旧批次失败回座后，表行快照按内容锚点顺序合并（历史窗口取最早批次）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        sid = "napcat:dm:10086"
+        base = datetime.now(timezone.utc)
+
+        def _mk(offset_min, history, batch, rounds):
+            stamp = (base + timedelta(minutes=offset_min)).isoformat()
+            return inst._retain_state_from_payload(
+                {
+                    "session_id": "10086",
+                    "platform": "napcat",
+                    "group_id": "",
+                    "user_id": "u1",
+                    "timestamp": stamp,
+                    "first_ts": stamp,
+                    "participants": [["napcat", "u1"]],
+                    "history_lines": history,
+                    "batch_lines": batch,
+                    "bot_lines": [],
+                    "rounds": rounds,
+                }
+            )
+
+        # 较旧批次 A（其历史窗口 = 前置上下文）与较新批次 C（历史窗口已含 A 的行）
+        older = _mk(0, ["前置上下文"], ["A1", "A2"], 2)
+        newer = _mk(10, ["前置上下文", "A1", "A2"], ["C1", "C2"], 2)
+
+        async def scenario():
+            # 在途：A（较旧）与 C（较新）同时在编码
+            inst._retain_inflight[sid] = [older, newer]
+            # A 失败回座：进 pending 槽（pending 槽本是「最新批次」位）
+            await inst._reseat_pending_batch(sid, older)
+            return inst._pending_snapshot_for_row(sid)
+
+        merged = asyncio.run(scenario())
+        self.assertEqual(
+            merged.batch_lines,
+            ["A1", "A2", "C1", "C2"],
+            "批次行须按内容锚点的时间序合并",
+        )
+        self.assertEqual(
+            merged.history_lines,
+            ["前置上下文"],
+            "历史窗口须取最早批次（否则与批次内容重复同一段对话）",
+        )
+
+    def test_s1_reseat_keeps_chronological_merge_order(self):
+        """S1：回座与已有 pending 合并时按内容锚点定先后（较旧在前）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        sid = "napcat:dm:10086"
+        base = datetime.now(timezone.utc)
+
+        def _mk(offset_min, history, batch):
+            stamp = (base + timedelta(minutes=offset_min)).isoformat()
+            return inst._retain_state_from_payload(
+                {
+                    "session_id": "10086",
+                    "platform": "napcat",
+                    "group_id": "",
+                    "user_id": "u1",
+                    "timestamp": stamp,
+                    "first_ts": stamp,
+                    "participants": [["napcat", "u1"]],
+                    "history_lines": history,
+                    "batch_lines": batch,
+                    "bot_lines": [],
+                    "rounds": 1,
+                }
+            )
+
+        # pending 槽里是较旧批次（同样来自失败回座），回座批次更新：
+        # 旧实现无条件把回座批次当作 old → 顺序倒置 + 历史窗口取错
+        older = _mk(0, ["前置上下文"], ["A1"])
+        newer = _mk(10, ["前置上下文", "A1"], ["C1"])
+
+        async def scenario():
+            inst._retain_pending[sid] = older
+            await inst._reseat_pending_batch(sid, newer)
+            return inst._retain_pending[sid]
+
+        merged = asyncio.run(scenario())
+        self.assertEqual(merged.batch_lines, ["A1", "C1"], "较旧批次须在前")
+        self.assertEqual(merged.history_lines, ["前置上下文"], "历史窗口取较旧批次")
 
 
 if __name__ == "__main__":
