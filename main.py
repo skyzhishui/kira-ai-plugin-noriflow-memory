@@ -1774,12 +1774,20 @@ class NoriflowMemoryPlugin(BasePlugin):
             # history 窗口（被编码两次）。合并后历史窗口取残留批次的历史
             # （攒批前快照），内容按时间序拼接。
             residual = self._retain_pending.pop(sid, None)
+            self._retain_pending_at.pop(sid, None)
             durable = False
             if residual is not None:
                 state = self._merge_retain_states(residual, state)
                 # 残留内容并入本轮后，失败时按攒批语义回座（内容不丢）；
                 # 无残留时保持逐轮路径的既有契约（失败回滚水位线）
                 durable = True
+                # 合并后的批次已离开 pending 槽（表行仍只有残留批次），
+                # 本轮内容只活在任务闭包里：编码是长耗时 LLM 调用，期间
+                # 崩溃或 terminate 超时取消（CancelledError 不走失败回座）
+                # → 本轮内容既不在内存也不在表行，重启后永久丢失。故先
+                # 登记在途 + 落表行（与攒批主路径一致），再调度编码。
+                self._retain_inflight.setdefault(sid, []).append(state)
+                self._spawn_pending_save(sid)
             self._spawn_retain_task(sid, state, delta_keys=delta_keys, durable=durable)
             return
 
@@ -2166,9 +2174,12 @@ class NoriflowMemoryPlugin(BasePlugin):
             user_id=str(payload.get("user_id", "")),
             timestamp=datetime.fromisoformat(str(payload["timestamp"])),
             participants=[tuple(item) for item in payload.get("participants", [])],
-            history_lines=list(payload.get("history_lines", [])),
-            batch_lines=list(payload.get("batch_lines", [])),
-            bot_lines=list(payload.get("bot_lines", [])),
+            # 行内容统一转 str：脏行含非字符串时，"\n".join 会在编码 try 之外
+            # 抛 TypeError——durable 批次的在途登记永远摘不掉（表行删不掉、
+            # 重启重复编码）。一行脏数据不该毒死整条链路。
+            history_lines=[str(line) for line in payload.get("history_lines", [])],
+            batch_lines=[str(line) for line in payload.get("batch_lines", [])],
+            bot_lines=[str(line) for line in payload.get("bot_lines", [])],
         )
         state._retain_rounds = int(payload.get("rounds", 1) or 1)
         # 内容锚点：恢复时保留批次链的最早时间（缺失则退回 timestamp）
@@ -2347,8 +2358,13 @@ class NoriflowMemoryPlugin(BasePlugin):
                     # 新=内存批次，轮数相加，两边内容都不丢
                     self._retain_pending[sid] = self._merge_retain_states(state, existing)
                 # 保留表行的真实龄期（不重置超时钟）：重启后仍按原时间戳
-                # 参与巡检超龄判定
-                self._retain_pending_at[sid] = now - self._row_age_seconds(row)
+                # 参与巡检超龄判定；但内存已有更晚批次时取较晚者——否则旧行
+                # 的龄期会让合并后的新批次被巡检提前冲刷（违背「续攒」语义）
+                restored_at = now - self._row_age_seconds(row)
+                existing_at = self._retain_pending_at.get(sid)
+                self._retain_pending_at[sid] = (
+                    restored_at if existing_at is None else max(existing_at, restored_at)
+                )
                 # 登记行时间戳（条件删除的 cutoff 依据）
                 row_ts = self._row_timestamp(row)
                 if row_ts is not None:

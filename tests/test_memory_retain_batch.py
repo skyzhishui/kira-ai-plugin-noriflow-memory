@@ -1520,5 +1520,131 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertIn("retain_encoded = failing_encode", src)
 
 
+    def test_x3_merged_residual_batch_is_backed_up_to_table(self):
+        """X3：interval<=1 的残留合并路径必须先落表行（编码期间崩溃不丢本轮内容）。"""
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+
+        async def scenario():
+            for i in range(3):
+                await _turn(inst, ctx, dm, f"残留第{i + 1}句", mid=f"x3r{i + 1}")
+                await asyncio.gather(*inst._retain_tasks)
+            await asyncio.gather(*inst._retain_tasks)
+            inst._config.retain_interval_private = 1
+            await _turn(inst, ctx, dm, "本轮内容", mid="x3now")
+            await asyncio.gather(*inst._retain_tasks)
+            await asyncio.gather(*inst._retain_tasks)
+
+        asyncio.run(scenario())
+        payloads = [
+            args[1]
+            for kind, sql, args in inst._db.pool.conn.sqls
+            if kind == "execute"
+            and "memory_retain_pending" in sql
+            and sql.lstrip().upper().startswith("INSERT")
+            and len(args) > 1
+        ]
+        self.assertTrue(payloads, "合并路径必须落表行（崩溃恢复备份）")
+        self.assertIn(
+            "本轮内容",
+            payloads[-1],
+            "表行快照必须含本轮内容（编码期间崩溃才不丢）",
+        )
+
+    def test_aa1_dirty_row_elements_are_coerced_to_str(self):
+        """AA1：脏表行的非字符串元素不得毒死链路（join 会抛 TypeError）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        state = inst._retain_state_from_payload(
+            {
+                "session_id": "10086",
+                "platform": "napcat",
+                "group_id": "",
+                "user_id": "u1",
+                "timestamp": datetime.now().isoformat(),
+                "participants": [["napcat", "u1"]],
+                "history_lines": [123, None],
+                "batch_lines": [456],
+                "bot_lines": [None],
+                "rounds": 1,
+            }
+        )
+        self.assertTrue(all(isinstance(x, str) for x in state.history_lines))
+        self.assertTrue(all(isinstance(x, str) for x in state.batch_lines))
+        self.assertTrue(all(isinstance(x, str) for x in state.bot_lines))
+        # join 不应抛
+        self.assertIsInstance("\n".join(state.history_lines), str)
+
+    def test_aa2_restore_keeps_newer_pending_age(self):
+        """AA2：回灌不得用旧行龄期覆盖内存里更新的批次龄期（会被巡检提前冲刷）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        sid = "napcat:dm:10086"
+        old_ts = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(
+            timespec="microseconds"
+        )
+        payload = {
+            "session_id": "10086",
+            "platform": "napcat",
+            "group_id": "",
+            "user_id": "u1",
+            "timestamp": datetime.now().isoformat(),
+            "participants": [["napcat", "u1"]],
+            "history_lines": [],
+            "batch_lines": ["旧行内容"],
+            "bot_lines": [],
+            "rounds": 1,
+        }
+
+        class _StubConn:
+            async def fetch(self, sql, *args):
+                return [
+                    {"session_key": sid, "payload": json.dumps(payload), "updated_at": old_ts}
+                ]
+
+        class _StubAcquire:
+            async def __aenter__(self):
+                return _StubConn()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class _StubPool:
+            def acquire(self):
+                return _StubAcquire()
+
+        async def scenario():
+            inst._db = types.SimpleNamespace(pool=_StubPool())
+            fresh_at = time.time()
+            inst._retain_pending_at[sid] = fresh_at
+            await inst._restore_retain_pending()
+            return fresh_at, inst._retain_pending_at.get(sid)
+
+        fresh_at, after = asyncio.run(scenario())
+        self.assertIsNotNone(after)
+        self.assertGreaterEqual(
+            after, fresh_at, "回灌不得把更新的批次龄期改旧（会被巡检提前冲刷）"
+        )
+
+    def test_aa3_residual_pop_clears_pending_age(self):
+        """AA3：残留批次出 pending 槽时同步清掉龄期条目（不留悬空键）。"""
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+
+        async def scenario():
+            for i in range(3):
+                await _turn(inst, ctx, dm, f"残留第{i + 1}句", mid=f"aa3{i + 1}")
+                await asyncio.gather(*inst._retain_tasks)
+            await asyncio.gather(*inst._retain_tasks)
+            self.assertIn(dm.sid, inst._retain_pending_at)
+            inst._config.retain_interval_private = 1
+            await _turn(inst, ctx, dm, "本轮内容", mid="aa3now")
+            await asyncio.gather(*inst._retain_tasks)
+            await asyncio.gather(*inst._retain_tasks)
+
+        asyncio.run(scenario())
+        self.assertNotIn(
+            dm.sid, inst._retain_pending_at, "残留出槽后不得留悬空的龄期键"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
