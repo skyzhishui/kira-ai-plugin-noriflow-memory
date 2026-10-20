@@ -2257,5 +2257,28 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
 
+    def test_ii1_overflow_config_values_do_not_break_assembly(self):
+        """II1：OverflowError 脏值不得让装配失败（float(10**400)/int(inf)）。"""
+        cfg = mod._build_config(
+            {
+                "dsn": DSN,
+                "flush_idle_s": 10 ** 400,
+                "backfill_interval_seconds": float("inf"),
+                "pool_max": float("inf"),
+            }
+        )
+        self.assertEqual(cfg.flush_idle_s, 1800.0)
+        self.assertEqual(cfg.backfill_interval_seconds, 300.0)
+        self.assertEqual(cfg.pool_max, 8)
+
+    def test_ii2_overflow_flush_idle_does_not_kill_sweep(self):
+        """II2：运行期脏阈值不得让巡检协程死掉（_retain_flush_idle_s 不抛）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        inst._config.flush_idle_s = 10 ** 400
+        self.assertEqual(inst._retain_flush_idle_s(), 1800.0)
+        inst._config.flush_idle_s = float("inf")
+        self.assertEqual(inst._retain_flush_idle_s(), 1800.0)
+
+
 if __name__ == "__main__":
     unittest.main()

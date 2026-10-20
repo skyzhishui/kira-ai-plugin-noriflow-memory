@@ -199,7 +199,9 @@ def _cfg_int(raw: dict, key: str, default: int) -> int:
     try:
         value = raw.get(key)
         return default if value in (None, "") else int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError：int(float('inf')) 一类脏值——不接住会冒泡到
+        # _build_config 让整个插件装配失败（与「越界值钳到合法区间」相悖）
         logger.warning("配置项 %s 非法（期望整数），使用默认 %s", key, default)
         return default
 
@@ -210,7 +212,8 @@ def _cfg_float(raw: dict, key: str, default: float) -> float:
         if value in (None, ""):
             return default
         value = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError：float(10**400) 一类脏值——不接住同样会让装配失败
         logger.warning("配置项 %s 非法（期望数值），使用默认 %s", key, default)
         return default
     if not math.isfinite(value):
@@ -1890,7 +1893,10 @@ class NoriflowMemoryPlugin(BasePlugin):
             # 与装配期钳制保持同一口径：0（或负数）→ 1.0，而不是 `or 1800.0`
             # 悄悄变成 1800（同一配置两条路径两种语义，末批滞留半小时）
             value = float(getattr(self._config, "flush_idle_s", 1800.0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError：热切换塞进来 10**400 一类脏值时 float() 会抛，
+            # 而本方法在巡检循环里于 try 之外调用——不接住会让巡检协程直接
+            # 死掉（不再自愈）
             return 1800.0
         if math.isnan(value) or math.isinf(value):
             # NaN/±inf（宿主 setattr 热切换可绕过 Pydantic 校验）：NaN 会让
