@@ -2079,5 +2079,72 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertTrue(deletes, "写后复查发现无未编码数据时须删掉残留行")
 
 
+    def test_ff1_stopping_turn_is_not_dropped_by_ready_gate(self):
+        """FF1：停机期间到达的回合必须走到 stopping 分支（不得被 _ready 门控吞掉）。"""
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+
+        async def scenario():
+            await inst.observe_message(
+                types.SimpleNamespace(
+                    message=make_msg("u1", "停机窗口的一轮", mid="ff1m"), session=dm
+                )
+            )
+            # 模拟 terminate 已置停机标志、_ready 已置 False
+            inst._retain_stopping = True
+            inst._ready = False
+            await ctx.event_bus.fire("session_memory_updated", {"session": dm.sid})
+            await asyncio.gather(*inst._retain_tasks)
+
+        asyncio.run(scenario())
+        pending = inst._retain_pending.get(dm.sid)
+        self.assertIsNotNone(pending, "停机窗口的回合不得被门控吞掉")
+        self.assertIn(
+            "停机窗口的一轮",
+            "\n".join(pending.batch_lines),
+            "停机窗口那一轮的内容必须保留",
+        )
+
+    def test_ff2_failed_flag_survives_restart(self):
+        """FF2：失败标记须随 payload 落盘并在恢复后读回（不与新轮次混批）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        state = inst._retain_state_from_payload(
+            {
+                "session_id": "10086",
+                "platform": "napcat",
+                "group_id": "",
+                "user_id": "u1",
+                "timestamp": datetime.now().isoformat(),
+                "participants": [["napcat", "u1"]],
+                "history_lines": [],
+                "batch_lines": ["行"],
+                "bot_lines": [],
+                "rounds": 2,
+                "failed": True,
+            }
+        )
+        self.assertTrue(
+            getattr(state, "_retain_failed", False), "恢复后须读回失败标记"
+        )
+        payload = inst._retain_payload(state)
+        self.assertTrue(payload.get("failed"), "payload 须带失败标记")
+        # 未标脏的批次不带该标记
+        plain = inst._retain_state_from_payload(
+            {
+                "session_id": "10086",
+                "platform": "napcat",
+                "group_id": "",
+                "user_id": "u1",
+                "timestamp": datetime.now().isoformat(),
+                "participants": [["napcat", "u1"]],
+                "history_lines": [],
+                "batch_lines": ["行"],
+                "bot_lines": [],
+                "rounds": 1,
+            }
+        )
+        self.assertFalse(inst._retain_payload(plain).get("failed"))
+
+
 if __name__ == "__main__":
     unittest.main()

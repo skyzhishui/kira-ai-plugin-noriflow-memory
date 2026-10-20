@@ -770,8 +770,11 @@ class NoriflowMemoryPlugin(BasePlugin):
 
     async def terminate(self) -> None:
         """Cleanup: unsubscribe turn signal -> flush in-flight retain -> stop background tasks -> close pools."""
-        self._ready = False
+        # 停机标志先置、_ready 后置：顺序反了的话（_ready 先 False）此后到达的
+        # 回合会被门控直接挡掉，停机分支（保留本轮内容）根本进不去——那轮
+        # 消息既不编码也不进表行（水位线未推进，但滚动缓存随进程退出丢失）
         self._retain_stopping = True
+        self._ready = False
         if self._mem_handler is not None:
             bus = getattr(self.ctx, "event_bus", None)
             if bus is not None:
@@ -1682,7 +1685,9 @@ class NoriflowMemoryPlugin(BasePlugin):
         若不等它就关连接池，它后续的停机快照写会跑在已关闭的池上（数据不
         落库）——这一轮既没编码也没表行备份，重启无法恢复。
         """
-        if not self._ready:
+        # 停机期间仍放行：让回合走到 _retain_stopping 分支保留本轮内容
+        # （直接 return 会让这一轮既不编码也不进表行）
+        if not self._ready and not self._retain_stopping:
             return
         self._retain_handler_active += 1
         try:
@@ -1708,7 +1713,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         first await (the alias upsert performs real DB I/O and can suspend
         for up to db_command_timeout) — see the inline comment.
         """
-        if not self._ready:
+        if not self._ready and not self._retain_stopping:
             return
         payload = getattr(event, "payload", None) or {}
         if not isinstance(payload, dict):
@@ -2236,6 +2241,9 @@ class NoriflowMemoryPlugin(BasePlugin):
             "history_lines": state.history_lines,
             "batch_lines": state.batch_lines, "bot_lines": state.bot_lines,
             "rounds": int(getattr(state, "_retain_rounds", 1)),
+            # 失败标记也落盘：重启恢复后仍能识别「这是回座待重试的批次」，
+            # 不会当成普通 pending 与新轮次混批
+            "failed": bool(getattr(state, "_retain_failed", False)),
         }
 
     @staticmethod
@@ -2323,6 +2331,8 @@ class NoriflowMemoryPlugin(BasePlugin):
             state._retain_rounds = max(int(payload.get("rounds", 1) or 1), 1)
         except (TypeError, ValueError):
             state._retain_rounds = 1
+        # 失败标记（回座待重试）：恢复后仍按「不与新轮次混批」处理
+        state._retain_failed = bool(payload.get("failed", False))
         # 内容锚点：恢复时保留批次链的最早时间（缺失则退回 timestamp）
         first_raw = payload.get("first_ts")
         if first_raw:
