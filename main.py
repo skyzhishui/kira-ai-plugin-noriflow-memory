@@ -1784,8 +1784,11 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 跳过（别名层可有缺口，回落原始文本即可）。
         try:
             await asyncio.wait_for(self._alias_upsert_batch(user_delta), timeout=2.0)
-        except (asyncio.TimeoutError, Exception):
-            logger.warning("别名层 upsert 未完成（旁路写入，跳过）", exc_info=True)
+        except asyncio.TimeoutError:
+            # 超时是预期路径：不带堆栈，避免真异常被噪音淹没
+            logger.warning("别名层 upsert 超时（旁路写入，跳过）")
+        except Exception:
+            logger.warning("别名层 upsert 失败（旁路写入，跳过）", exc_info=True)
 
         state = _RetainState(
             session_id=bare,
@@ -2604,7 +2607,13 @@ class NoriflowMemoryPlugin(BasePlugin):
                     logger.warning("retain pending 快照行损坏（跳过该行）", exc_info=True)
                     continue
             if rows:
-                logger.info("恢复 %d 个 retain pending 快照", len(rows))
+                # 口径修正：len(rows) 是**读到的表行数**（含坏行与幂等跳过的
+                # 行），不等于实际回灌的会话数——两个数一起打，排查不跑偏
+                logger.info(
+                    "读取 %d 个 retain pending 快照行（内存 pending 现有 %d 个会话）",
+                    len(rows),
+                    len(self._retain_pending),
+                )
             self._retain_restore_failed = False
         except Exception:
             # 标记待补恢复：表里的崩溃备份行还没回灌内存——后续保存前

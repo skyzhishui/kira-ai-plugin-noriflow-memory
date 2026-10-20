@@ -2368,5 +2368,31 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
 
+    def test_ll1_alias_upsert_handlers_are_split(self):
+        """LL1：别名 upsert 的超时（预期路径）不带堆栈，真异常才带。"""
+        import inspect
+
+        src = inspect.getsource(mod.NoriflowMemoryPlugin._on_session_memory_updated_impl)
+        self.assertNotIn(
+            "except (asyncio.TimeoutError, Exception)",
+            src,
+            "TimeoutError 是 Exception 子类，元组写法纯属叠甲",
+        )
+        self.assertIn("except asyncio.TimeoutError:", src, "超时须单独捕获")
+        # 超时分支不得带 exc_info（预期路径刷堆栈会淹没真异常）
+        timeout_branch = src.split("except asyncio.TimeoutError:")[1].split("except")[0]
+        self.assertNotIn("exc_info", timeout_branch, "超时分支不应打印堆栈")
+
+    def test_ll2_restore_log_reports_both_counts(self):
+        """LL2：恢复日志须区分「读到的表行数」与「内存 pending 会话数」。"""
+        import inspect
+
+        src = inspect.getsource(mod.NoriflowMemoryPlugin._restore_retain_pending)
+        self.assertIn("len(self._retain_pending)", src, "日志须带内存 pending 会话数")
+        self.assertNotIn(
+            '"恢复 %d 个 retain pending 快照"', src, "旧口径（行数当会话数）已误导"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
