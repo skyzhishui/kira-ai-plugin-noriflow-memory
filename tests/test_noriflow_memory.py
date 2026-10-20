@@ -380,8 +380,13 @@ def _ready_plugin(mod, cfg=None, ctx=None):
             if inst._merge_agent is not None:
                 await inst._merge_agent.stop()
             if inst._retain_sweep_task is not None:
-                inst._retain_sweep_task.cancel()
+                # 取消后必须 await 掉：cancel() 只是把取消回调排进 ready
+                # 队列，不 await 的话协程在 loop 关闭时仍是 pending →
+                # "Task was destroyed but it is pending!" 警告
+                sweep = inst._retain_sweep_task
                 inst._retain_sweep_task = None
+                sweep.cancel()
+                await asyncio.gather(sweep, return_exceptions=True)
 
         loop.run_until_complete(_stop_bg())
     finally:

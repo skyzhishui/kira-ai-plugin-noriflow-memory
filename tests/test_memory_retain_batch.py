@@ -641,5 +641,79 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
             asyncio.run(scenario())
 
 
+    def test_r1_delete_failure_does_not_escape_task(self):
+        """R1：成功路径删行失败不得让编码任务带异常结束（DB 抖动兜底）。"""
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+        original_delete = inst._delete_retain_pending
+
+        async def boom(sid, cutoff=None):
+            raise RuntimeError("删行失败（测试注入）")
+
+        inst._delete_retain_pending = boom
+
+        async def scenario():
+            for i in range(5):
+                await _turn(inst, ctx, dm, f"第{i + 1}句", mid=f"r{i + 1}")
+                await asyncio.gather(*inst._retain_tasks)
+            await asyncio.gather(*inst._retain_tasks)
+            return [t for t in inst._retain_tasks]
+
+        asyncio.run(scenario())
+        # 编码本身成功（表行仍在，属预期：删不掉留给下次刷新/重启覆盖）
+        self.assertEqual(len(inst._db.inserted_summaries), 1, "编码仍应成功")
+        inst._delete_retain_pending = original_delete
+
+    def test_i3_cutoff_kept_when_conditional_delete_misses(self):
+        """I3：条件删除未命中（更新行仍在）时不得丢弃 cutoff。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        sid = "napcat:dm:10086"
+
+        async def scenario():
+            inst._retain_pending[sid] = inst._retain_state_from_payload(
+                {
+                    "session_id": "10086",
+                    "platform": "napcat",
+                    "group_id": "",
+                    "user_id": "u1",
+                    "timestamp": datetime.now().isoformat(),
+                    "participants": [["napcat", "u1"]],
+                    "history_lines": [],
+                    "batch_lines": ["批次行"],
+                    "bot_lines": [],
+                    "rounds": 1,
+                }
+            )
+            await inst._save_retain_pending(sid)
+            old_cutoff = inst._retain_row_ts.get(sid)
+            # 更晚写入的行（并发新回合）
+            inst._retain_pending[sid] = inst._retain_state_from_payload(
+                {
+                    "session_id": "10086",
+                    "platform": "napcat",
+                    "group_id": "",
+                    "user_id": "u1",
+                    "timestamp": datetime.now().isoformat(),
+                    "participants": [["napcat", "u1"]],
+                    "history_lines": [],
+                    "batch_lines": ["新批次行"],
+                    "bot_lines": [],
+                    "rounds": 1,
+                }
+            )
+            await inst._save_retain_pending(sid)
+            new_cutoff = inst._retain_row_ts.get(sid)
+            self.assertGreater(new_cutoff, old_cutoff)
+            # 以旧 cutoff 删：未命中更新行 → cutoff 必须保留
+            await inst._delete_retain_pending(sid, old_cutoff)
+            self.assertEqual(
+                inst._retain_row_ts.get(sid),
+                new_cutoff,
+                "条件删除未命中时不得丢弃 cutoff（否则下次删除退回 now，抹掉新批次备份）",
+            )
+
+        asyncio.run(scenario())
+
+
 if __name__ == "__main__":
     unittest.main()

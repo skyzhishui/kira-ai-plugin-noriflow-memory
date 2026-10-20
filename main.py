@@ -534,12 +534,10 @@ class NoriflowMemoryPlugin(BasePlugin):
         self, db: MemoryDatabase, config: LocalMemoryConfig
     ) -> None:
         """Assemble services and background tasks (second half of initialize; exceptions are cleaned up uniformly by the caller)."""
-        # Retain cadence/idle flush values are kept on the shared runtime config
-        # so the host maintenance/config path can update them without changing
-        # the retain implementation in this P1 wiring pass.
-        self._retain_interval_group = config.retain_interval_group
-        self._retain_interval_private = config.retain_interval_private
-        self._flush_idle_s = config.flush_idle_s
+        # 攒批间隔/空闲 flush 阈值不另存实例属性：宿主配置页保存时是就地改
+        # 同一 LocalMemoryConfig 实例（setattr(self._config, ...)），攒批门控
+        # 与巡检阈值一律活读 self._config —— 存一份启动期快照既是死代码，
+        # 又会让人误以为改它能热生效（实则读不到）。
         # bot 身份：persona 名（先取，供 kernel/合并 agent 构造使用；
         # 消息 self_id 随首条消息回填）
         try:
@@ -1941,8 +1939,14 @@ class NoriflowMemoryPlugin(BasePlugin):
         remaining = self._pending_snapshot_for_row(sid)
         if remaining is None:
             # 条件删除（cutoff = 本批快照行写入时间戳）：判定与删除之间的
-            # await 窗口内并发新回合写入的更新行不受影响，不会被误删
-            await self._delete_retain_pending(sid, self._retain_row_ts.get(sid))
+            # await 窗口内并发新回合写入的更新行不受影响，不会被误删。
+            # 删除走 DB I/O，异常不外抛：外抛会让编码任务以未捕获异常结束
+            #（"Task exception was never retrieved"），且残留行会在重启后
+            # 被重放编码。删不掉就留给下次刷新/重启覆盖。
+            try:
+                await self._delete_retain_pending(sid, self._retain_row_ts.get(sid))
+            except Exception:
+                logger.warning("retain pending 快照删除失败（重启恢复时重放）", exc_info=True)
         else:
             try:
                 await self._save_retain_pending(sid)
@@ -2087,7 +2091,12 @@ class NoriflowMemoryPlugin(BasePlugin):
                     "WHERE session_key=$1 AND updated_at <= $2",
                     sid, limit,
                 )
-        self._retain_row_ts.pop(sid, None)
+        # 只在「本次删除确实覆盖到已登记的那一行」时清 cutoff：条件删除
+        # 未命中（表里是更晚写入的并发行）时保留它——否则下次删除会退回
+        # cutoff=now，把新批次的重启备份一并抹掉（条件删除本要防的竞态）
+        registered = self._retain_row_ts.get(sid)
+        if cutoff is not None and (registered is None or registered <= limit):
+            self._retain_row_ts.pop(sid, None)
 
     async def _restore_retain_pending(self) -> None:
         """读表回灌内存 pending（重启恢复，轮数延续）。
