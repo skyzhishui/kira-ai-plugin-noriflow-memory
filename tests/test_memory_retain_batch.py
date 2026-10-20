@@ -874,16 +874,17 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                     message=make_msg("u1", "慢 DB 的一轮", mid="slow1"), session=dm
                 )
             )
-            started = time.perf_counter()
             await ctx.event_bus.fire("session_memory_updated", {"session": dm.sid})
-            elapsed = time.perf_counter() - started
+            # 确定性判据：信号返回时写入门仍未放行 → 信号没有等快照写入
+            # （不靠墙钟阈值：CI 负载下会抖）
+            blocked = not slow["release"].is_set()
             slow["release"].set()
             await asyncio.gather(*inst._retain_tasks)
-            return elapsed
+            return blocked
 
-        elapsed = asyncio.run(scenario())
-        self.assertLess(
-            elapsed, 0.2, "回合完成信号不应等待快照写入（快照走后台任务）"
+        blocked = asyncio.run(scenario())
+        self.assertTrue(
+            blocked, "回合完成信号不得等待快照写入（快照应走后台任务）"
         )
 
     def test_p2_delete_without_cutoff_keeps_row(self):
@@ -1169,6 +1170,112 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
         sig = inspect.signature(mod.NoriflowMemoryPlugin._do_retain)
         self.assertIs(sig.parameters["durable"].default, False)
+
+
+    def test_w1_restore_failure_triggers_retry_before_save(self):
+        """W1：恢复失败后必须在保存前补恢复，否则新快照 UPSERT 覆盖旧行（永久丢失）。"""
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+        sid = dm.sid
+        calls = {"n": 0}
+
+        def _restored_state():
+            return inst._retain_state_from_payload(
+                {
+                    "session_id": "10086",
+                    "platform": "napcat",
+                    "group_id": "",
+                    "user_id": "u1",
+                    "timestamp": datetime.now().isoformat(),
+                    "participants": [["napcat", "u1"]],
+                    "history_lines": [],
+                    "batch_lines": ["崩溃备份内容"],
+                    "bot_lines": [],
+                    "rounds": 3,
+                }
+            )
+
+        async def scenario():
+            # 首次（初始化期）恢复失败 → 标记待补恢复
+            inst._retain_restore_failed = True
+            restored = _restored_state()
+
+            async def fake_restore():
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise RuntimeError("恢复失败（测试注入）")
+                inst._retain_pending[sid] = restored
+                inst._retain_restore_failed = False
+
+            inst._restore_retain_pending = fake_restore
+            # 第一次保存：补恢复仍失败 → 跳过写表（不覆盖未回灌的旧行）
+            await inst._save_retain_pending(sid)
+            first_inserts = len(
+                [s for s in _pending_sqls(inst) if s.lstrip().startswith("INSERT")]
+            )
+            # 第二次保存（DB 恢复后）：补恢复成功 → 合并落表
+            await inst._save_retain_pending(sid)
+            return calls["n"], first_inserts
+
+        calls_n, first_inserts = asyncio.run(scenario())
+        self.assertGreaterEqual(calls_n, 2, "保存前必须补恢复")
+        self.assertEqual(first_inserts, 0, "补恢复仍失败时不得写表行")
+        # 补回来的崩溃备份内容必须进了表行（不被新快照覆盖丢失）
+        payloads = [
+            args[1]
+            for kind, sql, args in inst._db.pool.conn.sqls
+            if kind == "execute" and "memory_retain_pending" in sql and len(args) > 1
+        ]
+        self.assertTrue(payloads, "应写入 pending 表行")
+        self.assertIn(
+            "崩溃备份内容",
+            payloads[-1],
+            "补恢复后的崩溃备份内容必须随快照落表（不得被覆盖丢失）",
+        )
+
+    def test_w1_save_skipped_while_restore_still_failing(self):
+        """W1：补恢复仍失败时不得写表行（否则覆盖未回灌的崩溃备份行→旧内容永久丢失）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        sid = "napcat:dm:10086"
+
+        async def scenario():
+            inst._retain_pending[sid] = inst._retain_state_from_payload(
+                {
+                    "session_id": "10086",
+                    "platform": "napcat",
+                    "group_id": "",
+                    "user_id": "u1",
+                    "timestamp": datetime.now().isoformat(),
+                    "participants": [["napcat", "u1"]],
+                    "history_lines": [],
+                    "batch_lines": ["新批次内容"],
+                    "bot_lines": [],
+                    "rounds": 1,
+                }
+            )
+
+            async def always_failing():
+                raise RuntimeError("恢复持续失败（测试注入）")
+
+            inst._restore_retain_pending = always_failing
+            inst._retain_restore_failed = True
+            await inst._save_retain_pending(sid)
+
+        asyncio.run(scenario())
+        inserts = [
+            s for s in _pending_sqls(inst) if s.lstrip().startswith("INSERT")
+        ]
+        self.assertEqual(inserts, [], "补恢复失败时不得写表行（会覆盖未回灌的旧行）")
+        self.assertTrue(
+            inst._retain_restore_failed, "恢复仍失败时标记须保持（下次保存继续补恢复）"
+        )
+
+    def test_v1_initialize_resets_stopping_flag(self):
+        """V1：装配期无条件复位停机标志（terminate 中途异常不得让标志粘住）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        inst._retain_stopping = True
+        asyncio.run(inst._initialize_services(inst._db, inst._config))
+        self.assertFalse(inst._retain_stopping, "装配期必须复位停机标志")
 
 
 if __name__ == "__main__":

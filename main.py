@@ -468,6 +468,9 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 表行写入时间戳（sid -> datetime）：条件删除的 cutoff 依据
         self._retain_row_ts: dict[str, datetime] = {}
         self._retain_stopping = False
+        # 快照恢复是否失败过（初始化时 DB 抖动 → 表里的崩溃备份行没回灌）：
+        # 后续保存前必须补恢复，否则新快照 UPSERT 会覆盖旧行（永久丢失）
+        self._retain_restore_failed = False
         # 攒批空闲巡检协程句柄（initialize 创建 / terminate 取消）
         self._retain_sweep_task: Optional[asyncio.Task] = None
 
@@ -544,6 +547,11 @@ class NoriflowMemoryPlugin(BasePlugin):
         self, db: MemoryDatabase, config: LocalMemoryConfig
     ) -> None:
         """Assemble services and background tasks (second half of initialize; exceptions are cleaned up uniformly by the caller)."""
+        # 停机标志在装配期无条件复位：terminate 只在末尾复位，中途抛异常
+        # （create_task 失败 / 未预期的 bus 错误）时标志会永久粘住——之后
+        # 所有回合只写 pending 不编码，巡检也被 _flush_pending_batch 的
+        # 门控挡死，等于静默「记忆下线」到下次停机。
+        self._retain_stopping = False
         # 攒批间隔/空闲 flush 阈值不另存实例属性：宿主配置页保存时是就地改
         # 同一 LocalMemoryConfig 实例（setattr(self._config, ...)），攒批门控
         # 与巡检阈值一律活读 self._config —— 存一份启动期快照既是死代码，
@@ -1909,6 +1917,9 @@ class NoriflowMemoryPlugin(BasePlugin):
         """
         idle_s = self._retain_flush_idle_s()
         now = time.time()
+        # 补恢复：恢复曾失败时表里还有未回灌的崩溃备份行——先回灌，
+        # 本轮巡检才能把它们按龄冲刷落库（否则一直躺在表里直到下次重启）
+        await self._ensure_retain_restored()
         for sid, state in list(self._retain_pending.items()):
             updated_at = self._retain_pending_at.get(sid, now)
             if now - updated_at <= idle_s:
@@ -2039,10 +2050,14 @@ class NoriflowMemoryPlugin(BasePlugin):
     async def _reseat_pending_batch(self, sid: str, state: _RetainState) -> None:
         """失败回座：批次合并回内存 pending（同步，无 await 点）+ 重写表行。
 
-        缓存 miss（无新代）：原批次放回（保留其 updated_at 供巡检按龄重试
-        语义由 _retain_pending_at 承担）；已有新代：按**内容锚点**定先后
-        合并（失败批次通常更旧，但不绝对——不能在途批次可能更晚），轮数
-        相加。
+        缓存 miss（无新代）：原批次放回；已有新代：按内容锚点定先后合并
+        （较旧在前），轮数相加。
+
+        龄期语义：回座时把 _retain_pending_at 重置为 now——这是**重试
+        退避**：编码端点持续失败时，巡检不会每 300s 就热重试一次；该会话
+        若不再有回合，重试最迟发生在 flush_idle_s 之后（内容不会丢，表行
+        备份仍在）。下一轮有新回合时，失败批次会被**单独冲刷重试**，
+        不必等巡检。
 
         回座批次打 _retain_failed 标记：它不得与后续新轮次混批（混合链会
         与在途批次交错，表行快照的合并顺序与历史窗口都会失真）——下一轮
@@ -2158,6 +2173,18 @@ class NoriflowMemoryPlugin(BasePlugin):
         """
         if self._db is None:
             raise RuntimeError("memory db unavailable")
+        # 保存前补恢复：初始化时恢复失败过的话，表里还有未回灌的崩溃备份
+        # 行——不补恢复，本行的 UPSERT 会把它们覆盖掉（永久丢失）
+        await self._ensure_retain_restored()
+        if self._retain_restore_failed:
+            # 补恢复仍失败：本次**不写表行**——写了会用只含新批次的快照
+            # 覆盖表里未回灌的崩溃备份行（旧内容立即永久丢失）。内存
+            # pending 仍持有全部未编码数据，DB 恢复后的下一次保存会补齐。
+            logger.warning(
+                "retain pending 快照保存跳过（补恢复失败，避免覆盖未回灌行）: session=%s",
+                sid,
+            )
+            return
         state = self._pending_snapshot_for_row(sid)
         if state is None:
             return
@@ -2228,6 +2255,22 @@ class NoriflowMemoryPlugin(BasePlugin):
         if cutoff is not None and (registered is None or registered <= limit):
             self._retain_row_ts.pop(sid, None)
 
+    async def _ensure_retain_restored(self) -> None:
+        """补恢复：初始化时恢复失败（DB 抖动）后，表里的崩溃备份行还没回灌。
+
+        不补恢复会造成**不可逆的数据丢失**：该会话再来新回合时，
+        _save_retain_pending 用只含新批次的快照 UPSERT 覆盖旧行（新时间戳
+        必过守卫）——旧批次内容既不在内存也不在表里，永远不会被编码。
+        """
+        if not self._retain_restore_failed:
+            return
+        logger.warning("retain pending 快照恢复曾失败，补恢复中")
+        try:
+            await self._restore_retain_pending()
+        except Exception:
+            self._retain_restore_failed = True
+            logger.warning("retain pending 快照补恢复失败", exc_info=True)
+
     async def _restore_retain_pending(self) -> None:
         """读表回灌内存 pending（重启恢复，轮数延续）。
 
@@ -2273,8 +2316,14 @@ class NoriflowMemoryPlugin(BasePlugin):
                     self._retain_row_ts[sid] = row_ts
             if rows:
                 logger.info("恢复 %d 个 retain pending 快照", len(rows))
+            self._retain_restore_failed = False
         except Exception:
-            logger.warning("retain pending 快照恢复失败（后续回合重试）", exc_info=True)
+            # 标记待补恢复：表里的崩溃备份行还没回灌内存——后续保存前
+            # 必须补恢复，否则会被新快照 UPSERT 覆盖（永久丢失）
+            self._retain_restore_failed = True
+            logger.warning(
+                "retain pending 快照恢复失败（保存前会补恢复）", exc_info=True
+            )
 
     @staticmethod
     def _row_age_seconds(row: Any) -> float:
