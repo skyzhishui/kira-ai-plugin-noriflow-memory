@@ -1837,9 +1837,12 @@ class NoriflowMemoryPlugin(BasePlugin):
         """攒批空闲 flush 阈值（活读配置，秒）：会话攒不满间隔时由巡检
         强制编码落库，防末批长期滞留不进记忆。"""
         try:
-            return max(float(getattr(self._config, "flush_idle_s", 1800.0) or 1800.0), 1.0)
+            # 与装配期钳制保持同一口径：0（或负数）→ 1.0，而不是 `or 1800.0`
+            # 悄悄变成 1800（同一配置两条路径两种语义，末批滞留半小时）
+            value = float(getattr(self._config, "flush_idle_s", 1800.0))
         except (TypeError, ValueError):
             return 1800.0
+        return max(value, 1.0)
 
     def _spawn_retain_task(
         self,
@@ -2151,6 +2154,13 @@ class NoriflowMemoryPlugin(BasePlugin):
         state._retain_rounds = int(getattr(old, "_retain_rounds", 1)) + int(
             getattr(new, "_retain_rounds", 1)
         )
+        # 失败标记必须随合并传播：合并返回新对象，不带过去的话标记就丢了
+        # ——下一轮守卫读不到 _retain_failed，失败批会与新轮次混成一批
+        # （正是该守卫要避免的混合链）
+        state._retain_failed = bool(
+            getattr(old, "_retain_failed", False)
+            or getattr(new, "_retain_failed", False)
+        )
         # 内容锚点取两批最早者（old 已是较早的一方）
         state._retain_first_ts = NoriflowMemoryPlugin._state_first_ts(old)
         return state
@@ -2190,6 +2200,26 @@ class NoriflowMemoryPlugin(BasePlugin):
         }
 
     @staticmethod
+    def _retain_participants_from_payload(raw: Any) -> list[tuple[str, str]]:
+        """参与者兜底解析：只接受可迭代二元组，其余降级为 (str(item), "")。
+
+        字符串也是 iterable，tuple("u1") 会得到 ('u','1')——参与者信息静默
+        损坏且下游解包可能炸；这里显式区分「序列」与「标量」。
+        """
+        result: list[tuple[str, str]] = []
+        for item in raw or []:
+            if isinstance(item, (list, tuple)):
+                if len(item) >= 2:
+                    result.append((str(item[0]), str(item[1])))
+                elif len(item) == 1:
+                    result.append((str(item[0]), ""))
+                else:
+                    result.append(("", ""))
+            else:
+                result.append((str(item), ""))
+        return result
+
+    @staticmethod
     def _retain_state_from_payload(payload: dict[str, Any]) -> _RetainState:
         state = _RetainState(
             session_id=str(payload.get("session_id", "")),
@@ -2197,7 +2227,12 @@ class NoriflowMemoryPlugin(BasePlugin):
             group_id=str(payload.get("group_id", "")),
             user_id=str(payload.get("user_id", "")),
             timestamp=datetime.fromisoformat(str(payload["timestamp"])),
-            participants=[tuple(item) for item in payload.get("participants", [])],
+            # 参与者只接受可迭代二元组：脏行里若是字符串，tuple(item) 不抛
+            # 异常而是拆成单字符元组（参与者信息静默损坏），长度不足 2 时
+            # 下游解包还可能炸——统一走兜底解析
+            participants=NoriflowMemoryPlugin._retain_participants_from_payload(
+                payload.get("participants", [])
+            ),
             # 行内容统一转 str：脏行含非字符串时，"\n".join 会在编码 try 之外
             # 抛 TypeError——durable 批次的在途登记永远摘不掉（表行删不掉、
             # 重启重复编码）。一行脏数据不该毒死整条链路。
@@ -2390,10 +2425,14 @@ class NoriflowMemoryPlugin(BasePlugin):
                 self._retain_pending_at[sid] = (
                     restored_at if existing_at is None else max(existing_at, restored_at)
                 )
-                # 登记行时间戳（条件删除的 cutoff 依据）
+                # 登记行时间戳（条件删除的 cutoff 依据）：只前进不后退——
+                # 补恢复期间并发保存写入的更晚行不能被旧行拉回（cutoff 回退
+                # 会让后续条件删除删不掉更新行，只能留行等重启重放）
                 row_ts = self._row_timestamp(row)
                 if row_ts is not None:
-                    self._retain_row_ts[sid] = row_ts
+                    registered = self._retain_row_ts.get(sid)
+                    if registered is None or row_ts > registered:
+                        self._retain_row_ts[sid] = row_ts
                     # 恢复登记（幂等判据）：该行已回灌过
                     self._retain_restored_ts[sid] = row_ts
             if rows:

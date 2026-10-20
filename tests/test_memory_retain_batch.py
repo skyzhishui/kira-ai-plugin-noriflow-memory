@@ -942,17 +942,27 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                     message=make_msg("u1", "慢 DB 的一轮", mid="slow1"), session=dm
                 )
             )
-            await ctx.event_bus.fire("session_memory_updated", {"session": dm.sid})
-            # 确定性判据：信号返回时写入门仍未放行 → 信号没有等快照写入
-            # （不靠墙钟阈值：CI 负载下会抖）
-            blocked = not slow["release"].is_set()
+            # 超时兜底：若信号真的 await 了快照写入，这里会超时而不是挂死
+            try:
+                await asyncio.wait_for(
+                    ctx.event_bus.fire("session_memory_updated", {"session": dm.sid}),
+                    timeout=2.0,
+                )
+            except asyncio.TimeoutError:
+                raise AssertionError(
+                    "回合完成信号不得等待快照写入（快照应走后台任务）"
+                ) from None
+            # 判据：信号返回时快照写入任务**仍未完成** → 信号没有等它
+            # （不能只看 release 未置位：那只在 fire 返回后才置位，恒真）
+            still_running = [t for t in inst._retain_tasks if not t.done()]
             slow["release"].set()
             await asyncio.gather(*inst._retain_tasks)
-            return blocked
+            return still_running
 
-        blocked = asyncio.run(scenario())
+        still_running = asyncio.run(scenario())
         self.assertTrue(
-            blocked, "回合完成信号不得等待快照写入（快照应走后台任务）"
+            still_running,
+            "回合完成信号返回时快照写入任务仍在进行（信号不得等它）",
         )
 
     def test_p2_delete_without_cutoff_keeps_row(self):
@@ -1738,6 +1748,121 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         merged = asyncio.run(scenario())
         self.assertIsNotNone(merged, "混合时区不得让快照链路抛异常")
         self.assertEqual(len(merged.batch_lines), 2, "两批内容都在")
+
+
+    def test_cc1_restore_does_not_rollback_newer_row_ts(self):
+        """CC1：回灌不得把已登记的较新行时间戳拉回（cutoff 回退会删不掉更新行）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        sid = "napcat:dm:10086"
+        newer = datetime.now(timezone.utc)
+        older = newer - timedelta(hours=1)
+
+        class _StubConn:
+            async def fetch(self, sql, *args):
+                return [
+                    {
+                        "session_key": sid,
+                        "payload": json.dumps(
+                            {
+                                "session_id": "10086",
+                                "platform": "napcat",
+                                "group_id": "",
+                                "user_id": "u1",
+                                "timestamp": datetime.now().isoformat(),
+                                "participants": [["napcat", "u1"]],
+                                "history_lines": [],
+                                "batch_lines": ["旧行"],
+                                "bot_lines": [],
+                                "rounds": 1,
+                            }
+                        ),
+                        "updated_at": older.isoformat(timespec="microseconds"),
+                    }
+                ]
+
+        class _StubAcquire:
+            async def __aenter__(self):
+                return _StubConn()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class _StubPool:
+            def acquire(self):
+                return _StubAcquire()
+
+        async def scenario():
+            inst._db = types.SimpleNamespace(pool=_StubPool())
+            # 并发保存已登记的较新时间戳
+            inst._retain_row_ts[sid] = newer
+            await inst._restore_retain_pending()
+            return inst._retain_row_ts.get(sid)
+
+        after = asyncio.run(scenario())
+        self.assertEqual(
+            after, newer, "回灌不得把较新的行时间戳拉回（cutoff 只前进不后退）"
+        )
+
+    def test_cc2_flush_idle_zero_uses_same_clamp_as_build(self):
+        """CC2：热切换 flush_idle_s=0 时，巡检阈值口径须与装配期一致（1.0 而非 1800）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5, flush_idle_s=1800.0))
+        inst._config.flush_idle_s = 0
+        self.assertEqual(inst._retain_flush_idle_s(), 1.0)
+        inst._config.flush_idle_s = -5
+        self.assertEqual(inst._retain_flush_idle_s(), 1.0)
+        inst._config.flush_idle_s = 60
+        self.assertEqual(inst._retain_flush_idle_s(), 60.0)
+
+    def test_cc3_dirty_participants_are_not_split_into_chars(self):
+        """CC3：脏 participants 不得被拆成单字符元组（参与者信息静默损坏）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        state = inst._retain_state_from_payload(
+            {
+                "session_id": "10086",
+                "platform": "napcat",
+                "group_id": "",
+                "user_id": "u1",
+                "timestamp": datetime.now().isoformat(),
+                "participants": ["u1", ["napcat", "u2"], ["only"]],
+                "history_lines": [],
+                "batch_lines": ["行"],
+                "bot_lines": [],
+                "rounds": 1,
+            }
+        )
+        self.assertEqual(state.participants[0], ("u1", ""), "字符串不得被拆成字符元组")
+        self.assertEqual(state.participants[1], ("napcat", "u2"))
+        self.assertEqual(state.participants[2], ("only", ""))
+        self.assertTrue(all(len(p) == 2 for p in state.participants))
+
+    def test_cc4_merge_preserves_failed_flag(self):
+        """1061：合并必须传播 _retain_failed（否则失败批与新轮次混批）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        base = {
+            "session_id": "10086",
+            "platform": "napcat",
+            "group_id": "",
+            "user_id": "u1",
+            "timestamp": datetime.now().isoformat(),
+            "participants": [["napcat", "u1"]],
+            "history_lines": [],
+            "batch_lines": ["行"],
+            "bot_lines": [],
+            "rounds": 1,
+        }
+        older = inst._retain_state_from_payload(base)
+        newer = inst._retain_state_from_payload(base)
+        older._retain_failed = True
+        merged = inst._merge_retain_states(older, newer)
+        self.assertTrue(
+            getattr(merged, "_retain_failed", False),
+            "合并必须传播失败标记（守卫靠它避免混批）",
+        )
+        merged2 = inst._merge_retain_states(newer, older)
+        self.assertTrue(
+            getattr(merged2, "_retain_failed", False),
+            "任一输入带标记，合并结果都必须带",
+        )
 
 
 if __name__ == "__main__":
