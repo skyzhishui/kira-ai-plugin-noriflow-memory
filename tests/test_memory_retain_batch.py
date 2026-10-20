@@ -667,15 +667,26 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         inst._delete_retain_pending = boom
 
         async def scenario():
+            results = []
             for i in range(5):
                 await _turn(inst, ctx, dm, f"第{i + 1}句", mid=f"r{i + 1}")
-                await asyncio.gather(*inst._retain_tasks)
-            await asyncio.gather(*inst._retain_tasks)
-            return [t for t in inst._retain_tasks]
+                results += await asyncio.gather(
+                    *inst._retain_tasks, return_exceptions=True
+                )
+            results += await asyncio.gather(
+                *inst._retain_tasks, return_exceptions=True
+            )
+            return results
 
-        asyncio.run(scenario())
+        results = asyncio.run(scenario())
         # 编码本身成功（表行仍在，属预期：删不掉留给下次刷新/重启覆盖）
         self.assertEqual(len(inst._db.inserted_summaries), 1, "编码仍应成功")
+        # 显式断言：删行失败不得让编码任务带异常结束
+        # （_retain_tasks 的 done 回调会摘掉已完成任务，不能靠读集合判断）
+        self.assertFalse(
+            [r for r in results if isinstance(r, BaseException)],
+            "删行失败不得让编码任务带异常结束",
+        )
         inst._delete_retain_pending = original_delete
 
     def test_i3_cutoff_kept_when_conditional_delete_misses(self):
@@ -2457,6 +2468,41 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         active = asyncio.run(scenario())
         self.assertGreaterEqual(active, 0, "在途 handler 计数不得为负")
         self.assertEqual(active, 0, "旧代 handler 收尾后新代计数应为 0")
+
+
+    def test_oo1_out_of_range_field_falls_back_individually(self):
+        """OO1：单个越界配置项只回退该项（其余用户配置保持不变）。"""
+        cfg = mod._try_build_config(
+            {
+                "dsn": DSN,
+                "storage_backend": "sqlite",
+                "pool_min": 0,          # 越界（ge=1）
+                "backfill_interval_seconds": 120.0,  # 正常值，须保留
+            }
+        )
+        self.assertNotEqual(cfg.pool_min, 0, "越界项不得原样生效")
+        self.assertEqual(cfg.pool_min, 2, "越界项回退默认值")
+        self.assertEqual(
+            cfg.backfill_interval_seconds, 120.0, "其余用户配置不得被一并清掉"
+        )
+        self.assertEqual(cfg.dsn, DSN)
+
+    def test_oo3_reassembly_cancels_old_sweep_task(self):
+        """OO3：重新装配须先收掉旧巡检协程（覆盖句柄会让旧协程泄漏到下次停机）。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+
+        async def scenario():
+            # 模拟「上一次装配留下的巡检协程」
+            old_sweep = asyncio.create_task(asyncio.sleep(3600))
+            inst._retain_sweep_task = old_sweep
+            await asyncio.sleep(0)
+            await inst._initialize_services(inst._db, inst._config)
+            # 必须在 loop 关闭前判定：loop 收尾会取消残留任务，届时无法区分
+            return old_sweep.cancelled()
+
+        cancelled = asyncio.run(scenario())
+        self.assertTrue(cancelled, "旧巡检协程必须被取消（否则泄漏到下次停机）")
+        self.assertIsNotNone(inst._retain_sweep_task, "新巡检协程须正常建立")
 
 
 if __name__ == "__main__":

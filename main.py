@@ -53,6 +53,8 @@ import math
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+
+from pydantic import ValidationError
 from pathlib import Path
 import time
 from typing import Any, Optional
@@ -263,9 +265,10 @@ def _cfg_strlist(raw: dict, key: str, default: Optional[list[str]] = None) -> li
 def _build_config(raw: dict) -> LocalMemoryConfig:
     """Plugin config dict -> LocalMemoryConfig (per-field tolerant, invalid values fall back to defaults).
 
-    越界值（如 interval=0 / flush_idle_s=0）在此**钳到合法区间**：LocalMemoryConfig
-    的 ge/gt 约束会让 0 触发 ValidationError → 构造失败 → 插件整体不可用
-    （一次配置页手滑就是一次静默的「记忆下线」）。
+    本 PR 新增的三个键（retain_interval_group / retain_interval_private /
+    flush_idle_s）在此**钳到合法区间**：LocalMemoryConfig 的 ge/gt 约束会让
+    0 触发 ValidationError。其余既有字段的越界值由 _try_build_config 兜底
+    （逐字段回退默认值，不会让插件整体不可用）。
     """
     return LocalMemoryConfig(
         storage_backend=_cfg_str(raw, "storage_backend"),
@@ -385,14 +388,30 @@ def _build_config(raw: dict) -> LocalMemoryConfig:
 
 def _try_build_config(raw: dict) -> LocalMemoryConfig:
     """Fallback layer for _build_config: when out-of-range values trigger a
-    pydantic validation exception, fall back to default parameters (keeping
-    only dsn), consistent with the module's "per-field tolerant" promise, so a
-    single config item (e.g. pool_min=0) cannot fail the whole plugin
-    initialization."""
+    pydantic validation exception, fall back to default parameters, consistent
+    with the module's "per-field tolerant" promise, so a single config item
+    (e.g. pool_min=0) cannot fail the whole plugin initialization.
+
+    逐字段回退：只把**越界的那几项**从入参里去掉再重建——其余用户配置
+    保持不变（整份回退会把用户的其他设置一并清掉）。
+    """
     try:
         return _build_config(raw)
+    except ValidationError as exc:
+        bad = {str(err["loc"][0]) for err in exc.errors() if err.get("loc")}
+        logger.warning(
+            "配置项越界（pydantic 校验失败）：%s 已回退默认值", sorted(bad)
+        )
+        cleaned = {k: v for k, v in raw.items() if k not in bad}
+        try:
+            return _build_config(cleaned)
+        except Exception:
+            logger.warning(
+                "配置项越界且逐项回退失败，全部回退默认值", exc_info=True
+            )
+            return LocalMemoryConfig(dsn=_cfg_str(raw, "dsn"))
     except Exception:
-        logger.warning("配置项越界（pydantic 校验失败），越界项回退默认值", exc_info=True)
+        logger.warning("配置构造失败，全部回退默认值", exc_info=True)
         return LocalMemoryConfig(dsn=_cfg_str(raw, "dsn"))
 
 
@@ -757,6 +776,15 @@ class NoriflowMemoryPlugin(BasePlugin):
                 self._mem_handler = None
         else:
             logger.warning("ctx.event_bus 不可用：回合完成信号无法订阅，自动 retain 不触发")
+        # 重新装配时先收掉旧巡检协程：直接覆盖句柄会让旧协程泄漏到下次停机
+        if self._retain_sweep_task is not None:
+            old_sweep = self._retain_sweep_task
+            self._retain_sweep_task = None
+            old_sweep.cancel()
+            try:
+                await asyncio.gather(old_sweep, return_exceptions=True)
+            except RuntimeError:
+                logger.warning("旧攒批巡检任务取消失败（事件循环已关闭）")
         self._retain_sweep_task = asyncio.create_task(self._retain_sweep_loop())
         if not self._allowed_user_ids() and not self._allowed_session_ids():
             # fail-closed: both whitelists empty keeps the proactive tools
