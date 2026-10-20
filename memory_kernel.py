@@ -93,6 +93,10 @@ from .vector_ops import EmbeddingService
 
 logger = get_logger("noriflow_memory.kernel", "cyan")
 
+# 慢调用哨兵阈值（毫秒）：超过则把耗时观测从 DEBUG 升级为 WARNING
+# （与上游 nori 口径一致：500ms）
+SLOW_CALL_THRESHOLD_MS = 500.0
+
 _T = TypeVar("_T")
 
 
@@ -1514,10 +1518,18 @@ class LocalMemoryKernel:
                 hints=hints,
             )
         finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
             logger.debug(
                 "build_injection_text 耗时 %.3f ms",
-                (time.perf_counter() - started) * 1000,
+                elapsed_ms,
             )
+            if elapsed_ms > SLOW_CALL_THRESHOLD_MS:
+                # 慢查询哨兵（与上游 nori 口径一致：>500ms 升级 WARNING）
+                logger.warning(
+                    "build_injection_text 慢调用 %.3f ms（session=%s）",
+                    elapsed_ms,
+                    session_id,
+                )
 
     async def _build_injection_text_impl(
         self,

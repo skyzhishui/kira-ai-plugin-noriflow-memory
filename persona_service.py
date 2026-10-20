@@ -35,6 +35,10 @@ from .time_labels import memory_time_label, resolve_local_tz
 
 logger = get_logger("noriflow_memory.persona", "cyan")
 
+# 慢调用哨兵阈值（毫秒）：超过则把耗时观测从 DEBUG 升级为 WARNING
+# （与上游 nori 口径一致：500ms）
+SLOW_CALL_THRESHOLD_MS = 500.0
+
 # 注入文本骨架三件套：逐字对齐 hindsight_persona（消费侧跨插件契约）。
 INJECTION_HEADER = "# 用户画像-背景信息"
 INJECTION_DISCLAIMER = "以下记录属于内部推理素材，回复时请概括转述，不要逐字照读。"
@@ -191,10 +195,18 @@ class LocalPersonaService:
                 user_id=user_id, session_id=session_id, platform=platform
             )
         finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
             logger.debug(
                 "build_profile_text 耗时 %.3f ms",
-                (time.perf_counter() - started) * 1000,
+                elapsed_ms,
             )
+            if elapsed_ms > SLOW_CALL_THRESHOLD_MS:
+                # 慢查询哨兵（与上游 nori 口径一致：>500ms 升级 WARNING）
+                logger.warning(
+                    "build_profile_text 慢调用 %.3f ms（user=%s）",
+                    elapsed_ms,
+                    user_id,
+                )
 
     async def _build_profile_text_impl(
         self, user_id: str, session_id: str = "", platform: str = ""

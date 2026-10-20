@@ -1371,14 +1371,23 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertEqual(calls["n"], 1, "并发补恢复必须串行（只补一次）")
 
     def test_y2_nickname_refresh_failure_does_not_leak_inflight(self):
-        """Y2：昵称刷新失败不得让 durable 批次的在途登记泄漏（批次须回座）。"""
+        """Y2：昵称刷新失败不得让 durable 批次的在途登记泄漏（批次须回座）。
+
+        编码同时失败（注入），确保走的是**失败回座**分支——否则用例只会
+        走成功路径（_drop_inflight），锁不到「异常逃逸导致在途登记泄漏」。
+        """
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+        kernel = inst._memory_kernel
+
+        async def failing_encode(**kwargs):
+            raise RuntimeError("编码失败（测试注入）")
 
         async def boom():
             raise RuntimeError("昵称刷新失败（测试注入）")
 
         inst._refresh_bot_nickname = boom
+        kernel.retain_encoded = failing_encode
 
         async def scenario():
             for i in range(3):
@@ -1391,7 +1400,13 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
         asyncio.run(scenario())
         self.assertNotIn(dm.sid, inst._retain_inflight, "在途登记不得泄漏")
-        self.assertIn(dm.sid, inst._retain_pending, "批次不得丢失（须回座）")
+        pending = inst._retain_pending.get(dm.sid)
+        self.assertIsNotNone(pending, "批次须回座（不得丢失）")
+        self.assertEqual(
+            int(getattr(pending, "_retain_rounds", 0)),
+            3,
+            "回座批次轮数须保留",
+        )
 
     def test_y3_restore_retry_does_not_double_merge(self):
         """Y3：半途失败的补恢复不得把同一行再合并一遍（内容翻倍 + 轮数虚高）。"""
@@ -1448,6 +1463,61 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
             int(getattr(first, "_retain_rounds", 0)),
             "补恢复不得让轮数虚高（会提前落库）",
         )
+
+
+    def test_z1_slow_call_sentinel_logs_warning(self):
+        """Z1：耗时观测超过阈值须升级 WARNING（慢查询哨兵，与上游 nori 口径一致）。"""
+        import logging
+
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        kernel = inst._memory_kernel
+        mk_mod = sys.modules["noriflow_memory_pkg.memory_kernel"]
+        original_impl = kernel._build_injection_text_impl
+
+        async def slow_impl(**kwargs):
+            await asyncio.sleep(0.01)
+            return "注入文本"
+
+        kernel._build_injection_text_impl = slow_impl
+        # 阈值降到 1ms，使 10ms 的调用必然越线（不依赖机器速度）
+        threshold = getattr(mk_mod, "SLOW_CALL_THRESHOLD_MS", 500.0)
+        mk_mod.SLOW_CALL_THRESHOLD_MS = 1.0
+        records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = _Capture()
+        target = logging.getLogger(mk_mod.logger.name)
+        target.addHandler(handler)
+        previous_level = target.level
+        target.setLevel(logging.DEBUG)
+        try:
+            asyncio.run(
+                kernel.build_injection_text(query="q", session_id="s1", top_k=1)
+            )
+        finally:
+            target.removeHandler(handler)
+            target.setLevel(previous_level)
+            mk_mod.SLOW_CALL_THRESHOLD_MS = threshold
+            kernel._build_injection_text_impl = original_impl
+
+        warnings = [
+            r for r in records if r.levelno >= logging.WARNING and "慢调用" in r.getMessage()
+        ]
+        self.assertTrue(warnings, "超阈值调用必须升级 WARNING（慢查询哨兵）")
+
+    def test_z2_y2_test_covers_reseat_branch(self):
+        """Z2：Y2 回归锁必须真正覆盖失败回座分支（否则锁是空的）。"""
+        import inspect
+
+        src = inspect.getsource(
+            TestRetainBatchReviewFixes.test_y2_nickname_refresh_failure_does_not_leak_inflight
+        )
+        # 回座分支的触发条件：编码必须失败（否则走成功路径的 _drop_inflight）
+        self.assertIn("failing_encode", src)
+        self.assertIn("retain_encoded = failing_encode", src)
 
 
 if __name__ == "__main__":
