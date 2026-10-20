@@ -2329,5 +2329,44 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
 
+    def test_kk2_dirty_failed_field_does_not_mark_batch_failed(self):
+        """KK2：脏 failed 字段（字符串 "false"）不得把正常批次误标为失败批。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        base = {
+            "session_id": "10086",
+            "platform": "napcat",
+            "group_id": "",
+            "user_id": "u1",
+            "timestamp": datetime.now().isoformat(),
+            "participants": [["napcat", "u1"]],
+            "history_lines": [],
+            "batch_lines": ["行"],
+            "bot_lines": [],
+            "rounds": 1,
+        }
+        for raw in ("false", "False", "0", "", 0, None):
+            state = inst._retain_state_from_payload({**base, "failed": raw})
+            self.assertFalse(
+                getattr(state, "_retain_failed", False),
+                f"failed={raw!r} 不得被当作真值",
+            )
+        for raw in (True, 1, "true", "yes", "1"):
+            state = inst._retain_state_from_payload({**base, "failed": raw})
+            self.assertTrue(
+                getattr(state, "_retain_failed", False),
+                f"failed={raw!r} 应识别为真值",
+            )
+
+    def test_kk1_shutdown_deadline_uses_monotonic_clock(self):
+        """KK1：停机等待预算须用单调时钟（墙钟回拨会让等待超时失控）。"""
+        import inspect
+
+        src = inspect.getsource(mod.NoriflowMemoryPlugin.terminate)
+        self.assertIn("time.monotonic()", src, "停机等待须用单调时钟")
+        self.assertNotIn(
+            "time.time() + 5.0", src, "不得用墙钟做停机等待预算"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

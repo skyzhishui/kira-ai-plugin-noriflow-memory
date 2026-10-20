@@ -814,8 +814,10 @@ class NoriflowMemoryPlugin(BasePlugin):
         # TimeoutStopSec=10s——等 60s+ 只会被 SIGKILL 抢先（收口更糟）。
         # 根治方式是让 handler 自身不被慢 DB 拖住（别名 upsert 2s + 停机
         # 快照写 3s ⇒ handler ≤5s），所以 5s 的等待足以覆盖它。
-        deadline = time.time() + 5.0
-        while self._retain_handler_active > 0 and time.time() < deadline:
+        # 单调时钟：墙钟回拨（NTP 校正/手动改时间）会让等待超时失控，
+        # 挤占后续 db.close() 的预算
+        deadline = time.monotonic() + 5.0
+        while self._retain_handler_active > 0 and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
         if self._retain_handler_active > 0:
             logger.warning(
@@ -2371,8 +2373,18 @@ class NoriflowMemoryPlugin(BasePlugin):
             # OverflowError：rounds=Infinity 一类脏值——不接住会让整行被
             # 当坏行跳过（该行未编码内容永不恢复）
             state._retain_rounds = 1
-        # 失败标记（回座待重试）：恢复后仍按「不与新轮次混批」处理
-        state._retain_failed = bool(payload.get("failed", False))
+        # 失败标记（回座待重试）：恢复后仍按「不与新轮次混批」处理。
+        # 只接受明确真值——bool("false") 是 True，脏行里的字符串 "false"
+        # 会把正常批次误标为失败批（被单独冲刷，攒批节奏被打乱）。
+        failed_raw = payload.get("failed", False)
+        state._retain_failed = (
+            failed_raw is True
+            or failed_raw == 1
+            or (
+                isinstance(failed_raw, str)
+                and failed_raw.strip().lower() in ("1", "true", "yes")
+            )
+        )
         # 内容锚点：恢复时保留批次链的最早时间（缺失则退回 timestamp）
         first_raw = payload.get("first_ts")
         if first_raw:
