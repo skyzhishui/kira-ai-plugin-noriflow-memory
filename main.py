@@ -455,6 +455,8 @@ class NoriflowMemoryPlugin(BasePlugin):
         self._retain_pending: dict[str, _RetainState] = {}
         self._retain_pending_at: dict[str, float] = {}
         self._retain_inflight: dict[str, list[_RetainState]] = {}
+        # 表行写入时间戳（sid -> datetime）：条件删除的 cutoff 依据
+        self._retain_row_ts: dict[str, datetime] = {}
         self._retain_stopping = False
         # 攒批空闲巡检协程句柄（initialize 创建 / terminate 取消）
         self._retain_sweep_task: Optional[asyncio.Task] = None
@@ -800,6 +802,11 @@ class NoriflowMemoryPlugin(BasePlugin):
         self._persona_service = None
         self._retain_pending.clear()
         self._retain_pending_at.clear()
+        # 在途登记必须一起清：超时被 cancel 的任务抛 CancelledError（不经过
+        # _do_retain 的 except 分支），_drop_inflight 不会执行——残留状态会
+        # 在下次 initialize 后被并进快照行（行删不掉 + 重启恢复重复编码）
+        self._retain_inflight.clear()
+        self._retain_row_ts.clear()
         self._retain_stopping = False
 
     # ------------------------------------------------------------------
@@ -1881,8 +1888,14 @@ class NoriflowMemoryPlugin(BasePlugin):
         await self._refresh_bot_nickname()
         kernel = self._memory_kernel
         if kernel is None:
-            if sid and not durable:
-                self._rollback_consumed(sid, delta_keys or set())
+            if not durable:
+                if sid:
+                    self._rollback_consumed(sid, delta_keys or set())
+            else:
+                # 攒批路径：批次已从 pending 弹出并登记在途，直接 return 会
+                # 让这批数据运行期不再被编码（只能等重启从表行恢复）——回座
+                # 交回 pending（表行备份仍在），等下一触发点重试
+                await self._reseat_pending_batch(sid, state)
             return
         parts: list[str] = []
         history_text = "\n".join(state.history_lines)
@@ -1927,7 +1940,9 @@ class NoriflowMemoryPlugin(BasePlugin):
         self._drop_inflight(sid, state)
         remaining = self._pending_snapshot_for_row(sid)
         if remaining is None:
-            await self._delete_retain_pending(sid)
+            # 条件删除（cutoff = 本批快照行写入时间戳）：判定与删除之间的
+            # await 窗口内并发新回合写入的更新行不受影响，不会被误删
+            await self._delete_retain_pending(sid, self._retain_row_ts.get(sid))
         else:
             try:
                 await self._save_retain_pending(sid)
@@ -1944,7 +1959,9 @@ class NoriflowMemoryPlugin(BasePlugin):
         current = self._retain_pending.get(sid)
         if current is None:
             self._retain_pending[sid] = state
-        else:
+        elif current is not state:
+            # 同一对象不得合并（否则轮数与批次行翻倍）；不同对象时失败批
+            # 前置合并（保持时间序）
             self._retain_pending[sid] = self._merge_retain_states(state, current)
         self._retain_pending_at[sid] = time.time()
         self._drop_inflight(sid, state)
@@ -1960,6 +1977,10 @@ class NoriflowMemoryPlugin(BasePlugin):
         历史窗口取较旧批次（old）的 history_lines——它正是「攒批之前」的
         快照，等价于 nori 侧 exclude_ids 机制回退到攒批前的历史窗口；
         批次内容按时间序拼接（old 在前），轮数相加。
+
+        不回退到 new.history_lines：old 的历史窗口合法为空（会话首轮就是
+        此情形），而 new 的历史窗口含 old 批次的行——回退会让同一句既进
+        历史窗口又进批次内容，编码输入里重复一遍。
         """
         participants = list(old.participants)
         seen = set(participants)
@@ -1971,7 +1992,7 @@ class NoriflowMemoryPlugin(BasePlugin):
             session_id=new.session_id, platform=new.platform,
             group_id=new.group_id, user_id=old.user_id or new.user_id,
             timestamp=new.timestamp, participants=participants,
-            history_lines=old.history_lines or new.history_lines,
+            history_lines=old.history_lines,
             batch_lines=old.batch_lines + new.batch_lines,
             bot_lines=old.bot_lines + new.bot_lines,
         )
@@ -2012,6 +2033,10 @@ class NoriflowMemoryPlugin(BasePlugin):
 
         快照 = 在途批次 ∪ 当前 pending（见 _pending_snapshot_for_row）——
         崩溃恢复时能恢复全部未编码数据，包括编码在途的批次。
+
+        行时间戳由客户端统一生成（双后端同源）：删除走条件删除（cutoff），
+        需要「本次写入的确切时间戳」才能判定新行，故在此登记到
+        _retain_row_ts。
         """
         if self._db is None:
             raise RuntimeError("memory db unavailable")
@@ -2019,26 +2044,50 @@ class NoriflowMemoryPlugin(BasePlugin):
         if state is None:
             return
         payload = json.dumps(self._retain_payload(state), ensure_ascii=False)
+        now = datetime.now(timezone.utc)
         async with self._db.pool.acquire() as conn:
             if getattr(self, "_backend_name", "postgres") == "sqlite":
                 await conn.execute(
                     "INSERT INTO memory_retain_pending(session_key,payload,updated_at) "
                     "VALUES ($1,$2,$3) ON CONFLICT(session_key) DO UPDATE SET "
                     "payload=excluded.payload, updated_at=excluded.updated_at",
-                    sid, payload, datetime.now(timezone.utc).isoformat(),
+                    sid, payload, now.isoformat(timespec="microseconds"),
                 )
             else:
                 await conn.execute(
                     "INSERT INTO memory_retain_pending(session_key,payload,updated_at) "
-                    "VALUES ($1,$2::jsonb,now()) ON CONFLICT(session_key) DO UPDATE SET "
-                    "payload=EXCLUDED.payload, updated_at=now()", sid, payload,
+                    "VALUES ($1,$2::jsonb,$3) ON CONFLICT(session_key) DO UPDATE SET "
+                    "payload=EXCLUDED.payload, updated_at=EXCLUDED.updated_at",
+                    sid, payload, now,
                 )
+        self._retain_row_ts[sid] = now
 
-    async def _delete_retain_pending(self, sid: str) -> None:
+    async def _delete_retain_pending(self, sid: str, cutoff: Optional[datetime] = None) -> None:
+        """删除攒批表行（条件删除：只删不晚于 cutoff 的行）。
+
+        cutoff = 本批编码完成时快照行的写入时间戳（_retain_row_ts）。
+        「判定无剩余数据」与「执行删除」之间有 await 窗口（pool.acquire /
+        conn.execute），并发新回合可能已写入更新的快照行——条件删除只删
+        updated_at <= cutoff 的行，新行（更晚时间戳）不受影响，避免把新
+        批次的重启备份抹掉。
+        """
         if self._db is None:
             return
+        limit = cutoff or datetime.now(timezone.utc)
         async with self._db.pool.acquire() as conn:
-            await conn.execute("DELETE FROM memory_retain_pending WHERE session_key=$1", sid)
+            if getattr(self, "_backend_name", "postgres") == "sqlite":
+                await conn.execute(
+                    "DELETE FROM memory_retain_pending "
+                    "WHERE session_key=$1 AND updated_at <= $2",
+                    sid, limit.isoformat(timespec="microseconds"),
+                )
+            else:
+                await conn.execute(
+                    "DELETE FROM memory_retain_pending "
+                    "WHERE session_key=$1 AND updated_at <= $2",
+                    sid, limit,
+                )
+        self._retain_row_ts.pop(sid, None)
 
     async def _restore_retain_pending(self) -> None:
         """读表回灌内存 pending（重启恢复，轮数延续）。
@@ -2072,6 +2121,10 @@ class NoriflowMemoryPlugin(BasePlugin):
                 # 保留表行的真实龄期（不重置超时钟）：重启后仍按原时间戳
                 # 参与巡检超龄判定
                 self._retain_pending_at[sid] = now - self._row_age_seconds(row)
+                # 登记行时间戳（条件删除的 cutoff 依据）
+                row_ts = self._row_timestamp(row)
+                if row_ts is not None:
+                    self._retain_row_ts[sid] = row_ts
             if rows:
                 logger.info("恢复 %d 个 retain pending 快照", len(rows))
         except Exception:
@@ -2097,6 +2150,26 @@ class NoriflowMemoryPlugin(BasePlugin):
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return max((datetime.now(timezone.utc) - dt).total_seconds(), 0.0)
+
+    @staticmethod
+    def _row_timestamp(row: Any) -> Optional[datetime]:
+        """表行 updated_at 的 datetime（PG 返回 datetime / SQLite 返回 ISO 字符串）。"""
+        try:
+            value = row["updated_at"]
+        except (KeyError, IndexError, TypeError):
+            return None
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            try:
+                dt = datetime.fromisoformat(str(value))
+            except ValueError:
+                return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
 
     # ------------------------------------------------------------------
     #  行缓存辅助

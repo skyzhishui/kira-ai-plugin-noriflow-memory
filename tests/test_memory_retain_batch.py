@@ -506,5 +506,140 @@ class TestRetainBatchSQLiteBackend(unittest.TestCase):
             asyncio.run(scenario())
 
 
+class TestRetainBatchReviewFixes(unittest.TestCase):
+    """pr-agent review 修复批（PR #16）的回归锁。"""
+
+    def test_f4_first_batch_history_is_not_duplicated(self):
+        """F4：首轮批次的历史窗口合法为空时，不得回退到新批历史（内容重复）。"""
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+        captured: list[str] = []
+
+        async def scenario():
+            _spy_encode(inst, captured)
+            for i in range(5):
+                await _turn(inst, ctx, dm, f"首轮第{i + 1}句", mid=f"d{i + 1}")
+                await asyncio.gather(*inst._retain_tasks)
+            await asyncio.gather(*inst._retain_tasks)
+
+        asyncio.run(scenario())
+        self.assertEqual(len(captured), 1)
+        text = captured[0]
+        for i in range(5):
+            self.assertEqual(
+                text.count(f"首轮第{i + 1}句"), 1, "同一句不得既进历史窗口又进批次内容"
+            )
+
+    def test_f1_terminate_clears_inflight_registry(self):
+        """F1：terminate 必须清空在途批次登记（取消任务不经过 _drop_inflight）。"""
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+
+        async def scenario():
+            await _turn(inst, ctx, dm, "在途批次", mid="inflight1")
+            # 模拟「已弹出并登记在途」的编码中状态
+            inst._retain_inflight[dm.sid] = [inst._retain_pending[dm.sid]]
+            await inst.terminate()
+
+        asyncio.run(scenario())
+        self.assertEqual(inst._retain_inflight, {}, "terminate 后不得残留在途登记")
+        self.assertEqual(inst._retain_pending, {})
+
+    def test_f2_kernel_missing_reseats_batch(self):
+        """F2：kernel 为空时攒批路径须回座（否则这批运行期不再被编码）。"""
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+
+        async def scenario():
+            # 4 轮未满批：批次仍在 pending
+            for i in range(4):
+                await _turn(inst, ctx, dm, f"第{i + 1}句", mid=f"k{i + 1}")
+                await asyncio.gather(*inst._retain_tasks)
+            await asyncio.gather(*inst._retain_tasks)
+            # kernel 缺席时到点 flush：批次弹出→在途→编码失败→必须回座
+            inst._memory_kernel = None
+            await _turn(inst, ctx, dm, "第5句", mid="k5")
+            await asyncio.gather(*inst._retain_tasks)
+            await asyncio.gather(*inst._retain_tasks)
+
+        asyncio.run(scenario())
+        self.assertIn(dm.sid, inst._retain_pending, "批次应回座到内存 pending")
+        self.assertNotIn(dm.sid, inst._retain_inflight, "在途登记不得泄漏")
+        self.assertEqual(
+            int(getattr(inst._retain_pending[dm.sid], "_retain_rounds", 0)),
+            5,
+            "回座后轮数应为 5（不得翻倍）",
+        )
+
+    def test_f3_conditional_delete_keeps_newer_row(self):
+        """F3：条件删除只删不晚于 cutoff 的行（并发新回合的更新行不被抹掉）。"""
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="noriflow_batch_sqlite_") as tmp:
+            db_path = str(Path(tmp) / "memory.sqlite3")
+            config = mod.LocalMemoryConfig(
+                storage_backend="sqlite",
+                sqlite_path=db_path,
+                embedding_dims=4,
+                retain_interval_private=5,
+            )
+            db = mod.SQLiteMemoryDatabase(config)
+
+            async def scenario():
+                await db.connect()
+                await db.apply_migrations(
+                    Path(__file__).resolve().parent.parent / "migrations_sqlite"
+                )
+                inst = mod.NoriflowMemoryPlugin(FakeCtx(), {"dsn": DSN})
+                inst._db, inst._backend_name, inst._config = db, "sqlite", config
+                sid = "napcat:dm:10086"
+
+                def _state(batch_line: str):
+                    return inst._retain_state_from_payload(
+                        {
+                            "session_id": "10086",
+                            "platform": "napcat",
+                            "group_id": "",
+                            "user_id": "u1",
+                            "timestamp": datetime.now().isoformat(),
+                            "participants": [["napcat", "u1"]],
+                            "history_lines": [],
+                            "batch_lines": [batch_line],
+                            "bot_lines": [],
+                            "rounds": 1,
+                        }
+                    )
+
+                inst._retain_pending[sid] = _state("批次行")
+                await inst._save_retain_pending(sid)
+                old_cutoff = inst._retain_row_ts.get(sid)
+                self.assertIsNotNone(old_cutoff, "写入须登记行时间戳")
+
+                # 模拟并发新回合写入了更新的行
+                inst._retain_pending[sid] = _state("新批次行")
+                await inst._save_retain_pending(sid)
+
+                # 以旧 cutoff 删行：更新行必须存活
+                await inst._delete_retain_pending(sid, old_cutoff)
+                async with db.pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT session_key FROM memory_retain_pending WHERE session_key=$1",
+                        sid,
+                    )
+                self.assertEqual(len(rows), 1, "更晚写入的行不应被旧 cutoff 删除")
+
+                # 以最新 cutoff 删行：本次写入的行应被删除
+                await inst._delete_retain_pending(sid, inst._retain_row_ts.get(sid))
+                async with db.pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT session_key FROM memory_retain_pending WHERE session_key=$1",
+                        sid,
+                    )
+                self.assertEqual(len(rows), 0, "本批快照行应被删除")
+                await db.close()
+
+            asyncio.run(scenario())
+
+
 if __name__ == "__main__":
     unittest.main()
