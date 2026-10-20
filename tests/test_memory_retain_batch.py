@@ -2622,5 +2622,49 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertNotIn("self._row_age_seconds(row)", src, "不得用两套时钟换算龄期")
 
 
+    def test_qq1_sweep_interval_read_is_guarded(self):
+        """QQ1：巡检间隔读取必须在 try 内（非预期异常不得让巡检协程死掉）。"""
+        import inspect
+
+        src = inspect.getsource(mod.NoriflowMemoryPlugin._retain_sweep_loop)
+        self.assertIn("interval = max(5.0, min(300.0", src)
+        self.assertIn("except asyncio.CancelledError:", src, "取消须原样上抛")
+        # 间隔读取不得直接作为 sleep 实参（异常会绕过 try）
+        self.assertNotIn(
+            "await asyncio.sleep(max(5.0, min(300.0",
+            src,
+            "间隔读取不得裸在 try 之外（协程会死）",
+        )
+
+    def test_qq1_sweep_survives_interval_read_failure(self):
+        """QQ1：间隔读取抛异常时巡检仍继续（自愈），不退出循环。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
+        calls = {"n": 0}
+
+        async def scenario():
+            original = inst._retain_flush_idle_s
+
+            def boom():
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise RuntimeError("间隔读取失败（测试注入）")
+                return original()
+
+            inst._retain_flush_idle_s = boom
+            # 让巡检跑两轮（第二轮起间隔读取正常）
+            inst._retain_flush_idle_s = boom
+            task = asyncio.create_task(inst._retain_sweep_loop())
+            await asyncio.sleep(0.2)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            return calls["n"]
+
+        n = asyncio.run(scenario())
+        self.assertGreaterEqual(n, 1, "间隔读取失败不得让巡检协程退出")
+
+
 if __name__ == "__main__":
     unittest.main()

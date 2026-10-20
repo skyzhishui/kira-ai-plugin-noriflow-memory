@@ -2090,9 +2090,21 @@ class NoriflowMemoryPlugin(BasePlugin):
         不终止循环；CancelledError 原样上抛配合 terminate 的取消收口。
         """
         while True:
-            # 下限 5s：flush_idle_s 误配成 0 会被钳到 1.0，无下限时巡检
-            # 退化成 1Hz 空转；上限仍是 300s，落库延迟上界基本不变
-            await asyncio.sleep(max(5.0, min(300.0, self._retain_flush_idle_s())))
+            # 间隔读取也要兜底：它在 sleep 调用处、try 之外——一次非预期
+            # 异常就会让巡检协程直接死掉（末批再也不冲刷，且无告警）。
+            # CancelledError 原样上抛（配合 terminate 的取消收口）。
+            try:
+                # 下限 5s：flush_idle_s 误配成 0 会被钳到 1.0，无下限时巡检
+                # 退化成 1Hz 空转；上限仍是 300s，落库延迟上界基本不变
+                interval = max(5.0, min(300.0, self._retain_flush_idle_s()))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "retain 攒批巡检间隔读取失败（回退 300s）", exc_info=True
+                )
+                interval = 300.0
+            await asyncio.sleep(interval)
             try:
                 await self._sweep_retain_pending()
             except asyncio.CancelledError:
