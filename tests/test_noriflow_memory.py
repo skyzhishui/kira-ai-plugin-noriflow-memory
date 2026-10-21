@@ -539,16 +539,33 @@ class TestHysteresisBandValidation(unittest.TestCase):
             )
 
     def test_06_unsafe_band_falls_back_to_defaults(self):
-        # 非法组合走兜底层：插件不因单个配置项起不来，回退到安全缺省值
+        # 非法组合走兜底层：插件不因单个配置项起不来；跨字段校验失败只回退
+        # 涉及的评分键，其余用户配置保留（评审意见：不得整份回退）
         cfg = mod._try_build_config({
             "dsn": "postgres://u:p@127.0.0.1:5432/db",
             "promote_threshold": 5.0,
             "demote_threshold": 3.0,
+            "recall_top_k": 7,
+            "merge_interval_hours": 12.0,
         })
         self.assertEqual(cfg.dsn, "postgres://u:p@127.0.0.1:5432/db")
         self.assertEqual(cfg.promote_threshold, 6.0)
         self.assertEqual(cfg.demote_threshold, 2.0)
         self.assertEqual(cfg.decay_factor, 0.9)
+        # 无关配置不被清掉
+        self.assertEqual(cfg.recall_top_k, 7)
+        self.assertEqual(cfg.merge_interval_hours, 12.0)
+
+    def test_09_pool_bounds_cross_field_fallback_keeps_other_keys(self):
+        # 另一条跨字段校验（pool_min > pool_max）同走 CROSS_FIELD_VALIDATED_KEYS
+        # 回退：只清池参数，其余配置保留
+        cfg = mod._try_build_config({
+            "pool_min": 9, "pool_max": 8,
+            "recall_top_k": 7,
+        })
+        self.assertEqual(cfg.pool_min, 2)
+        self.assertEqual(cfg.pool_max, 8)
+        self.assertEqual(cfg.recall_top_k, 7)
 
     def test_07_scaled_down_score_system_is_accepted(self):
         # 迟滞带按配置的证据加分换算（不写死 3 分）：整体缩放的刻度同样成立

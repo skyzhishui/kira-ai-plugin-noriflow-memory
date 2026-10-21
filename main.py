@@ -77,7 +77,7 @@ from . import config_web, webui_store
 from .alias_store import build_alias_rows
 from .circuit_breaker import MemoryDBCircuitBreaker
 from .clients import FastLlmExit, KiraEmbeddingClient, KiraRerankClient
-from .config import LocalMemoryConfig
+from .config import CROSS_FIELD_VALIDATED_KEYS, LocalMemoryConfig
 from .contracts import PersonaCandidate
 from .db import MemoryDatabase, SQLiteMemoryDatabase, resolve_backend_name
 from .entity_edge import relation_statement_line
@@ -394,14 +394,25 @@ def _try_build_config(raw: dict) -> LocalMemoryConfig:
 
     逐字段回退：只把**越界的那几项**从入参里去掉再重建——其余用户配置
     保持不变（整份回退会把用户的其他设置一并清掉）。
+
+    跨字段校验（model_validator，如迟滞带/池边界组合非法）的 pydantic 错误
+    loc 为空、无法逐项定位：按 config.CROSS_FIELD_VALIDATED_KEYS 只回退
+    涉及的键（其余用户配置保留），回退时打告警点名被回退的键。
     """
     try:
         return _build_config(raw)
     except ValidationError as exc:
         bad = {str(err["loc"][0]) for err in exc.errors() if err.get("loc")}
-        logger.warning(
-            "配置项越界（pydantic 校验失败）：%s 已回退默认值", sorted(bad)
-        )
+        if bad:
+            logger.warning(
+                "配置项越界（pydantic 校验失败）：%s 已回退默认值", sorted(bad)
+            )
+        else:
+            bad = set(CROSS_FIELD_VALIDATED_KEYS) & set(raw)
+            logger.warning(
+                "跨字段校验失败（迟滞带/池边界等组合非法），仅回退涉及的"
+                "配置键（其余配置保留）：%s", sorted(bad),
+            )
         cleaned = {k: v for k, v in raw.items() if k not in bad}
         try:
             return _build_config(cleaned)

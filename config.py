@@ -10,6 +10,15 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+# 跨字段校验（model_validator）涉及的配置键：装配期组合非法时，兜底层仅回退
+# 这些键、其余用户配置保留（main._try_build_config 逐项回退的依据）。
+# 字段级约束（gt/ge 等）不走此表——pydantic 错误自带 loc，可逐项定位。
+CROSS_FIELD_VALIDATED_KEYS: tuple = (
+    "pool_min", "pool_max",
+    "promote_threshold", "demote_threshold",
+    "score_start_high", "score_start_medium",
+)
+
 
 class LocalMemoryConfig(BaseModel):
     """Runtime config for the local memory backend (PostgreSQL + pgvector / SQLite dual backend)."""
@@ -86,8 +95,9 @@ class LocalMemoryConfig(BaseModel):
         default=6.0,
         gt=0,
         description="进入画像阈值（须为正：0 会让全部簇立即晋升）；"
-        "迟滞带 = promote_threshold - demote_threshold，应大于单条 high 证据加分"
-        "（score_start_high=3），否则降档簇一条证据即可回档（默认 6-2=4 > 3）",
+        "迟滞带 = promote_threshold - demote_threshold，不得小于单条证据最大加分"
+        "（max(score_start_high, score_start_medium)；相等亦安全——降档判定为严格小于），"
+        "否则降档簇一条证据即可回档（默认 6-2=4 ≥ 3；装配期强制校验）",
     )
     demote_threshold: float = Field(
         default=2.0,
