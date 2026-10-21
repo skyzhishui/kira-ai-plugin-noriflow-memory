@@ -124,28 +124,27 @@ SQLite 真实往返 + 并发/乱序定序/用户擦除/脏数据防御回归）�
 
 ## v1.17.3 (2026-10-14)
 
-### fix: 全仓评审修复批（7 medium / 15 low 缺陷 + 键公式单源化 + 文档失真修正）
+### fix: 全仓修复批——数据损坏防御 / LLM 契约 / 周期健壮性 / 向量召回 / 一致性 + 键公式单源化
 
-全量评审 ~15k LOC 后分阶段修复，两轮对抗性复核（2 + 5 subagent）+ 独立
-收尾，测试 371 → 383 全绿：
+全仓分阶段修复批，测试 371 → 383 全绿：
 
-- **数据损坏（M1）**：`json_utils` 正则修复改为分阶段——先直接 `json.loads`
+- **数据损坏**：`json_utils` 正则修复改为分阶段——先直接 `json.loads`
   透传合法 JSON（含 `, }`、`: True` 等诱饵序列的字符串值原样保留），失败才
   正则修复重试，json_repair 兜底；
-- **LLM 契约（M2/M3/L12）**：簇裁决与边审计部分覆盖时不再把未裁决项当
+- **LLM 契约**：簇裁决与边审计部分覆盖时不再把未裁决项当
   无关（杜绝重复簇 create）、水位不推进过未覆盖边；`true == 1` 布尔 ID
   拒绝（adjudicate 与边审计双处）；
-- **周期健壮性（M5/L11/L3）**：合并周期六个 DB 阶段各自 try/except 喂
+- **周期健壮性**：合并周期六个 DB 阶段各自 try/except 喂
   熔断 + 跳过续跑，`_save_skip_state` 进 finally；decay/lifecycle 时间戳
   kv 写失败不中断不双重衰减；重编码预留探针尊重毒丸跳过名单；
-- **向量与召回（M4/L4/L5/L6/L7）**：近重去重维度不匹配跳过比对（换
+- **向量与召回**：近重去重维度不匹配跳过比对（换
   embedding 模型后不再假命中丢行）；bot 排除双形态覆盖；召回 token 预算
   计入时间标签；滚动补回改两阶段 memo（build 暂存、prompt 装配成功才
   commit，宿主丢弃装配时不再双通道不可见）；写侧去重命中带告警；
-- **一致性（M7/L2）**：WebUI 摘要编辑的 SQLite FTS5 影子表同步并入同事务；
+- **一致性**：WebUI 摘要编辑的 SQLite FTS5 影子表同步并入同事务；
   `search_fact_clusters` 全空白 user_ids 双后端统一 fail-closed（杜绝
   跨用户暴露）；
-- **main.py（M6/L1/L8/L9/L10/L13/L14）**：enabled_tools None 守卫；
+- **main.py**：enabled_tools None 守卫；
   bot_platform 幽灵属性接线（捕获→传播→消费三点链路）；LRU 兜底取最近
   活跃会话；匿名消息键改单调计数器（地址复用不再静默丢失）；记忆删除
   DB 故障与不存在三态分文案；变量遮蔽与 config 端点防御式解引用；
@@ -379,7 +378,7 @@ fire-and-forget）。
 - migrate_backend 抽出可测入口 _run_migration；tests/test_sqlite_backend.py
   新增 13 项迁移 checks（FakePG 桩 + 真 SQLite 目标：跳过/偏移/混合重映射/
   kv 重映射/marker 守卫/4 维向量校验）。
-- P3-2 落地：kernel.search 的 embed_task 守卫（检索中止路径取消飞行中的
+- kernel.search 的 embed_task 守卫（检索中止路径取消飞行中的
   向量化请求，杜绝孤儿任务 "never retrieved" 告警）+ EmbeddingService.
   _validate 对非 list 形态 fail-open（封掉 len() TypeError 这唯一抛出面）；
   新增 TestRecallEmbedGuard / test_34d 两项用例。
@@ -391,7 +390,7 @@ fire-and-forget）。
   label + 迁入面板标题），面板说明中 KiraOS_Plugin → KiraAI（仅显示文案，
   kv 键名与后端语义不变）。
 
-### refactor(review): 测试套件去重合并 + 死代码清理（review 批）
+### refactor: 测试套件去重合并 + 死代码清理
 
 - 测试基建收敛：新增 `tests/_harness.py`（宿主桩 + 装载器），替换此前
   7 份近似拷贝的 core.* 桩样板（~600 行）；主套件 test_noriflow_memory
@@ -443,10 +442,9 @@ _backend_migration_done / kiraos_import_last_run 此前不在 KV_META 白名单
 
 ## v1.15.2 (2026-09-12, sqlite-backend 分支)
 
-### fix: SQLite 后端 review 修复 ×3（promote 画像列污染 / decay 参与者门控 / BM25 欠填）
+### fix: SQLite 后端三处修复（promote 画像列污染 / decay 参与者门控 / BM25 欠填）
 
-代码 review（059025f..943b672）确认的两个真 bug + 一处与 PG 的行为差异，
-共用同一根因：raw sqlite3.Row 的 JSON TEXT 列被当作 Python 数组消费。
+两处真 bug + 一处与 PG 的行为差异，共用同一根因：raw sqlite3.Row 的 JSON TEXT 列被当作 Python 数组消费。
 
 - **promote_pass 画像行 related_user_ids 污染**：raw 行的 JSON TEXT 喂给
   `_json_list` 被按字符迭代，晋档落库形如 `["[", "\"", "u", "2", "\"", "]"]`
@@ -481,7 +479,7 @@ children 参数（该参数按数组迭代），预览渲染第一行即抛 Type
 
 ## v1.15.0 (2026-09-12, sqlite-backend 分支)
 
-### feat: KiraOS_Plugin 记忆数据无损迁入（双后端方案 P4）
+### feat: KiraOS_Plugin 记忆数据无损迁入
 
 维护页设置栏新增「KiraOS 数据迁入」卡片：预览源目录计数 → 弹窗二次确认 →
 只读迁入 KiraOS_Plugin 的存量记忆（默认源 = 宿主 `data/memory`，可改路径）。
@@ -527,18 +525,17 @@ backend；harness 补方言派发契约回归锁（`webui_dialect_dispatch_contr
 ### feat: 双存储后端——新增 SQLite 后端（与 PostgreSQL 二选一）
 
 同一份 kernel / 合并 agent / 提示词 / WebUI 逻辑，新增 SQLite 存储后端，
-个人部署不再需要维护 PostgreSQL + pgvector 实例（设计定稿：
-nori-core `docs/plans/noriflow-dual-storage-backend-plan.md`，P0-P2/P3 落地）。
+个人部署不再需要维护 PostgreSQL + pgvector 实例。
 
 - **配置**：新增 `storage_backend`（postgres | sqlite | auto；auto=配置了
   dsn 用 postgres，否则 sqlite——现有部署行为零变化）与 `sqlite_path`
   （空 = 插件数据目录/memory.sqlite3）。均为启动期只读，运行中不可切换
   （切后端 = 换库，跨后端迁移走迁移工具，本期不做在线互转）。
-- **db 拆包（P0，零行为变化）**：`db.py` → `db/` 包（base 共享纯函数 +
+- **db 拆包（零行为变化）**：`db.py` → `db/` 包（base 共享纯函数 +
   MemoryBackend 接口契约 / postgres 原样迁入 / sqlite 新实现 / factory
   工厂 / _sqlite_pool 连接 shim）；`db/__init__` 重导出原名，全部上层
   调用方 `from .db import X` 零改动。
-- **SQLite 后端（P1）**：
+- **SQLite 后端**：
   - `migrations_sqlite/001_init.sql` 合并式初始化（等价 PG 001-010 终态，
     版本序列两侧共享，后续 schema 变更成对新增）；
   - 类型映射：TIMESTAMPTZ→固定格式 UTC TEXT（字典序=时间序）、TEXT[]→
@@ -546,13 +543,13 @@ nori-core `docs/plans/noriflow-dual-storage-backend-plan.md`，P0-P2/P3 落地�
     处理，换 embedding 模型无需重建表）；
   - 向量检索不引入 sqlite-vec：SQL 圈定行集 + Python/numpy 暴力余弦 +
     FTS5 影子表 BM25 路，`_rrf_fuse` 双后端共享融合；个人规模（≤10⁵ 行）
-    可用，天花板声明见方案 §5.3；
+    可用，更大规模建议 PostgreSQL 后端；
   - 写事务统一 `BEGIN IMMEDIATE`；数组语义（ANY/&&/array_append/unnest）
-    按方案 §5.2 改写；`REGEXP` 由 connect 注册 Python 实现（占位名守卫
+    按 SQLite 方言（json_each 等）等价改写；`REGEXP` 由 connect 注册 Python 实现（占位名守卫
     仍引用单源常量 PLACEHOLDER_NAME_SQL）；
   - `_SingleConnPool` shim：acquire 面与 asyncpg 池一致（同任务可重入），
     execute 返回 asyncpg 风格状态串（乐观锁/计数解析依赖）。
-- **WebUI 双后端（P2）**：`webui_store.py` 保留共享层（行装配/校验/常量），
+- **WebUI 双后端**：`webui_store.py` 保留共享层（行装配/校验/常量），
   方言分歧 SQL 拆到 `webui_store_pg.py` / `webui_store_sqlite.py`（函数
   一一对应，按 `backend.dialect` 派发）；维护页设置新增存储后端分组，
   dsn 非空守卫仅在 postgres（或 auto 且现值有 dsn）时生效。
