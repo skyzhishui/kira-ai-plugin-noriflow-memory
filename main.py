@@ -386,44 +386,65 @@ def _build_config(raw: dict) -> LocalMemoryConfig:
     )
 
 
+def _cross_field_fallback_keys(exc: "ValidationError") -> set:
+    """从 ValidationError 收集跨字段校验失败的回退键。
+
+    校验器抛 CrossFieldConfigError 自报管辖键（pydantic 把原始异常放在
+    errors()[i]["ctx"]["error"]），据此精确回退**该组**键；自报键缺失时
+    （未来新增校验器漏带 keys 的防御）返回空集，由调用方退回整表回退。
+    """
+    keys: set = set()
+    for err in exc.errors():
+        if err.get("loc"):
+            continue  # 字段级错误走逐项回退分支
+        declared = getattr((err.get("ctx") or {}).get("error"), "keys", None)
+        if declared:
+            keys |= set(declared)
+    return keys
+
+
 def _try_build_config(raw: dict) -> LocalMemoryConfig:
     """Fallback layer for _build_config: when out-of-range values trigger a
     pydantic validation exception, fall back to default parameters, consistent
     with the module's "per-field tolerant" promise, so a single config item
     (e.g. pool_min=0) cannot fail the whole plugin initialization.
 
-    逐字段回退：只把**越界的那几项**从入参里去掉再重建——其余用户配置
-    保持不变（整份回退会把用户的其他设置一并清掉）。
+    逐字段回退：字段级越界（gt/ge 等）只把**越界的那几项**从入参里去掉再
+    重建——其余用户配置保持不变（整份回退会把用户的其他设置一并清掉）。
 
-    跨字段校验（model_validator，如迟滞带/池边界组合非法）的 pydantic 错误
-    loc 为空、无法逐项定位：按 config.CROSS_FIELD_VALIDATED_KEYS 只回退
-    涉及的键（其余用户配置保留），回退时打告警点名被回退的键。
+    跨字段回退：model_validator 的 pydantic 错误 loc 为空、无法逐项定位；
+    校验器经 CrossFieldConfigError 自报管辖键，**只回退真正非法的那组**
+    （另一组合法的用户显式配置保留，如池边界非法时不牵连显式调好的画像
+    阈值）。pydantic 对多个 model_validator 只报第一个失败——两组同时非法
+    时逐轮回退（每轮至少移除一组键，键集单调收缩，循环必然终止）。
     """
-    try:
-        return _build_config(raw)
-    except ValidationError as exc:
-        bad = {str(err["loc"][0]) for err in exc.errors() if err.get("loc")}
-        if bad:
-            logger.warning(
-                "配置项越界（pydantic 校验失败）：%s 已回退默认值", sorted(bad)
-            )
-        else:
-            bad = set(CROSS_FIELD_VALIDATED_KEYS) & set(raw)
-            logger.warning(
-                "跨字段校验失败（迟滞带/池边界等组合非法），仅回退涉及的"
-                "配置键（其余配置保留）：%s", sorted(bad),
-            )
-        cleaned = {k: v for k, v in raw.items() if k not in bad}
+    cleaned = dict(raw)
+    for _ in range(6):  # 轮次上限：字段级与跨字段交替出现的兜底防御
         try:
             return _build_config(cleaned)
-        except Exception:
-            logger.warning(
-                "配置项越界且逐项回退失败，全部回退默认值", exc_info=True
+        except ValidationError as exc:
+            field_bad = {str(e["loc"][0]) for e in exc.errors() if e.get("loc")}
+            if field_bad:
+                logger.warning(
+                    "配置项越界（pydantic 校验失败）：%s 已回退默认值",
+                    sorted(field_bad),
+                )
+                cleaned = {k: v for k, v in cleaned.items() if k not in field_bad}
+                continue
+            group = _cross_field_fallback_keys(exc) or (
+                set(CROSS_FIELD_VALIDATED_KEYS) & set(cleaned)
             )
-            return LocalMemoryConfig(dsn=_cfg_str(raw, "dsn"))
-    except Exception:
-        logger.warning("配置构造失败，全部回退默认值", exc_info=True)
-        return LocalMemoryConfig(dsn=_cfg_str(raw, "dsn"))
+            if not (group & set(cleaned)):
+                break  # 无可回退键（如缺省组合本身非法），转全部回退
+            logger.warning(
+                "跨字段校验失败（迟滞带/池边界等组合非法），仅回退该组涉及的"
+                "配置键（其余配置保留）：%s", sorted(group & set(cleaned)),
+            )
+            cleaned = {k: v for k, v in cleaned.items() if k not in group}
+        except Exception:
+            break
+    logger.warning("配置项越界且逐项回退失败，全部回退默认值", exc_info=True)
+    return LocalMemoryConfig(dsn=_cfg_str(raw, "dsn"))
 
 
 @dataclass

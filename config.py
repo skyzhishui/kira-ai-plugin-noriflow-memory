@@ -10,14 +10,28 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-# 跨字段校验（model_validator）涉及的配置键：装配期组合非法时，兜底层仅回退
-# 这些键、其余用户配置保留（main._try_build_config 逐项回退的依据）。
+# 跨字段校验（model_validator）涉及的配置键：兜底回退范围的防御性上限。
+# 精确回退依赖校验器抛 CrossFieldConfigError 自报管辖键（main._try_build_config
+# 据此只回退真正非法的那组，不牵连其他组合法的显式配置）；仅当跨字段错误
+# 拿不到自报键（未来新增校验器漏带 keys）时，才退回整表回退。
 # 字段级约束（gt/ge 等）不走此表——pydantic 错误自带 loc，可逐项定位。
 CROSS_FIELD_VALIDATED_KEYS: tuple = (
     "pool_min", "pool_max",
     "promote_threshold", "demote_threshold",
     "score_start_high", "score_start_medium",
 )
+
+
+class CrossFieldConfigError(ValueError):
+    """跨字段校验失败：keys 声明该校验器管辖、需一并回退默认值的配置键。
+
+    pydantic 会把本异常实例原样放进 ValidationError.errors()[i]["ctx"]["error"]，
+    兜底层据此精确定位回退哪一组键。
+    """
+
+    def __init__(self, message: str, keys) -> None:
+        super().__init__(message)
+        self.keys = tuple(keys)
 
 
 class LocalMemoryConfig(BaseModel):
@@ -413,7 +427,9 @@ class LocalMemoryConfig(BaseModel):
     def _pool_bounds_consistent(self) -> "LocalMemoryConfig":
         """pool_min must not exceed pool_max (pool creation would fail)."""
         if self.pool_min > self.pool_max:
-            raise ValueError("pool_min 不能大于 pool_max")
+            raise CrossFieldConfigError(
+                "pool_min 不能大于 pool_max", ("pool_min", "pool_max")
+            )
         return self
 
     @model_validator(mode="after")
@@ -433,10 +449,14 @@ class LocalMemoryConfig(BaseModel):
         max_inc = max(self.score_start_high, self.score_start_medium)
         band = self.promote_threshold - self.demote_threshold
         if band < max_inc:
-            raise ValueError(
+            raise CrossFieldConfigError(
                 f"promote_threshold - demote_threshold ({band}) 不得小于单条证据最大加分"
                 f" ({max_inc} = max(score_start_high, score_start_medium))，"
-                "否则降档簇一条证据即可回档，画像会在降级与晋档之间反复翻转"
+                "否则降档簇一条证据即可回档，画像会在降级与晋档之间反复翻转",
+                (
+                    "promote_threshold", "demote_threshold",
+                    "score_start_high", "score_start_medium",
+                ),
             )
         return self
 

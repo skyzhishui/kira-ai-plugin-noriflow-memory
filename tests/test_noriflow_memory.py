@@ -567,6 +567,45 @@ class TestHysteresisBandValidation(unittest.TestCase):
         self.assertEqual(cfg.pool_max, 8)
         self.assertEqual(cfg.recall_top_k, 7)
 
+    def test_10_pool_invalid_keeps_valid_explicit_scoring(self):
+        # 评审场景：池边界非法不得牵连合法且有意调参的评分显式配置
+        # （promote=8/demote=3 band=5 >= 3 合法）——按校验器自报键精确回退该组
+        cfg = mod._try_build_config({
+            "pool_min": 9, "pool_max": 8,
+            "promote_threshold": 8.0, "demote_threshold": 3.0,
+            "recall_top_k": 7,
+        })
+        self.assertEqual(cfg.pool_min, 2)
+        self.assertEqual(cfg.pool_max, 8)
+        self.assertEqual(cfg.promote_threshold, 8.0)
+        self.assertEqual(cfg.demote_threshold, 3.0)
+        self.assertEqual(cfg.recall_top_k, 7)
+
+    def test_11_band_invalid_keeps_valid_explicit_pool(self):
+        # 反向场景：迟滞带非法时，合法的显式池参数不被重置
+        cfg = mod._try_build_config({
+            "promote_threshold": 5.0, "demote_threshold": 3.0,
+            "pool_min": 4, "pool_max": 6,
+        })
+        self.assertEqual(cfg.promote_threshold, 6.0)
+        self.assertEqual(cfg.demote_threshold, 2.0)
+        self.assertEqual(cfg.pool_min, 4)
+        self.assertEqual(cfg.pool_max, 6)
+
+    def test_12_both_groups_invalid_resets_both_keeps_rest(self):
+        # 两组同时非法：pydantic 只报第一个失败校验器，逐轮回退到两组全清、
+        # 其余用户配置保留
+        cfg = mod._try_build_config({
+            "pool_min": 9, "pool_max": 8,
+            "promote_threshold": 5.0, "demote_threshold": 3.0,
+            "recall_top_k": 7,
+        })
+        self.assertEqual(cfg.pool_min, 2)
+        self.assertEqual(cfg.pool_max, 8)
+        self.assertEqual(cfg.promote_threshold, 6.0)
+        self.assertEqual(cfg.demote_threshold, 2.0)
+        self.assertEqual(cfg.recall_top_k, 7)
+
     def test_07_scaled_down_score_system_is_accepted(self):
         # 迟滞带按配置的证据加分换算（不写死 3 分）：整体缩放的刻度同样成立
         cfg = self.LocalMemoryConfig(
