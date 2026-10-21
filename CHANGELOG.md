@@ -37,6 +37,14 @@
   其余用户配置保留、告警点名被回退的键；pydantic 对多个 model_validator 只报
   第一个失败，两组同时非法时逐轮回退（键集单调收缩必然终止）；自报键缺失时
   防御性退回 `CROSS_FIELD_VALIDATED_KEYS` 整表回退；
+- **起步分非负 + 倒挂显式守卫（修 pr #17 第六轮评审意见）**：`score_start_high` /
+  `score_start_medium` 补 `ge=0`——负起步分会让迟滞带校验的"单条证据最大加分"
+  变负、校验形同虚设，可配出 `promote=1 / demote=5` 的倒挂组合（迟滞带语义失效，
+  低分晋档高分降档互相矛盾）；同时 band 校验器前置显式 `promote > demote` 守卫，
+  关掉 `ge=0` 下仅剩的 `promote == demote` 零迟滞漏网组合。另修测试断言歧义：
+  `test_09/10/12` 原断言 `pool_max == 8`（入参值），但分组回退是整组复位、
+  `pool_max` 应取缺省——原入参 8 恰与缺省 8 相同而"碰巧"通过，现改入参为 6
+  （≠ 缺省）使断言无歧义；
 - **晋升阈值不得超过分数封顶（修 pr #17 第五轮评审意见）**：新增
   `_promote_thresholds_within_cap`——`promote_threshold` / `recent_promote_threshold`
   大于 `score_cap` 时装配期抛错（相等允许：分数经 `min(cap, ...)` 可达封顶，

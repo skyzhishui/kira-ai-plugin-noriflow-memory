@@ -222,13 +222,13 @@
     "type": "integer",
     "name": "high 置信事实起步分",
     "default": 3,
-    "hint": "high 置信度提取的事实进入簇时的初始分数。"
+    "hint": "high 置信度提取的事实进入簇时的初始分数（非负：负数会让迟滞带校验的单条证据加分失真，可配出 promote/demote 倒挂的非法组合）。"
   },
   "score_start_medium": {
     "type": "integer",
     "name": "medium 置信事实起步分",
     "default": 2,
-    "hint": "medium 置信度事实的初始分数。"
+    "hint": "medium 置信度事实的初始分数（非负，理由同 score_start_high）。"
   },
   "score_cap": {
     "type": "float",

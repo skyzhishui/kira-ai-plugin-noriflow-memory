@@ -98,8 +98,15 @@ class LocalMemoryConfig(BaseModel):
     )
 
     # ---- M4/M5：评分状态机 ----
-    score_start_high: int = Field(default=3, description="high 置信事实起步分")
-    score_start_medium: int = Field(default=2, description="medium 置信事实起步分")
+    score_start_high: int = Field(
+        default=3, ge=0,
+        description="high 置信事实起步分（非负：负数会让迟滞带校验的"
+        "单条证据加分失真，配出 promote/demote 倒挂的非法组合）",
+    )
+    score_start_medium: int = Field(
+        default=2, ge=0,
+        description="medium 置信事实起步分（非负，理由同 score_start_high）",
+    )
     score_cap: float = Field(
         default=10.0,
         gt=0,
@@ -452,6 +459,14 @@ class LocalMemoryConfig(BaseModel):
         """
         max_inc = max(self.score_start_high, self.score_start_medium)
         band = self.promote_threshold - self.demote_threshold
+        if self.promote_threshold <= self.demote_threshold:
+            # 显式倒挂守卫：ge=0 已挡负起步分，此处关掉仅剩的
+            # promote==demote（零迟滞）与任何路径漏进来的倒挂组合
+            raise CrossFieldConfigError(
+                f"promote_threshold ({self.promote_threshold}) 必须大于 "
+                f"demote_threshold ({self.demote_threshold})，迟滞带不得为零或负",
+                ("promote_threshold", "demote_threshold"),
+            )
         if band + 1e-9 < max_inc:
             raise CrossFieldConfigError(
                 f"promote_threshold - demote_threshold ({band}) 不得小于单条证据最大加分"

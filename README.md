@@ -146,7 +146,7 @@ flowchart TD
 | merge_batch_size | integer | 200 | 归一化遍单批事实数 |
 | candidate_top_k | integer | 20 | 候选簇向量检索 top-K |
 | llm_budget_per_cycle | integer | 200 | 每周期 LLM 裁定预算 |
-| score_start_high / score_start_medium | integer | 3 / 2 | high / medium 置信事实起步分 |
+| score_start_high / score_start_medium | integer | 3 / 2 | high / medium 置信事实起步分（非负：负数会让迟滞带校验的单条证据加分失真；`promote_threshold` 必须大于 `demote_threshold`，装配期强制校验） |
 | score_cap / promote_threshold / demote_threshold | float | 10 / 6 / 2 | 分数封顶 / 进画像阈值 / 降级迟滞下界（迟滞带 = promote − demote 不得小于单条证据最大加分 `max(score_start_high, score_start_medium)`，否则降档簇一条证据即可回档、画像反复翻转；promote 不得大于 score_cap（相等允许），否则晋升静默停摆；均由 `model_validator` 装配期强制校验，非法组合保存即被拒） |
 | decay_factor / decay_interval_days | float / integer | 0.9 / 14 | 每周期衰减系数与周期天数（interval 兼缺席冻结窗口粒度；pending 死亡窗口由 pending_dead_days 独立控制） |
 | recent_expire_days / recent_promote_threshold | integer / float | 30 / 4 | 近期维度过期天数与进画像阈值 |

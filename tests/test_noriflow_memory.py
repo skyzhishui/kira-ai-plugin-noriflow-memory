@@ -557,26 +557,26 @@ class TestHysteresisBandValidation(unittest.TestCase):
         self.assertEqual(cfg.merge_interval_hours, 12.0)
 
     def test_09_pool_bounds_cross_field_fallback_keeps_other_keys(self):
-        # 另一条跨字段校验（pool_min > pool_max）同走 CROSS_FIELD_VALIDATED_KEYS
-        # 回退：只清池参数，其余配置保留
+        # 另一条跨字段校验（pool_min > pool_max）同走分组回退：整组复位，
+        # pool_max 也回缺省（8）而非入参 6——入参故意取 != 缺省，避免断言歧义
         cfg = mod._try_build_config({
-            "pool_min": 9, "pool_max": 8,
+            "pool_min": 9, "pool_max": 6,
             "recall_top_k": 7,
         })
         self.assertEqual(cfg.pool_min, 2)
-        self.assertEqual(cfg.pool_max, 8)
+        self.assertEqual(cfg.pool_max, 8)  # 整组复位 -> 缺省值，非入参 6
         self.assertEqual(cfg.recall_top_k, 7)
 
     def test_10_pool_invalid_keeps_valid_explicit_scoring(self):
         # 评审场景：池边界非法不得牵连合法且有意调参的评分显式配置
         # （promote=8/demote=3 band=5 >= 3 合法）——按校验器自报键精确回退该组
         cfg = mod._try_build_config({
-            "pool_min": 9, "pool_max": 8,
+            "pool_min": 9, "pool_max": 6,
             "promote_threshold": 8.0, "demote_threshold": 3.0,
             "recall_top_k": 7,
         })
         self.assertEqual(cfg.pool_min, 2)
-        self.assertEqual(cfg.pool_max, 8)
+        self.assertEqual(cfg.pool_max, 8)  # 整组复位 -> 缺省值，非入参 6
         self.assertEqual(cfg.promote_threshold, 8.0)
         self.assertEqual(cfg.demote_threshold, 3.0)
         self.assertEqual(cfg.recall_top_k, 7)
@@ -596,15 +596,32 @@ class TestHysteresisBandValidation(unittest.TestCase):
         # 两组同时非法：pydantic 只报第一个失败校验器，逐轮回退到两组全清、
         # 其余用户配置保留
         cfg = mod._try_build_config({
-            "pool_min": 9, "pool_max": 8,
+            "pool_min": 9, "pool_max": 6,
             "promote_threshold": 5.0, "demote_threshold": 3.0,
             "recall_top_k": 7,
         })
         self.assertEqual(cfg.pool_min, 2)
-        self.assertEqual(cfg.pool_max, 8)
+        self.assertEqual(cfg.pool_max, 8)  # 整组复位 -> 缺省值，非入参 6
         self.assertEqual(cfg.promote_threshold, 6.0)
         self.assertEqual(cfg.demote_threshold, 2.0)
         self.assertEqual(cfg.recall_top_k, 7)
+
+    def test_19_negative_start_scores_are_rejected(self):
+        # 评审场景：负起步分让 max_inc 为负、迟滞带校验形同虚设（可配出
+        # promote=1/demote=5 倒挂）——ge=0 直接拒
+        with self.assertRaises(Exception):
+            self.LocalMemoryConfig(score_start_high=-5, score_start_medium=-5,
+                                   promote_threshold=1.0, demote_threshold=5.0)
+
+    def test_20_inverted_or_zero_band_is_rejected(self):
+        # 显式倒挂守卫：promote <= demote 一律拒（含零迟滞的相等情形，
+        # ge=0 下仅剩的漏网组合）
+        with self.assertRaises(Exception) as ctx:
+            self.LocalMemoryConfig(
+                promote_threshold=6.0, demote_threshold=6.0,
+                score_start_high=0, score_start_medium=0,
+            )
+        self.assertIn("必须大于", str(ctx.exception))
 
     def test_07_scaled_down_score_system_is_accepted(self):
         # 迟滞带按配置的证据加分换算（不写死 3 分）：整体缩放的刻度同样成立
