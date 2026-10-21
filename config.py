@@ -49,6 +49,15 @@ class LocalMemoryConfig(BaseModel):
         ge=0,
         description="编码输入字符上限（0=不截断）：超长输入截断保底，防编码必败降级成补编码毒丸行",
     )
+    retain_interval_group: int = Field(
+        default=1, ge=1, description="群聊 retain 触发间隔（回合数）"
+    )
+    retain_interval_private: int = Field(
+        default=5, ge=1, description="私聊 retain 触发间隔（回合数）"
+    )
+    flush_idle_s: float = Field(
+        default=1800.0, gt=0, description="会话空闲 flush 延迟（秒）"
+    )
 
     backfill_interval_seconds: float = Field(
         default=300.0, gt=0, description="embedding 补算任务周期（秒）"

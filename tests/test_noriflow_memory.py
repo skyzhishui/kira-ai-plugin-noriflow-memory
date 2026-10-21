@@ -360,7 +360,12 @@ def _ready_plugin(mod, cfg=None, ctx=None):
     initialize starts background tasks; they are stopped inside the same loop before the test ends to avoid
     cross-loop pending-task warnings.
     """
-    cfg = cfg if cfg is not None else {"dsn": "postgres://u:p@127.0.0.1:5432/db"}
+    cfg = cfg if cfg is not None else {
+        "dsn": "postgres://u:p@127.0.0.1:5432/db",
+        # 既有用例锁定改动前的逐轮 retain 语义（私聊默认攒批由
+        # tests/test_memory_retain_batch.py 单独覆盖）
+        "retain_interval_private": 1,
+    }
     ctx = ctx or FakeCtx()
     inst = mod.NoriflowMemoryPlugin(ctx, dict(cfg))
     orig_db = mod.MemoryDatabase
@@ -374,6 +379,14 @@ def _ready_plugin(mod, cfg=None, ctx=None):
                 await inst._backfill_task.stop()
             if inst._merge_agent is not None:
                 await inst._merge_agent.stop()
+            if inst._retain_sweep_task is not None:
+                # 取消后必须 await 掉：cancel() 只是把取消回调排进 ready
+                # 队列，不 await 的话协程在 loop 关闭时仍是 pending →
+                # "Task was destroyed but it is pending!" 警告
+                sweep = inst._retain_sweep_task
+                inst._retain_sweep_task = None
+                sweep.cancel()
+                await asyncio.gather(sweep, return_exceptions=True)
 
         loop.run_until_complete(_stop_bg())
     finally:
@@ -3765,7 +3778,7 @@ class TestWatermarkAtomicity(unittest.TestCase):
             inst._alias_upsert_batch = gated_alias
             retains: list[set] = []
 
-            async def fake_retain(state, sid="", delta_keys=None):
+            async def fake_retain(state, sid="", delta_keys=None, durable=True):
                 retains.append(set(delta_keys or ()))
 
             inst._do_retain = fake_retain
