@@ -37,6 +37,15 @@
   其余用户配置保留、告警点名被回退的键；pydantic 对多个 model_validator 只报
   第一个失败，两组同时非法时逐轮回退（键集单调收缩必然终止）；自报键缺失时
   防御性退回 `CROSS_FIELD_VALIDATED_KEYS` 整表回退；
+- **晋升阈值不得超过分数封顶（修 pr #17 第五轮评审意见）**：新增
+  `_promote_thresholds_within_cap`——`promote_threshold` / `recent_promote_threshold`
+  大于 `score_cap` 时装配期抛错（相等允许：分数经 `min(cap, ...)` 可达封顶，
+  旧缺省 promote=10==cap=10 即此形态；浮点比较带 1e-9 容差）。此前该组合可从
+  维护页直接配出且无任何拦截——簇分数被 cap 封顶后永远达不到阈值，**晋升被
+  静默关闭**；跨字段回退只复位 band 组、遗留小刻度 score_cap 的级联场景同样
+  中招（回退后 promote 复位 6.0 而 cap 留 1.5）。回退组联动：该校验器自报
+  键 (score_cap, promote_threshold, recent_promote_threshold)，band 组复位后
+  若与遗留 cap 组合非法，兜底循环第二轮自动复位 cap 组，终态刻度自洽；
 - **迟滞带比较带浮点容差 + 兜底告警保留异常堆栈（修 pr #17 第四轮评审意见）**：
   band 比较改为 `band + 1e-9 < max_inc`——二进制浮点减法有表示误差（实测
   `6.1 - 3.1 == 2.9999999999999996`），数学上 band 恰等于加分（相等亦安全）的

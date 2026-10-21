@@ -608,9 +608,11 @@ class TestHysteresisBandValidation(unittest.TestCase):
 
     def test_07_scaled_down_score_system_is_accepted(self):
         # 迟滞带按配置的证据加分换算（不写死 3 分）：整体缩放的刻度同样成立
+        # （recent_promote_threshold 也须随刻度缩到 cap 之内）
         cfg = self.LocalMemoryConfig(
             score_cap=1.5, promote_threshold=1.5, demote_threshold=0.5,
             score_start_high=1, score_start_medium=1,
+            recent_promote_threshold=1.0,
         )
         self.assertEqual(cfg.promote_threshold, 1.5)
 
@@ -637,6 +639,35 @@ class TestHysteresisBandValidation(unittest.TestCase):
             self.LocalMemoryConfig(
                 promote_threshold=5.1, demote_threshold=3.1,
             )
+
+    def test_15_promote_above_cap_is_rejected(self):
+        # 晋升阈值 > 封顶 = 晋升静默停摆，装配期直接拒（此前无任何拦截）
+        with self.assertRaises(Exception) as ctx:
+            self.LocalMemoryConfig(score_cap=1.5)  # promote 缺省 6.0 > 1.5
+        self.assertIn("不得大于 score_cap", str(ctx.exception))
+
+    def test_16_recent_promote_above_cap_is_rejected(self):
+        with self.assertRaises(Exception):
+            self.LocalMemoryConfig(score_cap=3.5)  # recent 缺省 4.0 > 3.5
+
+    def test_17_promote_equal_to_cap_is_accepted(self):
+        # 相等允许：分数经 min(cap, ...) 可达封顶（旧缺省 promote=10==cap=10 形态）
+        cfg = self.LocalMemoryConfig(score_cap=6.0)  # promote 缺省 6.0 == cap
+        self.assertEqual(cfg.score_cap, 6.0)
+
+    def test_18_band_fallback_cascades_to_cap_group(self):
+        # 评审级联场景：小刻度 cap + band 非法 -> band 组复位后 promote=6 > cap=1.5
+        # -> cap 组再复位，终态刻度自洽，晋升不会静默停摆；其余配置保留
+        cfg = mod._try_build_config({
+            "score_cap": 1.5, "promote_threshold": 1.5, "demote_threshold": 0.5,
+            "score_start_high": 2, "score_start_medium": 1,
+            "recall_top_k": 7,
+        })
+        self.assertEqual(cfg.score_cap, 10.0)
+        self.assertEqual(cfg.promote_threshold, 6.0)
+        self.assertEqual(cfg.demote_threshold, 2.0)
+        self.assertEqual(cfg.recent_promote_threshold, 4.0)
+        self.assertEqual(cfg.recall_top_k, 7)
 
 
 class TestFastLlmExit(unittest.TestCase):
@@ -4545,6 +4576,7 @@ class TestConfigConstraints(unittest.TestCase):
         cfg = mod.LocalMemoryConfig(
             score_cap=1.5, promote_threshold=1.5, demote_threshold=0.5,
             score_start_high=1, score_start_medium=1,
+            recent_promote_threshold=1.0,
             failure_threshold=1, embedding_dims=1024,
         )
         self.assertEqual(cfg.score_cap, 1.5)

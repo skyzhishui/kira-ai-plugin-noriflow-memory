@@ -147,7 +147,7 @@ flowchart TD
 | candidate_top_k | integer | 20 | 候选簇向量检索 top-K |
 | llm_budget_per_cycle | integer | 200 | 每周期 LLM 裁定预算 |
 | score_start_high / score_start_medium | integer | 3 / 2 | high / medium 置信事实起步分 |
-| score_cap / promote_threshold / demote_threshold | float | 10 / 6 / 2 | 分数封顶 / 进画像阈值 / 降级迟滞下界（迟滞带 = promote − demote 不得小于单条证据最大加分 `max(score_start_high, score_start_medium)`，否则降档簇一条证据即可回档、画像反复翻转；该不变量在配置装配期由 `model_validator` 强制校验，非法组合保存即被拒） |
+| score_cap / promote_threshold / demote_threshold | float | 10 / 6 / 2 | 分数封顶 / 进画像阈值 / 降级迟滞下界（迟滞带 = promote − demote 不得小于单条证据最大加分 `max(score_start_high, score_start_medium)`，否则降档簇一条证据即可回档、画像反复翻转；promote 不得大于 score_cap（相等允许），否则晋升静默停摆；均由 `model_validator` 装配期强制校验，非法组合保存即被拒） |
 | decay_factor / decay_interval_days | float / integer | 0.9 / 14 | 每周期衰减系数与周期天数（interval 兼缺席冻结窗口粒度；pending 死亡窗口由 pending_dead_days 独立控制） |
 | recent_expire_days / recent_promote_threshold | integer / float | 30 / 4 | 近期维度过期天数与进画像阈值 |
 | commitment_expire_days | integer | 60 | 约定维度过期天数：最近一次被确认后超此天数无新证据，降待定出画像（簇体保留可复活；持续被提起的约定自动续期） |

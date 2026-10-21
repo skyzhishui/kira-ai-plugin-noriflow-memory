@@ -234,13 +234,13 @@
     "type": "float",
     "name": "分数封顶",
     "default": 10.0,
-    "hint": "簇分数上限（达到 promote_threshold 即入画像，封顶防无限增长）。"
+    "hint": "簇分数上限（达到 promote_threshold 即入画像，封顶防无限增长）。promote_threshold / recent_promote_threshold 不得大于该值（装配期强制校验），否则簇分数永远达不到晋升阈值、晋升静默停摆。"
   },
   "promote_threshold": {
     "type": "float",
     "name": "进入画像阈值",
     "default": 6.0,
-    "hint": "簇分数达到该值进入用户画像。迟滞带（promote_threshold - demote_threshold）不得小于单条证据最大加分（max(score_start_high, score_start_medium)），否则降档簇一条证据即可回档；该不变量在配置装配期强制校验，非法值保存即被拒。"
+    "hint": "簇分数达到该值进入用户画像。迟滞带（promote_threshold - demote_threshold）不得小于单条证据最大加分（max(score_start_high, score_start_medium)），否则降档簇一条证据即可回档；且不得大于 score_cap（相等允许）。两项均装配期强制校验，非法值保存即被拒。"
   },
   "demote_threshold": {
     "type": "float",

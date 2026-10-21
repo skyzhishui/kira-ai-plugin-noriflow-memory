@@ -17,8 +17,8 @@ from pydantic import BaseModel, Field, model_validator
 # 字段级约束（gt/ge 等）不走此表——pydantic 错误自带 loc，可逐项定位。
 CROSS_FIELD_VALIDATED_KEYS: tuple = (
     "pool_min", "pool_max",
-    "promote_threshold", "demote_threshold",
-    "score_start_high", "score_start_medium",
+    "score_cap", "promote_threshold", "demote_threshold",
+    "recent_promote_threshold", "score_start_high", "score_start_medium",
 )
 
 
@@ -461,6 +461,30 @@ class LocalMemoryConfig(BaseModel):
                     "promote_threshold", "demote_threshold",
                     "score_start_high", "score_start_medium",
                 ),
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _promote_thresholds_within_cap(self) -> "LocalMemoryConfig":
+        """晋升阈值不得超过分数封顶，否则簇分数被 score_cap 封顶后永远达不到
+        阈值，晋升被静默关闭（此前维护页可直接配出该组合且无任何拦截——
+        含跨字段回退只复位 band 组、遗留小刻度 score_cap 的级联场景）。
+
+        相等允许：分数经 min(score_cap, ...) 可达封顶值（旧缺省
+        promote=10 == score_cap=10 即此形态）。浮点比较带 1e-9 容差，
+        与迟滞带校验同口径。
+        """
+        cap = self.score_cap
+        if (
+            self.promote_threshold > cap + 1e-9
+            or self.recent_promote_threshold > cap + 1e-9
+        ):
+            raise CrossFieldConfigError(
+                f"promote_threshold ({self.promote_threshold}) / "
+                f"recent_promote_threshold ({self.recent_promote_threshold}) "
+                f"不得大于 score_cap ({cap})：簇分数被 score_cap 封顶后永远达不到"
+                "晋升阈值，晋升会被静默关闭",
+                ("score_cap", "promote_threshold", "recent_promote_threshold"),
             )
         return self
 
