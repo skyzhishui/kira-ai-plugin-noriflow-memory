@@ -10,6 +10,29 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+# 跨字段校验（model_validator）涉及的配置键：兜底回退范围的防御性上限。
+# 精确回退依赖校验器抛 CrossFieldConfigError 自报管辖键（main._try_build_config
+# 据此只回退真正非法的那组，不牵连其他组合法的显式配置）；仅当跨字段错误
+# 拿不到自报键（未来新增校验器漏带 keys）时，才退回整表回退。
+# 字段级约束（gt/ge 等）不走此表——pydantic 错误自带 loc，可逐项定位。
+CROSS_FIELD_VALIDATED_KEYS: tuple = (
+    "pool_min", "pool_max",
+    "score_cap", "promote_threshold", "demote_threshold",
+    "recent_promote_threshold", "score_start_high", "score_start_medium",
+)
+
+
+class CrossFieldConfigError(ValueError):
+    """跨字段校验失败：keys 声明该校验器管辖、需一并回退默认值的配置键。
+
+    pydantic 会把本异常实例原样放进 ValidationError.errors()[i]["ctx"]["error"]，
+    兜底层据此精确定位回退哪一组键。
+    """
+
+    def __init__(self, message: str, keys) -> None:
+        super().__init__(message)
+        self.keys = tuple(keys)
+
 
 class LocalMemoryConfig(BaseModel):
     """Runtime config for the local memory backend (PostgreSQL + pgvector / SQLite dual backend)."""
@@ -49,6 +72,15 @@ class LocalMemoryConfig(BaseModel):
         ge=0,
         description="编码输入字符上限（0=不截断）：超长输入截断保底，防编码必败降级成补编码毒丸行",
     )
+    retain_interval_group: int = Field(
+        default=1, ge=1, description="群聊 retain 触发间隔（回合数）"
+    )
+    retain_interval_private: int = Field(
+        default=5, ge=1, description="私聊 retain 触发间隔（回合数）"
+    )
+    flush_idle_s: float = Field(
+        default=1800.0, gt=0, description="会话空闲 flush 延迟（秒）"
+    )
 
     backfill_interval_seconds: float = Field(
         default=300.0, gt=0, description="embedding 补算任务周期（秒）"
@@ -66,20 +98,36 @@ class LocalMemoryConfig(BaseModel):
     )
 
     # ---- M4/M5：评分状态机 ----
-    score_start_high: int = Field(default=3, description="high 置信事实起步分")
-    score_start_medium: int = Field(default=2, description="medium 置信事实起步分")
+    score_start_high: int = Field(
+        default=3, ge=0,
+        description="high 置信事实起步分（非负：负数会让迟滞带校验的"
+        "单条证据加分失真，配出 promote/demote 倒挂的非法组合）",
+    )
+    score_start_medium: int = Field(
+        default=2, ge=0,
+        description="medium 置信事实起步分（非负，理由同 score_start_high）",
+    )
     score_cap: float = Field(
         default=10.0,
         gt=0,
         description="分数封顶（须为正：0 会把簇分数钉死 0、晋升停摆）",
     )
     promote_threshold: float = Field(
-        default=10.0,
+        default=6.0,
         gt=0,
-        description="进入画像阈值（须为正：0 会让全部簇立即晋升）",
+        description="进入画像阈值（须为正：0 会让全部簇立即晋升）；"
+        "迟滞带 = promote_threshold - demote_threshold，不得小于单条证据最大加分"
+        "（max(score_start_high, score_start_medium)；相等亦安全——降档判定为严格小于），"
+        "否则降档簇一条证据即可回档（默认 6-2=4 ≥ 3；装配期强制校验）",
     )
-    demote_threshold: float = Field(default=3.0, description="画像降级阈值（迟滞下界）")
-    decay_factor: float = Field(default=0.8, gt=0, le=1, description="每衰减周期分数系数")
+    demote_threshold: float = Field(
+        default=2.0,
+        gt=0,
+        description="画像降级阈值（迟滞下界；须为正：0 会让画像永不掉出）；"
+        "与 promote_threshold 的差值不得小于单条证据最大加分"
+        "（max(score_start_high, score_start_medium)），否则降档簇一条证据即可回档",
+    )
+    decay_factor: float = Field(default=0.9, gt=0, le=1, description="每衰减周期分数系数")
     decay_interval_days: int = Field(default=14, ge=1, description="衰减周期（天），兼缺席冻结窗口粒度")
     recent_expire_days: int = Field(default=30, ge=1, description="recent 维度过期天数")
     recent_promote_threshold: float = Field(default=4.0, description="recent 维度进画像阈值")
@@ -386,7 +434,73 @@ class LocalMemoryConfig(BaseModel):
     def _pool_bounds_consistent(self) -> "LocalMemoryConfig":
         """pool_min must not exceed pool_max (pool creation would fail)."""
         if self.pool_min > self.pool_max:
-            raise ValueError("pool_min 不能大于 pool_max")
+            raise CrossFieldConfigError(
+                "pool_min 不能大于 pool_max", ("pool_min", "pool_max")
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _hysteresis_band_guards_repromote(self) -> "LocalMemoryConfig":
+        """迟滞带校验：降档簇一条证据即可回档时，画像会在"降级→单条证据→再晋档"之间翻转。
+
+        降档判定是严格小于（`score < demote_threshold`），故降档簇分数上界为
+        `demote_threshold - ε`；复活时按 `min(cap, score + start_score)` 累加，
+        再晋档要求 `score >= promote_threshold`。于是当
+        `band = promote - demote >= 单条证据最大加分` 时，
+        `demote - ε + 加分 < promote` 恒成立（band 恰等于加分也安全），一条证据
+        无法回档；band 小于加分时（如 5/3）降档簇 + 一条 high 即可回档。
+
+        非法组合在配置装配期即抛出（维护页保存走同一模型，非法值返回 422），
+        不再只靠 description 文字约束。
+
+        浮点比较带 1e-9 容差：二进制浮点减法有表示误差（如 6.1 - 3.1 =
+        2.9999999999999996），数学上 band 恰等于加分（相等亦安全）的组合
+        不得因表示误差被误拒。
+        """
+        max_inc = max(self.score_start_high, self.score_start_medium)
+        band = self.promote_threshold - self.demote_threshold
+        if self.promote_threshold <= self.demote_threshold:
+            # 显式倒挂守卫：ge=0 已挡负起步分，此处关掉仅剩的
+            # promote==demote（零迟滞）与任何路径漏进来的倒挂组合
+            raise CrossFieldConfigError(
+                f"promote_threshold ({self.promote_threshold}) 必须大于 "
+                f"demote_threshold ({self.demote_threshold})，迟滞带不得为零或负",
+                ("promote_threshold", "demote_threshold"),
+            )
+        if band + 1e-9 < max_inc:
+            raise CrossFieldConfigError(
+                f"promote_threshold - demote_threshold ({band}) 不得小于单条证据最大加分"
+                f" ({max_inc} = max(score_start_high, score_start_medium))，"
+                "否则降档簇一条证据即可回档，画像会在降级与晋档之间反复翻转",
+                (
+                    "promote_threshold", "demote_threshold",
+                    "score_start_high", "score_start_medium",
+                ),
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _promote_thresholds_within_cap(self) -> "LocalMemoryConfig":
+        """晋升阈值不得超过分数封顶，否则簇分数被 score_cap 封顶后永远达不到
+        阈值，晋升被静默关闭（此前维护页可直接配出该组合且无任何拦截——
+        含跨字段回退只复位 band 组、遗留小刻度 score_cap 的级联场景）。
+
+        相等允许：分数经 min(score_cap, ...) 可达封顶值（旧缺省
+        promote=10 == score_cap=10 即此形态）。浮点比较带 1e-9 容差，
+        与迟滞带校验同口径。
+        """
+        cap = self.score_cap
+        if (
+            self.promote_threshold > cap + 1e-9
+            or self.recent_promote_threshold > cap + 1e-9
+        ):
+            raise CrossFieldConfigError(
+                f"promote_threshold ({self.promote_threshold}) / "
+                f"recent_promote_threshold ({self.recent_promote_threshold}) "
+                f"不得大于 score_cap ({cap})：簇分数被 score_cap 封顶后永远达不到"
+                "晋升阈值，晋升会被静默关闭",
+                ("score_cap", "promote_threshold", "recent_promote_threshold"),
+            )
         return self
 
     # ---- 主动工具安全 ----

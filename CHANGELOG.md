@@ -2,30 +2,149 @@
 
 ## Unreleased
 
+### feat(config): 画像评分缺省值对齐长周期陪伴场景（promote 10→6 / demote 3→2 / decay 0.8→0.9）
+
+- 缺省值改动：`promote_threshold` 10→6、`demote_threshold` 3→2、`decay_factor` 0.8→0.9
+  （`config.py` 模型缺省、`main.py` 宿主配置兜底、`schema.json` 维护页展示三处口径一致）；
+- 依据（线上 seki 平台画像数据）：晋升阈值原与 `score_cap`（10）相等，簇需 4-5 次独立
+  确认才能入画像——实测 1390 个簇中仅 59 个（4.3%）达到 3 次确认，26 个 3-5 次确认的
+  高质量事实（人设/偏好/互动边界）长期卡在 6-10 分区间进不了画像；降为 6 后这批事实
+  可直接晋档（两次独立 high 抽取或三次 medium 抽取即达线）；
+- 迟滞带同步收窄但仍留有余量：`promote - demote = 4 > score_start_high(3)`，保证降档簇
+  （分数 < demote）一条 high 证据无法回档、需 2 条，避免"降级→单条证据→再晋档"翻转；
+- **模型级强制校验（修 pr #17 评审意见）**：新增 `model_validator(mode="after")`
+  `_hysteresis_band_guards_repromote`——当 `promote_threshold - demote_threshold` 小于
+  单条证据最大加分 `max(score_start_high, score_start_medium)` 时直接抛错，非法组合在
+  配置装配期即炸出（维护页保存走同一模型，非法值返回 422 并带原因），不再依赖
+  description 文字约束；同时给 `demote_threshold` 补 `gt=0`（0 会让画像永不掉出）。
+  判定阈值取 **小于** 而非"不大于"：降档判定是严格 `score < demote_threshold`，降档簇
+  分数上界为 `demote - ε`，故 band 恰等于单条证据加分时仍安全（`demote-ε+加分 <
+  promote`），band 2 才真正允许一条证据回档（已核 5/3 → 5.999 ≥ 5 可回档）。
+  校验按配置的证据加分换算而非写死 3 分，评分刻度整体缩放的部署同样成立；推论：
+  `demote_threshold > 0` + band ≥ 加分 ⇒ `promote_threshold` 必然大于单条证据加分
+  （缺省 6 > 3），低于该值的部署在装配期被拒并回退安全缺省值；
+- `decay_factor` 0.8→0.9：半衰期 = `ln(0.5)/ln(factor)` 个衰减周期——按仓库缺省周期
+  `decay_interval_days=14` 折算，0.8 约 3.11 周期（43 天 / 1.4 个月）、0.9 约 6.58 周期
+  （92 天 / 3.1 个月）；按线上部署的 30 天周期折算则分别为 93 天（3.1 个月）与
+  197 天（6.6 个月）。线上实测（30 天周期、0.8）：仅跑过 1 次衰减就有 27/51 已晋档事实
+  跌破晋升线、15 个进入降档危险区；改 0.9 后显著放缓自然遗忘；
+- **跨字段校验失败的降级范围收窄（修 pr #17 第二/三轮评审意见）**：跨字段校验
+  （model_validator）的 pydantic 错误 loc 为空，原逐项回退定位不到键会退化为
+  **整份回退默认值**（用户其余配置一并被清）；且跨字段键表若按并集回退，任一组
+  非法会把另一组**合法的显式配置**也清掉。现校验器经 `CrossFieldConfigError`
+  **自报管辖键**（pydantic 把原始异常放入 `errors()[i]["ctx"]["error"]`），
+  兜底层据此**只回退真正非法的那组**（如池边界非法不牵连显式调好的画像阈值），
+  其余用户配置保留、告警点名被回退的键；pydantic 对多个 model_validator 只报
+  第一个失败，两组同时非法时逐轮回退（键集单调收缩必然终止）；自报键缺失时
+  防御性退回 `CROSS_FIELD_VALIDATED_KEYS` 整表回退；
+- **起步分非负 + 倒挂显式守卫（修 pr #17 第六轮评审意见）**：`score_start_high` /
+  `score_start_medium` 补 `ge=0`——负起步分会让迟滞带校验的"单条证据最大加分"
+  变负、校验形同虚设，可配出 `promote=1 / demote=5` 的倒挂组合（迟滞带语义失效，
+  低分晋档高分降档互相矛盾）；同时 band 校验器前置显式 `promote > demote` 守卫，
+  关掉 `ge=0` 下仅剩的 `promote == demote` 零迟滞漏网组合。另修测试断言歧义：
+  `test_09/10/12` 原断言 `pool_max == 8`（入参值），但分组回退是整组复位、
+  `pool_max` 应取缺省——原入参 8 恰与缺省 8 相同而"碰巧"通过，现改入参为 6
+  （≠ 缺省）使断言无歧义；
+- **晋升阈值不得超过分数封顶（修 pr #17 第五轮评审意见）**：新增
+  `_promote_thresholds_within_cap`——`promote_threshold` / `recent_promote_threshold`
+  大于 `score_cap` 时装配期抛错（相等允许：分数经 `min(cap, ...)` 可达封顶，
+  旧缺省 promote=10==cap=10 即此形态；浮点比较带 1e-9 容差）。此前该组合可从
+  维护页直接配出且无任何拦截——簇分数被 cap 封顶后永远达不到阈值，**晋升被
+  静默关闭**；跨字段回退只复位 band 组、遗留小刻度 score_cap 的级联场景同样
+  中招（回退后 promote 复位 6.0 而 cap 留 1.5）。回退组联动：该校验器自报
+  键 (score_cap, promote_threshold, recent_promote_threshold)，band 组复位后
+  若与遗留 cap 组合非法，兜底循环第二轮自动复位 cap 组，终态刻度自洽；
+- **迟滞带比较带浮点容差 + 兜底告警保留异常堆栈（修 pr #17 第四轮评审意见）**：
+  band 比较改为 `band + 1e-9 < max_inc`——二进制浮点减法有表示误差（实测
+  `6.1 - 3.1 == 2.9999999999999996`），数学上 band 恰等于加分（相等亦安全）的
+  组合不得因表示误差被误拒（维护页 422 / 启动回退均受影响）；真非法组合
+  （band=2.0 远超容差）仍被拒。`_try_build_config` 终端告警的 `exc_info` 显式
+  传捕获的异常——重写后告警位于 except 块外，`sys.exc_info()` 已清空（轮次
+  耗尽路径更无活动异常），不带会丢掉定位配置构造失败所需的堆栈；
+- 破坏性提示：已显式写入宿主配置且**迟滞带组合合法**的部署（如旧缺省 10/3、
+  6/2）不受影响，宿主配置优先于模型缺省；显式配置组合非法（band < 单条证据最大
+  加分，如 5/3）的部署在装配期被拒——维护页保存时 422 拒绝、启动装配期仅回退
+  涉及的评分键（其余配置保留）并打告警；仅新装或配置缺键的部署采用新缺省；
+  降档阈值下移后画像保留期变长（低分事实清理节奏放缓），且 recent 维度的过期
+  降档不清零分数，其单证据回档路径与本组阈值无关。
+
+### docs: 文档与配置 schema 对齐 v1.18.0（无功能变更）
+
+- README 配置表补齐 v1.18.0 三个键：`retain_interval_group` / `retain_interval_private`
+  （攒批触发间隔，1=逐轮）与 `flush_idle_s`（空闲 flush 延迟 + 巡检周期换算 +
+  `memory_retain_pending` 恢复备份），升级者据此可知私聊写入延迟默认由逐轮变为 5 轮攒批；
+- README「本地测试」补 `tests/test_memory_retain_batch.py`（v1.18.0 主交付 95 例），
+  `test_memory_tools_sqlite.py` 的口径改为中性的「记忆工具」，避免与正文档「六件」冲突；
+- README 适用平台改回 `KiraAI >= 3.0.0rc1`（与 manifest `core_version` 一致，
+  `>=3.0.0` 会拒绝 rc.1 宿主）；依赖说明补条件依赖 `tomli`（Python < 3.11）与 `tzdata`（Windows）；
+- `schema.json` 补 `recall_time_label_mode`（string / relative|absolute|both，默认 both）——
+  此前仅插件维护页可编辑，宿主插件配置页缺失该项；
+- CHANGELOG v1.18.0 尾注「SQLite 迁移脚本 112/112」改为「SQLite 后端套件 112 checks 全绿」
+  （112 为 `tests/test_sqlite_backend.py` 的 check 计数，非迁移脚本数）。
+
+## v1.18.0 (2026-10-20)
+
+### feat: 私聊 retain 攒批合并编码 + 注入/画像耗时观测
+
+同步 nori 仓 PR #25（feat(memory): 私聊 retain 攒批合并编码 + 注入/画像耗时观测下沉），
+按 KiraAI 插件架构适配实现（nori 原实现基于 nori_core 对象模型与仅 PG 部署假设，
+kira 侧按「回合完成信号 + 滚动行缓存水位线 + PG/SQLite 双后端」重写）：
+
+- **攒批门控**：新增 `retain_interval_group`（默认 1=群聊逐轮，行为零变化）/
+  `retain_interval_private`（默认 5）/ `flush_idle_s`（默认 1800）三配置键，
+  运行时活读、热切换即时生效；
+- **批次合并**：私聊 N 轮合并为单批次编码——合并批次 = 各轮批次行按时间序
+  拼接，历史窗口取攒批前的快照（等价 nori 的 exclude_ids 回退机制，
+  保证攒批轮次不进历史窗口）；
+- **双持久化**：内存 pending 为主真源，`memory_retain_pending` 表（迁移 013，
+  PG/SQLite 双方言）为重启恢复备份——每轮 UPSERT「该会话全部未编码数据」的
+  合并快照（含编码在途批次），崩溃恢复不丢在途内容；
+- **失败回座**：编码失败不丢批次（合并回内存 + 重写表行），待下一触发点重试；
+  攒批路径不回滚水位线（真源已移交攒批缓存/表行，逐轮路径的回滚语义不变）；
+- **重启恢复与空闲巡检**：读表回灌轮数延续（回灌不提前编码，续攒到间隔才落库）；
+  巡检协程按 `max(5s, min(300s, flush_idle_s))` 周期对超龄批次强制编码，防末批滞留；
+- **生命周期联动**：会话逐出（LRU）时调度该会话攒批编码，不滞留；停机
+  （terminate）强制编码未满批；巡检协程挂插件 start/stop 配对；
+- **数据一致性收口**：同一会话的回合在别名 I/O 前冻结快照、合并按内容
+  锚点定序（并发信号不再乱序/重复进编码输入）；编码成功后删行失败交由
+  巡检重试；PG JSONB 的 pending 快照写入前清理 U+0000（恢复副本丢弃该
+  字符，内存编码仍用原文）；
+- **用户擦除联动**：WebUI 删除用户记忆前先脱敏/清除该用户的 pending 与
+  在途批次并取消编码任务（群聊保留其他成员的行），同时重写/删除
+  `memory_retain_pending` 备份行，避免删除后旧内容被重新编码；
+- **后端迁移**：`migrate_backend.py` 一并迁移 `memory_retain_pending`
+  快照（JSONB → JSON TEXT），同会话快照冲突时拒绝覆盖（即使 `--force`）；
+- **耗时观测**：`build_injection_text` / `build_profile_text` 增加计时包装
+  （DEBUG 落盘；超过 500ms 升级 WARNING 作慢查询哨兵，与上游 nori 口径一致）。
+
+测试：新增 `tests/test_memory_retain_batch.py`（95 例：门控等价性/批次内容
+正确性/表行生命周期/失败回座/水位线语义/恢复续攒/巡检/逐出联动/停机收口/
+SQLite 真实往返 + 并发/乱序定序/用户擦除/脏数据防御回归）；全量 485 passed
+（基线 390 + 新增 95），SQLite 后端套件 112 checks 全绿。
+
 ## v1.17.3 (2026-10-14)
 
-### fix: 全仓评审修复批（7 medium / 15 low 缺陷 + 键公式单源化 + 文档失真修正）
+### fix: 全仓修复批——数据损坏防御 / LLM 契约 / 周期健壮性 / 向量召回 / 一致性 + 键公式单源化
 
-全量评审 ~15k LOC 后分阶段修复，两轮对抗性复核（2 + 5 subagent）+ 独立
-收尾，测试 371 → 383 全绿：
+全仓分阶段修复批，测试 371 → 383 全绿：
 
-- **数据损坏（M1）**：`json_utils` 正则修复改为分阶段——先直接 `json.loads`
+- **数据损坏**：`json_utils` 正则修复改为分阶段——先直接 `json.loads`
   透传合法 JSON（含 `, }`、`: True` 等诱饵序列的字符串值原样保留），失败才
   正则修复重试，json_repair 兜底；
-- **LLM 契约（M2/M3/L12）**：簇裁决与边审计部分覆盖时不再把未裁决项当
+- **LLM 契约**：簇裁决与边审计部分覆盖时不再把未裁决项当
   无关（杜绝重复簇 create）、水位不推进过未覆盖边；`true == 1` 布尔 ID
   拒绝（adjudicate 与边审计双处）；
-- **周期健壮性（M5/L11/L3）**：合并周期六个 DB 阶段各自 try/except 喂
+- **周期健壮性**：合并周期六个 DB 阶段各自 try/except 喂
   熔断 + 跳过续跑，`_save_skip_state` 进 finally；decay/lifecycle 时间戳
   kv 写失败不中断不双重衰减；重编码预留探针尊重毒丸跳过名单；
-- **向量与召回（M4/L4/L5/L6/L7）**：近重去重维度不匹配跳过比对（换
+- **向量与召回**：近重去重维度不匹配跳过比对（换
   embedding 模型后不再假命中丢行）；bot 排除双形态覆盖；召回 token 预算
   计入时间标签；滚动补回改两阶段 memo（build 暂存、prompt 装配成功才
   commit，宿主丢弃装配时不再双通道不可见）；写侧去重命中带告警；
-- **一致性（M7/L2）**：WebUI 摘要编辑的 SQLite FTS5 影子表同步并入同事务；
+- **一致性**：WebUI 摘要编辑的 SQLite FTS5 影子表同步并入同事务；
   `search_fact_clusters` 全空白 user_ids 双后端统一 fail-closed（杜绝
   跨用户暴露）；
-- **main.py（M6/L1/L8/L9/L10/L13/L14）**：enabled_tools None 守卫；
+- **main.py**：enabled_tools None 守卫；
   bot_platform 幽灵属性接线（捕获→传播→消费三点链路）；LRU 兜底取最近
   活跃会话；匿名消息键改单调计数器（地址复用不再静默丢失）；记忆删除
   DB 故障与不存在三态分文案；变量遮蔽与 config 端点防御式解引用；
@@ -259,7 +378,7 @@ fire-and-forget）。
 - migrate_backend 抽出可测入口 _run_migration；tests/test_sqlite_backend.py
   新增 13 项迁移 checks（FakePG 桩 + 真 SQLite 目标：跳过/偏移/混合重映射/
   kv 重映射/marker 守卫/4 维向量校验）。
-- P3-2 落地：kernel.search 的 embed_task 守卫（检索中止路径取消飞行中的
+- kernel.search 的 embed_task 守卫（检索中止路径取消飞行中的
   向量化请求，杜绝孤儿任务 "never retrieved" 告警）+ EmbeddingService.
   _validate 对非 list 形态 fail-open（封掉 len() TypeError 这唯一抛出面）；
   新增 TestRecallEmbedGuard / test_34d 两项用例。
@@ -271,7 +390,7 @@ fire-and-forget）。
   label + 迁入面板标题），面板说明中 KiraOS_Plugin → KiraAI（仅显示文案，
   kv 键名与后端语义不变）。
 
-### refactor(review): 测试套件去重合并 + 死代码清理（review 批）
+### refactor: 测试套件去重合并 + 死代码清理
 
 - 测试基建收敛：新增 `tests/_harness.py`（宿主桩 + 装载器），替换此前
   7 份近似拷贝的 core.* 桩样板（~600 行）；主套件 test_noriflow_memory
@@ -323,10 +442,9 @@ _backend_migration_done / kiraos_import_last_run 此前不在 KV_META 白名单
 
 ## v1.15.2 (2026-09-12, sqlite-backend 分支)
 
-### fix: SQLite 后端 review 修复 ×3（promote 画像列污染 / decay 参与者门控 / BM25 欠填）
+### fix: SQLite 后端三处修复（promote 画像列污染 / decay 参与者门控 / BM25 欠填）
 
-代码 review（059025f..943b672）确认的两个真 bug + 一处与 PG 的行为差异，
-共用同一根因：raw sqlite3.Row 的 JSON TEXT 列被当作 Python 数组消费。
+两处真 bug + 一处与 PG 的行为差异，共用同一根因：raw sqlite3.Row 的 JSON TEXT 列被当作 Python 数组消费。
 
 - **promote_pass 画像行 related_user_ids 污染**：raw 行的 JSON TEXT 喂给
   `_json_list` 被按字符迭代，晋档落库形如 `["[", "\"", "u", "2", "\"", "]"]`
@@ -361,7 +479,7 @@ children 参数（该参数按数组迭代），预览渲染第一行即抛 Type
 
 ## v1.15.0 (2026-09-12, sqlite-backend 分支)
 
-### feat: KiraOS_Plugin 记忆数据无损迁入（双后端方案 P4）
+### feat: KiraOS_Plugin 记忆数据无损迁入
 
 维护页设置栏新增「KiraOS 数据迁入」卡片：预览源目录计数 → 弹窗二次确认 →
 只读迁入 KiraOS_Plugin 的存量记忆（默认源 = 宿主 `data/memory`，可改路径）。
@@ -407,18 +525,17 @@ backend；harness 补方言派发契约回归锁（`webui_dialect_dispatch_contr
 ### feat: 双存储后端——新增 SQLite 后端（与 PostgreSQL 二选一）
 
 同一份 kernel / 合并 agent / 提示词 / WebUI 逻辑，新增 SQLite 存储后端，
-个人部署不再需要维护 PostgreSQL + pgvector 实例（设计定稿：
-nori-core `docs/plans/noriflow-dual-storage-backend-plan.md`，P0-P2/P3 落地）。
+个人部署不再需要维护 PostgreSQL + pgvector 实例。
 
 - **配置**：新增 `storage_backend`（postgres | sqlite | auto；auto=配置了
   dsn 用 postgres，否则 sqlite——现有部署行为零变化）与 `sqlite_path`
   （空 = 插件数据目录/memory.sqlite3）。均为启动期只读，运行中不可切换
   （切后端 = 换库，跨后端迁移走迁移工具，本期不做在线互转）。
-- **db 拆包（P0，零行为变化）**：`db.py` → `db/` 包（base 共享纯函数 +
+- **db 拆包（零行为变化）**：`db.py` → `db/` 包（base 共享纯函数 +
   MemoryBackend 接口契约 / postgres 原样迁入 / sqlite 新实现 / factory
   工厂 / _sqlite_pool 连接 shim）；`db/__init__` 重导出原名，全部上层
   调用方 `from .db import X` 零改动。
-- **SQLite 后端（P1）**：
+- **SQLite 后端**：
   - `migrations_sqlite/001_init.sql` 合并式初始化（等价 PG 001-010 终态，
     版本序列两侧共享，后续 schema 变更成对新增）；
   - 类型映射：TIMESTAMPTZ→固定格式 UTC TEXT（字典序=时间序）、TEXT[]→
@@ -426,13 +543,13 @@ nori-core `docs/plans/noriflow-dual-storage-backend-plan.md`，P0-P2/P3 落地�
     处理，换 embedding 模型无需重建表）；
   - 向量检索不引入 sqlite-vec：SQL 圈定行集 + Python/numpy 暴力余弦 +
     FTS5 影子表 BM25 路，`_rrf_fuse` 双后端共享融合；个人规模（≤10⁵ 行）
-    可用，天花板声明见方案 §5.3；
+    可用，更大规模建议 PostgreSQL 后端；
   - 写事务统一 `BEGIN IMMEDIATE`；数组语义（ANY/&&/array_append/unnest）
-    按方案 §5.2 改写；`REGEXP` 由 connect 注册 Python 实现（占位名守卫
+    按 SQLite 方言（json_each 等）等价改写；`REGEXP` 由 connect 注册 Python 实现（占位名守卫
     仍引用单源常量 PLACEHOLDER_NAME_SQL）；
   - `_SingleConnPool` shim：acquire 面与 asyncpg 池一致（同任务可重入），
     execute 返回 asyncpg 风格状态串（乐观锁/计数解析依赖）。
-- **WebUI 双后端（P2）**：`webui_store.py` 保留共享层（行装配/校验/常量），
+- **WebUI 双后端**：`webui_store.py` 保留共享层（行装配/校验/常量），
   方言分歧 SQL 拆到 `webui_store_pg.py` / `webui_store_sqlite.py`（函数
   一一对应，按 `backend.dialect` 派发）；维护页设置新增存储后端分组，
   dsn 非空守卫仅在 postgres（或 auto 且现值有 dsn）时生效。

@@ -4,6 +4,9 @@
 Same-schema, full-fidelity copy — NO re-embedding and NO re-encoding:
 original row ids, timestamps, embeddings (pgvector text → float32 BLOB),
 array columns (TEXT[] → JSON TEXT), search_text (+ FTS5 shadow rebuild).
+Pending retain snapshots are copied too (JSONB → JSON TEXT); conflicting
+session snapshots abort before copying, even with --force, rather than
+silently losing one backend's unencoded conversation.
 
 Id-collision aware: when the target table already holds rows (e.g. the
 service ran on sqlite before the cutover), all source ids of that table are
@@ -381,17 +384,47 @@ async def _run_migration(
         kv_rows = await pg.fetch(
             "SELECT key, value, updated_at FROM _memory_local_kv"
         )
+        # Older PG sources predate migration 013. A missing pending table is
+        # valid; an existing table is part of the data-loss-free copy contract.
+        pending_rows = []
+        if await pg.fetchval("SELECT to_regclass('memory_retain_pending')"):
+            pending_rows = await pg.fetch(
+                "SELECT session_key,payload,updated_at FROM memory_retain_pending "
+                "ORDER BY session_key"
+            )
+        async with sdb.pool.acquire() as conn:
+            target_pending = {
+                r["session_key"]: r for r in await conn.fetch(
+                    "SELECT session_key,payload,updated_at FROM memory_retain_pending"
+                )
+            }
+        pending_copy = []
+        for row in pending_rows:
+            payload = row["payload"]
+            parsed = json.loads(payload) if isinstance(payload, str) else payload
+            if not isinstance(parsed, dict):
+                raise ValueError(f"invalid pending snapshot: {row['session_key']}")
+            existing = target_pending.get(row["session_key"])
+            if existing and json.loads(existing["payload"]) != parsed:
+                print(f"ERROR: pending 会话快照冲突: {row['session_key']}；"
+                      "请先在源/目标库冲刷该会话，禁止用 --force 覆盖未编码数据")
+                return 2
+            pending_copy.append((
+                row["session_key"], json.dumps(parsed, ensure_ascii=False),
+                _fmt_ts(row["updated_at"]),
+            ))
         print("== 迁移预检 ==")
         for spec in _TABLES:
             n = stats[spec["name"]]
             print(f"  {spec['name']}: pg={n['pg']} target={n['target']}")
         print(f"  _memory_local_kv: pg={len(kv_rows)}")
+        print(f"  memory_retain_pending: pg={len(pending_rows)} target={len(target_pending)}")
 
         if dry_run:
             print("dry-run：未写入。")
             return 0
 
-        if any(s["target"] > 0 for s in stats.values()) and not force:
+        if (any(s["target"] > 0 for s in stats.values()) or target_pending) and not force:
             print("ERROR: 目标库已有数据（可能服务已在 sqlite 上运行过）。"
                   "--force 语义：id 整体偏移并重映射引用，唯一键冲突的行"
                   "跳过（保留目标现状）；确认请加 --force 重跑")
@@ -476,6 +509,18 @@ async def _run_migration(
                     r["key"], value, _fmt_ts(r["updated_at"]),
                 )
         print(f"  copied _memory_local_kv: {len(kv_rows)} rows")
+        async with sdb.pool.acquire() as conn:
+            async with conn.transaction():
+                for sid, payload, updated_at in pending_copy:
+                    await conn.execute(
+                        "INSERT INTO memory_retain_pending(session_key,payload,updated_at) "
+                        "VALUES ($1,$2,$3) ON CONFLICT(session_key) DO UPDATE SET "
+                        "updated_at=MAX(memory_retain_pending.updated_at,excluded.updated_at)",
+                        sid, payload, updated_at,
+                    )
+        copied["memory_retain_pending"] = sum(
+            sid not in target_pending for sid, _, _ in pending_copy
+        )
 
         # FTS5 shadow-table rebuild (search_text carried over as-is)
         async with sdb.pool.acquire() as conn:
@@ -494,6 +539,12 @@ async def _run_migration(
         print("== 校验 ==")
         ok = True
         async with sdb.pool.acquire() as conn:
+            for sid, payload, _ in pending_copy:
+                stored = await conn.fetchval(
+                    "SELECT payload FROM memory_retain_pending WHERE session_key=$1", sid
+                )
+                ok &= stored is not None and json.loads(stored) == json.loads(payload)
+            print(f"  pending 快照校验: {len(pending_copy)} 个会话")
             for spec in _TABLES:
                 name = spec["name"]
                 pg_n = stats[name]["pg"]
