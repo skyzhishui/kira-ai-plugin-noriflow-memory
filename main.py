@@ -521,6 +521,10 @@ class NoriflowMemoryPlugin(BasePlugin):
         self._retain_handler_generation = 0
         # 攒批空闲巡检协程句柄（initialize 创建 / terminate 取消）
         self._retain_sweep_task: Optional[asyncio.Task] = None
+        self._retain_erasure_generation: dict[tuple[str, str], int] = {}
+        self._retain_erasing_users: set[tuple[str, str]] = set()
+        self._retain_task_states: dict[asyncio.Task, tuple[str, Optional[_RetainState]]] = {}
+        self._retain_delete_retry: dict[str, datetime] = {}
 
     # ------------------------------------------------------------------
     #  生命周期
@@ -889,6 +893,7 @@ class NoriflowMemoryPlugin(BasePlugin):
                     task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
         self._retain_tasks.clear()
+        self._retain_task_states.clear()
         self._consumed.clear()
 
         # 两个 stop 各自兜底：任一失败不能跳过其后的 db.close()（池泄漏）
@@ -927,6 +932,7 @@ class NoriflowMemoryPlugin(BasePlugin):
         self._retain_inflight.clear()
         self._retain_row_ts.clear()
         self._retain_restored_ts.clear()
+        self._retain_delete_retry.clear()
         self._retain_stopping = False
 
     # ------------------------------------------------------------------
@@ -1832,6 +1838,27 @@ class NoriflowMemoryPlugin(BasePlugin):
         delta_keys = {k for k, _ in delta}
         consumed.update(delta_keys)
         self._prune_consumed(sid)
+        # Freeze the round before alias I/O. Without this, a later concurrent
+        # signal can finish first and become the older batch by completion time.
+        state = _RetainState(
+            session_id=bare,
+            platform=adapter,
+            group_id=bare if stype == "gm" else "",
+            user_id=user_delta[0][1].uid,
+            timestamp=datetime.now(),
+            participants=participants,
+            history_lines=self._history_snapshot(sid, {k for k, _ in delta}),
+            batch_lines=[v.line for _, v in user_delta],
+            bot_lines=[v.line for _, v in delta if v.is_bot],
+        )
+        state._retain_first_ts = state.timestamp
+        erase_generation = self._retain_erasure_generation.get((adapter, state.user_id), 0)
+        state._retain_erasure_generation = erase_generation
+        state._retain_user_generations = {
+            (platform, uid): self._retain_erasure_generation.get((platform, uid), 0)
+            for platform, uid in participants
+        }
+        state._retain_user_generations[(adapter, state.user_id)] = erase_generation
         # Persistent alias layer batch upsert (fail-open, independent of retain).
         # 有界等待：这是**旁路**写入（别名层），不该把回合处理链拖住——
         # 无界等待时慢 DB 会让 handler 卡到 db_command_timeout（默认 60s），
@@ -1846,19 +1873,9 @@ class NoriflowMemoryPlugin(BasePlugin):
         except Exception:
             logger.warning("别名层 upsert 失败（旁路写入，跳过）", exc_info=True)
 
-        state = _RetainState(
-            session_id=bare,
-            platform=adapter,
-            group_id=bare if stype == "gm" else "",
-            user_id=user_delta[0][1].uid,
-            timestamp=datetime.now(),
-            participants=participants,
-            history_lines=self._history_snapshot(sid, {k for k, _ in delta}),
-            batch_lines=[v.line for _, v in user_delta],
-            bot_lines=[v.line for _, v in delta if v.is_bot],
-        )
-        # 内容锚点：新批次链的最早一轮 = 本轮
-        state._retain_first_ts = state.timestamp
+        if self._retain_state_erased(state):
+            return  # 用户擦除发生在别名 await 期间，禁止旧回合重新入批
+
         # P2: coalesce private-chat turns (and persist the frozen snapshot).
         # 停机门控：terminate 期间不再派新任务——收口的 asyncio.wait 只
         # 覆盖调用瞬间的任务集合，之后新建的任务不会被等待，而随后
@@ -1928,6 +1945,10 @@ class NoriflowMemoryPlugin(BasePlugin):
             # 失败回座的批次不与新轮次混批：单独冲刷（重试），新轮次另开
             # 批次——混合链（失败批 + 新轮次）会与在途批次交错，表行快照
             # 的合并顺序与历史窗口都会失真
+            #
+            # 该不变式只约束正常攒批路径。interval<=1 的残留合并路径与停机
+            # 保命分支仍会把批次并入本轮：那里首要目标是内容不丢/不重复
+            # 进历史，而不是维持批次独立性。
             self._flush_pending_batch(sid)
             pending = None
         if pending is not None:
@@ -1993,9 +2014,9 @@ class NoriflowMemoryPlugin(BasePlugin):
     ) -> asyncio.Task:
         """创建并追踪 retain 编码任务（逐轮与攒批共用同一收口）。"""
         task = asyncio.create_task(self._do_retain(state, sid, delta_keys, durable))
-        task._retain_sid = sid  # type: ignore[attr-defined]
         self._retain_tasks.add(task)
-        task.add_done_callback(self._retain_tasks.discard)
+        self._retain_task_states[task] = (sid, state)
+        task.add_done_callback(self._retain_task_done)
         return task
 
     def _spawn_pending_save(self, sid: str) -> None:
@@ -2004,9 +2025,28 @@ class NoriflowMemoryPlugin(BasePlugin):
         与编码任务同一收口集合（terminate 统一等待/取消）。
         """
         task = asyncio.create_task(self._save_retain_pending_guarded(sid))
-        task._retain_sid = sid  # type: ignore[attr-defined]
         self._retain_tasks.add(task)
-        task.add_done_callback(self._retain_tasks.discard)
+        self._retain_task_states[task] = (sid, None)
+        task.add_done_callback(self._retain_task_done)
+
+    def _retain_task_done(self, task: asyncio.Task) -> None:
+        self._retain_tasks.discard(task)
+        self._retain_task_states.pop(task, None)
+
+    @staticmethod
+    def _retain_state_mentions(state: _RetainState, key: tuple[str, str]) -> bool:
+        return key == (state.platform, state.user_id) or key in state.participants
+
+    def _retain_state_erased(self, state: _RetainState) -> bool:
+        generations = getattr(state, "_retain_user_generations", {
+            key: int(getattr(state, "_retain_erasure_generation", 0))
+            for key in {*state.participants, (state.platform, state.user_id)}
+        })
+        return any(
+            key in self._retain_erasing_users
+            or self._retain_erasure_generation.get(key, 0) != generation
+            for key, generation in generations.items()
+        )
 
     async def _save_retain_pending_guarded(self, sid: str) -> None:
         """快照写入的兜底包装：失败只记 warning（内存 pending 是主真源）。"""
@@ -2076,13 +2116,19 @@ class NoriflowMemoryPlugin(BasePlugin):
         """巡检单轮：超龄的攒批会话强制编码（攒不满间隔的末批不滞留）。
 
         判据 = 内存 pending 的最后追加时间距今超过 flush_idle_s（活读）；
-        巡检周期取 min(300s, flush_idle_s)，故实际落库延迟上界约
-        flush_idle_s + min(300s, flush_idle_s)。
+        巡检周期取 max(5s, min(300s, flush_idle_s))，故实际落库延迟
+        上界约 flush_idle_s + max(5s, min(300s, flush_idle_s))。
         """
         idle_s = self._retain_flush_idle_s()
         # 补恢复：恢复曾失败时表里还有未回灌的崩溃备份行——先回灌，
         # 本轮巡检才能把它们按龄冲刷落库（否则一直躺在表里直到下次重启）
         await self._ensure_retain_restored()
+        for sid, cutoff in list(self._retain_delete_retry.items()):
+            try:
+                await self._delete_retain_pending(sid, cutoff)
+                self._retain_delete_retry.pop(sid, None)
+            except Exception:
+                logger.warning("retain pending 删除重试失败: session=%s", sid, exc_info=True)
         # 取时必须在恢复之后：补恢复含 DB fetch 的 await 点，提前取时会把
         # 恢复耗时从「龄期」里扣掉，让刚超龄的批次被误判为未超龄、推迟一轮
         now = time.time()
@@ -2193,7 +2239,8 @@ class NoriflowMemoryPlugin(BasePlugin):
         """Assemble the encoding input and write (Semaphore rate-limited).
 
         durable=False（逐轮路径，间隔<=1）：失败回滚水位线，下轮信号重取
-        重编——与改动前逐字等价。
+        重编——逐轮路径的失败回滚语义与改动前一致（昵称刷新另行兜底，
+        不影响该语义）。
         durable=True（攒批路径）：失败不碰水位线（真源已移交攒批缓存/表
         行），改为失败回座——批次合并回内存 pending 并重写表行快照，待下
         一触发点（到点/巡检超龄/停机 flush）重试，消息不因失败丢失。
@@ -2207,6 +2254,13 @@ class NoriflowMemoryPlugin(BasePlugin):
         except Exception:
             logger.warning("刷新 bot 昵称失败（不影响 retain 编码）", exc_info=True)
         kernel = self._memory_kernel
+        if self._retain_state_erased(state):
+            self._drop_inflight(sid, state)
+            try:
+                await self._delete_retain_pending(sid, self._retain_row_ts.get(sid))
+            except Exception:
+                logger.warning("用户擦除后清理 retain pending 失败: session=%s", sid, exc_info=True)
+            return
         if kernel is None:
             if not durable:
                 if sid:
@@ -2287,8 +2341,16 @@ class NoriflowMemoryPlugin(BasePlugin):
             # 被重放编码。删不掉就留给下次刷新/重启覆盖。
             try:
                 await self._delete_retain_pending(sid, self._retain_row_ts.get(sid))
+            except asyncio.CancelledError:
+                cutoff = self._retain_row_ts.get(sid)
+                if cutoff is not None:
+                    self._retain_delete_retry[sid] = cutoff
+                raise
             except Exception:
                 logger.warning("retain pending 快照删除失败（重启恢复时重放）", exc_info=True)
+                cutoff = self._retain_row_ts.get(sid)
+                if cutoff is not None:
+                    self._retain_delete_retry[sid] = cutoff
         else:
             try:
                 await self._save_retain_pending(sid)
@@ -2342,7 +2404,14 @@ class NoriflowMemoryPlugin(BasePlugin):
         不回退到 new.history_lines：old 的历史窗口合法为空（会话首轮就是
         此情形），而 new 的历史窗口含 old 批次的行——回退会让同一句既进
         历史窗口又进批次内容，编码输入里重复一遍。
+
+        入参先后不作为语义依据：调用方顺序可能反映别名 I/O 的完成顺序，
+        而回合锚点/历史窗口已在首个 await 前冻结，这里统一按锚点定序。
         """
+        # Caller order may reflect alias I/O completion, not round arrival.
+        # Round anchors/history are frozen before that await in the handler.
+        if NoriflowMemoryPlugin._state_sort_key(new) < NoriflowMemoryPlugin._state_sort_key(old):
+            old, new = new, old
         participants = list(old.participants)
         seen = set(participants)
         for participant in new.participants:
@@ -2371,6 +2440,14 @@ class NoriflowMemoryPlugin(BasePlugin):
         )
         # 内容锚点取两批最早者（old 已是较早的一方）
         state._retain_first_ts = NoriflowMemoryPlugin._state_first_ts(old)
+        state._retain_erasure_generation = max(
+            int(getattr(old, "_retain_erasure_generation", 0)),
+            int(getattr(new, "_retain_erasure_generation", 0)),
+        )
+        state._retain_user_generations = {
+            **getattr(old, "_retain_user_generations", {}),
+            **getattr(new, "_retain_user_generations", {}),
+        }
         return state
 
     @staticmethod
@@ -2396,14 +2473,28 @@ class NoriflowMemoryPlugin(BasePlugin):
         return value.astimezone(timezone.utc)
 
     def _retain_payload(self, state: _RetainState) -> dict[str, Any]:
+        """Serializable backup; JSONB cannot store U+0000.
+
+        Replace NUL only in the recovery copy, not the live encoding state.
+        """
+        def sanitize(value):
+            if isinstance(value, str):
+                return value.replace("\x00", "�")
+            if isinstance(value, list):
+                return [sanitize(item) for item in value]
+            if isinstance(value, tuple):
+                return [sanitize(item) for item in value]
+            return value
+
         return {
-            "session_id": state.session_id, "platform": state.platform,
-            "group_id": state.group_id, "user_id": state.user_id,
+            "session_id": sanitize(state.session_id), "platform": sanitize(state.platform),
+            "group_id": sanitize(state.group_id), "user_id": sanitize(state.user_id),
             "timestamp": state.timestamp.isoformat(),
             "first_ts": self._state_first_ts(state).isoformat(),
-            "participants": state.participants,
-            "history_lines": state.history_lines,
-            "batch_lines": state.batch_lines, "bot_lines": state.bot_lines,
+            "participants": sanitize(state.participants),
+            "history_lines": sanitize(state.history_lines),
+            "batch_lines": sanitize(state.batch_lines),
+            "bot_lines": sanitize(state.bot_lines),
             "rounds": int(getattr(state, "_retain_rounds", 1)),
             # 失败标记也落盘：重启恢复后仍能识别「这是回座待重试的批次」，
             # 不会当成普通 pending 与新轮次混批
@@ -2553,6 +2644,8 @@ class NoriflowMemoryPlugin(BasePlugin):
             state = self._pending_snapshot_for_row(sid)
             if state is None:
                 return
+            if self._retain_state_erased(state):
+                return
             payload = json.dumps(self._retain_payload(state), ensure_ascii=False)
             now = datetime.now(timezone.utc)
             # 先登记本次写入时间戳：编码成功路径的条件删除会读它——否则
@@ -2666,6 +2759,8 @@ class NoriflowMemoryPlugin(BasePlugin):
             try:
                 await self._restore_retain_pending()
             except Exception:
+                # 兜底：_restore_retain_pending 正常已自吞异常，这里覆盖其
+                # 实现被替换/未来改动的极端情况，保持「失败即待补恢复」语义
                 self._retain_restore_failed = True
                 logger.warning("retain pending 快照补恢复失败", exc_info=True)
 
@@ -2696,6 +2791,8 @@ class NoriflowMemoryPlugin(BasePlugin):
                     if not isinstance(raw, dict):
                         continue
                     state = self._retain_state_from_payload(raw)
+                    if self._retain_state_erased(state):
+                        continue
                     sid = str(row["session_key"])
                     row_ts = self._row_timestamp(row)
                     if row_ts is not None and row_ts == self._retain_restored_ts.get(sid):
@@ -2735,9 +2832,9 @@ class NoriflowMemoryPlugin(BasePlugin):
                     # 参与巡检超龄判定；但内存已有更晚批次时取较晚者——否则
                     # 旧行的龄期会让合并后的新批次被巡检提前冲刷（违背
                     # 「续攒」语义）
-                    # 龄期用已解析的行时间戳换算：now 取自循环外，而
-                    # _row_age_seconds 内部又读一次 datetime.now()，两套时钟
-                    # 错位 + 循环耗时会让后处理的行龄期偏旧（巡检可能提前冲刷）
+                    # 龄期用已解析的行时间戳换算（now 取自循环外）：直接
+                    # 用 datetime.now() 重算会引入两套时钟，循环耗时会让后
+                    # 处理的行龄期偏旧（巡检可能提前冲刷）
                     restored_at = (
                         row_ts.timestamp() if row_ts is not None else time.time()
                     )
@@ -2775,27 +2872,6 @@ class NoriflowMemoryPlugin(BasePlugin):
             logger.warning(
                 "retain pending 快照恢复失败（保存前会补恢复）", exc_info=True
             )
-
-    @staticmethod
-    def _row_age_seconds(row: Any) -> float:
-        """表行 updated_at 距今的秒数（PG 返回 datetime / SQLite 返回 ISO 字符串）。"""
-        value = None
-        try:
-            value = row["updated_at"]
-        except (KeyError, IndexError, TypeError):
-            return 0.0
-        if value is None:
-            return 0.0
-        if isinstance(value, datetime):
-            dt = value
-        else:
-            try:
-                dt = datetime.fromisoformat(str(value))
-            except ValueError:
-                return 0.0
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return max((datetime.now(timezone.utc) - dt).total_seconds(), 0.0)
 
     @staticmethod
     def _row_timestamp(row: Any) -> Optional[datetime]:
@@ -4097,9 +4173,179 @@ class NoriflowMemoryPlugin(BasePlugin):
         """
         if self._db is None:
             raise HTTPException(status_code=503, detail="记忆功能未启用或数据库不可用")
+        await self._erase_retain_for_user(platform, user_id)
         return await webui_store.delete_user_memories(
             self._pool_or_503(), platform, user_id
         )
+
+    async def _erase_retain_for_user(self, platform: str, user_id: str) -> None:
+        """Remove a user's unencoded retain content before per-user erasure.
+
+        A plain table delete is insufficient: a pending batch can be flushed
+        after the WebUI deletion and recreate the user's facts. Three sources
+        must be neutralised:
+
+        - memory pending / in-flight batches: redact the user's lines (or drop
+          the batch when nothing of the batch remains);
+        - already-running encode tasks: cancel and wait, otherwise they may
+          write after the deletion returns;
+        - ``memory_retain_pending`` rows (crash-recovery backup): rewrite or
+          delete them so a restart cannot replay the old content.
+
+        Group batches keep the other members' lines; only the erased user's
+        envelope lines are removed. Erasure is a generation bump, so a turn
+        already suspended in alias I/O cannot enter a batch afterwards, while
+        post-erasure conversations are recorded normally.
+        """
+        key = (str(platform).strip(), str(user_id).strip())
+        if not all(key):
+            raise HTTPException(status_code=422, detail="platform 与 user_id 均不能为空")
+        self._retain_erasure_generation[key] = self._retain_erasure_generation.get(key, 0) + 1
+        self._retain_erasing_users.add(key)
+        cancelled = []
+        reseat: dict[str, list[_RetainState]] = {}
+        try:
+            for sid, state in list(self._retain_pending.items()):
+                if not self._retain_state_mentions(state, key):
+                    continue
+                redacted = self._retain_state_without_user(state, key)
+                if redacted is None:
+                    self._retain_pending.pop(sid, None)
+                    self._retain_pending_at.pop(sid, None)
+                else:
+                    self._retain_pending[sid] = redacted
+            for sid, states in list(self._retain_inflight.items()):
+                kept = []
+                for state in states:
+                    if self._retain_state_mentions(state, key):
+                        redacted = self._retain_state_without_user(state, key)
+                        if redacted is not None:
+                            kept.append(redacted)
+                            reseat.setdefault(sid, []).append(redacted)
+                    else:
+                        kept.append(state)
+                if kept:
+                    self._retain_inflight[sid] = kept
+                else:
+                    self._retain_inflight.pop(sid, None)
+            for task, (sid, state) in list(self._retain_task_states.items()):
+                if state is not None and self._retain_state_mentions(state, key):
+                    task.cancel()
+                    cancelled.append(task)
+            # Cancellation acknowledgement must precede the DB erase. An encoder
+            # suspended in LLM/embedding/SQL must not write after deletion returns.
+            if cancelled:
+                await asyncio.gather(*cancelled, return_exceptions=True)
+            # Keep the other members' share of cancelled group batches (several
+            # generations may be in flight for the same session).
+            for sid, redacted_states in reseat.items():
+                for redacted in redacted_states:
+                    current = self._retain_pending.get(sid)
+                    merged = (
+                        self._merge_retain_states(current, redacted)
+                        if current is not None else redacted
+                    )
+                    merged._retain_failed = True
+                    self._retain_pending[sid] = merged
+                self._retain_pending_at[sid] = time.time()
+            if self._db is not None:
+                # 先按内存中的脱敏内容重写表行（崩溃也不会回放被擦除内容），
+                # 再删除已无内存对应、但仍提及该用户的孤儿行。
+                for sid in list(self._retain_pending):
+                    try:
+                        await self._save_retain_pending(sid)
+                    except Exception:
+                        logger.warning(
+                            "擦除后重写 retain pending 快照失败: session=%s", sid,
+                            exc_info=True,
+                        )
+                async with self._db.pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT session_key,payload FROM memory_retain_pending"
+                    )
+                    for row in rows:
+                        sid = str(row["session_key"])
+                        if sid in self._retain_pending:
+                            continue
+                        try:
+                            payload = row["payload"]
+                            if isinstance(payload, str):
+                                payload = json.loads(payload)
+                            if not self._payload_mentions_user(payload, key):
+                                continue
+                        except Exception:
+                            continue
+                        await conn.execute(
+                            "DELETE FROM memory_retain_pending WHERE session_key=$1", sid
+                        )
+                        self._retain_row_ts.pop(sid, None)
+                        self._retain_restored_ts.pop(sid, None)
+                        self._retain_delete_retry.pop(sid, None)
+        finally:
+            self._retain_erasing_users.discard(key)
+
+    def _retain_state_without_user(
+        self, state: _RetainState, key: tuple[str, str]
+    ) -> Optional[_RetainState]:
+        """Redact one user's envelope lines from a batch.
+
+        Returns None when no encodable line remains (e.g. a one-to-one DM
+        batch). Bot lines carry no uid and are kept as context.
+        """
+        needle = f'uid="{key[1]}"'
+
+        def belongs_to_user(line: str) -> bool:
+            # 只检查信封属性区（第一个 '>' 之前）：正文里出现的同形文本
+            # （用户自己打的 uid="..."）不会被误删。
+            head = line.partition(">")[0]
+            return needle in head
+
+        batch = [ln for ln in state.batch_lines if not belongs_to_user(ln)]
+        bot = [ln for ln in state.bot_lines if not belongs_to_user(ln)]
+        if not batch and not bot:
+            return None
+        participants = [p for p in state.participants if tuple(p) != key]
+        if key == (state.platform, state.user_id):
+            owner = participants[0][1] if participants else ""
+        else:
+            owner = state.user_id
+        if not owner:
+            return None
+        redacted = _RetainState(
+            session_id=state.session_id, platform=state.platform,
+            group_id=state.group_id, user_id=owner,
+            timestamp=state.timestamp, participants=participants,
+            history_lines=[ln for ln in state.history_lines if not belongs_to_user(ln)],
+            batch_lines=batch, bot_lines=bot,
+        )
+        redacted._retain_rounds = int(getattr(state, "_retain_rounds", 1))
+        redacted._retain_first_ts = self._state_first_ts(state)
+        redacted._retain_failed = bool(getattr(state, "_retain_failed", False))
+        # 以「当前代」重建代次视图：脱敏后批次只代表仍在世的参与者，
+        # 否则旧代次会让它被误判为已擦除而永不编码。
+        redacted._retain_erasure_generation = self._retain_erasure_generation.get(
+            (redacted.platform, redacted.user_id), 0
+        )
+        redacted._retain_user_generations = {
+            (p, uid): self._retain_erasure_generation.get((p, uid), 0)
+            for p, uid in participants
+        }
+        redacted._retain_user_generations[
+            (redacted.platform, redacted.user_id)
+        ] = redacted._retain_erasure_generation
+        return redacted
+
+    @staticmethod
+    def _payload_mentions_user(payload: Any, key: tuple[str, str]) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if (payload.get("platform"), payload.get("user_id")) == key:
+            return True
+        return key in {
+            tuple(item)
+            for item in payload.get("participants", [])
+            if isinstance(item, (list, tuple)) and len(item) == 2
+        }
 
     @register.api(method="GET", path="/memory/summaries")
     async def api_memory_summaries(

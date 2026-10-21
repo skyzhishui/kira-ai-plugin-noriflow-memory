@@ -2909,5 +2909,179 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
 
+class TestMultiReviewFixes(unittest.TestCase):
+    def test_concurrent_alias_wait_preserves_batch_order(self):
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+        captured = []
+
+        async def scenario():
+            entered, release = asyncio.Event(), asyncio.Event()
+            calls = 0
+
+            async def alias(delta):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    entered.set()
+                    await release.wait()
+
+            inst._alias_upsert_batch = alias
+            first = asyncio.create_task(_turn(inst, ctx, dm, "先到第一句", "order1"))
+            await entered.wait()
+            second = asyncio.create_task(_turn(inst, ctx, dm, "后到第二句", "order2"))
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(first, second)
+            pending = inst._retain_pending[dm.sid]
+            self.assertIn("先到第一句", pending.batch_lines[0])
+            self.assertIn("后到第二句", pending.batch_lines[1])
+            self.assertFalse(pending.history_lines)
+            _spy_encode(inst, captured)
+            inst._flush_pending_batch(dm.sid)
+            await asyncio.gather(*inst._retain_tasks)
+
+        asyncio.run(scenario())
+        self.assertEqual(captured[0].count("先到第一句"), 1)
+        self.assertEqual(captured[0].count("后到第二句"), 1)
+
+    def test_group_batch_keeps_other_members_after_erase(self):
+        """擦除一个成员只脱敏其行；同批次其他成员的未编码内容不得丢。"""
+        inst, _ = _ready_plugin(mod, cfg=_cfg(group=3))
+        sid = "napcat:gm:778899"
+        line_u1 = mod.format_history_message(
+            speaker_name="u1", content="u1 的私有发言", user_id="u1"
+        )
+        line_u2 = mod.format_history_message(
+            speaker_name="u2", content="u2 的正常发言", user_id="u2"
+        )
+        state = inst._retain_state_from_payload({
+            "session_id": "778899", "platform": "napcat", "group_id": "778899",
+            "user_id": "u1", "timestamp": datetime.now().isoformat(),
+            "participants": [["napcat", "u1"], ["napcat", "u2"]],
+            "history_lines": [], "batch_lines": [line_u1, line_u2],
+            "bot_lines": [], "rounds": 2,
+        })
+        inst._retain_pending[sid] = state
+
+        async def scenario():
+            await inst._erase_retain_for_user("napcat", "u1")
+
+        asyncio.run(scenario())
+        kept = inst._retain_pending.get(sid)
+        self.assertIsNotNone(kept, "其他成员的批次必须保留")
+        text = "\n".join(kept.batch_lines)
+        self.assertNotIn("u1 的私有发言", text)
+        self.assertIn("u2 的正常发言", text)
+        self.assertEqual(kept.user_id, "u2")
+        self.assertNotIn(("napcat", "u1"), [tuple(p) for p in kept.participants])
+
+    def test_erase_during_alias_wait_drops_stale_turn(self):
+        """擦除发生在别名 await 期间：旧回合不得再进入 pending。"""
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+
+        async def scenario():
+            entered, release = asyncio.Event(), asyncio.Event()
+
+            async def alias(delta):
+                entered.set()
+                await release.wait()
+
+            inst._alias_upsert_batch = alias
+            turn = asyncio.create_task(_turn(inst, ctx, dm, "擦除前发出的一轮", "stale1"))
+            await entered.wait()
+            await inst._erase_retain_for_user("napcat", "u1")
+            release.set()
+            await turn
+            self.assertNotIn(dm.sid, inst._retain_pending)
+
+        asyncio.run(scenario())
+
+    def test_pending_payload_nul_is_jsonb_safe_without_mutating_live_state(self):
+        inst, _ = _ready_plugin(mod, cfg=_cfg())
+        state = inst._retain_state_from_payload({
+            "session_id": "10086", "platform": "napcat", "group_id": "",
+            "user_id": "u1", "timestamp": datetime.now().isoformat(),
+            "participants": [["napcat", "u1"]], "history_lines": ["history\x00"],
+            "batch_lines": ["body\x00"], "bot_lines": ["bot\x00"], "rounds": 1,
+        })
+        encoded = json.dumps(inst._retain_payload(state))
+        self.assertNotIn("\\u0000", encoded)
+        self.assertEqual(state.batch_lines, ["body\x00"])
+
+    def test_successful_batch_delete_failure_is_retried_by_sweep(self):
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=2))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+
+        async def scenario():
+            original = inst._delete_retain_pending
+            calls = 0
+
+            async def flaky(sid, cutoff=None):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise RuntimeError("temporary delete failure")
+                await original(sid, cutoff)
+
+            inst._delete_retain_pending = flaky
+            for i in range(2):
+                await _turn(inst, ctx, dm, f"delete retry {i}", f"dr{i}")
+                await asyncio.gather(*inst._retain_tasks)
+            self.assertIn(dm.sid, inst._retain_delete_retry)
+            await inst._sweep_retain_pending()
+            self.assertNotIn(dm.sid, inst._retain_delete_retry)
+            self.assertGreaterEqual(calls, 2)
+
+        asyncio.run(scenario())
+
+    def test_user_erase_cancels_inflight_and_removes_pending_backup(self):
+        import tempfile
+        inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
+        dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
+
+        async def scenario(path):
+            config = mod.LocalMemoryConfig(storage_backend="sqlite", sqlite_path=path, embedding_dims=4)
+            db = mod.SQLiteMemoryDatabase(config)
+            await db.connect()
+            await db.apply_migrations(Path(__file__).resolve().parent.parent / "migrations_sqlite")
+            inst._db, inst._backend_name = db, "sqlite"
+            encoded, cancelled = asyncio.Event(), asyncio.Event()
+
+            async def slow_encode(**kwargs):
+                encoded.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+
+            inst._memory_kernel.retain_encoded = slow_encode
+            try:
+                await _turn(inst, ctx, dm, "erase pending", "erase1")
+                await asyncio.gather(*inst._retain_tasks)
+                inst._flush_pending_batch(dm.sid)
+                await encoded.wait()
+                response = await inst.api_memory_user_delete("napcat", "u1")
+                self.assertTrue(response["deleted"])
+                self.assertTrue(cancelled.is_set())
+                self.assertNotIn(dm.sid, inst._retain_pending)
+                self.assertNotIn(dm.sid, inst._retain_inflight)
+                async with db.pool.acquire() as conn:
+                    rows = await conn.fetch("SELECT payload FROM memory_retain_pending")
+                self.assertEqual(rows, [])
+                await inst._restore_retain_pending()
+                self.assertNotIn(dm.sid, inst._retain_pending)
+                # Erasure invalidates old work, not future conversations.
+                await _turn(inst, ctx, dm, "new after erase", "erase2")
+                await asyncio.gather(*inst._retain_tasks)
+                self.assertIn(dm.sid, inst._retain_pending)
+            finally:
+                await db.close()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            asyncio.run(scenario(str(Path(tmp) / "memory.sqlite3")))
+
+
 if __name__ == "__main__":
     unittest.main()
