@@ -42,7 +42,7 @@ PLUGIN_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # 桩设施统一入口（review 2026-09-12 冗余项 1）
-from plugin_env import install_host_stubs, load_plugin_module  # noqa: E402
+from plugin_env import install_host_stubs, load_modules, load_plugin_module  # noqa: E402
 
 # ---------------------------------------------------------------------------
 #  core.* 桩模块（先于加载插件主模块注入）
@@ -461,14 +461,14 @@ class TestConfigBuilder(unittest.TestCase):
         self.assertTrue(cfg.summary_recall_session_scoped)
         self.assertTrue(cfg.decay_requires_activity)
         self.assertEqual(cfg.sticky_evidence_count, 4)
-        # 画像评分缺省值：迟滞带（promote - demote = 4）须大于单条 high 证据加分 3，
-        # 否则降档簇一条证据即可回档（翻转）
+        # 画像评分缺省值：迟滞带（promote - demote = 4）不得小于单条证据最大加分 3，
+        # 否则降档簇一条证据即可回档（翻转）——模型级校验强制该不变量
         self.assertEqual(cfg.promote_threshold, 6.0)
         self.assertEqual(cfg.demote_threshold, 2.0)
         self.assertEqual(cfg.decay_factor, 0.9)
-        self.assertGreater(
+        self.assertGreaterEqual(
             cfg.promote_threshold - cfg.demote_threshold,
-            cfg.score_start_high,
+            max(cfg.score_start_high, cfg.score_start_medium),
         )
 
     def test_12_garbage_falls_back(self):
@@ -493,6 +493,78 @@ class TestConfigBuilder(unittest.TestCase):
         })
         self.assertEqual(cfg.dsn, "postgres://u:p@127.0.0.1:5432/db")
         self.assertEqual(cfg.pool_min, 2)
+
+
+class TestHysteresisBandValidation(unittest.TestCase):
+    """迟滞带强制校验：band < 单条证据最大加分时降档簇一条证据即可回档。
+
+    band = promote_threshold - demote_threshold；降档判定是严格
+    `score < demote_threshold`，故降档簇分数上界为 demote - ε，
+    band 恰等于单条证据加分时仍安全（demote-ε+加分 < promote）。
+    """
+
+    def setUp(self):
+        self.config_mod = load_modules("config")[0]
+        self.LocalMemoryConfig = self.config_mod.LocalMemoryConfig
+
+    def test_01_default_band_is_valid(self):
+        cfg = self.LocalMemoryConfig()
+        self.assertGreaterEqual(
+            cfg.promote_threshold - cfg.demote_threshold,
+            max(cfg.score_start_high, cfg.score_start_medium),
+        )
+
+    def test_02_band_equal_to_one_evidence_is_accepted(self):
+        # band == 加分（6/3）：降档簇最高 2.999+3=5.999 < 6，一条证据无法回档
+        cfg = self.LocalMemoryConfig(promote_threshold=6.0, demote_threshold=3.0)
+        self.assertEqual(cfg.promote_threshold - cfg.demote_threshold, 3.0)
+
+    def test_03_band_below_one_evidence_is_rejected(self):
+        with self.assertRaises(Exception) as ctx:
+            self.LocalMemoryConfig(promote_threshold=5.0, demote_threshold=3.0)
+        self.assertIn("不得小于单条证据最大加分", str(ctx.exception))
+
+    def test_04_demote_threshold_must_be_positive(self):
+        with self.assertRaises(Exception):
+            self.LocalMemoryConfig(demote_threshold=0.0)
+
+    def test_05_medium_start_score_above_high_uses_the_max(self):
+        # 单条证据最大加分取 max(high, medium)：medium 配得比 high 高时按 medium 判
+        with self.assertRaises(Exception):
+            self.LocalMemoryConfig(
+                promote_threshold=6.0,
+                demote_threshold=3.0,
+                score_start_high=2,
+                score_start_medium=5,
+            )
+
+    def test_06_unsafe_band_falls_back_to_defaults(self):
+        # 非法组合走兜底层：插件不因单个配置项起不来，回退到安全缺省值
+        cfg = mod._try_build_config({
+            "dsn": "postgres://u:p@127.0.0.1:5432/db",
+            "promote_threshold": 5.0,
+            "demote_threshold": 3.0,
+        })
+        self.assertEqual(cfg.dsn, "postgres://u:p@127.0.0.1:5432/db")
+        self.assertEqual(cfg.promote_threshold, 6.0)
+        self.assertEqual(cfg.demote_threshold, 2.0)
+        self.assertEqual(cfg.decay_factor, 0.9)
+
+    def test_07_scaled_down_score_system_is_accepted(self):
+        # 迟滞带按配置的证据加分换算（不写死 3 分）：整体缩放的刻度同样成立
+        cfg = self.LocalMemoryConfig(
+            score_cap=1.5, promote_threshold=1.5, demote_threshold=0.5,
+            score_start_high=1, score_start_medium=1,
+        )
+        self.assertEqual(cfg.promote_threshold, 1.5)
+
+    def test_08_promote_must_exceed_one_evidence_increment(self):
+        # demote > 0 + band >= 单条证据加分 => promote_threshold 必然大于该加分
+        with self.assertRaises(Exception):
+            self.LocalMemoryConfig(
+                promote_threshold=3.0, demote_threshold=0.5,
+                score_start_high=3, score_start_medium=2,
+            )
 
 
 class TestFastLlmExit(unittest.TestCase):
@@ -4396,11 +4468,14 @@ class TestConfigConstraints(unittest.TestCase):
                 mod.LocalMemoryConfig(**kwargs)
 
     def test_positive_values_accepted(self):
+        # 评分刻度整体缩放时（start_score/promote/demote 同比例）仍应通过：
+        # 迟滞带按配置的证据加分换算，不写死 3 分
         cfg = mod.LocalMemoryConfig(
-            score_cap=0.5, promote_threshold=0.5,
+            score_cap=1.5, promote_threshold=1.5, demote_threshold=0.5,
+            score_start_high=1, score_start_medium=1,
             failure_threshold=1, embedding_dims=1024,
         )
-        self.assertEqual(cfg.score_cap, 0.5)
+        self.assertEqual(cfg.score_cap, 1.5)
 
 
 class TestPersistSemantics(unittest.TestCase):

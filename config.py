@@ -91,8 +91,10 @@ class LocalMemoryConfig(BaseModel):
     )
     demote_threshold: float = Field(
         default=2.0,
-        description="画像降级阈值（迟滞下界；与 promote_threshold 的差值应大于"
-        "单条 high 证据加分，避免降档→单条证据→再晋档的翻转）",
+        gt=0,
+        description="画像降级阈值（迟滞下界；须为正：0 会让画像永不掉出）；"
+        "与 promote_threshold 的差值不得小于单条证据最大加分"
+        "（max(score_start_high, score_start_medium)），否则降档簇一条证据即可回档",
     )
     decay_factor: float = Field(default=0.9, gt=0, le=1, description="每衰减周期分数系数")
     decay_interval_days: int = Field(default=14, ge=1, description="衰减周期（天），兼缺席冻结窗口粒度")
@@ -402,6 +404,30 @@ class LocalMemoryConfig(BaseModel):
         """pool_min must not exceed pool_max (pool creation would fail)."""
         if self.pool_min > self.pool_max:
             raise ValueError("pool_min 不能大于 pool_max")
+        return self
+
+    @model_validator(mode="after")
+    def _hysteresis_band_guards_repromote(self) -> "LocalMemoryConfig":
+        """迟滞带校验：降档簇一条证据即可回档时，画像会在"降级→单条证据→再晋档"之间翻转。
+
+        降档判定是严格小于（`score < demote_threshold`），故降档簇分数上界为
+        `demote_threshold - ε`；复活时按 `min(cap, score + start_score)` 累加，
+        再晋档要求 `score >= promote_threshold`。于是当
+        `band = promote - demote >= 单条证据最大加分` 时，
+        `demote - ε + 加分 < promote` 恒成立（band 恰等于加分也安全），一条证据
+        无法回档；band 小于加分时（如 5/3）降档簇 + 一条 high 即可回档。
+
+        非法组合在配置装配期即抛出（维护页保存走同一模型，非法值返回 422），
+        不再只靠 description 文字约束。
+        """
+        max_inc = max(self.score_start_high, self.score_start_medium)
+        band = self.promote_threshold - self.demote_threshold
+        if band < max_inc:
+            raise ValueError(
+                f"promote_threshold - demote_threshold ({band}) 不得小于单条证据最大加分"
+                f" ({max_inc} = max(score_start_high, score_start_medium))，"
+                "否则降档簇一条证据即可回档，画像会在降级与晋档之间反复翻转"
+            )
         return self
 
     # ---- 主动工具安全 ----

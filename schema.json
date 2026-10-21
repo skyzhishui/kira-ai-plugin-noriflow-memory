@@ -240,13 +240,13 @@
     "type": "float",
     "name": "进入画像阈值",
     "default": 6.0,
-    "hint": "簇分数达到该值进入用户画像。迟滞带（promote_threshold - demote_threshold）应大于单条 high 证据加分（3 分），否则降档簇一条证据即可回档。"
+    "hint": "簇分数达到该值进入用户画像。迟滞带（promote_threshold - demote_threshold）不得小于单条证据最大加分（max(score_start_high, score_start_medium)），否则降档簇一条证据即可回档；该不变量在配置装配期强制校验，非法值保存即被拒。"
   },
   "demote_threshold": {
     "type": "float",
     "name": "画像降级阈值",
     "default": 2.0,
-    "hint": "迟滞下界：衰减低于该值才跌出画像。与 promote_threshold 的差值应大于单条 high 证据加分（3 分）。"
+    "hint": "迟滞下界：衰减低于该值才跌出画像（须为正，0 会让画像永不掉出）。与 promote_threshold 的差值不得小于单条证据最大加分，配置装配期强制校验。"
   },
   "decay_factor": {
     "type": "float",
