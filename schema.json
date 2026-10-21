@@ -503,6 +503,17 @@
     "default": true,
     "hint": "注入记忆尾部追加相对时间（今天/昨天/N天前/约N周前/约N个月前，按本地时区换算），让模型可区分久远记忆与近况。"
   },
+  "recall_time_label_mode": {
+    "type": "string",
+    "name": "时间标注形态",
+    "default": "both",
+    "options": [
+      "relative",
+      "absolute",
+      "both"
+    ],
+    "hint": "relative=今天/N天前；absolute=9月28日 14:30（跨年带年份，7 天内带时分、更久只到日期）；both=相对+绝对并列。"
+  },
   "timezone": {
     "type": "string",
     "name": "本地时区",

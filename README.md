@@ -45,7 +45,7 @@ WebUI 逻辑跑在两个后端上（双后端方案演进见本仓 `CHANGELOG.md
   幂等键去重、DB 熔断保护，无半提交残留；
 - **召回质量工程**：扩选、问及他人召回、近时排除、近重复去重、时间衰减、
   相对 / 绝对时间标注等十余项可调机制，默认即合理；
-- **对齐 nori 生态**：记忆工具语义与 nori 侧五件套同源，生命周期、时间
+- **对齐 nori 生态**：记忆工具语义与 nori 侧工具集同源，生命周期、时间
   标注、关系边等机制持续对齐上游。
 
 ## 工作原理
@@ -109,6 +109,12 @@ flowchart TD
     T1 -. "scope 隔离与注入路径同语义" .-> R4
 ```
 
+> 攒批时序（v1.18.0）：写入链路按回合累计后才触发编码——群聊默认每 1 回合、
+> 私聊默认每 5 回合（`retain_interval_group` / `retain_interval_private`，1=逐轮）；
+> 未满批时由空闲巡检按 `flush_idle_s`（默认 1800s）兜底强制编码，停机与会话
+> 逐出也会冲刷未满批。攒批只改变触发时机，编码输入仍是「历史窗口 + 合并后的
+> 各轮批次」。
+
 ## 配置
 
 | 键 | 类型 | 默认 | 说明 |
@@ -132,6 +138,8 @@ flowchart TD
 | embedding_dims | integer | 1024 | 向量维度：迁移 DDL 固定 vector(1024)，除非手工改表否则必须保持默认（不一致时插件拒绝启动） |
 | embedding_model | string | 空 | 覆盖 default_embedding，格式 `provider_id:model_id`（与 WebUI 模型标识一致）；解析失败回退默认并告警 |
 | encode_input_max_chars | integer | 30000 | 编码输入字符上限（0=不截断）：超长文本截断保底，防补编码毒丸行 |
+| retain_interval_group / retain_interval_private | integer | 1 / 5 | 攒批触发间隔（回合数，运行时活读热切换）：群聊 / 私聊分别生效，1 = 逐轮编码（旧行为）；私聊默认 5 即攒满 5 轮合并为单批编码，历史窗口取攒批前快照（攒批轮次不入窗口），降低编码调用频次与成本 |
+| flush_idle_s | float | 1800 | 空闲 flush 延迟（秒）：攒批未满而会话最后一条消息距今已超此时长，由巡检协程强制编码防末批滞留；巡检周期 = max(5s, min(300s, 本值))。未编码内容另有 `memory_retain_pending` 表行做重启恢复备份（每轮 UPSERT 合并快照，崩溃不丢在途批次） |
 | backfill_interval_seconds | float | 300 | 向量补算周期 |
 | backfill_batch_size | integer | 64 | 补算单批行数 |
 | merge_interval_hours | float | 6 | 合并 agent 周期 |
@@ -204,8 +212,9 @@ flowchart TD
    `default_embedding`（向量化）、`default_rerank`（可选，未配置退化为纯向量序）。
 3. 将本目录放入 `data/plugins/`：SQLite 后端启用即用；postgres 后端在 WebUI
    插件配置中填写 dsn（或保持 `storage_backend=auto` 且配置 dsn）。
-4. 依赖：`asyncpg`、`aiosqlite`、`json_repair`（插件安装时自动 pip 安装，
-   无其他额外依赖）。
+4. 依赖：`asyncpg`、`aiosqlite`、`json_repair`（插件安装时自动 pip 安装）；
+   另有条件依赖 `tomli`（Python < 3.11，读 TOML 供记忆迁入）与 `tzdata`
+   （Windows 宿主无系统 tz 库时的时区解析）。
 
 > SQLite 后端说明：`pool_min/pool_max/db_command_timeout` 忽略（单连接 +
 > WAL）；向量列无固定维度，维度不匹配的存量向量按缺失处理（换 embedding
@@ -229,7 +238,8 @@ python tests/test_time_label.py             # 时间标注（三形态/分层精
 python tests/test_fix_batch_20260912.py     # 2026-09-12 review 修复批回归
 python tests/test_kira_memory_import.py          # Kira 记忆迁入工具真文件 harness
 python tests/test_sqlite_backend.py         # SQLite 后端真库集成（收敛管线/recall/alias/edge/WebUI）
-python tests/test_memory_tools_sqlite.py    # 记忆工具五件套 + 生命周期真 SQLite 集成（直写链/状态机/归档判据）
+python tests/test_memory_tools_sqlite.py    # 记忆工具 + 生命周期真 SQLite 集成（直写链/状态机/归档判据）
+python tests/test_memory_retain_batch.py    # 私聊 retain 攒批（门控/合并/表行生命周期/失败回座/恢复续攒/巡检/SQLite 往返/擦除联动）
 ```
 
 共享桩基建两件：`tests/_harness.py`（宿主桩 + load_module 装载器）与
@@ -251,7 +261,7 @@ NORIFLOW_MEMORY_CONFIG=/path/to/config.json python tests/live_check.py
 
 ## 信息
 
-- 适用平台：KiraAI >= 3.0.0
+- 适用平台：KiraAI >= 3.0.0rc1（与 manifest `core_version` 一致；写成 `>=3.0.0` 会拒绝 rc.1 预发布宿主）
 - 数据存储：PostgreSQL + pgvector（asyncpg 直连）或 SQLite，由 `storage_backend` 配置选择（默认 SQLite）
 
 ## 许可证

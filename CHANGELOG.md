@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### docs: 文档与配置 schema 对齐 v1.18.0（无功能变更）
+
+- README 配置表补齐 v1.18.0 三个键：`retain_interval_group` / `retain_interval_private`
+  （攒批触发间隔，1=逐轮）与 `flush_idle_s`（空闲 flush 延迟 + 巡检周期换算 +
+  `memory_retain_pending` 恢复备份），升级者据此可知私聊写入延迟默认由逐轮变为 5 轮攒批；
+- README「本地测试」补 `tests/test_memory_retain_batch.py`（v1.18.0 主交付 95 例），
+  `test_memory_tools_sqlite.py` 的口径改为中性的「记忆工具」，避免与正文档「六件」冲突；
+- README 适用平台改回 `KiraAI >= 3.0.0rc1`（与 manifest `core_version` 一致，
+  `>=3.0.0` 会拒绝 rc.1 宿主）；依赖说明补条件依赖 `tomli`（Python < 3.11）与 `tzdata`（Windows）；
+- `schema.json` 补 `recall_time_label_mode`（string / relative|absolute|both，默认 both）——
+  此前仅插件维护页可编辑，宿主插件配置页缺失该项；
+- CHANGELOG v1.18.0 尾注「SQLite 迁移脚本 112/112」改为「SQLite 后端套件 112 checks 全绿」
+  （112 为 `tests/test_sqlite_backend.py` 的 check 计数，非迁移脚本数）。
+
 ## v1.18.0 (2026-10-20)
 
 ### feat: 私聊 retain 攒批合并编码 + 注入/画像耗时观测
@@ -40,7 +54,7 @@ kira 侧按「回合完成信号 + 滚动行缓存水位线 + PG/SQLite 双后�
 测试：新增 `tests/test_memory_retain_batch.py`（95 例：门控等价性/批次内容
 正确性/表行生命周期/失败回座/水位线语义/恢复续攒/巡检/逐出联动/停机收口/
 SQLite 真实往返 + 并发/乱序定序/用户擦除/脏数据防御回归）；全量 485 passed
-（基线 390 + 新增 95），SQLite 迁移脚本 112/112。
+（基线 390 + 新增 95），SQLite 后端套件 112 checks 全绿。
 
 ## v1.17.3 (2026-10-14)
 
