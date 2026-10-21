@@ -239,19 +239,19 @@
   "promote_threshold": {
     "type": "float",
     "name": "进入画像阈值",
-    "default": 10.0,
-    "hint": "簇分数达到该值进入用户画像。"
+    "default": 6.0,
+    "hint": "簇分数达到该值进入用户画像。迟滞带（promote_threshold - demote_threshold）应大于单条 high 证据加分（3 分），否则降档簇一条证据即可回档。"
   },
   "demote_threshold": {
     "type": "float",
     "name": "画像降级阈值",
-    "default": 3.0,
-    "hint": "迟滞下界：衰减低于该值才跌出画像。"
+    "default": 2.0,
+    "hint": "迟滞下界：衰减低于该值才跌出画像。与 promote_threshold 的差值应大于单条 high 证据加分（3 分）。"
   },
   "decay_factor": {
     "type": "float",
     "name": "每周期衰减系数",
-    "default": 0.8,
+    "default": 0.9,
     "hint": "每个衰减周期簇分数乘以该系数（0-1，越小衰减越快）。"
   },
   "decay_interval_days": {

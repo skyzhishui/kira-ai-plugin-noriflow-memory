@@ -461,12 +461,21 @@ class TestConfigBuilder(unittest.TestCase):
         self.assertTrue(cfg.summary_recall_session_scoped)
         self.assertTrue(cfg.decay_requires_activity)
         self.assertEqual(cfg.sticky_evidence_count, 4)
+        # 画像评分缺省值：迟滞带（promote - demote = 4）须大于单条 high 证据加分 3，
+        # 否则降档簇一条证据即可回档（翻转）
+        self.assertEqual(cfg.promote_threshold, 6.0)
+        self.assertEqual(cfg.demote_threshold, 2.0)
+        self.assertEqual(cfg.decay_factor, 0.9)
+        self.assertGreater(
+            cfg.promote_threshold - cfg.demote_threshold,
+            cfg.score_start_high,
+        )
 
     def test_12_garbage_falls_back(self):
         cfg = mod._build_config({"pool_min": "abc", "recall_top_k": None, "decay_factor": "x"})
         self.assertEqual(cfg.pool_min, 2)
         self.assertEqual(cfg.recall_top_k, 5)
-        self.assertEqual(cfg.decay_factor, 0.8)
+        self.assertEqual(cfg.decay_factor, 0.9)
 
     def test_13_bool_coercion(self):
         self.assertTrue(mod._build_config({"summary_recall_session_scoped": "true"}).summary_recall_session_scoped)

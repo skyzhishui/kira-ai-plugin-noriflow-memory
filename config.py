@@ -83,12 +83,18 @@ class LocalMemoryConfig(BaseModel):
         description="分数封顶（须为正：0 会把簇分数钉死 0、晋升停摆）",
     )
     promote_threshold: float = Field(
-        default=10.0,
+        default=6.0,
         gt=0,
-        description="进入画像阈值（须为正：0 会让全部簇立即晋升）",
+        description="进入画像阈值（须为正：0 会让全部簇立即晋升）；"
+        "迟滞带 = promote_threshold - demote_threshold，应大于单条 high 证据加分"
+        "（score_start_high=3），否则降档簇一条证据即可回档（默认 6-2=4 > 3）",
     )
-    demote_threshold: float = Field(default=3.0, description="画像降级阈值（迟滞下界）")
-    decay_factor: float = Field(default=0.8, gt=0, le=1, description="每衰减周期分数系数")
+    demote_threshold: float = Field(
+        default=2.0,
+        description="画像降级阈值（迟滞下界；与 promote_threshold 的差值应大于"
+        "单条 high 证据加分，避免降档→单条证据→再晋档的翻转）",
+    )
+    decay_factor: float = Field(default=0.9, gt=0, le=1, description="每衰减周期分数系数")
     decay_interval_days: int = Field(default=14, ge=1, description="衰减周期（天），兼缺席冻结窗口粒度")
     recent_expire_days: int = Field(default=30, ge=1, description="recent 维度过期天数")
     recent_promote_threshold: float = Field(default=4.0, description="recent 维度进画像阈值")

@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### feat(config): 画像评分缺省值对齐长周期陪伴场景（promote 10→6 / demote 3→2 / decay 0.8→0.9）
+
+- 缺省值改动：`promote_threshold` 10→6、`demote_threshold` 3→2、`decay_factor` 0.8→0.9
+  （`config.py` 模型缺省、`main.py` 宿主配置兜底、`schema.json` 维护页展示三处口径一致）；
+- 依据（线上 seki 平台画像数据）：晋升阈值原与 `score_cap`（10）相等，簇需 4-5 次独立
+  确认才能入画像——实测 1390 个簇中仅 59 个（4.3%）达到 3 次确认，26 个 3-5 次确认的
+  高质量事实（人设/偏好/互动边界）长期卡在 6-10 分区间进不了画像；降为 6 后这批事实
+  可直接晋档（两次独立 high 抽取或三次 medium 抽取即达线）；
+- 迟滞带同步收窄但仍留有余量：`promote - demote = 4 > score_start_high(3)`，保证降档簇
+  （分数 < demote）一条 high 证据无法回档、需 2 条，避免"降级→单条证据→再晋档"翻转；
+  该不变量写入 `promote_threshold` / `demote_threshold` 的 description 与维护页 hint；
+- `decay_factor` 0.8→0.9：0.8 每 30 天衰减一次时半衰期约 1.4 个月，已入画像事实在
+  1-2 个周期内即跌破晋升线并进入降档危险区；0.9 半衰期约 6.6 个月，显著放缓自然遗忘；
+- 破坏性提示：已显式写入宿主配置的部署**不受影响**（宿主配置优先于模型缺省），仅新装或
+  配置缺键的部署采用新缺省；降档阈值下移后画像保留期变长（低分事实清理节奏放缓），
+  且 recent 维度的过期降档不清零分数，其单证据回档路径与本组阈值无关。
+
 ### docs: 文档与配置 schema 对齐 v1.18.0（无功能变更）
 
 - README 配置表补齐 v1.18.0 三个键：`retain_interval_group` / `retain_interval_private`
