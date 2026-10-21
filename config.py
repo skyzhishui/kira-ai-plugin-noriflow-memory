@@ -445,10 +445,14 @@ class LocalMemoryConfig(BaseModel):
 
         非法组合在配置装配期即抛出（维护页保存走同一模型，非法值返回 422），
         不再只靠 description 文字约束。
+
+        浮点比较带 1e-9 容差：二进制浮点减法有表示误差（如 6.1 - 3.1 =
+        2.9999999999999996），数学上 band 恰等于加分（相等亦安全）的组合
+        不得因表示误差被误拒。
         """
         max_inc = max(self.score_start_high, self.score_start_medium)
         band = self.promote_threshold - self.demote_threshold
-        if band < max_inc:
+        if band + 1e-9 < max_inc:
             raise CrossFieldConfigError(
                 f"promote_threshold - demote_threshold ({band}) 不得小于单条证据最大加分"
                 f" ({max_inc} = max(score_start_high, score_start_medium))，"

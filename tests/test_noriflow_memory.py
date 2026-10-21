@@ -622,6 +622,22 @@ class TestHysteresisBandValidation(unittest.TestCase):
                 score_start_high=3, score_start_medium=2,
             )
 
+    def test_13_float_boundary_equal_band_is_accepted(self):
+        # 浮点表示误差不得把"数学上 band 恰等于加分"的组合误判为非法：
+        # 6.1 - 3.1 == 2.9999999999999996（二进制浮点），数学上 band=3 应安全
+        self.assertEqual(6.1 - 3.1, 2.9999999999999996)
+        cfg = self.LocalMemoryConfig(
+            promote_threshold=6.1, demote_threshold=3.1,
+        )
+        self.assertEqual(cfg.promote_threshold, 6.1)
+
+    def test_14_float_tolerance_still_rejects_truly_smaller_band(self):
+        # 容差只吸收表示误差：真非法（band=2.0，远超 1e-9）仍被拒
+        with self.assertRaises(Exception):
+            self.LocalMemoryConfig(
+                promote_threshold=5.1, demote_threshold=3.1,
+            )
+
 
 class TestFastLlmExit(unittest.TestCase):
     """Structured exit: schema goes through a forced tool call, with text fallback when no tool_call is present."""

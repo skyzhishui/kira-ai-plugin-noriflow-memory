@@ -419,10 +419,12 @@ def _try_build_config(raw: dict) -> LocalMemoryConfig:
     时逐轮回退（每轮至少移除一组键，键集单调收缩，循环必然终止）。
     """
     cleaned = dict(raw)
+    last_exc: BaseException | None = None
     for _ in range(6):  # 轮次上限：字段级与跨字段交替出现的兜底防御
         try:
             return _build_config(cleaned)
         except ValidationError as exc:
+            last_exc = exc
             field_bad = {str(e["loc"][0]) for e in exc.errors() if e.get("loc")}
             if field_bad:
                 logger.warning(
@@ -441,9 +443,14 @@ def _try_build_config(raw: dict) -> LocalMemoryConfig:
                 "配置键（其余配置保留）：%s", sorted(group & set(cleaned)),
             )
             cleaned = {k: v for k, v in cleaned.items() if k not in group}
-        except Exception:
+        except Exception as exc:
+            last_exc = exc
             break
-    logger.warning("配置项越界且逐项回退失败，全部回退默认值", exc_info=True)
+    # exc_info 显式传捕获的异常：此处已在 except 块外，sys.exc_info() 已清空
+    # （轮次耗尽路径更是没有活动异常），不带 last_exc 会丢掉定位所需堆栈
+    logger.warning(
+        "配置项越界且逐项回退失败，全部回退默认值", exc_info=last_exc
+    )
     return LocalMemoryConfig(dsn=_cfg_str(raw, "dsn"))
 
 
