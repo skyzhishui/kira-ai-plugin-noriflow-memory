@@ -77,7 +77,7 @@ from . import config_web, webui_store
 from .alias_store import build_alias_rows
 from .circuit_breaker import MemoryDBCircuitBreaker
 from .clients import FastLlmExit, KiraEmbeddingClient, KiraRerankClient
-from .config import LocalMemoryConfig
+from .config import CROSS_FIELD_VALIDATED_KEYS, LocalMemoryConfig
 from .contracts import PersonaCandidate
 from .db import MemoryDatabase, SQLiteMemoryDatabase, resolve_backend_name
 from .entity_edge import relation_statement_line
@@ -292,9 +292,9 @@ def _build_config(raw: dict) -> LocalMemoryConfig:
         score_start_high=_cfg_int(raw, "score_start_high", 3),
         score_start_medium=_cfg_int(raw, "score_start_medium", 2),
         score_cap=_cfg_float(raw, "score_cap", 10.0),
-        promote_threshold=_cfg_float(raw, "promote_threshold", 10.0),
-        demote_threshold=_cfg_float(raw, "demote_threshold", 3.0),
-        decay_factor=_cfg_float(raw, "decay_factor", 0.8),
+        promote_threshold=_cfg_float(raw, "promote_threshold", 6.0),
+        demote_threshold=_cfg_float(raw, "demote_threshold", 2.0),
+        decay_factor=_cfg_float(raw, "decay_factor", 0.9),
         decay_interval_days=_cfg_int(raw, "decay_interval_days", 14),
         recent_expire_days=_cfg_int(raw, "recent_expire_days", 30),
         recent_promote_threshold=_cfg_float(raw, "recent_promote_threshold", 4.0),
@@ -386,33 +386,72 @@ def _build_config(raw: dict) -> LocalMemoryConfig:
     )
 
 
+def _cross_field_fallback_keys(exc: "ValidationError") -> set:
+    """从 ValidationError 收集跨字段校验失败的回退键。
+
+    校验器抛 CrossFieldConfigError 自报管辖键（pydantic 把原始异常放在
+    errors()[i]["ctx"]["error"]），据此精确回退**该组**键；自报键缺失时
+    （未来新增校验器漏带 keys 的防御）返回空集，由调用方退回整表回退。
+    """
+    keys: set = set()
+    for err in exc.errors():
+        if err.get("loc"):
+            continue  # 字段级错误走逐项回退分支
+        declared = getattr((err.get("ctx") or {}).get("error"), "keys", None)
+        if declared:
+            keys |= set(declared)
+    return keys
+
+
 def _try_build_config(raw: dict) -> LocalMemoryConfig:
     """Fallback layer for _build_config: when out-of-range values trigger a
     pydantic validation exception, fall back to default parameters, consistent
     with the module's "per-field tolerant" promise, so a single config item
     (e.g. pool_min=0) cannot fail the whole plugin initialization.
 
-    逐字段回退：只把**越界的那几项**从入参里去掉再重建——其余用户配置
-    保持不变（整份回退会把用户的其他设置一并清掉）。
+    逐字段回退：字段级越界（gt/ge 等）只把**越界的那几项**从入参里去掉再
+    重建——其余用户配置保持不变（整份回退会把用户的其他设置一并清掉）。
+
+    跨字段回退：model_validator 的 pydantic 错误 loc 为空、无法逐项定位；
+    校验器经 CrossFieldConfigError 自报管辖键，**只回退真正非法的那组**
+    （另一组合法的用户显式配置保留，如池边界非法时不牵连显式调好的画像
+    阈值）。pydantic 对多个 model_validator 只报第一个失败——两组同时非法
+    时逐轮回退（每轮至少移除一组键，键集单调收缩，循环必然终止）。
     """
-    try:
-        return _build_config(raw)
-    except ValidationError as exc:
-        bad = {str(err["loc"][0]) for err in exc.errors() if err.get("loc")}
-        logger.warning(
-            "配置项越界（pydantic 校验失败）：%s 已回退默认值", sorted(bad)
-        )
-        cleaned = {k: v for k, v in raw.items() if k not in bad}
+    cleaned = dict(raw)
+    last_exc: BaseException | None = None
+    for _ in range(6):  # 轮次上限：字段级与跨字段交替出现的兜底防御
         try:
             return _build_config(cleaned)
-        except Exception:
-            logger.warning(
-                "配置项越界且逐项回退失败，全部回退默认值", exc_info=True
+        except ValidationError as exc:
+            last_exc = exc
+            field_bad = {str(e["loc"][0]) for e in exc.errors() if e.get("loc")}
+            if field_bad:
+                logger.warning(
+                    "配置项越界（pydantic 校验失败）：%s 已回退默认值",
+                    sorted(field_bad),
+                )
+                cleaned = {k: v for k, v in cleaned.items() if k not in field_bad}
+                continue
+            group = _cross_field_fallback_keys(exc) or (
+                set(CROSS_FIELD_VALIDATED_KEYS) & set(cleaned)
             )
-            return LocalMemoryConfig(dsn=_cfg_str(raw, "dsn"))
-    except Exception:
-        logger.warning("配置构造失败，全部回退默认值", exc_info=True)
-        return LocalMemoryConfig(dsn=_cfg_str(raw, "dsn"))
+            if not (group & set(cleaned)):
+                break  # 无可回退键（如缺省组合本身非法），转全部回退
+            logger.warning(
+                "跨字段校验失败（迟滞带/池边界等组合非法），仅回退该组涉及的"
+                "配置键（其余配置保留）：%s", sorted(group & set(cleaned)),
+            )
+            cleaned = {k: v for k, v in cleaned.items() if k not in group}
+        except Exception as exc:
+            last_exc = exc
+            break
+    # exc_info 显式传捕获的异常：此处已在 except 块外，sys.exc_info() 已清空
+    # （轮次耗尽路径更是没有活动异常），不带 last_exc 会丢掉定位所需堆栈
+    logger.warning(
+        "配置项越界且逐项回退失败，全部回退默认值", exc_info=last_exc
+    )
+    return LocalMemoryConfig(dsn=_cfg_str(raw, "dsn"))
 
 
 @dataclass
