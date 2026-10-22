@@ -4259,7 +4259,13 @@ class NoriflowMemoryPlugin(BasePlugin):
                     if self._retain_state_mentions(state, key):
                         redacted = self._retain_state_without_user(state, key)
                         if redacted is not None:
-                            kept.append(redacted)
+                            # 脱敏副本只回座 pending，不写回在途登记：持有它
+                            # 的原任务即将被取消，CancelledError 不经过
+                            # _do_retain 的清理分支，且 _drop_inflight 只认
+                            # 原 state 对象——若同时留在 _retain_inflight，
+                            # 孤儿副本无任务持有、永远不会被摘除，
+                            # _pending_snapshot_for_row 会把它与 pending
+                            # 双份并进快照（表行删不掉、重启重复编码）
                             reseat.setdefault(sid, []).append(redacted)
                     else:
                         kept.append(state)
