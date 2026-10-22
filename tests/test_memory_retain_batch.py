@@ -2976,6 +2976,47 @@ class TestMultiReviewFixes(unittest.TestCase):
         self.assertEqual(kept.user_id, "u2")
         self.assertNotIn(("napcat", "u1"), [tuple(p) for p in kept.participants])
 
+    def test_user_erase_group_inflight_leaves_no_orphan_copy(self):
+        """群聊在途批次擦除脱敏：脱敏副本只回座 pending，不得残留孤儿在途登记。
+
+        回归：原实现把脱敏副本同时放进 kept（写回 _retain_inflight）与
+        reseat（合并进 pending）。在途侧副本没有任务持有（原任务已被
+        取消，CancelledError 不走 _do_retain 清理分支），_drop_inflight
+        又只认原 state 对象——孤儿副本永远摘不掉：_pending_snapshot_for_row
+        把它与 pending 双份并进快照，表行条件删除永假（行删不掉），重启
+        恢复会把已编码内容再次编码。
+        """
+        inst, _ = _ready_plugin(mod, cfg=_cfg(group=3))
+        sid = "napcat:gm:778899"
+        line_u1 = mod.format_history_message(
+            speaker_name="u1", content="u1 的机密", user_id="u1"
+        )
+        line_u2 = mod.format_history_message(
+            speaker_name="u2", content="u2 的正常发言", user_id="u2"
+        )
+        state = inst._retain_state_from_payload({
+            "session_id": "778899", "platform": "napcat", "group_id": "778899",
+            "user_id": "u1", "timestamp": datetime.now().isoformat(),
+            "participants": [["napcat", "u1"], ["napcat", "u2"]],
+            "history_lines": [], "batch_lines": [line_u1, line_u2],
+            "bot_lines": [], "rounds": 2,
+        })
+        inst._retain_inflight[sid] = [state]
+
+        async def scenario():
+            await inst._erase_retain_for_user("napcat", "u1")
+
+        asyncio.run(scenario())
+        # 脱敏副本不得残留在途登记（无任务持有的孤儿，永远摘不掉）
+        self.assertNotIn(sid, inst._retain_inflight)
+        # 其他成员内容经回座进 pending（失败回座标记，待下一触发点重试）
+        pending = inst._retain_pending.get(sid)
+        self.assertIsNotNone(pending, "其他成员的批次必须回座 pending")
+        text = "\n".join(pending.batch_lines)
+        self.assertNotIn("u1 的机密", text)
+        self.assertIn("u2 的正常发言", text)
+        self.assertNotIn(("napcat", "u1"), [tuple(p) for p in pending.participants])
+
     def test_erase_during_alias_wait_drops_stale_turn(self):
         """擦除发生在别名 await 期间：旧回合不得再进入 pending。"""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
