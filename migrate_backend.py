@@ -185,6 +185,28 @@ def _fmt_ts(value) -> str | None:
     ) + "Z"
 
 
+def _fmt_pending_ts(value) -> str | None:
+    """memory_retain_pending.updated_at → runtime-compatible timestamp text.
+
+    The pending row is the only table written directly by main.py (not via
+    db.base.sqlite_format_ts): runtime writes use
+    ``datetime.isoformat(timespec="microseconds")`` (``+00:00`` suffix) while
+    regular tables use the ``Z`` suffix. SQLite compares TEXT lexicographically
+    and ``'Z' > '+'``, so a ``Z``-format row never satisfies
+    ``updated_at <= cutoff`` against runtime-format cutoffs — the migrated row
+    can never be conditionally deleted and gets re-encoded after every restart.
+    ``Z`` strings are also rejected by ``datetime.fromisoformat`` on
+    Python < 3.11, making _row_timestamp return None (delete skipped entirely).
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if value.tzinfo is None:
+        value = value.astimezone()
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
 def _json_list(value) -> str:
     """PG TEXT[] (asyncpg list) → JSON TEXT (empty/None → '[]')."""
     return json.dumps(list(value or []), ensure_ascii=False)
@@ -411,7 +433,7 @@ async def _run_migration(
                 return 2
             pending_copy.append((
                 row["session_key"], json.dumps(parsed, ensure_ascii=False),
-                _fmt_ts(row["updated_at"]),
+                _fmt_pending_ts(row["updated_at"]),
             ))
         print("== 迁移预检 ==")
         for spec in _TABLES:

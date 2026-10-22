@@ -12,7 +12,7 @@
   可直接晋档（两次独立 high 抽取或三次 medium 抽取即达线）；
 - 迟滞带同步收窄但仍留有余量：`promote - demote = 4 > score_start_high(3)`，保证降档簇
   （分数 < demote）一条 high 证据无法回档、需 2 条，避免"降级→单条证据→再晋档"翻转；
-- **模型级强制校验（修 pr #17 评审意见）**：新增 `model_validator(mode="after")`
+- **模型级强制校验**：新增 `model_validator(mode="after")`
   `_hysteresis_band_guards_repromote`——当 `promote_threshold - demote_threshold` 小于
   单条证据最大加分 `max(score_start_high, score_start_medium)` 时直接抛错，非法组合在
   配置装配期即炸出（维护页保存走同一模型，非法值返回 422 并带原因），不再依赖
@@ -28,7 +28,7 @@
   （92 天 / 3.1 个月）；按线上部署的 30 天周期折算则分别为 93 天（3.1 个月）与
   197 天（6.6 个月）。线上实测（30 天周期、0.8）：仅跑过 1 次衰减就有 27/51 已晋档事实
   跌破晋升线、15 个进入降档危险区；改 0.9 后显著放缓自然遗忘；
-- **跨字段校验失败的降级范围收窄（修 pr #17 第二/三轮评审意见）**：跨字段校验
+- **跨字段校验失败的降级范围收窄**：跨字段校验
   （model_validator）的 pydantic 错误 loc 为空，原逐项回退定位不到键会退化为
   **整份回退默认值**（用户其余配置一并被清）；且跨字段键表若按并集回退，任一组
   非法会把另一组**合法的显式配置**也清掉。现校验器经 `CrossFieldConfigError`
@@ -37,7 +37,7 @@
   其余用户配置保留、告警点名被回退的键；pydantic 对多个 model_validator 只报
   第一个失败，两组同时非法时逐轮回退（键集单调收缩必然终止）；自报键缺失时
   防御性退回 `CROSS_FIELD_VALIDATED_KEYS` 整表回退；
-- **起步分非负 + 倒挂显式守卫（修 pr #17 第六轮评审意见）**：`score_start_high` /
+- **起步分非负 + 倒挂显式守卫**：`score_start_high` /
   `score_start_medium` 补 `ge=0`——负起步分会让迟滞带校验的"单条证据最大加分"
   变负、校验形同虚设，可配出 `promote=1 / demote=5` 的倒挂组合（迟滞带语义失效，
   低分晋档高分降档互相矛盾）；同时 band 校验器前置显式 `promote > demote` 守卫，
@@ -45,7 +45,7 @@
   `test_09/10/12` 原断言 `pool_max == 8`（入参值），但分组回退是整组复位、
   `pool_max` 应取缺省——原入参 8 恰与缺省 8 相同而"碰巧"通过，现改入参为 6
   （≠ 缺省）使断言无歧义；
-- **晋升阈值不得超过分数封顶（修 pr #17 第五轮评审意见）**：新增
+- **晋升阈值不得超过分数封顶**：新增
   `_promote_thresholds_within_cap`——`promote_threshold` / `recent_promote_threshold`
   大于 `score_cap` 时装配期抛错（相等允许：分数经 `min(cap, ...)` 可达封顶，
   旧缺省 promote=10==cap=10 即此形态；浮点比较带 1e-9 容差）。此前该组合可从
@@ -54,7 +54,7 @@
   中招（回退后 promote 复位 6.0 而 cap 留 1.5）。回退组联动：该校验器自报
   键 (score_cap, promote_threshold, recent_promote_threshold)，band 组复位后
   若与遗留 cap 组合非法，兜底循环第二轮自动复位 cap 组，终态刻度自洽；
-- **迟滞带比较带浮点容差 + 兜底告警保留异常堆栈（修 pr #17 第四轮评审意见）**：
+- **迟滞带比较带浮点容差 + 兜底告警保留异常堆栈**：
   band 比较改为 `band + 1e-9 < max_inc`——二进制浮点减法有表示误差（实测
   `6.1 - 3.1 == 2.9999999999999996`），数学上 band 恰等于加分（相等亦安全）的
   组合不得因表示误差被误拒（维护页 422 / 启动回退均受影响）；真非法组合

@@ -1399,7 +1399,12 @@ async def _migrate_backend_checks() -> None:
                 rows = await conn.fetch("SELECT payload,updated_at FROM memory_retain_pending")
             check(f"migrate_pending_{type(shape).__name__}",
                   code == 0 and len(rows) == 1 and json.loads(rows[0]["payload"]) == pending_payload
-                  and rows[0]["updated_at"] == mig._fmt_ts(now))
+                  # 运行时同款格式（isoformat 微秒 + 偏移）：Z 后缀会让
+                  # updated_at <= cutoff 的字符串比较永假（'Z' > '+'），
+                  # 迁移行删不掉；Python<3.11 的 fromisoformat 也不认 Z
+                  and rows[0]["updated_at"]
+                  == now.astimezone(timezone.utc).isoformat(timespec="microseconds")
+                  and rows[0]["updated_at"] <= datetime.now(timezone.utc).isoformat(timespec="microseconds"))
             await verify.close()
 
         # --force must not silently overwrite either backend's unencoded

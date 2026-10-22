@@ -261,6 +261,31 @@ class LocalPersonaService:
         candidates: list[PersonaCandidate],
         session_id: str,
     ) -> str:
+        started = time.perf_counter()
+        try:
+            return await self._build_multi_profile_text_impl(
+                candidates, session_id
+            )
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            logger.debug(
+                "build_multi_profile_text 耗时 %.3f ms",
+                elapsed_ms,
+            )
+            if elapsed_ms > SLOW_CALL_THRESHOLD_MS:
+                # 慢查询哨兵（与 build_profile_text 同口径：>500ms 升级 WARNING，
+                # 群聊画像构建同样纳入观测）
+                logger.warning(
+                    "build_multi_profile_text 慢调用 %.3f ms（candidates=%d）",
+                    elapsed_ms,
+                    len(candidates),
+                )
+
+    async def _build_multi_profile_text_impl(
+        self,
+        candidates: list[PersonaCandidate],
+        session_id: str,
+    ) -> str:
         """Build multi-participant persona injection text for group chat.
 
         Assembles "{display_name}:\n{profile}" blocks per candidate and
