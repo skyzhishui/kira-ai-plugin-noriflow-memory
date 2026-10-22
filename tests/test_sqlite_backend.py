@@ -122,7 +122,7 @@ async def main_async() -> None:
     db = SQLiteMemoryDatabase(config)
     await db.connect()
     applied = await db.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
-    check("migrations_applied", applied == [1, 11, 12], str(applied))
+    check("migrations_applied", applied == [1, 11, 12, 13], str(applied))
     applied_again = await db.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
     check("migrations_idempotent", applied_again == [])
 
@@ -1081,6 +1081,8 @@ class _FakePG:
         self.closed = False
 
     async def fetch(self, sql: str, *args):
+        if "FROM memory_retain_pending" in sql:
+            return self.tables.get("memory_retain_pending", [])
         if "_memory_local_kv" in sql:
             return self.kv_rows
         if sql.startswith("SELECT document_id FROM memory_chat_summary"):
@@ -1092,6 +1094,8 @@ class _FakePG:
         raise AssertionError("unexpected pg fetch: " + sql[:100])
 
     async def fetchval(self, sql: str, *args):
+        if "to_regclass('memory_retain_pending')" in sql:
+            return "memory_retain_pending" if "memory_retain_pending" in self.tables else None
         if "WHERE embedding IS NOT NULL ORDER BY id LIMIT 1" in sql:
             rows = self.tables["memory_chat_summary"]
             emb = next((r["embedding"] for r in rows
@@ -1370,6 +1374,54 @@ async def _migrate_backend_checks() -> None:
         await sdb2.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
         code2 = await mig._run_migration(pg2, sdb2)
         check("migrate_marker_guard", code2 == 2, str(code2))
+
+        # Migration 013 introduces durable unencoded conversations, not just
+        # derived memory rows. Both JSONB codec shapes must survive cutover.
+        pending_payload = {"platform": "napcat", "user_id": "u1", "rounds": 3,
+                           "batch_lines": ["迁移前未编码内容"]}
+        for shape in (pending_payload, json.dumps(pending_payload)):
+            pending_cfg = LocalMemoryConfig(
+                storage_backend="sqlite", sqlite_path=str(Path(td) / f"pending-{type(shape).__name__}.sqlite3"),
+                embedding_dims=4,
+            )
+            pending_db = SQLiteMemoryDatabase(pending_cfg)
+            await pending_db.connect()
+            await pending_db.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
+            source = _FakePG(tables={
+                **{spec["name"]: [] for spec in mig._TABLES},
+                "memory_retain_pending": [{"session_key": "napcat:dm:10086",
+                                          "payload": shape, "updated_at": now}],
+            }, kv_rows=[])
+            code = await mig._run_migration(source, pending_db)
+            verify = SQLiteMemoryDatabase(pending_cfg)
+            await verify.connect()
+            async with verify.pool.acquire() as conn:
+                rows = await conn.fetch("SELECT payload,updated_at FROM memory_retain_pending")
+            check(f"migrate_pending_{type(shape).__name__}",
+                  code == 0 and len(rows) == 1 and json.loads(rows[0]["payload"]) == pending_payload
+                  # 运行时同款格式（isoformat 微秒 + 偏移）：Z 后缀会让
+                  # updated_at <= cutoff 的字符串比较永假（'Z' > '+'），
+                  # 迁移行删不掉；Python<3.11 的 fromisoformat 也不认 Z
+                  and rows[0]["updated_at"]
+                  == now.astimezone(timezone.utc).isoformat(timespec="microseconds")
+                  and rows[0]["updated_at"] <= datetime.now(timezone.utc).isoformat(timespec="microseconds"))
+            await verify.close()
+
+        # --force must not silently overwrite either backend's unencoded
+        # conversation when the same session has different snapshots.
+        conflict_db = SQLiteMemoryDatabase(pending_cfg)
+        await conflict_db.connect()
+        source.tables["memory_retain_pending"][0]["payload"] = {**pending_payload, "rounds": 4}
+        code = await mig._run_migration(source, conflict_db, force=True)
+        check("migrate_pending_conflict_refused", code == 2)
+        conflict_db = SQLiteMemoryDatabase(pending_cfg)
+        await conflict_db.connect()
+        async with conflict_db.pool.acquire() as conn:
+            stored = await conn.fetchval("SELECT payload FROM memory_retain_pending")
+        check("migrate_pending_conflict_keeps_target",
+              isinstance(stored, str) and json.loads(stored) == pending_payload,
+              repr(stored)[:80])
+        await conflict_db.close()
 
 
 def main() -> int:

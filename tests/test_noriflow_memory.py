@@ -42,7 +42,7 @@ PLUGIN_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # 桩设施统一入口（review 2026-09-12 冗余项 1）
-from plugin_env import install_host_stubs, load_plugin_module  # noqa: E402
+from plugin_env import install_host_stubs, load_modules, load_plugin_module  # noqa: E402
 
 # ---------------------------------------------------------------------------
 #  core.* 桩模块（先于加载插件主模块注入）
@@ -360,7 +360,12 @@ def _ready_plugin(mod, cfg=None, ctx=None):
     initialize starts background tasks; they are stopped inside the same loop before the test ends to avoid
     cross-loop pending-task warnings.
     """
-    cfg = cfg if cfg is not None else {"dsn": "postgres://u:p@127.0.0.1:5432/db"}
+    cfg = cfg if cfg is not None else {
+        "dsn": "postgres://u:p@127.0.0.1:5432/db",
+        # 既有用例锁定改动前的逐轮 retain 语义（私聊默认攒批由
+        # tests/test_memory_retain_batch.py 单独覆盖）
+        "retain_interval_private": 1,
+    }
     ctx = ctx or FakeCtx()
     inst = mod.NoriflowMemoryPlugin(ctx, dict(cfg))
     orig_db = mod.MemoryDatabase
@@ -374,6 +379,14 @@ def _ready_plugin(mod, cfg=None, ctx=None):
                 await inst._backfill_task.stop()
             if inst._merge_agent is not None:
                 await inst._merge_agent.stop()
+            if inst._retain_sweep_task is not None:
+                # 取消后必须 await 掉：cancel() 只是把取消回调排进 ready
+                # 队列，不 await 的话协程在 loop 关闭时仍是 pending →
+                # "Task was destroyed but it is pending!" 警告
+                sweep = inst._retain_sweep_task
+                inst._retain_sweep_task = None
+                sweep.cancel()
+                await asyncio.gather(sweep, return_exceptions=True)
 
         loop.run_until_complete(_stop_bg())
     finally:
@@ -448,12 +461,21 @@ class TestConfigBuilder(unittest.TestCase):
         self.assertTrue(cfg.summary_recall_session_scoped)
         self.assertTrue(cfg.decay_requires_activity)
         self.assertEqual(cfg.sticky_evidence_count, 4)
+        # 画像评分缺省值：迟滞带（promote - demote = 4）不得小于单条证据最大加分 3，
+        # 否则降档簇一条证据即可回档（翻转）——模型级校验强制该不变量
+        self.assertEqual(cfg.promote_threshold, 6.0)
+        self.assertEqual(cfg.demote_threshold, 2.0)
+        self.assertEqual(cfg.decay_factor, 0.9)
+        self.assertGreaterEqual(
+            cfg.promote_threshold - cfg.demote_threshold,
+            max(cfg.score_start_high, cfg.score_start_medium),
+        )
 
     def test_12_garbage_falls_back(self):
         cfg = mod._build_config({"pool_min": "abc", "recall_top_k": None, "decay_factor": "x"})
         self.assertEqual(cfg.pool_min, 2)
         self.assertEqual(cfg.recall_top_k, 5)
-        self.assertEqual(cfg.decay_factor, 0.8)
+        self.assertEqual(cfg.decay_factor, 0.9)
 
     def test_13_bool_coercion(self):
         self.assertTrue(mod._build_config({"summary_recall_session_scoped": "true"}).summary_recall_session_scoped)
@@ -471,6 +493,198 @@ class TestConfigBuilder(unittest.TestCase):
         })
         self.assertEqual(cfg.dsn, "postgres://u:p@127.0.0.1:5432/db")
         self.assertEqual(cfg.pool_min, 2)
+
+
+class TestHysteresisBandValidation(unittest.TestCase):
+    """迟滞带强制校验：band < 单条证据最大加分时降档簇一条证据即可回档。
+
+    band = promote_threshold - demote_threshold；降档判定是严格
+    `score < demote_threshold`，故降档簇分数上界为 demote - ε，
+    band 恰等于单条证据加分时仍安全（demote-ε+加分 < promote）。
+    """
+
+    def setUp(self):
+        self.config_mod = load_modules("config")[0]
+        self.LocalMemoryConfig = self.config_mod.LocalMemoryConfig
+
+    def test_01_default_band_is_valid(self):
+        cfg = self.LocalMemoryConfig()
+        self.assertGreaterEqual(
+            cfg.promote_threshold - cfg.demote_threshold,
+            max(cfg.score_start_high, cfg.score_start_medium),
+        )
+
+    def test_02_band_equal_to_one_evidence_is_accepted(self):
+        # band == 加分（6/3）：降档簇最高 2.999+3=5.999 < 6，一条证据无法回档
+        cfg = self.LocalMemoryConfig(promote_threshold=6.0, demote_threshold=3.0)
+        self.assertEqual(cfg.promote_threshold - cfg.demote_threshold, 3.0)
+
+    def test_03_band_below_one_evidence_is_rejected(self):
+        with self.assertRaises(Exception) as ctx:
+            self.LocalMemoryConfig(promote_threshold=5.0, demote_threshold=3.0)
+        self.assertIn("不得小于单条证据最大加分", str(ctx.exception))
+
+    def test_04_demote_threshold_must_be_positive(self):
+        with self.assertRaises(Exception):
+            self.LocalMemoryConfig(demote_threshold=0.0)
+
+    def test_05_medium_start_score_above_high_uses_the_max(self):
+        # 单条证据最大加分取 max(high, medium)：medium 配得比 high 高时按 medium 判
+        with self.assertRaises(Exception):
+            self.LocalMemoryConfig(
+                promote_threshold=6.0,
+                demote_threshold=3.0,
+                score_start_high=2,
+                score_start_medium=5,
+            )
+
+    def test_06_unsafe_band_falls_back_to_defaults(self):
+        # 非法组合走兜底层：插件不因单个配置项起不来；跨字段校验失败只回退
+        # 涉及的评分键，其余用户配置保留（评审意见：不得整份回退）
+        cfg = mod._try_build_config({
+            "dsn": "postgres://u:p@127.0.0.1:5432/db",
+            "promote_threshold": 5.0,
+            "demote_threshold": 3.0,
+            "recall_top_k": 7,
+            "merge_interval_hours": 12.0,
+        })
+        self.assertEqual(cfg.dsn, "postgres://u:p@127.0.0.1:5432/db")
+        self.assertEqual(cfg.promote_threshold, 6.0)
+        self.assertEqual(cfg.demote_threshold, 2.0)
+        self.assertEqual(cfg.decay_factor, 0.9)
+        # 无关配置不被清掉
+        self.assertEqual(cfg.recall_top_k, 7)
+        self.assertEqual(cfg.merge_interval_hours, 12.0)
+
+    def test_09_pool_bounds_cross_field_fallback_keeps_other_keys(self):
+        # 另一条跨字段校验（pool_min > pool_max）同走分组回退：整组复位，
+        # pool_max 也回缺省（8）而非入参 6——入参故意取 != 缺省，避免断言歧义
+        cfg = mod._try_build_config({
+            "pool_min": 9, "pool_max": 6,
+            "recall_top_k": 7,
+        })
+        self.assertEqual(cfg.pool_min, 2)
+        self.assertEqual(cfg.pool_max, 8)  # 整组复位 -> 缺省值，非入参 6
+        self.assertEqual(cfg.recall_top_k, 7)
+
+    def test_10_pool_invalid_keeps_valid_explicit_scoring(self):
+        # 评审场景：池边界非法不得牵连合法且有意调参的评分显式配置
+        # （promote=8/demote=3 band=5 >= 3 合法）——按校验器自报键精确回退该组
+        cfg = mod._try_build_config({
+            "pool_min": 9, "pool_max": 6,
+            "promote_threshold": 8.0, "demote_threshold": 3.0,
+            "recall_top_k": 7,
+        })
+        self.assertEqual(cfg.pool_min, 2)
+        self.assertEqual(cfg.pool_max, 8)  # 整组复位 -> 缺省值，非入参 6
+        self.assertEqual(cfg.promote_threshold, 8.0)
+        self.assertEqual(cfg.demote_threshold, 3.0)
+        self.assertEqual(cfg.recall_top_k, 7)
+
+    def test_11_band_invalid_keeps_valid_explicit_pool(self):
+        # 反向场景：迟滞带非法时，合法的显式池参数不被重置
+        cfg = mod._try_build_config({
+            "promote_threshold": 5.0, "demote_threshold": 3.0,
+            "pool_min": 4, "pool_max": 6,
+        })
+        self.assertEqual(cfg.promote_threshold, 6.0)
+        self.assertEqual(cfg.demote_threshold, 2.0)
+        self.assertEqual(cfg.pool_min, 4)
+        self.assertEqual(cfg.pool_max, 6)
+
+    def test_12_both_groups_invalid_resets_both_keeps_rest(self):
+        # 两组同时非法：pydantic 只报第一个失败校验器，逐轮回退到两组全清、
+        # 其余用户配置保留
+        cfg = mod._try_build_config({
+            "pool_min": 9, "pool_max": 6,
+            "promote_threshold": 5.0, "demote_threshold": 3.0,
+            "recall_top_k": 7,
+        })
+        self.assertEqual(cfg.pool_min, 2)
+        self.assertEqual(cfg.pool_max, 8)  # 整组复位 -> 缺省值，非入参 6
+        self.assertEqual(cfg.promote_threshold, 6.0)
+        self.assertEqual(cfg.demote_threshold, 2.0)
+        self.assertEqual(cfg.recall_top_k, 7)
+
+    def test_19_negative_start_scores_are_rejected(self):
+        # 评审场景：负起步分让 max_inc 为负、迟滞带校验形同虚设（可配出
+        # promote=1/demote=5 倒挂）——ge=0 直接拒
+        with self.assertRaises(Exception):
+            self.LocalMemoryConfig(score_start_high=-5, score_start_medium=-5,
+                                   promote_threshold=1.0, demote_threshold=5.0)
+
+    def test_20_inverted_or_zero_band_is_rejected(self):
+        # 显式倒挂守卫：promote <= demote 一律拒（含零迟滞的相等情形，
+        # ge=0 下仅剩的漏网组合）
+        with self.assertRaises(Exception) as ctx:
+            self.LocalMemoryConfig(
+                promote_threshold=6.0, demote_threshold=6.0,
+                score_start_high=0, score_start_medium=0,
+            )
+        self.assertIn("必须大于", str(ctx.exception))
+
+    def test_07_scaled_down_score_system_is_accepted(self):
+        # 迟滞带按配置的证据加分换算（不写死 3 分）：整体缩放的刻度同样成立
+        # （recent_promote_threshold 也须随刻度缩到 cap 之内）
+        cfg = self.LocalMemoryConfig(
+            score_cap=1.5, promote_threshold=1.5, demote_threshold=0.5,
+            score_start_high=1, score_start_medium=1,
+            recent_promote_threshold=1.0,
+        )
+        self.assertEqual(cfg.promote_threshold, 1.5)
+
+    def test_08_promote_must_exceed_one_evidence_increment(self):
+        # demote > 0 + band >= 单条证据加分 => promote_threshold 必然大于该加分
+        with self.assertRaises(Exception):
+            self.LocalMemoryConfig(
+                promote_threshold=3.0, demote_threshold=0.5,
+                score_start_high=3, score_start_medium=2,
+            )
+
+    def test_13_float_boundary_equal_band_is_accepted(self):
+        # 浮点表示误差不得把"数学上 band 恰等于加分"的组合误判为非法：
+        # 6.1 - 3.1 == 2.9999999999999996（二进制浮点），数学上 band=3 应安全
+        self.assertEqual(6.1 - 3.1, 2.9999999999999996)
+        cfg = self.LocalMemoryConfig(
+            promote_threshold=6.1, demote_threshold=3.1,
+        )
+        self.assertEqual(cfg.promote_threshold, 6.1)
+
+    def test_14_float_tolerance_still_rejects_truly_smaller_band(self):
+        # 容差只吸收表示误差：真非法（band=2.0，远超 1e-9）仍被拒
+        with self.assertRaises(Exception):
+            self.LocalMemoryConfig(
+                promote_threshold=5.1, demote_threshold=3.1,
+            )
+
+    def test_15_promote_above_cap_is_rejected(self):
+        # 晋升阈值 > 封顶 = 晋升静默停摆，装配期直接拒（此前无任何拦截）
+        with self.assertRaises(Exception) as ctx:
+            self.LocalMemoryConfig(score_cap=1.5)  # promote 缺省 6.0 > 1.5
+        self.assertIn("不得大于 score_cap", str(ctx.exception))
+
+    def test_16_recent_promote_above_cap_is_rejected(self):
+        with self.assertRaises(Exception):
+            self.LocalMemoryConfig(score_cap=3.5)  # recent 缺省 4.0 > 3.5
+
+    def test_17_promote_equal_to_cap_is_accepted(self):
+        # 相等允许：分数经 min(cap, ...) 可达封顶（旧缺省 promote=10==cap=10 形态）
+        cfg = self.LocalMemoryConfig(score_cap=6.0)  # promote 缺省 6.0 == cap
+        self.assertEqual(cfg.score_cap, 6.0)
+
+    def test_18_band_fallback_cascades_to_cap_group(self):
+        # 评审级联场景：小刻度 cap + band 非法 -> band 组复位后 promote=6 > cap=1.5
+        # -> cap 组再复位，终态刻度自洽，晋升不会静默停摆；其余配置保留
+        cfg = mod._try_build_config({
+            "score_cap": 1.5, "promote_threshold": 1.5, "demote_threshold": 0.5,
+            "score_start_high": 2, "score_start_medium": 1,
+            "recall_top_k": 7,
+        })
+        self.assertEqual(cfg.score_cap, 10.0)
+        self.assertEqual(cfg.promote_threshold, 6.0)
+        self.assertEqual(cfg.demote_threshold, 2.0)
+        self.assertEqual(cfg.recent_promote_threshold, 4.0)
+        self.assertEqual(cfg.recall_top_k, 7)
 
 
 class TestFastLlmExit(unittest.TestCase):
@@ -3765,7 +3979,7 @@ class TestWatermarkAtomicity(unittest.TestCase):
             inst._alias_upsert_batch = gated_alias
             retains: list[set] = []
 
-            async def fake_retain(state, sid="", delta_keys=None):
+            async def fake_retain(state, sid="", delta_keys=None, durable=True):
                 retains.append(set(delta_keys or ()))
 
             inst._do_retain = fake_retain
@@ -4374,11 +4588,15 @@ class TestConfigConstraints(unittest.TestCase):
                 mod.LocalMemoryConfig(**kwargs)
 
     def test_positive_values_accepted(self):
+        # 评分刻度整体缩放时（start_score/promote/demote 同比例）仍应通过：
+        # 迟滞带按配置的证据加分换算，不写死 3 分
         cfg = mod.LocalMemoryConfig(
-            score_cap=0.5, promote_threshold=0.5,
+            score_cap=1.5, promote_threshold=1.5, demote_threshold=0.5,
+            score_start_high=1, score_start_medium=1,
+            recent_promote_threshold=1.0,
             failure_threshold=1, embedding_dims=1024,
         )
-        self.assertEqual(cfg.score_cap, 0.5)
+        self.assertEqual(cfg.score_cap, 1.5)
 
 
 class TestPersistSemantics(unittest.TestCase):

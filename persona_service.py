@@ -25,6 +25,7 @@ from __future__ import annotations
 from core.logging_manager import get_logger
 
 from datetime import datetime, timezone
+import time
 from typing import Optional
 
 from .config import LocalMemoryConfig
@@ -33,6 +34,10 @@ from .db import MemoryDatabase
 from .time_labels import memory_time_label, resolve_local_tz
 
 logger = get_logger("noriflow_memory.persona", "cyan")
+
+# 慢调用哨兵阈值（毫秒）：超过则把耗时观测从 DEBUG 升级为 WARNING
+# （与上游 nori 口径一致：500ms）
+SLOW_CALL_THRESHOLD_MS = 500.0
 
 # 注入文本骨架三件套：逐字对齐 hindsight_persona（消费侧跨插件契约）。
 INJECTION_HEADER = "# 用户画像-背景信息"
@@ -184,6 +189,28 @@ class LocalPersonaService:
     async def build_profile_text(
         self, user_id: str, session_id: str = "", platform: str = ""
     ) -> str:
+        started = time.perf_counter()
+        try:
+            return await self._build_profile_text_impl(
+                user_id=user_id, session_id=session_id, platform=platform
+            )
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            logger.debug(
+                "build_profile_text 耗时 %.3f ms",
+                elapsed_ms,
+            )
+            if elapsed_ms > SLOW_CALL_THRESHOLD_MS:
+                # 慢查询哨兵（与上游 nori 口径一致：>500ms 升级 WARNING）
+                logger.warning(
+                    "build_profile_text 慢调用 %.3f ms（user=%s）",
+                    elapsed_ms,
+                    user_id,
+                )
+
+    async def _build_profile_text_impl(
+        self, user_id: str, session_id: str = "", platform: str = ""
+    ) -> str:
         """Build single-user persona injection text (triple format, verbatim-aligned with hindsight).
 
         Args:
@@ -230,6 +257,31 @@ class LocalPersonaService:
         )
 
     async def build_multi_profile_text(
+        self,
+        candidates: list[PersonaCandidate],
+        session_id: str,
+    ) -> str:
+        started = time.perf_counter()
+        try:
+            return await self._build_multi_profile_text_impl(
+                candidates, session_id
+            )
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            logger.debug(
+                "build_multi_profile_text 耗时 %.3f ms",
+                elapsed_ms,
+            )
+            if elapsed_ms > SLOW_CALL_THRESHOLD_MS:
+                # 慢查询哨兵（与 build_profile_text 同口径：>500ms 升级 WARNING，
+                # 群聊画像构建同样纳入观测）
+                logger.warning(
+                    "build_multi_profile_text 慢调用 %.3f ms（candidates=%d）",
+                    elapsed_ms,
+                    len(candidates),
+                )
+
+    async def _build_multi_profile_text_impl(
         self,
         candidates: list[PersonaCandidate],
         session_id: str,

@@ -121,6 +121,24 @@
     "default": 30000,
     "hint": "超长对话文本送编码 LLM 前截断保底（0 = 不截断）：防用户粘贴超长文本导致编码必败、降级原文入库后补编码遍反复失败的毒丸行阻塞。"
   },
+  "retain_interval_group": {
+    "type": "integer",
+    "name": "群聊 retain 触发间隔",
+    "default": 1,
+    "hint": "群聊每隔多少个回合触发一次 retain。"
+  },
+  "retain_interval_private": {
+    "type": "integer",
+    "name": "私聊 retain 触发间隔",
+    "default": 5,
+    "hint": "私聊每隔多少个回合触发一次 retain。"
+  },
+  "flush_idle_s": {
+    "type": "float",
+    "name": "空闲 flush 延迟（秒）",
+    "default": 1800.0,
+    "hint": "会话空闲达到此时长后 flush。"
+  },
   "backfill_interval_seconds": {
     "type": "float",
     "name": "向量补算周期（秒）",
@@ -204,36 +222,36 @@
     "type": "integer",
     "name": "high 置信事实起步分",
     "default": 3,
-    "hint": "high 置信度提取的事实进入簇时的初始分数。"
+    "hint": "high 置信度提取的事实进入簇时的初始分数（非负：负数会让迟滞带校验的单条证据加分失真，可配出 promote/demote 倒挂的非法组合）。"
   },
   "score_start_medium": {
     "type": "integer",
     "name": "medium 置信事实起步分",
     "default": 2,
-    "hint": "medium 置信度事实的初始分数。"
+    "hint": "medium 置信度事实的初始分数（非负，理由同 score_start_high）。"
   },
   "score_cap": {
     "type": "float",
     "name": "分数封顶",
     "default": 10.0,
-    "hint": "簇分数上限（达到 promote_threshold 即入画像，封顶防无限增长）。"
+    "hint": "簇分数上限（达到 promote_threshold 即入画像，封顶防无限增长）。promote_threshold / recent_promote_threshold 不得大于该值（装配期强制校验），否则簇分数永远达不到晋升阈值、晋升静默停摆。"
   },
   "promote_threshold": {
     "type": "float",
     "name": "进入画像阈值",
-    "default": 10.0,
-    "hint": "簇分数达到该值进入用户画像。"
+    "default": 6.0,
+    "hint": "簇分数达到该值进入用户画像。迟滞带（promote_threshold - demote_threshold）不得小于单条证据最大加分（max(score_start_high, score_start_medium)），否则降档簇一条证据即可回档；且不得大于 score_cap（相等允许）。两项均装配期强制校验，非法值保存即被拒。"
   },
   "demote_threshold": {
     "type": "float",
     "name": "画像降级阈值",
-    "default": 3.0,
-    "hint": "迟滞下界：衰减低于该值才跌出画像。"
+    "default": 2.0,
+    "hint": "迟滞下界：衰减低于该值才跌出画像（须为正，0 会让画像永不掉出）。与 promote_threshold 的差值不得小于单条证据最大加分，配置装配期强制校验。"
   },
   "decay_factor": {
     "type": "float",
     "name": "每周期衰减系数",
-    "default": 0.8,
+    "default": 0.9,
     "hint": "每个衰减周期簇分数乘以该系数（0-1，越小衰减越快）。"
   },
   "decay_interval_days": {
@@ -484,6 +502,17 @@
     "name": "相对时间标注",
     "default": true,
     "hint": "注入记忆尾部追加相对时间（今天/昨天/N天前/约N周前/约N个月前，按本地时区换算），让模型可区分久远记忆与近况。"
+  },
+  "recall_time_label_mode": {
+    "type": "string",
+    "name": "时间标注形态",
+    "default": "both",
+    "options": [
+      "relative",
+      "absolute",
+      "both"
+    ],
+    "hint": "relative=今天/N天前；absolute=9月28日 14:30（跨年带年份，7 天内带时分、更久只到日期）；both=相对+绝对并列。"
   },
   "timezone": {
     "type": "string",
