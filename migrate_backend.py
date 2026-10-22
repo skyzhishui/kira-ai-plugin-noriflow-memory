@@ -201,7 +201,9 @@ def _fmt_pending_ts(value) -> str | None:
     if value is None:
         return None
     if isinstance(value, str):
-        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        # 只归一化结尾的时区 Z：全局 replace 会误伤字符串其他位置的 Z
+        text = value[:-1] + "+00:00" if value.endswith("Z") else value
+        value = datetime.fromisoformat(text)
     if value.tzinfo is None:
         value = value.astimezone()
     return value.astimezone(timezone.utc).isoformat(timespec="microseconds")

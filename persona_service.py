@@ -274,10 +274,11 @@ class LocalPersonaService:
             )
             if elapsed_ms > SLOW_CALL_THRESHOLD_MS:
                 # 慢查询哨兵（与 build_profile_text 同口径：>500ms 升级 WARNING，
-                # 群聊画像构建同样纳入观测）
+                # 群聊画像构建同样纳入观测；带 session_id 便于群聊排障定位）
                 logger.warning(
-                    "build_multi_profile_text 慢调用 %.3f ms（candidates=%d）",
+                    "build_multi_profile_text 慢调用 %.3f ms（session=%s, candidates=%d）",
                     elapsed_ms,
+                    session_id,
                     len(candidates),
                 )
 
