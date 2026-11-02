@@ -1456,9 +1456,13 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 检索即排除已注入行（双通道不重复暴露）。
         if hasattr(kernel, "refresh_cross_session_memo"):
             kernel.refresh_cross_session_memo(session.session_id, [])
+        # 白名单（== "dm"）而非黑名单（!= "gm"）：跨会话摘要是隐私敏感
+        # 注入（本人其他会话内容），宿主契约当前仅 {dm, gm}（session_tools
+        # 强校验）两者等价，但未来出现第三种会话类型时白名单 fail-closed
+        # （不注入）而黑名单会把本人跨会话内容暴露给非私聊上下文
         if (
             self._config.cross_session_summary_enabled
-            and getattr(session, "session_type", "dm") != "gm"
+            and getattr(session, "session_type", "dm") == "dm"
         ):
             cs_user_id, _ = self._trigger_identity(messages)
             if platform and cs_user_id:
