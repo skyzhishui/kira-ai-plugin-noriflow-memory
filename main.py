@@ -1459,10 +1459,12 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 白名单（== "dm"）而非黑名单（!= "gm"）：跨会话摘要是隐私敏感
         # 注入（本人其他会话内容），宿主契约当前仅 {dm, gm}（session_tools
         # 强校验）两者等价，但未来出现第三种会话类型时白名单 fail-closed
-        # （不注入）而黑名单会把本人跨会话内容暴露给非私聊上下文
+        # （不注入）而黑名单会把本人跨会话内容暴露给非私聊上下文。
+        # getattr 缺省取 ""（而非 "dm"）：session_type 字段缺失/改名的
+        # 会话对象一律不注入——缺省方向同样 fail-closed（评审意见）
         if (
             self._config.cross_session_summary_enabled
-            and getattr(session, "session_type", "dm") == "dm"
+            and getattr(session, "session_type", "") == "dm"
         ):
             cs_user_id, _ = self._trigger_identity(messages)
             if platform and cs_user_id:
@@ -1494,7 +1496,18 @@ class NoriflowMemoryPlugin(BasePlugin):
                         )
                         # 防重契约：只登记实际呈现给模型的行——被预算裁剪/
                         # 空内容丢弃的行未注入，保持可检索（否则本轮既看不
-                        # 到又召不回，形成召回盲区）
+                        # 到又召不回，形成召回盲区）。
+                        #
+                        # 与滚动补回两阶段契约的关系（评审两轮重提，此处
+                        # 固化论证）：两阶段的实义是「先把块真正 append 进
+                        # 本轮 prompt pieces，再落实 memo」——本路径的
+                        # append → register 顺序即该性质（两者之间仅隔纯
+                        # 内存 list.append，不存在可失败间隙）。宿主是否
+                        # 最终采纳本轮装配对插件不可观测（无中止回调），
+                        # 该残余对滚动补回（commit 亦已在 append 后执行）
+                        # 与本路径完全对称，且都被下一轮 llm_request 入口
+                        # 的无条件清空兜住（至多一轮间隔）——不存在本路径
+                        # 独有的盲区窗口。
                         kernel.refresh_cross_session_memo(
                             session.session_id, cs_injected_ids
                         )
