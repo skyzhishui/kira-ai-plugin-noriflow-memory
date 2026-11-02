@@ -860,6 +860,59 @@ class MemoryDatabase(MemoryBackend):
             )
         return [dict(r) for r in rows]
 
+    async def fetch_recent_cross_session_summaries(
+        self,
+        *,
+        current_session_id: str,
+        user_keys: list[str],
+        limit: int,
+        max_age_days: int = 0,
+    ) -> list[dict]:
+        """Recent encoded summaries of the user's other sessions (cross-session
+        injection source), newest first.
+
+        Row contract mirrors the recall summary shape (summarized
+        chat_summary, not archived); ``participants && $2`` overlaps any of
+        the user's identity keys ("platform:uid" composite keys, linked
+        accounts merged by the caller). Rows of the current session are
+        excluded. None/blank keys are dropped before the array bind
+        (str(None) == 'None' is truthy and would pollute the match).
+
+        Args:
+            current_session_id: session to exclude.
+            user_keys: composite identity keys of the current user.
+            limit: max rows (callers bound by cross_session_summary_top_k).
+            max_age_days: drop rows older than this (0 = unlimited).
+
+        Returns:
+            Dict rows (document_id / session_id / content / occurred_at),
+            occurred_at DESC, id DESC.
+        """
+        keys = [
+            stripped
+            for key in user_keys
+            if key is not None and (stripped := str(key).strip())
+        ]
+        if not keys:
+            return []
+        params: list[object] = [current_session_id, keys]
+        age_sql = ""
+        if int(max_age_days) > 0:
+            params.append(int(max_age_days))
+            age_sql = " AND occurred_at >= now() - make_interval(days => $3)"
+        params.append(int(limit))
+        limit_ph = f"${len(params)}"
+        sql = (
+            f"SELECT document_id, session_id, content, occurred_at "
+            f"FROM {CHAT_SUMMARY_TABLE} "  # noqa: S608 -- whitelist constant table names
+            "WHERE summarized AND kind = 'chat_summary' AND NOT archived "
+            "AND session_id <> $1 AND participants && $2"
+            f"{age_sql} ORDER BY occurred_at DESC, id DESC LIMIT {limit_ph}"
+        )
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        return [dict(r) for r in rows]
+
     async def fetch_embeddings_by_ids(self, *, ids: list[int]) -> dict[int, object]:
         """Fetch embeddings by primary key in one batch (lazy recall dedup,
         perf P2).
@@ -1272,6 +1325,7 @@ class MemoryDatabase(MemoryBackend):
         score_cap: float,
         promote_threshold: float,
         recent_promote_threshold: float,
+        naming_promote_threshold: float = 3.0,
         contradict_cluster_ids: list[int] | None = None,
     ) -> dict:
         """Dispose of one raw fact in a single transaction
@@ -1424,7 +1478,14 @@ class MemoryDatabase(MemoryBackend):
                              source_fact_ids, last_evidence_at, occurred_at,
                              related_user_ids, embedding)
                         SELECT f.platform, f.user_id, f.category, f.statement,
-                               $2, 'active', 1, ARRAY[f.evidence_key], ARRAY[f.id],
+                               $2,
+                               CASE WHEN $2 >= CASE WHEN f.category = 'recent'
+                                                     THEN $4::real
+                                                     WHEN f.category = 'naming'
+                                                     THEN $5::real
+                                                     ELSE $3::real END
+                                    THEN 'profiled' ELSE 'active' END,
+                               1, ARRAY[f.evidence_key], ARRAY[f.id],
                                f.occurred_at, f.occurred_at, f.related_user_ids,
                                f.embedding
                         FROM memory_persona_fact_raw f
@@ -1433,9 +1494,31 @@ class MemoryDatabase(MemoryBackend):
                         """,
                         fact_id,
                         start_score,
+                        promote_threshold,
+                        recent_promote_threshold,
+                        naming_promote_threshold,
                     )
                     if row is None:
                         raise RuntimeError(f"建簇来源事实不存在: fact_id={fact_id}")
+                    if row["status"] == "profiled":
+                        # 建簇即时晋档（nori 96214f4 同款）：起步分已达维度
+                        # 阈值（naming 单次明确表态即 3.0）时建簇即 profiled
+                        # 并同事务写画像行，不依赖晋档遍——规避同周期衰减遍
+                        # 先把分数打到阈值之下的时序窗口（run_cycle 顺序：
+                        # 事实处置 → 衰减 → 晋档）。未达标建簇行为不变
+                        # （active，待晋档遍）
+                        await conn.execute(
+                            PROFILE_UPSERT_SQL.format(
+                                source=(
+                                    "SELECT platform, user_id, category, id, "
+                                    "canonical_statement, score, "
+                                    "related_user_ids FROM memory_fact_cluster "
+                                    "WHERE id = $1"
+                                ),
+                                updated_at="now()",
+                            ),
+                            row["id"],
+                        )
                     return {"action": "create", "cluster_id": row["id"],
                             "score": row["score"], "status": row["status"]}
 
@@ -1452,13 +1535,16 @@ class MemoryDatabase(MemoryBackend):
                            LEAST($3, GREATEST($2, c.score))::real,
                            CASE WHEN LEAST($3, GREATEST($2, c.score))
                                       >= CASE WHEN f.category = 'recent'
-                                              THEN $5::real ELSE $4::real END
+                                              THEN $5::real
+                                              WHEN f.category = 'naming'
+                                              THEN $6::real
+                                              ELSE $4::real END
                                 THEN 'profiled' ELSE 'active' END,
                            1, ARRAY[f.evidence_key], ARRAY[f.id],
                            f.occurred_at, f.occurred_at, f.related_user_ids,
                            f.embedding
                     FROM memory_persona_fact_raw f
-                    JOIN memory_fact_cluster c ON c.id = $6
+                    JOIN memory_fact_cluster c ON c.id = $7
                     WHERE f.id = $1
                     RETURNING id, score, status
                     """,
@@ -1467,6 +1553,7 @@ class MemoryDatabase(MemoryBackend):
                     score_cap,
                     promote_threshold,
                     recent_promote_threshold,
+                    naming_promote_threshold,
                     cluster_id,
                 )
                 if row is None:
@@ -1725,17 +1812,22 @@ class MemoryDatabase(MemoryBackend):
         }
 
     async def promote_pass(
-        self, *, promote_threshold: float, recent_promote_threshold: float
+        self,
+        *,
+        promote_threshold: float,
+        recent_promote_threshold: float,
+        naming_promote_threshold: float = 3.0,
     ) -> int:
         """Promotion pass: active clusters reaching the threshold become
         profiled with a profile-table upsert (single-transaction CTE).
 
-        The recent dimension uses its own lower threshold
-        (recent_promote_threshold).
+        The recent / naming dimensions use their own lower thresholds
+        (recent_promote_threshold / naming_promote_threshold).
 
         Args:
             promote_threshold: profile threshold.
             recent_promote_threshold: recent-dimension profile threshold.
+            naming_promote_threshold: naming-dimension profile threshold.
 
         Returns:
             Clusters promoted in this run.
@@ -1760,7 +1852,10 @@ class MemoryDatabase(MemoryBackend):
                         SET status = 'profiled', updated_at = now()
                         WHERE c.status = 'active'
                           AND c.score >= CASE WHEN c.category = 'recent'
-                                              THEN $2::real ELSE $1::real END
+                                              THEN $2::real
+                                              WHEN c.category = 'naming'
+                                              THEN $3::real
+                                              ELSE $1::real END
                         RETURNING c.id, c.platform, c.user_id, c.category,
                                   c.canonical_statement, c.score,
                                   c.related_user_ids
@@ -1769,6 +1864,7 @@ class MemoryDatabase(MemoryBackend):
                     """,
                     promote_threshold,
                     recent_promote_threshold,
+                    naming_promote_threshold,
                 )
         return row["promoted"]
 

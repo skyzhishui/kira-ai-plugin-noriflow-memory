@@ -122,7 +122,7 @@ async def main_async() -> None:
     db = SQLiteMemoryDatabase(config)
     await db.connect()
     applied = await db.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
-    check("migrations_applied", applied == [1, 11, 12, 13], str(applied))
+    check("migrations_applied", applied == [1, 11, 12, 13, 14], str(applied))
     applied_again = await db.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
     check("migrations_idempotent", applied_again == [])
 
@@ -811,11 +811,17 @@ async def main_async() -> None:
         promote_threshold=9.0, recent_promote_threshold=4.0,
         occurred_at=now,
     )
-    check("regress_promote_create", out["action"] == "create", str(out))
+    # start_score(9.0) 已达维度阈值(9.0)：建簇即时晋档并同事务写画像行
+    # （v1.18.2 移植 nori 96214f4），晋档遍不再有事可做
+    check(
+        "regress_promote_create",
+        out["action"] == "create" and out["status"] == "profiled",
+        str(out),
+    )
     promoted = await db.promote_pass(
         promote_threshold=9.0, recent_promote_threshold=4.0
     )
-    check("regress_promote_pass", promoted == 1, str(promoted))
+    check("regress_promote_pass", promoted == 0, str(promoted))
     async with db.pool.acquire() as conn:
         prow = await conn.fetchrow(
             "SELECT id, related_user_ids FROM memory_user_profile "

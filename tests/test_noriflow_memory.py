@@ -33,7 +33,7 @@ import tempfile
 import types
 import unittest
 import unittest.mock
-from typing import Literal, get_args, get_origin
+from typing import Literal, Optional, get_args, get_origin
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -630,6 +630,7 @@ class TestHysteresisBandValidation(unittest.TestCase):
             score_cap=1.5, promote_threshold=1.5, demote_threshold=0.5,
             score_start_high=1, score_start_medium=1,
             recent_promote_threshold=1.0,
+            naming_promote_threshold=1.0,
         )
         self.assertEqual(cfg.promote_threshold, 1.5)
 
@@ -666,6 +667,38 @@ class TestHysteresisBandValidation(unittest.TestCase):
     def test_16_recent_promote_above_cap_is_rejected(self):
         with self.assertRaises(Exception):
             self.LocalMemoryConfig(score_cap=3.5)  # recent 缺省 4.0 > 3.5
+
+    def test_16b_naming_promote_above_cap_is_rejected(self):
+        # naming 维度同口径（v1.18.2）：阈值 > 封顶 = 称呼偏好静默进不了画像。
+        # 只让 naming 越界（cap=10 下 promote/recent 缺省合法）——若只给
+        # cap=2.5，promote 缺省 6.0 会先触发同一校验器，删掉 naming 分支
+        # 测试照样绿（评审指出的假阳性）
+        with self.assertRaises(Exception) as ctx:
+            self.LocalMemoryConfig(
+                score_cap=10.0, naming_promote_threshold=11.0
+            )
+        self.assertIn("naming_promote_threshold", str(ctx.exception))
+        self.assertIn("不得大于 score_cap", str(ctx.exception))
+        # 显式高于 score_start_high（但 ≤ cap）是合法的保守配置
+        # （退化为二次证据累积），不拒
+        cfg = self.LocalMemoryConfig(
+            score_cap=10.0, score_start_high=3.0, naming_promote_threshold=5.0
+        )
+        self.assertEqual(cfg.naming_promote_threshold, 5.0)
+
+    def test_16c_naming_threshold_derives_from_scale(self):
+        # 缺省（None/不设）从 score_start_high 派生：单次晋档承诺在任何
+        # 评分刻度下按构造成立；缩放刻度的既有部署不设新键时天然合法，
+        # 不触发跨字段回退连坐复位合法显式评分键（升级级联修复）
+        cfg = self.LocalMemoryConfig(score_start_high=1.0)
+        self.assertEqual(cfg.naming_promote_threshold, 1.0)
+        scaled = self.LocalMemoryConfig(
+            score_cap=1.5, promote_threshold=1.5, demote_threshold=0.5,
+            score_start_high=1, score_start_medium=1,
+            recent_promote_threshold=1.0,
+        )  # 老部署形态：未设 naming，派生 1.0 <= cap 1.5，原样通过
+        self.assertEqual(scaled.naming_promote_threshold, 1.0)
+        self.assertEqual(scaled.score_cap, 1.5)
 
     def test_17_promote_equal_to_cap_is_accepted(self):
         # 相等允许：分数经 min(cap, ...) 可达封顶（旧缺省 promote=10==cap=10 形态）
@@ -4016,6 +4049,12 @@ class TestBuildConfigReflection(unittest.TestCase):
                 f.default_factory() if f.default_factory is not None else f.default
             )
             ann = f.annotation
+            # Optional[float] 解包：按 float 探测；None 缺省（派生字段）用
+            # 缺省刻度下的派生值作探测基准（保证探针值 != 缺省）
+            if ann == Optional[float]:
+                ann = float
+                if default is None:
+                    default = 3.0
             lo = hi = None
             ge = gt = le = None
             for m in f.metadata:
@@ -4594,6 +4633,7 @@ class TestConfigConstraints(unittest.TestCase):
             score_cap=1.5, promote_threshold=1.5, demote_threshold=0.5,
             score_start_high=1, score_start_medium=1,
             recent_promote_threshold=1.0,
+            naming_promote_threshold=1.0,
             failure_threshold=1, embedding_dims=1024,
         )
         self.assertEqual(cfg.score_cap, 1.5)
