@@ -112,6 +112,9 @@ async def test_cross_session_pg_sql_shape() -> None:
 
 async def test_cross_session_sqlite_fetch() -> None:
     SQLiteMemoryDatabase = _db_pkg.SQLiteMemoryDatabase
+    # 用墙钟相对时间构造数据：查询侧 max_age_days 截止值按 now() 计算，
+    # 固定时间戳会在 ~30 天后让断言腐烂（评审指出的 flaky）
+    wall_now = datetime.now(timezone.utc)
     with tempfile.TemporaryDirectory(prefix="nm_cs_") as tmp:
         config = LocalMemoryConfig(
             storage_backend="sqlite",
@@ -120,12 +123,12 @@ async def test_cross_session_sqlite_fetch() -> None:
         )
         db = await _make_sqlite_db(tmp)
         try:
-            old = _NOW - timedelta(days=40)
+            old = wall_now - timedelta(days=40)
             for i, (doc, sid, occurred, parts) in enumerate([
-                ("d-other", "s2", _NOW - timedelta(hours=2), ["qq:u1"]),
+                ("d-other", "s2", wall_now - timedelta(hours=2), ["qq:u1"]),
                 ("d-other-old", "s3", old, ["qq:u1"]),
-                ("d-current", "s1", _NOW - timedelta(hours=1), ["qq:u1"]),
-                ("d-stranger", "s4", _NOW - timedelta(hours=1), ["qq:u9"]),
+                ("d-current", "s1", wall_now - timedelta(hours=1), ["qq:u1"]),
+                ("d-stranger", "s4", wall_now - timedelta(hours=1), ["qq:u9"]),
             ]):
                 await db.insert_chat_summary(
                     document_id=doc, kind="chat_summary", platform="qq",

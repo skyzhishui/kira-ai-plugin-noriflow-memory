@@ -1497,7 +1497,13 @@ const Page = {
         return c;
       }
       if (f.type === "int" || f.type === "float") {
-        const c = this.el("input", { type: "number", step: f.type === "float" ? "any" : "1" });
+        const attrs = { type: "number", step: f.type === "float" ? "any" : "1" };
+        // Backend-derived bounds keep the input itself from offering
+        // invalid values (e.g. score_cap=0 would pin scores and stall
+        // promotion) -- restored from the old page.
+        if (f.min !== undefined && f.min !== null) attrs.min = String(f.min);
+        if (f.max !== undefined && f.max !== null) attrs.max = String(f.max);
+        const c = this.el("input", attrs);
         if (v !== null && v !== undefined) c.value = String(v);
         return c;
       }
@@ -1586,7 +1592,7 @@ const Page = {
             // 已热生效但落盘失败：重启后会回退，必须显式告知
             UI.toast(`已热生效但落盘失败，重启后将回退：${r.persistence_error}`, "err");
           }
-          if (r.restart_required.length) {
+          if (r.restart_required && r.restart_required.length) {
             UI.modal("部分配置需重启进程生效", [
               this.el("p", {}, ["以下字段在组件装配期取值，已写入配置文件，需重启进程才改变行为："]),
               this.el("div", { class: "pre-box" }, [r.restart_required.join("\n")]),
