@@ -753,7 +753,7 @@ const Page = {
       status.appendChild(this.el("option", Object.assign({ value: s }, s === c.status ? { selected: "" } : {}), [s]));
     }
     if (c.status === "replaced") status.disabled = true;
-    UI.modal(`修正簇 #${c.id}（用户 ${c.user_id}）`, [
+    const closeM = UI.modal(`修正簇 #${c.id}（用户 ${c.user_id}）`, [
       this.el("div", { class: "cfg-field" }, [this.el("label", {}, ["规范陈述（改陈述会重置向量待重算）"]), stmt]),
       this.el("div", { class: "cfg-field" }, [this.el("label", {}, ["确信度分数（0~10，≥10 进画像 / <4 降级待定）"]), score]),
       this.el("div", { class: "cfg-field" }, [this.el("label", {}, ["状态（切出 profiled 会同步移除画像投影）"]), status]),
@@ -775,6 +775,7 @@ const Page = {
               body: JSON.stringify(body),
             });
             UI.toast("簇已修正", "ok");
+            closeM();
             refresh();
           } catch (e) { UI.toast("修正失败：" + e.message, "err"); }
         },
@@ -962,7 +963,7 @@ const Page = {
     const bfFullBtn = this.el("button", { class: "btn small ghost", title: "忽略水位，对全部已确认簇重新提取（不计分，只刷新）", disabled: d.backfill_available ? null : "" }, [
       "全量重跑",
     ]);
-    if (!d.backfill_available) bfStatus.textContent = "task_router 未装配，回填不可用";
+    if (!d.backfill_available) bfStatus.textContent = "fast LLM 未配置，回填不可用";
     const startBackfill = (full) => {
       UI.api("/relations/backfill" + (full ? "?full=1" : ""), { method: "POST" })
         .then(() => { UI.toast(full ? "全量重跑已启动" : "回填已启动（每批一次 LLM 调用，完成后自动刷新）", "ok"); pollBackfill(); })
@@ -1150,7 +1151,9 @@ const Page = {
         this.el("label", { class: "graph-chk" }, [chkSuperseded, "superseded 边"]),
         this.el("button", { class: "btn small ghost", onclick: () => fg.resetView() }, ["重置视图"]),
         this.el("span", { class: "muted", style: "font-size:12px;margin-left:auto" }, [
-          `${d.stats.nodes} 节点 · ${d.stats.edges} 边`,
+          d.stats.edges_shown < d.stats.edges
+            ? `${d.stats.nodes} 节点 · 仅展示 ${d.stats.edges_shown}/${d.stats.edges} 边`
+            : `${d.stats.nodes} 节点 · ${d.stats.edges} 边`,
         ]),
       ]),
       this.el("div", { class: "graph-wrap" }, [graphHost, side]),
@@ -1255,7 +1258,7 @@ const Page = {
 
   editSummary(s, refresh) {
     const ta = this.el("textarea", { class: "code", style: "min-height:180px" }, [s.content]);
-    UI.modal(`修正摘要 #${s.id}`, [
+    const closeM = UI.modal(`修正摘要 #${s.id}`, [
       this.el("p", { class: "muted" }, ["修改内容会把向量置空，由补算任务自动重算（约 5 分钟内生效）。"]),
       ta,
     ], [
@@ -1265,6 +1268,7 @@ const Page = {
           try {
             await UI.api(`/summaries/${s.id}`, { method: "PUT", body: JSON.stringify({ content: ta.value }) });
             UI.toast("摘要已修正，向量待重算", "ok");
+            closeM();
             refresh();
           } catch (e) { UI.toast("修正失败：" + e.message, "err"); }
         },
