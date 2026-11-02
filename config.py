@@ -131,6 +131,19 @@ class LocalMemoryConfig(BaseModel):
     decay_interval_days: int = Field(default=14, ge=1, description="衰减周期（天），兼缺席冻结窗口粒度")
     recent_expire_days: int = Field(default=30, ge=1, description="recent 维度过期天数")
     recent_promote_threshold: float = Field(default=4.0, description="recent 维度进画像阈值")
+    naming_promote_threshold: float = Field(
+        default=3.0,
+        gt=0,
+        description="naming（称呼偏好）维度进画像阈值：本人明确称呼要求"
+        "（confidence=high，起步分 score_start_high=3.0）单次即可晋档入画像；"
+        "该承诺前提为本值 ≤ score_start_high，否则退化为需二次证据累积",
+    )
+    naming_prompt_enabled: bool = Field(
+        default=True,
+        description="naming 附加编码段开关（只控制编码提示词扩展节附加与否，"
+        "对齐 relation_extract_enabled 模式；关闭后编码提示词不含该段，"
+        "naming 提取退回基础规则行为）",
+    )
     commitment_expire_days: int = Field(
         default=60,
         ge=1,
@@ -420,6 +433,20 @@ class LocalMemoryConfig(BaseModel):
     )
     recent_rollout_max_chars: int = Field(
         default=1500, ge=100, description="滚动补回块字符预算（超限按批丢弃旧批，单批超限截断）"
+    )
+    cross_session_summary_enabled: bool = Field(
+        default=False,
+        description="跨会话近期摘要：私聊回合前置当前用户在其他会话的近期"
+        "摘要（仅 dm 注入；recall 同轮排除已注入行防重复暴露）",
+    )
+    cross_session_summary_top_k: int = Field(
+        default=2, ge=1, description="跨会话摘要候选条数"
+    )
+    cross_session_summary_max_chars: int = Field(
+        default=1500, ge=100, description="跨会话摘要整块字符预算（含前言；超限丢弃旧条，首条超限截断）"
+    )
+    cross_session_summary_max_age_days: int = Field(
+        default=30, ge=0, description="跨会话摘要最大陈旧天数（0=不限）"
     )
 
     # ---- 熔断 ----

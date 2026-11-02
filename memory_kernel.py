@@ -330,6 +330,10 @@ class LocalMemoryKernel:
         # 滚动补回去重 memo：{session_id: (已注入 document_id 列表, monotonic 时间)}
         # 同轮 recall/主动检索据此排除已注入行；TTL 覆盖单轮 pipeline 时长
         self._rollout_memo: dict[str, tuple[list[str], float]] = {}
+        # 跨会话注入去重 memo（同构）：{session_id: (已注入 document_id, 时间)}
+        # 与滚动补回共用检索排除通道；入口统一清空，任何提前返回不残留
+        # 上轮排除项（TTL 窗口内错误排除会造成召回盲区）
+        self._cross_session_memo: dict[str, tuple[list[str], float]] = {}
         # 两阶段提交的暂存区（build_recent_rollout_text 写入，commit_
         # rollout_memo 落实）：构建与最终注入之间 prompt 装配可能被丢弃，
         # 未落实的 id 不得进入 memo（否则既不出现在补回、又被 recall 排除，
@@ -780,6 +784,7 @@ class LocalMemoryKernel:
                     score_cap=cfg.score_cap,
                     promote_threshold=cfg.promote_threshold,
                     recent_promote_threshold=cfg.recent_promote_threshold,
+                    naming_promote_threshold=cfg.naming_promote_threshold,
                 )
 
             if not await self._guarded(
@@ -1233,7 +1238,7 @@ class LocalMemoryKernel:
                 query_text=query,
                 hybrid=self.config.hybrid_search_enabled,
                 rrf_k=self.config.hybrid_rrf_k,
-                exclude_document_ids=self._rollout_excluded_ids(session_id),
+                exclude_document_ids=self._injected_excluded_ids(session_id),
                 with_embedding=(
                     self.config.dedup_similarity_threshold > 0
                     and not lazy_embeddings
@@ -2112,6 +2117,89 @@ class LocalMemoryKernel:
             self._rollout_memo.pop(session_id, None)
             return None
         return ids or None
+
+    def refresh_cross_session_memo(self, session_id: str, document_ids: list[str]) -> None:
+        """Replace this round's cross-session injected ids; empty clears.
+
+        Synchronous (no await): the injection hook calls it twice per round
+        -- entry (clear) and after assembling (register the ids actually
+        rendered, budget-dropped rows stay retrievable). Mirrors the rollout
+        memo TTL/capacity semantics.
+        """
+        if not session_id or not document_ids:
+            self._cross_session_memo.pop(session_id, None)
+            return
+        unique = list(dict.fromkeys(str(doc_id) for doc_id in document_ids if doc_id))
+        if not unique:
+            self._cross_session_memo.pop(session_id, None)
+            return
+        self._cross_session_memo[session_id] = (unique, time.monotonic())
+        if len(self._cross_session_memo) > self._ROLLOUT_MEMO_MAX_SESSIONS:
+            now_m = time.monotonic()
+            self._cross_session_memo = {
+                key: value
+                for key, value in self._cross_session_memo.items()
+                if now_m - value[1] <= self._ROLLOUT_MEMO_TTL_SECONDS
+            }
+
+    def _cross_session_excluded_ids(self, session_id: str) -> list[str] | None:
+        """Cross-session memo ids within TTL (None when absent/expired)."""
+        if not session_id:
+            return None
+        entry = self._cross_session_memo.get(session_id)
+        if not entry:
+            return None
+        ids, at = entry
+        if time.monotonic() - at > self._ROLLOUT_MEMO_TTL_SECONDS:
+            self._cross_session_memo.pop(session_id, None)
+            return None
+        return ids or None
+
+    def _injected_excluded_ids(self, session_id: str) -> list[str] | None:
+        """Union of every already-injected memo (rollout fill-back +
+        cross-session summaries) for this session, deduped.
+
+        The shared retrieval path (recall + active memory_search) consumes
+        this: rows already presented to the model this round are excluded so
+        the same summary cannot be both injected and recalled (double
+        exposure), while budget-dropped rows stay searchable.
+        """
+        ids = [
+            *(self._rollout_excluded_ids(session_id) or []),
+            *(self._cross_session_excluded_ids(session_id) or []),
+        ]
+        return list(dict.fromkeys(ids)) or None
+
+    async def fetch_recent_cross_session_summaries(
+        self,
+        *,
+        current_session_id: str,
+        user_keys: list[str],
+        limit: int,
+        max_age_days: int = 0,
+    ) -> list[dict]:
+        """Fetch recent cross-session summaries through the shared guarded
+        call (fail-open: a DB failure logs and returns []).
+
+        Args:
+            current_session_id: session to exclude.
+            user_keys: composite identity keys ("platform:uid") of the user.
+            limit: max rows.
+            max_age_days: drop rows older than this (0 = unlimited).
+
+        Returns:
+            Dict rows (document_id / session_id / content / occurred_at).
+        """
+        rows = await self._guarded_call(
+            lambda: self.db.fetch_recent_cross_session_summaries(
+                current_session_id=current_session_id,
+                user_keys=user_keys,
+                limit=limit,
+                max_age_days=max_age_days,
+            ),
+            description="跨会话摘要查询",
+        )
+        return rows or []
 
     async def build_recent_rollout_text(
         self, session_id: str, platform: str = ""

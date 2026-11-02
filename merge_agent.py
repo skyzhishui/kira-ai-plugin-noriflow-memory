@@ -850,6 +850,7 @@ class FactMergeAgent:
                         score_cap=cfg.score_cap,
                         promote_threshold=cfg.promote_threshold,
                         recent_promote_threshold=cfg.recent_promote_threshold,
+                        naming_promote_threshold=cfg.naming_promote_threshold,
                         contradict_cluster_ids=contradict_ids or None,
                     )
                 except Exception:
@@ -904,6 +905,7 @@ class FactMergeAgent:
                 stats["promoted"] = await self._db.promote_pass(
                     promote_threshold=cfg.promote_threshold,
                     recent_promote_threshold=cfg.recent_promote_threshold,
+                    naming_promote_threshold=cfg.naming_promote_threshold,
                 )
             except Exception:
                 await self._record_db_failure()

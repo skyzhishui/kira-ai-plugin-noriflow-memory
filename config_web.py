@@ -70,6 +70,7 @@ _CONFIG_GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
         "score_start_high", "score_start_medium", "score_cap",
         "promote_threshold", "demote_threshold", "decay_factor",
         "decay_interval_days", "recent_expire_days", "recent_promote_threshold",
+        "naming_promote_threshold", "naming_prompt_enabled",
         "commitment_expire_days",
         "decay_requires_activity", "sticky_evidence_count", "pending_dead_days",
         "anchor_profile_size",
@@ -102,6 +103,11 @@ _CONFIG_GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
     ("rollout", "滚动补回", (
         "recent_rollout_enabled", "recent_rollout_batches",
         "recent_rollout_max_chars",
+    )),
+    ("cross_session", "跨会话摘要", (
+        "cross_session_summary_enabled", "cross_session_summary_top_k",
+        "cross_session_summary_max_chars",
+        "cross_session_summary_max_age_days",
     )),
     ("lifecycle", "摘要生命周期", (
         "summary_lifecycle_enabled", "summary_lifecycle_grace_days",

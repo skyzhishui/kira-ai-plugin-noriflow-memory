@@ -840,6 +840,62 @@ class SQLiteMemoryDatabase(MemoryBackend):
             rows = await conn.fetch(sql, *params)
         return _decode_rows(rows)
 
+    async def fetch_recent_cross_session_summaries(
+        self,
+        *,
+        current_session_id: str,
+        user_keys: list[str],
+        limit: int,
+        max_age_days: int = 0,
+    ) -> list[dict]:
+        """Recent encoded summaries of the user's other sessions (cross-session
+        injection source), newest first (SQLite twin of the PG method;
+        participants array-overlap via json_each EXISTS).
+
+        Args:
+            current_session_id: session to exclude.
+            user_keys: composite identity keys ("platform:uid") of the user.
+            limit: max rows (callers bound by cross_session_summary_top_k).
+            max_age_days: drop rows older than this (0 = unlimited; the
+                cutoff is bound as a canonical TEXT timestamp, matching the
+                write-side sqlite_format_ts format).
+
+        Returns:
+            Dict rows (document_id / session_id / content / occurred_at),
+            occurred_at DESC, id DESC.
+        """
+        keys = [
+            stripped
+            for key in user_keys
+            if key is not None and (stripped := str(key).strip())
+        ]
+        if not keys:
+            return []
+        p = _Params(None)
+        conds = [
+            "summarized",
+            "kind = 'chat_summary'",
+            "NOT archived",
+            f"session_id <> {p.add(current_session_id)}",
+            _overlap_cond(p, "participants", keys) or "0",
+        ]
+        if int(max_age_days) > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(
+                days=int(max_age_days)
+            )
+            conds.append(
+                f"occurred_at >= {p.add(sqlite_format_ts(_ensure_tz(cutoff)))}"
+            )
+        sql = (
+            "SELECT document_id, session_id, content, occurred_at "
+            f"FROM {CHAT_SUMMARY_TABLE} "  # noqa: S608
+            f"WHERE {' AND '.join(conds)} "
+            f"ORDER BY occurred_at DESC, id DESC LIMIT {p.add(int(limit))}"
+        )
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(sql, *p.values)
+        return _decode_rows(rows)
+
     async def fetch_embeddings_by_ids(self, *, ids: list[int]) -> dict[int, object]:
         """Fetch embeddings by primary key in one batch (lazy recall dedup,
         perf P2).
@@ -1187,6 +1243,7 @@ class SQLiteMemoryDatabase(MemoryBackend):
         score_cap: float,
         promote_threshold: float,
         recent_promote_threshold: float,
+        naming_promote_threshold: float = 3.0,
         contradict_cluster_ids: list[int] | None = None,
     ) -> dict:
         """Dispose of one raw fact in a single transaction
@@ -1319,6 +1376,20 @@ class SQLiteMemoryDatabase(MemoryBackend):
                     raise RuntimeError(f"建簇来源事实不存在: fact_id={fact_id}")
 
                 if action == "create":
+                    # 维度阈值（recent/naming 各自低阈值，其余通用）——
+                    # 起步分已达即建簇晋档（见 INSERT 后的画像行写入）
+                    create_threshold = (
+                        float(recent_promote_threshold)
+                        if raw["category"] == "recent"
+                        else float(naming_promote_threshold)
+                        if raw["category"] == "naming"
+                        else float(promote_threshold)
+                    )
+                    create_status = (
+                        "profiled"
+                        if float(start_score) >= create_threshold
+                        else "active"
+                    )
                     row = await conn.fetchrow(
                         f"""
                         INSERT INTO {FACT_CLUSTER_TABLE}
@@ -1327,19 +1398,34 @@ class SQLiteMemoryDatabase(MemoryBackend):
                              source_fact_ids, last_evidence_at, occurred_at,
                              related_user_ids, embedding, written_at,
                              updated_at)
-                        VALUES ($1, $2, $3, $4, $5, 'active', 1, $6, $7,
-                                $8, $8, $9, $10, $11, $11)
+                        VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8,
+                                $9, $9, $10, $11, $12, $12)
                         RETURNING id
                         """,  # noqa: S608
                         raw["platform"], raw["user_id"], raw["category"],
-                        raw["statement"], float(start_score),
+                        raw["statement"], float(start_score), create_status,
                         _json_list([raw["evidence_key"]]),
                         _json_list([int(fact_id)]),
                         raw["occurred_at"], raw["related_user_ids"],
                         raw["embedding"], now,
                     )
+                    if create_status == "profiled":
+                        # 建簇即时晋档（与 PG 版同款，nori 96214f4）：起步分
+                        # 已达维度阈值（naming 单次明确表态）时建簇即晋档并
+                        # 同事务写画像行，不依赖晋档遍（规避同周期衰减遍的
+                        # 时序窗口）；未达标建簇行为不变（active）
+                        await conn.execute(
+                            PROFILE_UPSERT_SQL.format(
+                                source="VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                                updated_at="$8",
+                            ),
+                            raw["platform"], raw["user_id"], raw["category"],
+                            int(row["id"]), raw["statement"],
+                            float(start_score),
+                            raw["related_user_ids"] or "[]", now,
+                        )
                     return {"action": "create", "cluster_id": int(row["id"]),
-                            "score": float(start_score), "status": "active"}
+                            "score": float(start_score), "status": create_status}
 
                 # action == "replace": the new cluster inherits the old
                 # cluster's score and the old one demotes to replaced
@@ -1359,6 +1445,8 @@ class SQLiteMemoryDatabase(MemoryBackend):
                 threshold = (
                     float(recent_promote_threshold)
                     if raw["category"] == "recent"
+                    else float(naming_promote_threshold)
+                    if raw["category"] == "naming"
                     else float(promote_threshold)
                 )
                 new_status = "profiled" if new_score >= threshold else "active"
@@ -1648,7 +1736,11 @@ class SQLiteMemoryDatabase(MemoryBackend):
         }
 
     async def promote_pass(
-        self, *, promote_threshold: float, recent_promote_threshold: float
+        self,
+        *,
+        promote_threshold: float,
+        recent_promote_threshold: float,
+        naming_promote_threshold: float = 3.0,
     ) -> int:
         """Promotion pass: active clusters reaching the threshold become
         profiled with a profile-table upsert (single transaction)."""
@@ -1660,9 +1752,12 @@ class SQLiteMemoryDatabase(MemoryBackend):
                     "canonical_statement, score, related_user_ids FROM "
                     f"{FACT_CLUSTER_TABLE} "
                     "WHERE status = 'active' AND score >= CASE "
-                    "WHEN category = 'recent' THEN $2 ELSE $1 END",
+                    "WHEN category = 'recent' THEN $2 "
+                    "WHEN category = 'naming' THEN $3 "
+                    "ELSE $1 END",
                     promote_threshold,
                     recent_promote_threshold,
+                    naming_promote_threshold,
                 )
                 if promoted:
                     ids = [int(r["id"]) for r in promoted]

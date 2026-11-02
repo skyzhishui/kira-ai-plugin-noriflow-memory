@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from core.logging_manager import get_logger
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -57,6 +58,53 @@ _VALID_CATEGORIES = frozenset(
 )
 # confidence 值域
 _VALID_CONFIDENCES = frozenset({"high", "medium"})
+
+# ---------------------------------------------------------------------------
+# 半句截断防护（移植自 nori #26）。上游 LLM 在 response_format=json_object
+# 引导解码下会间歇性提前终止：摘要停在半句，JSON 由上游自行闭合，
+# finish_reason 仍为 stop（无截断信号、预算未耗尽）——半句 JSON 合法，
+# 解析层无从察觉，照单写入即成为「可召回的残缺记忆」（该轮 facts 全丢）。
+# 判定为反向白名单口径（误杀完整摘要的代价〔重试 + 可能整轮降级〕高于
+# 漏杀半句，宁可少判）：
+# - 末字为汉字：中文半句切断几乎必落在汉字上（nori 生产 186 例末字全是
+#   汉字/逗号族/开括号：发/说/称/的/侃/（/喊/梗…）；
+# - 末字为逗号族（，、：；,;:）：任何脚本下逗号结尾必是半句；
+# - 末字为开括号/开引号（（「『“‘《【(['）：开而不闭必是半句。
+# 反之，句末标点（。！？…”』」～!?.)）、ASCII 字母/数字（"查ID"、
+# "version 2"）、半角 ~、emoji 等结尾一律不判截断（nori 生产 190 条疑似
+# 中旧白名单口径曾误杀 4 条完整摘要：末字 ~ ×3、ASCII 字母 ×1）。
+# ---------------------------------------------------------------------------
+_CJK_IDEOGRAPH_RE = re.compile(r"[一-鿿]")
+_CLAUSE_MID_PUNCT = frozenset("，、：；,;:")
+_OPENING_BRACKETS = frozenset("（「『“‘《【(['")
+
+
+def _looks_truncated(summary: str) -> bool:
+    """摘要是否疑似被上游提前终止（半句截断）。
+
+    判定口径（见上方模块注释，反向白名单）：
+    - 多行摘要（首行【话题】锚点 + 分节正文）：末字为汉字/逗号族/开括号
+      → 判截断；
+    - 单行摘要：提示词规定的纯锚点形态「【话题】XXX」合法，仅当末字为
+      逗号族、或锚点为空（连话题都没写出）时判截断。
+
+    已知残余（有意取舍）：截断恰落在首行锚点中间的单行结果与合法纯锚点
+    形态文本上不可区分，按设计放行——nori 生产 12495 行中锚点中途截断
+    0 例，为消此残余对每次合法锚点摘要重试 learner 得不偿失。
+    """
+    text = (summary or "").strip()
+    if not text:
+        return True
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return True
+    last_char = lines[-1][-1]
+    if last_char in _CLAUSE_MID_PUNCT or last_char in _OPENING_BRACKETS:
+        return True
+    if len(lines) == 1:
+        # 空锚点（"【话题】" 或仅前缀）：话题本身没写出来，必是残缺
+        return text.rstrip("】").endswith("【话题")
+    return bool(_CJK_IDEOGRAPH_RE.match(last_char))
 # 事实陈述长度上限（截断保留，对照关系通道 ≤200 的量级；簇
 # canonical_statement 直接继承该值，不设限会放大簇表与裁定 prompt 体积）
 _FACT_STATEMENT_MAX_CHARS = 200
@@ -65,6 +113,7 @@ _FACT_STATEMENT_MAX_CHARS = 200
 _ENCODE_PROMPT_NAME = "memory_encode"
 # P2 关系提取扩展节模板（relations_enabled 时附加在编码提示词尾部）
 _RELATIONS_PROMPT_NAME = "memory_relations"
+_NAMING_PROMPT_NAME = "memory_encode_naming"
 
 # 编码结果 JSON Schema（tool calling 强制出口；与提示词输出格式及
 # _parse_payload 校验字段一致——校验仍以 _parse_payload 为准）
@@ -144,6 +193,7 @@ class MemoryEncoder:
         prompt_dir: Optional[str | Path] = None,
         input_max_chars: int = 0,
         relations_enabled: bool = False,
+        naming_enabled: bool = True,
         config: Optional["LocalMemoryConfig"] = None,
     ) -> None:
         """Initialize the encoder.
@@ -163,17 +213,23 @@ class MemoryEncoder:
                 encoding prompt tail (an independent relations array); when
                 off, the prompt is verbatim-identical to existing behavior
                 (grayscale regression guarantee).
+            naming_enabled: naming 称呼偏好扩展段开关，开启时在编码提示词
+                尾部追加 memory_encode_naming 判定节（证据分级 a-f：仅记录
+                本人希望被如何称呼/明确反感的称呼，他人称呼习惯须有本人
+                接受迹象才可提取，自称/对 bot 的叫法/纯关系称谓一律不提
+                取）；关闭时提示词不含该段，naming 提取退回基础规则行为。
             config: Plugin runtime config (optional): when provided,
-                input_max_chars / relations_enabled read this instance per
-                call at runtime, taking effect immediately after saving config
-                on the maintenance page; constructor params are the default
-                fallback.
+                input_max_chars / relations_enabled / naming_enabled read
+                this instance per call at runtime, taking effect immediately
+                after saving config on the maintenance page; constructor
+                params are the default fallback.
         """
         self.llm = llm
         self.prompt_dir = Path(prompt_dir or (Path(__file__).resolve().parent / "prompts"))
         self._config = config
         self._static_input_max_chars = max(int(input_max_chars or 0), 0)
         self._static_relations_enabled = bool(relations_enabled)
+        self._static_naming_enabled = bool(naming_enabled)
         self._loader = PromptLoader(self.prompt_dir)
 
     @property
@@ -189,6 +245,14 @@ class MemoryEncoder:
         if self._config is not None:
             return bool(self._config.relation_extract_enabled)
         return self._static_relations_enabled
+
+    @property
+    def naming_enabled(self) -> bool:
+        """naming extension-section switch (read at runtime from config when
+        provided, hot-effective)."""
+        if self._config is not None:
+            return bool(self._config.naming_prompt_enabled)
+        return self._static_naming_enabled
 
     async def encode(
         self,
@@ -245,6 +309,44 @@ class MemoryEncoder:
                 self.input_max_chars,
             )
 
+        # 半句截断防护（nori #26 移植）：疑似截断重试一次，仍截断则降级
+        # 原文单通道（summarized=false 不参与召回，由合并 agent 补编码遍
+        # 重编码）——半句摘要绝不作为完整记忆写入
+        for attempt in (1, 2):
+            result = await self._encode_once(conversation_text, bot_nickname, bot_user_id)
+            if result is None:
+                return conversation_text, [], [], False
+            summary, facts, relations = result
+            if _looks_truncated(summary):
+                tail = summary[-40:]
+                if attempt == 1:
+                    logger.warning(
+                        "编码摘要疑似半句截断（上游提前终止），重试一次，末 40 字: %r",
+                        tail,
+                    )
+                    continue
+                logger.warning(
+                    "编码摘要重试后仍疑似截断，降级原文单通道（补编码遍重编码），"
+                    "末 40 字: %r",
+                    tail,
+                )
+                return conversation_text, [], [], False
+            return summary, facts, relations, True
+        return conversation_text, [], [], False  # pragma: no cover - loop always returns
+
+    async def _encode_once(
+        self,
+        conversation_text: str,
+        bot_nickname: str,
+        bot_user_id: str,
+    ) -> Optional[tuple[str, list[EncodedFact], list[EncodedRelation]]]:
+        """One encoding attempt: prompt render -> LLM -> parse -> payload.
+
+        Returns:
+            (summary, facts, relations); None on any hard failure (LLM call
+            failure / unparseable output / missing summary) -- the failure is
+            logged here and the caller degrades to the raw single channel.
+        """
         try:
             system_prompt = self._loader.render(
                 _ENCODE_PROMPT_NAME,
@@ -257,6 +359,20 @@ class MemoryEncoder:
                     bot_nickname=bot_nickname,
                     bot_user_id=bot_user_id or "未知",
                 )
+            if self.naming_enabled:
+                # naming 判定节是可选增强：模板缺失降级跳过并告警（主编码
+                # 行为不受影响，退回基础规则），与 relations 段同模式
+                try:
+                    system_prompt += "\n\n" + self._loader.render(
+                        _NAMING_PROMPT_NAME,
+                        bot_nickname=bot_nickname,
+                        bot_user_id=bot_user_id or "未知",
+                    )
+                except Exception:
+                    logger.warning(
+                        "naming 扩展段模板缺失/渲染失败，跳过该段（退回基础规则）",
+                        exc_info=True,
+                    )
             raw = await self.llm.run_structured(
                 system_prompt=system_prompt,
                 user_prompt=conversation_text,
@@ -265,7 +381,7 @@ class MemoryEncoder:
             )
         except Exception:
             logger.warning("记忆编码 LLM 调用失败，降级为原文单通道", exc_info=True)
-            return conversation_text, [], [], False
+            return None
 
         parsed = safe_parse_llm_json(raw)
         if not isinstance(parsed, dict):
@@ -273,14 +389,14 @@ class MemoryEncoder:
                 "记忆编码输出无法解析为 JSON 对象，降级为原文单通道: %r",
                 (raw or "")[:200],
             )
-            return conversation_text, [], [], False
+            return None
 
         summary, facts, relations = self._parse_payload(parsed)
         if not summary:
             # summary 缺失时降级为原文（chat_summary 通道永不丢原材料）
             logger.warning("记忆编码未产出 summary，降级为原文单通道")
-            return conversation_text, [], [], False
-        return summary, facts, relations, True
+            return None
+        return summary, facts, relations
 
     def _parse_payload(
         self, payload: dict
