@@ -79,6 +79,20 @@ const UI = {
     return this.el("span", { class: "badge " + color }, [text]);
   },
 
+  // List/profile load failure card with a retry affordance (fire-and-forget
+  // refreshes have no other place to surface the error).
+  errorCard(err, onRetry) {
+    const msg = err && err.message ? err.message : String(err);
+    return this.el("div", { class: "card" }, [
+      this.el("div", { class: "empty" }, [this.svg("CircleCloseFilled"), "加载失败：" + msg]),
+      onRetry
+        ? this.el("div", { style: "text-align:center;margin-top:8px" }, [
+            this.el("button", { class: "btn small ghost", onclick: onRetry }, ["重试"]),
+          ])
+        : null,
+    ]);
+  },
+
   scoreBar(score, max = 10) {
     const pct = Math.max(0, Math.min(100, (score / max) * 100));
     return this.el("span", { class: "score-bar", title: `确信度 ${score}` }, [
@@ -663,31 +677,38 @@ const Page = {
 
     const refresh = async () => {
       listBox.innerHTML = '<div class="loading">正在打捞记忆</div>';
-      const p = new URLSearchParams(Object.assign({ size: 30 }, query));
-      const d = await UI.api("/clusters?" + p.toString());
-      const statusColor = { active: "sky", profiled: "ok", pending_uncertain: "warn", replaced: "gray", dead: "bad" };
-      const rows = d.items.map((c) => this.el("tr", {}, [
-        this.el("td", { class: "mono" }, [String(c.id)]),
-        this.el("td", {}, [
-          this.el("div", { class: "mono" }, [c.user_id]),
-          this.el("div", {}, [UI.badge(c.category, "pink")]),
-        ]),
-        this.el("td", { class: "wrap" }, [c.statement]),
-        this.el("td", {}, [UI.scoreBar(c.score)]),
-        this.el("td", {}, [UI.badge(c.status, statusColor[c.status] || "gray")]),
-        this.el("td", {}, [`${c.evidence_count} 证据`]),
-        this.el("td", {}, [UI.fmtTime(c.updated_at)]),
-        this.el("td", {}, [
-          this.el("button", { class: "btn small ghost", onclick: () => this.editCluster(c, refresh) }, [UI.svg("EditPen"), "修正"]),
-        ]),
-      ]));
-      listBox.innerHTML = "";
-      listBox.appendChild(this.tableCard(
-        `事实簇（共 ${d.total} 条，按确信度排序）`,
-        ["ID", "用户/分类", "规范陈述", "确信度", "状态", "证据", "更新时间", "操作"],
-        rows,
-        UI.pager(d.total, d.page, d.size, (p2) => { query.page = p2; refresh(); })
-      ));
+      try {
+        const p = new URLSearchParams(Object.assign({ size: 30 }, query));
+        const d = await UI.api("/clusters?" + p.toString());
+        const statusColor = { active: "sky", profiled: "ok", pending_uncertain: "warn", replaced: "gray", dead: "bad" };
+        const rows = d.items.map((c) => this.el("tr", {}, [
+          this.el("td", { class: "mono" }, [String(c.id)]),
+          this.el("td", {}, [
+            this.el("div", { class: "mono" }, [c.user_id]),
+            this.el("div", {}, [UI.badge(c.category, "pink")]),
+          ]),
+          this.el("td", { class: "wrap" }, [c.statement]),
+          this.el("td", {}, [UI.scoreBar(c.score)]),
+          this.el("td", {}, [UI.badge(c.status, statusColor[c.status] || "gray")]),
+          this.el("td", {}, [`${c.evidence_count} 证据`]),
+          this.el("td", {}, [UI.fmtTime(c.updated_at)]),
+          this.el("td", {}, [
+            this.el("button", { class: "btn small ghost", onclick: () => this.editCluster(c, refresh) }, [UI.svg("EditPen"), "修正"]),
+          ]),
+        ]));
+        listBox.innerHTML = "";
+        listBox.appendChild(this.tableCard(
+          `事实簇（共 ${d.total} 条，按确信度排序）`,
+          ["ID", "用户/分类", "规范陈述", "确信度", "状态", "证据", "更新时间", "操作"],
+          rows,
+          UI.pager(d.total, d.page, d.size, (p2) => { query.page = p2; refresh(); })
+        ));
+      } catch (e) {
+        // Paging/filter callers are fire-and-forget: surface the failure here
+        // with a retry instead of leaving the list stuck on "loading".
+        listBox.innerHTML = "";
+        listBox.appendChild(UI.errorCard(e, refresh));
+      }
     };
     await refresh();
   },
@@ -750,40 +771,46 @@ const Page = {
 
     const refresh = async () => {
       listBox.innerHTML = '<div class="loading">正在打捞记忆</div>';
-      const p = new URLSearchParams(Object.assign({ size: 30 }, query));
-      const d = await UI.api("/facts?" + p.toString());
-      const rows = d.items.map((f) => this.el("tr", {}, [
-        this.el("td", { class: "mono" }, [String(f.id)]),
-        this.el("td", {}, [
-          this.el("div", {}, [f.display_name || f.user_id]),
-          this.el("div", { class: "muted mono", style: "font-size:11px" }, [f.user_id]),
-        ]),
-        this.el("td", {}, [UI.badge(f.category, "pink")]),
-        this.el("td", { class: "wrap" }, [f.statement]),
-        this.el("td", {}, [UI.badge(f.confidence, f.confidence === "high" ? "ok" : "warn")]),
-        this.el("td", {}, [UI.badge(f.extracted ? "已入簇" : "待处理", f.extracted ? "gray" : "sky")]),
-        this.el("td", { class: "mono", style: "font-size:11px" }, [f.session_id]),
-        this.el("td", {}, [UI.fmtTime(f.occurred_at)]),
-        this.el("td", {}, [
-          this.el("button", {
-            class: "btn small danger",
-            onclick: () => UI.confirm("删除原始事实", `确定删除事实 #${f.id} 吗？${f.extracted ? "该事实已入簇，删除不影响簇本身。" : "该事实还未入簇，删除后不会再参与合并。"}`, async () => {
-              try {
-                await UI.api(`/facts/${f.id}`, { method: "DELETE" });
-                UI.toast("事实已删除", "ok");
-                refresh();
-              } catch (e) { UI.toast("删除失败：" + e.message, "err"); }
-            }, "删除"),
-          }, [UI.svg("Delete")]),
-        ]),
-      ]));
-      listBox.innerHTML = "";
-      listBox.appendChild(this.tableCard(
-        `原始事实（共 ${d.total} 条）`,
-        ["ID", "用户", "分类", "事实陈述", "确信度", "状态", "来源会话", "发生时间", "操作"],
-        rows,
-        UI.pager(d.total, d.page, d.size, (p2) => { query.page = p2; refresh(); })
-      ));
+      try {
+        const p = new URLSearchParams(Object.assign({ size: 30 }, query));
+        const d = await UI.api("/facts?" + p.toString());
+        const rows = d.items.map((f) => this.el("tr", {}, [
+          this.el("td", { class: "mono" }, [String(f.id)]),
+          this.el("td", {}, [
+            this.el("div", {}, [f.display_name || f.user_id]),
+            this.el("div", { class: "muted mono", style: "font-size:11px" }, [f.user_id]),
+          ]),
+          this.el("td", {}, [UI.badge(f.category, "pink")]),
+          this.el("td", { class: "wrap" }, [f.statement]),
+          this.el("td", {}, [UI.badge(f.confidence, f.confidence === "high" ? "ok" : "warn")]),
+          this.el("td", {}, [UI.badge(f.extracted ? "已入簇" : "待处理", f.extracted ? "gray" : "sky")]),
+          this.el("td", { class: "mono", style: "font-size:11px" }, [f.session_id]),
+          this.el("td", {}, [UI.fmtTime(f.occurred_at)]),
+          this.el("td", {}, [
+            this.el("button", {
+              class: "btn small danger",
+              onclick: () => UI.confirm("删除原始事实", `确定删除事实 #${f.id} 吗？${f.extracted ? "该事实已入簇，删除不影响簇本身。" : "该事实还未入簇，删除后不会再参与合并。"}`, async () => {
+                try {
+                  await UI.api(`/facts/${f.id}`, { method: "DELETE" });
+                  UI.toast("事实已删除", "ok");
+                  refresh();
+                } catch (e) { UI.toast("删除失败：" + e.message, "err"); }
+              }, "删除"),
+            }, [UI.svg("Delete")]),
+          ]),
+        ]));
+        listBox.innerHTML = "";
+        listBox.appendChild(this.tableCard(
+          `原始事实（共 ${d.total} 条）`,
+          ["ID", "用户", "分类", "事实陈述", "确信度", "状态", "来源会话", "发生时间", "操作"],
+          rows,
+          UI.pager(d.total, d.page, d.size, (p2) => { query.page = p2; refresh(); })
+        ));
+      } catch (e) {
+        // Paging/filter callers are fire-and-forget: surface the failure here with a retry.
+        listBox.innerHTML = "";
+        listBox.appendChild(UI.errorCard(e, refresh));
+      }
     };
     await refresh();
   },
@@ -798,62 +825,92 @@ const Page = {
     let page = 1, kw = "";
     const loadUsers = async () => {
       pickerCard.innerHTML = '<div class="loading">正在打捞记忆</div>';
-      const d = await UI.api(`/users?page=${page}&size=30&q=${encodeURIComponent(kw)}`);
-      pickerCard.innerHTML = "";
-      const search = this.el("div", { class: "filter-row" }, [
-        this.el("div", { class: "f" }, [this.el("label", {}, ["搜索用户 ID"])]),
-      ]);
-      const inp = this.el("input", { type: "text", placeholder: "user_id", value: kw });
-      search.querySelector(".f").appendChild(inp);
-      search.appendChild(this.el("button", { class: "btn small", onclick: () => { kw = inp.value.trim(); page = 1; loadUsers(); } }, [UI.svg("Search")]));
-      pickerCard.appendChild(this.el("h3", {}, [UI.paw(), `选择用户查看画像（共 ${d.total} 个有簇用户）`]));
-      pickerCard.appendChild(search);
-      const rows = d.items.map((u) => this.el("tr", { style: "cursor:pointer", onclick: () => loadProfile(u.platform, u.user_id, u.display_name) }, [
-        this.el("td", {}, [
-          this.el("div", { style: "font-weight:700" }, [u.display_name || "（无名）"]),
-          this.el("div", { class: "muted mono", style: "font-size:11px" }, [u.user_id]),
-        ]),
-        this.el("td", {}, [u.platform]),
-        this.el("td", {}, [UI.badge(`画像 ${u.profiled}`, u.profiled ? "ok" : "gray"), " ",
-          UI.badge(`活跃 ${u.active}`, "sky"), " ",
-          u.pending ? UI.badge(`待定 ${u.pending}`, "warn") : null]),
-        this.el("td", {}, [UI.scoreBar(u.max_score)]),
-        this.el("td", {}, [UI.fmtTime(u.updated_at)]),
-      ]));
-      pickerCard.appendChild(this.el("table", { class: "tbl" }, [
-        this.el("thead", {}, [this.el("tr", {}, ["用户", "平台", "簇构成", "最高确信度", "最近更新"].map((t) => this.el("th", {}, [t])))]),
-        this.el("tbody", {}, rows),
-      ]));
-      pickerCard.appendChild(UI.pager(d.total, d.page, d.size, (p) => { page = p; loadUsers(); }));
+      try {
+        const d = await UI.api(`/users?page=${page}&size=30&q=${encodeURIComponent(kw)}`);
+        pickerCard.innerHTML = "";
+        const search = this.el("div", { class: "filter-row" }, [
+          this.el("div", { class: "f" }, [this.el("label", {}, ["搜索用户 ID"])]),
+        ]);
+        const inp = this.el("input", { type: "text", placeholder: "user_id", value: kw });
+        search.querySelector(".f").appendChild(inp);
+        search.appendChild(this.el("button", { class: "btn small", onclick: () => { kw = inp.value.trim(); page = 1; loadUsers(); } }, [UI.svg("Search")]));
+        pickerCard.appendChild(this.el("h3", {}, [UI.paw(), `选择用户查看画像（共 ${d.total} 个有簇用户）`]));
+        pickerCard.appendChild(search);
+        const rows = d.items.map((u) => this.el("tr", { style: "cursor:pointer", onclick: () => loadProfile(u.platform, u.user_id, u.display_name) }, [
+          this.el("td", {}, [
+            this.el("div", { style: "font-weight:700" }, [u.display_name || "（无名）"]),
+            this.el("div", { class: "muted mono", style: "font-size:11px" }, [u.user_id]),
+          ]),
+          this.el("td", {}, [u.platform]),
+          this.el("td", {}, [UI.badge(`画像 ${u.profiled}`, u.profiled ? "ok" : "gray"), " ",
+            UI.badge(`活跃 ${u.active}`, "sky"), " ",
+            u.pending ? UI.badge(`待定 ${u.pending}`, "warn") : null]),
+          this.el("td", {}, [UI.scoreBar(u.max_score)]),
+          this.el("td", {}, [UI.fmtTime(u.updated_at)]),
+          this.el("td", {}, [
+            this.el("button", {
+              class: "btn small danger",
+              onclick: (ev) => {
+                // Row click opens the profile; the button click erases memory.
+                ev.stopPropagation();
+                UI.confirm("清除该用户的全部记忆",
+                  `确定删除 ${u.platform}:${u.user_id} 的画像/事实簇/原始事实/别名与关系边吗？此操作不可恢复（对话摘要为会话维度、可能涉及他人，不随此级联删除）。`,
+                  async () => {
+                    try {
+                      const r = await UI.api(`/users/${encodeURIComponent(u.platform)}/${encodeURIComponent(u.user_id)}`, { method: "DELETE" });
+                      UI.toast(`已删除：簇 ${r.clusters} · 事实 ${r.facts} · 画像 ${r.profiles} · 别名 ${r.aliases} · 边 ${r.edges}`, "ok");
+                      loadUsers();
+                    } catch (e) { UI.toast("删除失败：" + e.message, "err"); }
+                  }, "删除");
+              },
+            }, ["清除记忆"]),
+          ]),
+        ]));
+        pickerCard.appendChild(this.el("table", { class: "tbl" }, [
+          this.el("thead", {}, [this.el("tr", {}, ["用户", "平台", "簇构成", "最高确信度", "最近更新", "操作"].map((t) => this.el("th", {}, [t])))]),
+          this.el("tbody", {}, rows),
+        ]));
+        pickerCard.appendChild(UI.pager(d.total, d.page, d.size, (p) => { page = p; loadUsers(); }));
+      } catch (e) {
+        // Search/paging callers are fire-and-forget: surface the failure here with a retry.
+        pickerCard.innerHTML = "";
+        pickerCard.appendChild(UI.errorCard(e, loadUsers));
+      }
     };
 
     const loadProfile = async (platform, userId, displayName) => {
       profileCard.innerHTML = '<div class="card"><div class="loading">正在打捞记忆</div></div>';
-      const d = await UI.api(`/profile/${encodeURIComponent(platform)}/${encodeURIComponent(userId)}`);
-      profileCard.innerHTML = "";
-      const sectionNames = { identity: "基本信息", naming: "称呼偏好", stable: "已知事实", interaction: "互动偏好", recent: "近期动态" };
-      const sectionCards = Object.entries(sectionNames).map(([cat, title]) =>
-        this.el("div", { class: "card", style: "margin:0" }, [
-          this.el("h3", {}, [title]),
-          (d.sections[cat] && d.sections[cat].length)
-            ? this.el("ul", { style: "margin:0;padding-left:18px" }, d.sections[cat].map((s) => this.el("li", {}, [s])))
+      try {
+        const d = await UI.api(`/profile/${encodeURIComponent(platform)}/${encodeURIComponent(userId)}`);
+        profileCard.innerHTML = "";
+        const sectionNames = { identity: "基本信息", naming: "称呼偏好", stable: "已知事实", interaction: "互动偏好", recent: "近期动态" };
+        const sectionCards = Object.entries(sectionNames).map(([cat, title]) =>
+          this.el("div", { class: "card", style: "margin:0" }, [
+            this.el("h3", {}, [title]),
+            (d.sections[cat] && d.sections[cat].length)
+              ? this.el("ul", { style: "margin:0;padding-left:18px" }, d.sections[cat].map((s) => this.el("li", {}, [s])))
+              : this.el("div", { class: "muted" }, ["暂无"]),
+          ])
+        );
+        sectionCards.push(this.el("div", { class: "card", style: "margin:0" }, [
+          this.el("h3", {}, ["待定信息"]),
+          d.uncertain.length
+            ? this.el("ul", { style: "margin:0;padding-left:18px" }, d.uncertain.map((s) => this.el("li", {}, [s])))
             : this.el("div", { class: "muted" }, ["暂无"]),
-        ])
-      );
-      sectionCards.push(this.el("div", { class: "card", style: "margin:0" }, [
-        this.el("h3", {}, ["待定信息"]),
-        d.uncertain.length
-          ? this.el("ul", { style: "margin:0;padding-left:18px" }, d.uncertain.map((s) => this.el("li", {}, [s])))
-          : this.el("div", { class: "muted" }, ["暂无"]),
-      ]));
-      profileCard.appendChild(this.el("div", { class: "card" }, [
-        this.el("h3", {}, [UI.paw(), `${d.display_name} 的画像（与注入内容逐字一致）`]),
-        d.injection_text
-          ? this.el("div", { class: "pre-box" }, [d.injection_text])
-          : this.el("div", { class: "empty" }, ["该用户暂无可注入的画像内容"]),
-      ]));
-      profileCard.appendChild(this.el("div", { class: "card-grid", style: "grid-template-columns:repeat(auto-fill,minmax(300px,1fr))" }, sectionCards));
-      profileCard.scrollIntoView({ behavior: "smooth" });
+        ]));
+        profileCard.appendChild(this.el("div", { class: "card" }, [
+          this.el("h3", {}, [UI.paw(), `${d.display_name} 的画像（与注入内容逐字一致）`]),
+          d.injection_text
+            ? this.el("div", { class: "pre-box" }, [d.injection_text])
+            : this.el("div", { class: "empty" }, ["该用户暂无可注入的画像内容"]),
+        ]));
+        profileCard.appendChild(this.el("div", { class: "card-grid", style: "grid-template-columns:repeat(auto-fill,minmax(300px,1fr))" }, sectionCards));
+        profileCard.scrollIntoView({ behavior: "smooth" });
+      } catch (e) {
+        // Row clicks are fire-and-forget: surface the failure here with a retry.
+        profileCard.innerHTML = "";
+        profileCard.appendChild(UI.errorCard(e, () => loadProfile(platform, userId, displayName)));
+      }
     };
 
     await loadUsers();
@@ -1120,37 +1177,43 @@ const Page = {
 
     const refresh = async () => {
       listBox.innerHTML = '<div class="loading">正在打捞记忆</div>';
-      const p = new URLSearchParams(Object.assign({ size: 20 }, query));
-      const d = await UI.api("/summaries?" + p.toString());
-      const rows = d.items.map((s) => this.el("tr", {}, [
-        this.el("td", { class: "mono" }, [String(s.id)]),
-        this.el("td", { class: "mono", style: "font-size:11px" }, [s.session_id]),
-        this.el("td", {}, [UI.badge(s.kind, s.kind === "bot_self" ? "pink" : "sky")]),
-        this.el("td", { class: "wrap", style: "max-width:520px" }, [s.content]),
-        this.el("td", {}, [UI.fmtTime(s.occurred_at)]),
-        this.el("td", {}, [s.has_embedding ? UI.badge("已向量化", "ok") : UI.badge("待补算", "warn")]),
-        this.el("td", { style: "white-space:nowrap" }, [
-          this.el("button", { class: "btn small ghost", onclick: () => this.editSummary(s, refresh) }, [UI.svg("EditPen")]),
-          " ",
-          this.el("button", {
-            class: "btn small danger",
-            onclick: () => UI.confirm("删除摘要", "删除后该轮内容不再参与 recall，确定吗？", async () => {
-              try {
-                await UI.api(`/summaries/${s.id}`, { method: "DELETE" });
-                UI.toast("摘要已删除", "ok");
-                refresh();
-              } catch (e) { UI.toast("删除失败：" + e.message, "err"); }
-            }, "删除"),
-          }, [UI.svg("Delete")]),
-        ]),
-      ]));
-      listBox.innerHTML = "";
-      listBox.appendChild(this.tableCard(
-        `对话摘要 = recall 注入语料（共 ${d.total} 条）`,
-        ["ID", "会话", "类型", "内容", "发生时间", "向量", "操作"],
-        rows,
-        UI.pager(d.total, d.page, d.size, (p2) => { query.page = p2; refresh(); })
-      ));
+      try {
+        const p = new URLSearchParams(Object.assign({ size: 20 }, query));
+        const d = await UI.api("/summaries?" + p.toString());
+        const rows = d.items.map((s) => this.el("tr", {}, [
+          this.el("td", { class: "mono" }, [String(s.id)]),
+          this.el("td", { class: "mono", style: "font-size:11px" }, [s.session_id]),
+          this.el("td", {}, [UI.badge(s.kind, s.kind === "bot_self" ? "pink" : "sky")]),
+          this.el("td", { class: "wrap", style: "max-width:520px" }, [s.content]),
+          this.el("td", {}, [UI.fmtTime(s.occurred_at)]),
+          this.el("td", {}, [s.has_embedding ? UI.badge("已向量化", "ok") : UI.badge("待补算", "warn")]),
+          this.el("td", { style: "white-space:nowrap" }, [
+            this.el("button", { class: "btn small ghost", onclick: () => this.editSummary(s, refresh) }, [UI.svg("EditPen")]),
+            " ",
+            this.el("button", {
+              class: "btn small danger",
+              onclick: () => UI.confirm("删除摘要", "删除后该轮内容不再参与 recall，确定吗？", async () => {
+                try {
+                  await UI.api(`/summaries/${s.id}`, { method: "DELETE" });
+                  UI.toast("摘要已删除", "ok");
+                  refresh();
+                } catch (e) { UI.toast("删除失败：" + e.message, "err"); }
+              }, "删除"),
+            }, [UI.svg("Delete")]),
+          ]),
+        ]));
+        listBox.innerHTML = "";
+        listBox.appendChild(this.tableCard(
+          `对话摘要 = recall 注入语料（共 ${d.total} 条）`,
+          ["ID", "会话", "类型", "内容", "发生时间", "向量", "操作"],
+          rows,
+          UI.pager(d.total, d.page, d.size, (p2) => { query.page = p2; refresh(); })
+        ));
+      } catch (e) {
+        // Paging/filter callers are fire-and-forget: surface the failure here with a retry.
+        listBox.innerHTML = "";
+        listBox.appendChild(UI.errorCard(e, refresh));
+      }
     };
     await refresh();
   },
