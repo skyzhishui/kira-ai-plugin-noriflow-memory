@@ -1177,7 +1177,9 @@ const Page = {
         ]));
       listBox.innerHTML = "";
       listBox.appendChild(this.tableCard(
-        `关系边（共 ${d.edges.length} 条，按证据数排序）`,
+        d.stats.edges_shown < d.stats.edges
+          ? `关系边（共 ${d.stats.edges} 条，按证据数排序，仅展示前 ${d.stats.edges_shown} 条）`
+          : `关系边（共 ${d.stats.edges} 条，按证据数排序）`,
         ["label", "端点", "状态", "证据", "陈述", "最近证据"],
         rows
       ));

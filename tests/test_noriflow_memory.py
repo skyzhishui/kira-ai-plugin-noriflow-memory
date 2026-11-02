@@ -669,9 +669,15 @@ class TestHysteresisBandValidation(unittest.TestCase):
             self.LocalMemoryConfig(score_cap=3.5)  # recent 缺省 4.0 > 3.5
 
     def test_16b_naming_promote_above_cap_is_rejected(self):
-        # naming 维度同口径（v1.18.2）：阈值 > 封顶 = 称呼偏好静默进不了画像
+        # naming 维度同口径（v1.18.2）：阈值 > 封顶 = 称呼偏好静默进不了画像。
+        # 只让 naming 越界（cap=10 下 promote/recent 缺省合法）——若只给
+        # cap=2.5，promote 缺省 6.0 会先触发同一校验器，删掉 naming 分支
+        # 测试照样绿（评审指出的假阳性）
         with self.assertRaises(Exception) as ctx:
-            self.LocalMemoryConfig(score_cap=2.5)  # naming 派生 3.0 > 2.5
+            self.LocalMemoryConfig(
+                score_cap=10.0, naming_promote_threshold=11.0
+            )
+        self.assertIn("naming_promote_threshold", str(ctx.exception))
         self.assertIn("不得大于 score_cap", str(ctx.exception))
         # 显式高于 score_start_high（但 ≤ cap）是合法的保守配置
         # （退化为二次证据累积），不拒
