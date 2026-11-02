@@ -140,6 +140,13 @@ class MemoryDatabase(MemoryBackend):
         pool: asyncpg connection pool (available after connect).
     """
 
+    # Latched once a query proves the tsv column (migration 015) is missing
+    # (e.g. the schema was rolled back manually): the BM25 leg then goes
+    # straight to the expression form instead of paying one failed query per
+    # recall. Class-level default so instances built via __new__ (tests)
+    # inherit it; recovery happens on restart (migrations re-run at startup).
+    _bm25_tsv_missing = False
+
     def __init__(self, config: LocalMemoryConfig) -> None:
         """Initialize (no connection is made yet).
 
@@ -508,7 +515,9 @@ class MemoryDatabase(MemoryBackend):
           filtering and ranking both read the column, eliminating per-row
           re-tokenization (13.5k rows measured: ~160ms -> ~30ms per leg).
           Legacy rows with NULL search_text have a NULL tsv and simply skip
-          the BM25 leg (no impact until the backfill pass fills them);
+          the BM25 leg (no impact until the backfill pass fills them). On a
+          schema without migration 015 (column missing) the leg degrades to
+          the to_tsvector expression form -- latched until restart;
         - The two legs fuse via RRF (score = Σ 1/(rrf_k + rank), merged and
           deduplicated by id); the fused score lands in the "rrf" field and
           rows return in its descending order. With rerank enabled the fused
@@ -776,15 +785,47 @@ class MemoryDatabase(MemoryBackend):
             if not tokens:
                 return vec_rows
             q_ph = p.add(" | ".join(tokens))
-            bm25_sql = (
-                f"SELECT {select_cols} "
-                f"FROM {CHAT_SUMMARY_TABLE} "
-                f"WHERE embedding IS NOT NULL AND ({where}) "
-                f"AND tsv @@ to_tsquery('simple', {q_ph}) "
-                f"ORDER BY ts_rank(tsv, "
-                f"to_tsquery('simple', {q_ph})) DESC LIMIT {limit_ph}"
+
+            def _bm25_sql(expr: str) -> str:
+                return (
+                    f"SELECT {select_cols} "
+                    f"FROM {CHAT_SUMMARY_TABLE} "
+                    f"WHERE embedding IS NOT NULL AND ({where}) "
+                    f"AND {expr} @@ to_tsquery('simple', {q_ph}) "
+                    f"ORDER BY ts_rank({expr}, "
+                    f"to_tsquery('simple', {q_ph})) DESC LIMIT {limit_ph}"
+                )
+
+            # The BM25 leg reads the materialized tsv column (migration 015,
+            # applied at startup in the same release); if the column is absent
+            # (schema rolled back manually / DDL failed then memory re-enabled
+            # without a restart), degrade to the expression form instead of
+            # failing the whole leg -- correct results, slower, latched so a
+            # broken schema does not cost one failed query per recall
+            expr = (
+                "to_tsvector('simple', search_text)"
+                if self._bm25_tsv_missing
+                else "tsv"
             )
-            bm25_rows = [dict(r) for r in await conn.fetch(bm25_sql, *p.values)]
+            try:
+                bm25_rows = [
+                    dict(r) for r in await conn.fetch(_bm25_sql(expr), *p.values)
+                ]
+            except asyncpg.UndefinedColumnError:
+                self._bm25_tsv_missing = True
+                logger.warning(
+                    "tsv 列不可用（migration 015 未生效），BM25 腿回退 "
+                    "to_tsvector 表达式形态（结果正确、性能回退）；"
+                    "重启重跑迁移后恢复",
+                    exc_info=True,
+                )
+                bm25_rows = [
+                    dict(r)
+                    for r in await conn.fetch(
+                        _bm25_sql("to_tsvector('simple', search_text)"),
+                        *p.values,
+                    )
+                ]
         return _rrf_fuse(vec_rows, bm25_rows, rrf_k)
 
     async def fetch_recent_session_participants(

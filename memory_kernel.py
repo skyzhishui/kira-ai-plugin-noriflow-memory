@@ -1322,22 +1322,23 @@ class LocalMemoryKernel:
         # rows for dedup comparison (P2). Scan window = top_k*4 (at least 16,
         # covering consecutive near-duplicate runs); rows outside the window
         # fetch no vector and follow the existing "missing vector" semantics
-        # (not compared, never dropped). Fetch failures fail open and do not
-        # block recall.
+        # (not compared, never dropped). The fetch goes through the shared
+        # guarded call (failures count toward the circuit breaker, same as
+        # the retrieval leg); any failure fails open and does not block
+        # recall.
         if lazy_embeddings and sim_threshold > 0 and rows:
             scan_bound = min(len(rows), max(top_k * 4, 16))
             head_ids = [
                 r["id"] for r in rows[:scan_bound] if r.get("id") is not None
             ]
             if head_ids:
-                try:
-                    embed_by_id = await fetch_embeddings_by_id(ids=head_ids)
-                except Exception:
-                    logger.warning(
-                        "去重向量惰性取回失败（本轮头部行不参与去重比对）",
-                        exc_info=True,
+                embed_by_id = (
+                    await self._guarded_call(
+                        lambda: fetch_embeddings_by_id(ids=head_ids),
+                        description="去重向量取回",
                     )
-                    embed_by_id = {}
+                    or {}
+                )
                 for row in rows[:scan_bound]:
                     embedding = (
                         embed_by_id.get(row.get("id")) if embed_by_id else None

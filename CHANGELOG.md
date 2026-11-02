@@ -26,6 +26,14 @@
 - **`rerank_candidates` 缺省 50→20**：`config.py` 模型缺省、`main.py` 宿主配置
   兜底、`schema.json` 维护页展示与 README 配置表四处口径一致。已显式配置该键的
   部署不受影响（宿主配置优先于模型缺省），仅新装/缺键部署生效。
+- **评审收尾（neko 建议，PR #19）**：
+  - BM25 腿迁移前兜底——`tsv` 列缺失（schema 被手动回滚等 migration 015 未生效
+    场景）时精确捕获 `asyncpg.UndefinedColumnError` 并**闩锁**回退 to_tsvector
+    表达式形态（结果正确、仅变慢；重启重跑迁移后恢复），不再让 `UndefinedColumn`
+    打挂整条召回与熔断；闩锁避免每轮召回都付一次失败查询，健康路径零额外开销；
+  - 去重向量惰性取回纳入熔断口径——`fetch_embeddings_by_ids` 改经共享
+    `_guarded_call` 调用（失败计入熔断、与检索腿同口径），熔断打开时自然退回
+    "缺向量不比对"语义，对外行为不变。
 
 ### feat(config): 画像评分缺省值对齐长周期陪伴场景（promote 10→6 / demote 3→2 / decay 0.8→0.9）
 
