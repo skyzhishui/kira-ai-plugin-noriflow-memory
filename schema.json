@@ -311,7 +311,7 @@
   "rerank_candidates": {
     "type": "integer",
     "name": "重排序候选数",
-    "default": 50
+    "default": 20
   },
   "failure_threshold": {
     "type": "integer",

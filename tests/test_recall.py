@@ -24,6 +24,8 @@ Coverage:
 - build_search_text tokenization + both write points land search_text;
 - hybrid retrieval: dual-leg query, RRF fusion order, single leg when
   disabled, row-exclusion push-down;
+- BM25 tsv missing (schema without migration 015): expression-form
+  fallback, correct results, latched until restart;
 - rolling restore block: skip the latest K batches, oldest->newest
   presentation, budget truncation, memo-driven recall row exclusion, no
   exclusion after TTL expiry;
@@ -52,6 +54,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _harness import load_module  # noqa: E402
+
+import asyncpg  # noqa: E402 -- used to emulate the pre-migration column error
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 
@@ -968,7 +972,11 @@ async def test_hybrid_two_legs_rrf_fusion() -> None:
     assert len(pool.conn.queries) == 2, "须发出向量+BM25 两路查询"
     vec_sql, bm25_sql = pool.conn.queries[0][0], pool.conn.queries[1][0]
     assert "ORDER BY embedding <=> $1::vector" in vec_sql
-    assert "to_tsvector('simple', search_text)" in bm25_sql
+    assert "tsv @@ to_tsquery('simple', $" in bm25_sql
+    assert "ORDER BY ts_rank(tsv, " in bm25_sql
+    assert "to_tsvector('simple', search_text)" not in bm25_sql, (
+        "migration 015 materializes tsv; the BM25 leg must read the column"
+    )
     assert "to_tsquery('simple', $" in bm25_sql, "OR 连接用 to_tsquery"
     assert "plainto_tsquery" not in bm25_sql, "AND 语义（plainto）须废弃"
     for sql_i, params_i in pool.conn.queries:
@@ -993,6 +1001,75 @@ async def test_hybrid_two_legs_rrf_fusion() -> None:
     )
     assert all("rrf" in r for r in rows)
     print("PASS test_hybrid_two_legs_rrf_fusion")
+
+
+class _NoTsvConn:
+    """fetch stub emulating a schema without migration 015, routed by SQL
+    content: the vector leg returns its own (empty) results, the tsv-form
+    BM25 leg raises UndefinedColumnError, the legacy expression form
+    succeeds -- so BM25-origin assertions cannot pass via the vector leg."""
+
+    def __init__(
+        self,
+        vec_results: list[list[dict]],
+        legacy_results: list[list[dict]],
+    ) -> None:
+        self._vec_results = list(vec_results)
+        self._legacy_results = list(legacy_results)
+        self.queries: list[tuple[str, tuple]] = []
+
+    async def fetch(self, sql, *params):
+        self.queries.append((sql, params))
+        # Route by FTS shape: both legs' SELECT list carries the cosine
+        # distance expression ("embedding <=>"), so the leg can only be told
+        # apart by its FTS clauses. The legacy form is checked first (it also
+        # contains "@@ to_tsquery", but never "tsv @@" / "ts_rank(tsv").
+        if "to_tsvector('simple', search_text) @@" in sql:
+            return self._legacy_results.pop(0) if self._legacy_results else []
+        if "@@ to_tsquery" in sql:
+            raise asyncpg.UndefinedColumnError('column "tsv" does not exist')
+        return self._vec_results.pop(0) if self._vec_results else []
+
+
+async def test_bm25_tsv_missing_falls_back_and_latches() -> None:
+    """Missing tsv column (schema without migration 015): the BM25 leg
+    degrades to the expression form (correct, slower) instead of failing
+    the whole leg; the fallback latches so later recalls skip the failed
+    probe until restart."""
+    db = MemoryDatabase.__new__(MemoryDatabase)
+    pool = _ExecPool()
+    pool.conn = _NoTsvConn(
+        vec_results=[[], []],  # both recalls: empty vector leg
+        legacy_results=[
+            [_leg_row(3, "bm25-only", 0.5)],  # legacy BM25 retry (recall 1)
+            [_leg_row(3, "bm25-only", 0.5)],  # legacy BM25 direct (recall 2)
+        ],
+    )
+    db._pool = pool
+    rows = await db.search_chat_summaries(
+        query_vec=[0.1], limit=20, scope="session", session_id="s1",
+        query_text="明日方舟", hybrid=True, rrf_k=60,
+    )
+    assert len(pool.conn.queries) == 3, "首轮须为 tsv 探测失败 + 表达式回退共三查"
+    assert "tsv @@" in pool.conn.queries[1][0], "首轮先按 tsv 列探测"
+    legacy_sql = pool.conn.queries[2][0]
+    assert "to_tsvector('simple', search_text) @@" in legacy_sql, "回退用表达式形态"
+    assert "ts_rank(to_tsvector('simple', search_text), " in legacy_sql
+    # vector leg returned nothing, so every hit here can only come from the
+    # legacy BM25 leg -- this is the actual fusion assertion
+    assert [r["document_id"] for r in rows] == ["bm25-only"], "回退轮结果正确融合"
+    await db.search_chat_summaries(
+        query_vec=[0.1], limit=20, scope="session", session_id="s1",
+        query_text="明日方舟", hybrid=True, rrf_k=60,
+    )
+    assert len(pool.conn.queries) == 5, "闩锁后第二轮只发两查（向量+表达式）"
+    bm25_2 = pool.conn.queries[4][0]
+    assert "to_tsvector('simple', search_text) @@" in bm25_2
+    assert "tsv @@" not in bm25_2 and "ts_rank(tsv" not in bm25_2, (
+        "闩锁生效：不再探测 tsv 列"
+    )
+    assert db._bm25_tsv_missing is True, "闩锁置位（重启后重探测）"
+    print("PASS test_bm25_tsv_missing_falls_back_and_latches")
 
 
 async def test_hybrid_disabled_single_leg() -> None:
@@ -1484,6 +1561,7 @@ async def main() -> None:
     await test_insert_writes_search_text()
     await test_update_encoded_rewrites_search_text()
     await test_hybrid_two_legs_rrf_fusion()
+    await test_bm25_tsv_missing_falls_back_and_latches()
     await test_hybrid_disabled_single_leg()
     await test_exclude_document_ids_clause()
     await test_hybrid_fallback_threshold_scale_guard()

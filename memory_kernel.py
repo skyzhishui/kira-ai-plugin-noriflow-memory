@@ -1200,6 +1200,17 @@ class LocalMemoryKernel:
             # 用户的行占满时配额无法凭空补位（放大缓解，非保底）
             n_candidates = max(n_candidates, top_k * 4 * len(uids))
 
+        # Lazy embedding fetch (perf P2): when not per_user and the DB exposes
+        # fetch_embeddings_by_ids, the retrieval SELECT carries no embedding --
+        # dedup consumes vectors only for the rows it actually visits, fetched
+        # precisely by id in paged chunks (head chunk up front, further chunks
+        # on demand; avoiding transfer + JSON parsing of 2 x n_candidates rows
+        # x ~18KB of vector text). Older DB implementations/test stubs without
+        # this method keep the old behavior (rows ship their own embedding) for
+        # cross-version compatibility.
+        fetch_embeddings_by_id = getattr(self.db, "fetch_embeddings_by_ids", None)
+        lazy_embeddings = not is_per_user and fetch_embeddings_by_id is not None
+
         # 单池检索（per_user 同路——完整管线过滤/扩选/排除/混合在此生效，
         # 配额只在截断阶段引入；with_participants 供归属判定）
         rows = await self._guarded_call(
@@ -1223,7 +1234,10 @@ class LocalMemoryKernel:
                 hybrid=self.config.hybrid_search_enabled,
                 rrf_k=self.config.hybrid_rrf_k,
                 exclude_document_ids=self._rollout_excluded_ids(session_id),
-                with_embedding=self.config.dedup_similarity_threshold > 0,
+                with_embedding=(
+                    self.config.dedup_similarity_threshold > 0
+                    and not lazy_embeddings
+                ),
                 with_participants=is_per_user,
             ),
             description="recall 检索",
@@ -1305,13 +1319,54 @@ class LocalMemoryKernel:
         # 双视角摘要）保留其一即可。
         dedup_dropped = 0
         sim_threshold = self.config.dedup_similarity_threshold
+        # Lazy embedding loading (P2, paged): the retrieval SELECT carries no
+        # embedding; dedup fetches vectors by id only for the rows it actually
+        # consumes, chunk by chunk (chunk = top_k*4, min 16). The head chunk
+        # is loaded up front; dropped rows do not count toward top_k, so a
+        # long near-duplicate run can push the loop past the loaded boundary
+        # -- further chunks are then fetched on demand, so beyond-window
+        # near-duplicates still get deduped instead of silently kept. Rows
+        # whose vector is missing or failed to fetch follow the existing
+        # "missing vector" semantics (not compared, never dropped); fetch
+        # failures fail open via the shared guarded call (breaker accounting
+        # same as the retrieval leg) and do not block recall.
+        dedup_chunk = max(top_k * 4, 16)
+        loaded_upto = 0
+        # Stop paging on the first failed chunk fetch (dedup_fetch_dead):
+        # failed chunk fetches happen back-to-back with no retrieval success
+        # in between, so without this latch a pool spanning many chunks with
+        # a persistently failing fetch would accumulate breaker failures
+        # within one round and trip the shared breaker, silently killing the
+        # whole recall (review). With the latch, one round counts at most one
+        # fetch failure (the next round's retrieval success resets the
+        # counter), and the un-fetched rows keep missing-vector semantics.
+        dedup_fetch_dead = False
+        if lazy_embeddings and sim_threshold > 0 and rows:
+            await self._load_dedup_vectors(
+                rows, 0, dedup_chunk, fetch_embeddings_by_id
+            )
+            loaded_upto = min(len(rows), dedup_chunk)
         keep_bound = len(rows) if is_per_user else top_k
         if sim_threshold > 0 and rows:
             kept_rows: list[dict] = []
             kept_unit_vecs: list[list[float]] = []
-            for row in rows:
+            for idx, row in enumerate(rows):
                 if len(kept_rows) >= keep_bound:
                     break
+                if (
+                    lazy_embeddings
+                    and not dedup_fetch_dead
+                    and idx >= loaded_upto
+                ):
+                    fetched = await self._load_dedup_vectors(
+                        rows,
+                        loaded_upto,
+                        idx + dedup_chunk,
+                        fetch_embeddings_by_id,
+                    )
+                    if not fetched:
+                        dedup_fetch_dead = True
+                    loaded_upto = min(idx + dedup_chunk, len(rows))
                 vec = parse_vector(row.get("embedding"))
                 is_dup = False
                 if vec:
@@ -2467,6 +2522,55 @@ class LocalMemoryKernel:
             row["score"] = row.get("rrf", row["relevance"])
         rows.sort(key=lambda r: float(r["score"]), reverse=True)
         return rows
+
+    async def _load_dedup_vectors(
+        self,
+        rows: list[dict],
+        start: int,
+        end: int,
+        fetch_embeddings_by_id: Callable[..., Awaitable[dict[int, object]]] | None,
+    ) -> bool:
+        """Attach embeddings to rows[start:end] in place, fetched by primary
+        key in one batch (lazy dedup loading, perf P2).
+
+        Fail-open: the fetch goes through the shared guarded call; a failure
+        (circuit-open included, which returns None) or an id missing from the
+        returned mapping leaves the row vector-less -- "missing vector"
+        semantics (not compared in dedup, never dropped), recall unblocked.
+        Rows with a None id cannot be fetched and stay vector-less.
+
+        Args:
+            rows: recall candidate rows (mutated in place).
+            start/end: half-open row index range to load (end is clamped to
+                len(rows); a degenerate range is a no-op).
+            fetch_embeddings_by_id: the backend's fetch_embeddings_by_ids
+                coroutine (the caller only invokes this helper on the lazy
+                path, where it is not None).
+
+        Returns:
+            True when the guarded fetch succeeded (rows attached, the mapping
+            itself may be empty); False on failure or circuit-open skip -- the
+            caller stops paging for the rest of the round, so one recall
+            round counts at most one breaker failure and the paging loop
+            cannot trip the shared breaker on its own.
+        """
+        end = min(end, len(rows))
+        if end <= start:
+            return True
+        ids = [r["id"] for r in rows[start:end] if r.get("id") is not None]
+        if not ids:
+            return True
+        embed_by_id = await self._guarded_call(
+            lambda: fetch_embeddings_by_id(ids=ids),
+            description="去重向量取回",
+        )
+        if embed_by_id is None:
+            return False
+        for row in rows[start:end]:
+            embedding = embed_by_id.get(row.get("id")) if embed_by_id else None
+            if embedding is not None:
+                row["embedding"] = embedding
+        return True
 
     async def _guarded_call(
         self, operation: Callable[[], Awaitable[_T]], description: str

@@ -242,7 +242,7 @@ class LocalMemoryConfig(BaseModel):
         "不占 top_k 名额；注入层保留二次防线兜漏网",
     )
     rerank_enabled: bool = Field(default=True, description="是否启用重排序（需 model_config [rerank]）")
-    rerank_candidates: int = Field(default=50, ge=1, description="进入重排序的向量候选数")
+    rerank_candidates: int = Field(default=20, ge=1, description="进入重排序的向量候选数")
 
     # ---- 召回质量优化（扩选/近时排除/去重/时间标注，同步自上游 nori 版） ----
     recall_expansion_enabled: bool = Field(

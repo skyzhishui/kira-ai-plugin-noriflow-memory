@@ -1,6 +1,79 @@
 # Changelog
 
-## Unreleased
+## v1.18.1 (2026-11-02)
+
+### perf(recall): BM25 物化 tsv 生成列 + 去重向量按 id 惰性取回
+
+- **BM25 物化（P1）**：新增 `migrations/015_bm25_materialize.sql`（仅 PostgreSQL，
+  编号跳过 014 预留 nori-core 侧 `014_cross_session_time_index` 移植位）——
+  `memory_chat_summary` 增加 stored 生成列 `tsv = to_tsvector('simple', search_text)`
+  （to_tsvector(regconfig, text) 为 immutable，PG12+ 可用于生成列），BM25 腿的
+  过滤与 `ts_rank` 排序均改读该列，表达式 GIN 索引 `idx_mcs_fts` 退役、由
+  `GIN(tsv)`（`idx_mcs_tsv`）接管。实测 13,515 行语料：BM25 腿 ~160ms → ~30ms
+  （原 ORDER BY `ts_rank(to_tsvector(...))` 对每条命中行重复分词 ~400 字正文，
+  高选择率下 planner 弃 GIN 走 Parallel Seq Scan；拆分测量 GIN 过滤单独 24ms、
+  预截断 token 后 2.4ms——~135ms 为重复分词）。回滚兼容：旧代码（表达式形态）
+  在无 `idx_mcs_fts` 时退化为 Seq Scan，变慢但结果正确；SQLite 路径不涉及；
+- **去重向量惰性取回（P2，按需分页）**：召回检索 SELECT 不再随行携带向量（asyncpg
+  未注册 pgvector codec 时每行 ~18KB `'[...]'` 文本，两路 × rerank_candidates 约
+  1.8MB 传输 + JSON 解析）——去重循环只为其**实际消费**的行按主键批量补取向量：
+  首块 = `top_k * 4`（至少 16 行）启动前取回，循环越过已加载边界时按需续取下一块
+  （被丢行不占 `top_k` 名额，长近重复段会把循环推过头块——窗外近重复必须继续比对
+  去重，不得静默保留）。PG/SQLite 双后端新增 `fetch_embeddings_by_ids`（PG 走
+  `id = ANY($1)` 精确批量，SQLite 走 `IN` 占位符批查，均跳过 NULL embedding 行）；
+  健康（早停）路径仍只付一次批量取回。取回失败 fail-open（经共享 `_guarded_call`，
+  失败计入熔断），缺向量行沿用"不比对、永不误删"语义；旧版 DB 实现/测试桩无该
+  方法时自动保持旧行为（检索行自带向量），跨版本兼容；
+- **`rerank_candidates` 缺省 50→20**：`config.py` 模型缺省、`main.py` 宿主配置
+  兜底、`schema.json` 维护页展示与 README 配置表四处口径一致。已显式配置该键的
+  部署不受影响（宿主配置优先于模型缺省），仅新装/缺键部署生效。
+- **评审收尾（neko 建议，PR #19）**：
+  - BM25 腿迁移前兜底——`tsv` 列缺失（schema 被手动回滚等 migration 015 未生效
+    场景）时精确捕获 `asyncpg.UndefinedColumnError` 并**闩锁**回退 to_tsvector
+    表达式形态（结果正确、仅变慢；重启重跑迁移后恢复），不再让 `UndefinedColumn`
+    打挂整条召回与熔断；闩锁避免每轮召回都付一次失败查询，健康路径零额外开销；
+  - 去重向量惰性取回纳入熔断口径——`fetch_embeddings_by_ids` 改经共享
+    `_guarded_call` 调用（失败计入熔断、与检索腿同口径）。熔断按**连续失败**
+    计数：检索腿每轮成功即清零计数，惰性取回单独失败最多累计 1 次、不会独自
+    打开熔断（只有检索腿自身连续失败——真库不可用——才会熔断短路召回，属预期
+    行为）；单轮取回失败 fail-open 退回"缺向量不比对"语义，对外行为不变。
+  - 评审测试桩修正——`_NoTsvConn` 按 SQL 内容分流向量腿/表达式 BM25 腿/tsv
+    探测（原实现不区分，向量腿被喂入 BM25 桩行、融合断言空转通过）；断言
+    加强为向量腿空结果下命中行只能来自表达式回退腿。
+  - 去重窗口缺口（neko 第二轮 review，重要）——原惰性实现只为头部窗
+    （`top_k*4`，至少 16 行）取向量，而被丢行不占 `top_k` 名额、去重循环可越过
+    窗口：窗外近重复因无向量被静默保留（相对旧全量比对行为是质量回归）。改为
+    按循环实际消费**分页补取**（新增 `_load_dedup_vectors`：首块启动前取，
+    越界即续取下一块并继续比对），窗外照常去重；健康（早停）路径仍只付一次
+    批量取回，最坏情况（候选池全重复）续取次数以池大小为界，仍远小于旧行为的
+    全量向量传输 + JSON 解析。
+  - 分页熔断累计（neko 第五轮 review，成立）——分页续取使"单轮最多 1 次取回
+    失败"的前提失效：同轮多块连续失败（中间无检索腿成功清零）可在单轮内累到
+    `failure_threshold`（缺省 5）打开共享熔断，下一轮召回被整体短路为空。
+    修复：任一分页块取回失败即停止本轮后续分页（`dedup_fetch_dead` 闩锁，
+    `_load_dedup_vectors` 返回成败），单轮计入熔断的取回失败恒 ≤1 次；未取到
+    的行保持"缺向量不比对"语义，且不再重复无效探测（每轮一次告警）。
+  - 用例注册遗漏（neko 第五轮 review，成立）——`test_recall.py` 的 `main()`
+    漏注册 `test_bm25_tsv_missing_falls_back_and_latches`，直跑方式下零执行
+    （重蹈上文 runner 空转覆辙）；注册后真实运行立即揪出测试桩路由错误——
+    两腿 SELECT 列都含余弦距离表达式 `embedding <=>`，原按该片段分流会把
+    BM25 查询误判为向量腿，改按 FTS 算子判别（先判表达式形态、再判 tsv
+    探测）后用例方才真实通过。
+  - `tests/test_recall_lazy_embeddings.py` 补上缺失的 `__main__` runner——该文件
+    是唯一没有 runner 的测试套件，CI 逐脚本直跑方式下实际零执行（退出码恒 0），
+    此前"全绿"对该文件为空转；补齐后惰性/兼容/迁移守卫用例首次真正运行并通过，
+    分页续取用例即在其中。
+  - **migration 015 锁与重写评估（neko 第三轮 review，结论：无代码改动）**：
+    `ADD COLUMN ... GENERATED ALWAYS ... STORED` 确会一次性整表重写并持
+    ACCESS EXCLUSIVE 锁（13.5k 行毫秒级；数百万行历史表会拉长启动窗口），
+    但：执行器按脚本**单事务**包裹（`apply_migrations`），DROP/CREATE 索引
+    原子、中途失败全回滚，不存在"无 FTS 索引窗口"；语句受池级
+    `db_command_timeout`（缺省 60s）约束，超时干净回滚、记忆功能关闭并在
+    下次启动重试，不会半途无限持锁。`CREATE INDEX CONCURRENTLY` 无法在
+    事务内运行（需改造执行器），"普通列 + 触发器 + 分批回填"会引入永久写
+    放大（写路径性能回退），均不采纳。大表部署可在升级前**手工预执行**本
+    迁移（全幂等：三处 `IF NOT EXISTS`；旧代码不读 `tsv`，仅 BM25 腿短暂
+    退化为 Seq Scan，见迁移头注），避开启动重写窗口。
 
 ### feat(config): 画像评分缺省值对齐长周期陪伴场景（promote 10→6 / demote 3→2 / decay 0.8→0.9）
 
