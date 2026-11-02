@@ -51,6 +51,17 @@
     是唯一没有 runner 的测试套件，CI 逐脚本直跑方式下实际零执行（退出码恒 0），
     此前"全绿"对该文件为空转；补齐后惰性/兼容/迁移守卫用例首次真正运行并通过，
     分页续取用例即在其中。
+  - **migration 015 锁与重写评估（neko 第三轮 review，结论：无代码改动）**：
+    `ADD COLUMN ... GENERATED ALWAYS ... STORED` 确会一次性整表重写并持
+    ACCESS EXCLUSIVE 锁（13.5k 行毫秒级；数百万行历史表会拉长启动窗口），
+    但：执行器按脚本**单事务**包裹（`apply_migrations`），DROP/CREATE 索引
+    原子、中途失败全回滚，不存在"无 FTS 索引窗口"；语句受池级
+    `db_command_timeout`（缺省 60s）约束，超时干净回滚、记忆功能关闭并在
+    下次启动重试，不会半途无限持锁。`CREATE INDEX CONCURRENTLY` 无法在
+    事务内运行（需改造执行器），"普通列 + 触发器 + 分批回填"会引入永久写
+    放大（写路径性能回退），均不采纳。大表部署可在升级前**手工预执行**本
+    迁移（全幂等：三处 `IF NOT EXISTS`；旧代码不读 `tsv`，仅 BM25 腿短暂
+    退化为 Seq Scan，见迁移头注），避开启动重写窗口。
 
 ### feat(config): 画像评分缺省值对齐长周期陪伴场景（promote 10→6 / demote 3→2 / decay 0.8→0.9）
 
