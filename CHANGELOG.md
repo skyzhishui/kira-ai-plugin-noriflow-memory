@@ -1,5 +1,109 @@
 # Changelog
 
+## v1.18.2 (2026-11-02)
+
+同步 nori 上游（nori_plugin_noriflow_memory）四项：跨会话近期摘要注入（#31）、
+称呼偏好低门槛入库（#32）、编码摘要半句截断防护（#26）、记忆工具准则单面注入
+收敛（#29）；维护页换装「记忆星图 / Memory Atlas」改版（#32，去品牌化）。
+
+### feat(cross-session): 跨会话近期摘要注入（同步 nori #31 + migration 014）
+
+- 私聊回合前置当前用户在**其他会话**的近期已编码摘要（时间线置于滚动补回/
+  召回之前）：补充"这个人最近在别处聊了什么"的背景，补齐跨会话记忆面；
+  仅 `session_type != gm` 注入，`cross_session_summary_enabled` 缺省**关闭**；
+- 新增 `migrations/014_cross_session_time_index.sql` + `migrations_sqlite/`
+  同构版（部分索引 `idx_mcs_cross_session_time`，SQLite 支持部分索引、布尔
+  列 0/1 真值语义一致）——编号 014 正是 1.18.1 迁移头注预留的坑位；
+- 双后端新增 `fetch_recent_cross_session_summaries`：PG `participants &&`
+  数组重叠 + `make_interval` 陈旧窗口；SQLite 走 `json_each` EXISTS 同语义、
+  陈旧窗口按写侧 `sqlite_format_ts` 同构 TEXT 截止值比较；
+- kernel 新增跨会话注入去重 memo（与滚动补回同构的 TTL/容量语义）：入口
+  **无条件清空**本轮 memo（任何提前返回不残留上轮排除项——残留项会在 TTL
+  窗口内错误排除 recall/检索结果）；共享检索排除通道升级为
+  `_injected_excluded_ids = 滚动补回 ∪ 跨会话`，recall 与 memory_search
+  同轮排除已注入行，防双通道重复暴露；
+- **防重契约**：memo 只登记实际呈现给模型的行（前言计入整块预算、超限丢
+  旧条、首条超限截断且正文残留 < 10 字符整条放弃）——被预算裁剪的行保持
+  可检索，否则本轮既看不到又召不回，形成召回盲区；
+- 身份归并：宿主暂无跨平台身份服务，按单复合键（platform:uid）回退（与
+  nori 侧身份未命中时的回退同构）；会话名暂无目录服务，统一「（未命名
+  会话）」；
+- 新增四配置键（enabled/top_k/max_chars/max_age_days），config.py / main.py
+  兜底 / schema.json / config_web / README 五处口径一致。
+
+### feat(naming): 称呼偏好低门槛入库（同步 nori #32 + 96214f4）
+
+- 新增 `naming_promote_threshold`（缺省 3.0，需 ≤ `score_start_high`）：
+  naming 维度按专属低阈值晋档——本人明确称呼要求（"叫我X""别叫我Y"，
+  confidence=high 起步分 3.0）**单次即可入画像**，不再需要 4-5 次证据累积；
+- **建簇即时晋档**（nori 96214f4 同款，双后端）：`apply_fact_merge` create
+  路径起步分已达维度阈值（recent/naming 各自低阈值，其余通用）时建簇即
+  `profiled` 并**同事务写画像行**，不再依赖晋档遍——堵住同周期衰减遍先把
+  分数打到阈值之下的时序窗口（run_cycle 顺序：事实处置 → 衰减 → 晋档）；
+  replace 路径与晋档遍的维度阈值 CASE 同步加 naming 臂；
+- 新增 `naming_prompt_enabled`（缺省开）：编码提示词附加
+  `prompts/memory_encode_naming.prompt` 判定节——证据分级 a-f：仅记录本人
+  希望被如何称呼/明确反感的称呼（a 档）；他人称呼习惯须有本人接受迹象才可
+  提取且最高 medium（b 档，bot 行仅作语境）；自称/对 bot 的叫法/纯关系
+  身份称谓（"主人""爸爸"类）/推断一律不提取；模板缺失自动降级跳过并告警；
+- 维度阈值经 `apply_fact_merge` / `promote_pass` 全链路下渗（主动写入、
+  合并处置、晋档遍三处调用点），PG 与 SQLite 行为逐字对齐。
+
+### fix(encoder): 编码摘要半句截断防护（同步 nori #26）
+
+- 上游 LLM 在 `response_format=json_object` 引导解码下会**间歇性提前终止**：
+  摘要停在半句、JSON 由上游自行闭合、`finish_reason` 仍为 stop（无截断
+  信号）——半句 JSON 合法，解析层无从察觉，照单写入即成为可召回的残缺
+  记忆（该轮 facts 全丢）。Kira 侧同款 learner 链路同样暴露；
+- 新增 `_looks_truncated`（反向白名单口径）：多行摘要末字为汉字/逗号族/
+  开括号判截断；单行纯锚点形态合法，仅空锚点或逗号族收尾判截断；ASCII
+  字母/数字/半角 ~/emoji/句末标点收尾一律不判（nori 生产 190 条疑似中旧
+  白名单口径曾误杀 4 条完整摘要）；
+- 疑似截断**重试一次**，仍截断则降级原文单通道（summarized=false 不参与
+  召回，由合并 agent 补编码遍重编码）——半句摘要绝不作为完整记忆写入；
+  encode 主流程重构为 `_encode_once`（渲染→调用→解析→装配）+ 重试外环，
+  硬失败降级语义不变。
+
+### chore(tools): 记忆工具准则单面注入收敛（同步 nori #29）
+
+- `:tools` 准则块撤下逐工具路由复述（"memory_lookup 查…memory_write 仅
+  在…"六件套 + memory_search 参数形态）——各工具 description 已是准确
+  唯一口径，准则复述会随实现漂移（nori #29"幻影能力"教训）；准则保留
+  跨工具行为守则（不重复检索已注入内容/不假装记得/不提工具名/跨会话时间
+  与当事人/答应记住自然应下）并显式声明"以工具自身说明为准"；
+- 新增锁定测试：准则块不得出现任何工具名（防回潮）。
+
+### feat(web): 维护页换装「记忆星图 / Memory Atlas」（同步 nori #32 改版）
+
+- 维护页从单文件朴素版换装 nori 侧星图改版（模块化 `memory.js` /
+  `memory.css` / `ambient.js` + 星系视觉），API base 适配 Kira 路由
+  （`/api/plugin/kira-ai-plugin-noriflow-memory/memory/...`），认证改为
+  宿主同源 Cookie、主题跟随宿主 plugin-bridge `data-theme`；
+- **去品牌化**：移除 nori 人像立绘/头像与全部品牌文案，拟人语气（喵~）
+  泛化为中性文案，标题改为「记忆星图 · MEMORY ATLAS」；
+- 原 Kira 专有功能块（Kira 记忆迁入 / 宿主库迁入 / 手动补编码，对应 6
+  条端点）移植进新页设置区，无功能丢失；页面引用的 17 个唯一端点全部
+  在 `@register.api` 注册表内核对。
+
+### 核对结论（未改动项）
+
+- nori #23（retain 写入门控——仅 bot 参与轮次写入）：Kira 架构性已满足
+  ——`session_memory_updated` 仅由 IM finalize 阶段（bot 回复落库后）发射，
+  未参与轮次永不触发编码；历史窗口仍含未参与消息作上下文，语义一致；
+- nori #20（memory_search 关系边归并）：Kira 已包含——工具 description
+  明确"查某成员时 fact 结果一并返回该成员的确切人际关系边"，无独立
+  category=relation 维度；
+- nori #30（计划任务履约观测）：平台依赖（订阅 nori 调度插件
+  `task_triggered` 事件，Kira 无对应事件源），暂缓。
+
+### 测试
+
+- 新增 `tests/test_cross_session_naming.py`（9 用例）：PG/SQLite 查询形状
+  与行为、memo 排除接线、装配器预算语义、naming 即时晋档/晋档遍维度臂、
+  截断判定矩阵、重试-降级链路、判定节开关、准则无工具名锁定；
+- `test_sqlite_backend.py`：迁移列表补 014；建簇即时晋档后晋档遍期望归零；
+- 全量 14 套件本地全绿（Python 3.12，CI 同款逐脚本直跑）。
+
 ## v1.18.1 (2026-11-02)
 
 ### perf(recall): BM25 物化 tsv 生成列 + 去重向量按 id 惰性取回
