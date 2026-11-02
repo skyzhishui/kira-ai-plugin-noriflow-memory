@@ -2,8 +2,9 @@
 migration guard.
 
 - Lazy path: when the DB exposes fetch_embeddings_by_ids, the retrieval
-  SELECT carries no embedding (with_embedding=False) and the dedup head rows
-  get their vectors attached by a precise id fetch;
+  SELECT carries no embedding (with_embedding=False) and the dedup rows get
+  their vectors attached by precise id fetches, paged as the dedup loop
+  consumes them (head chunk up front, further chunks on demand);
 - Compatibility path: a DB without that method keeps the old behavior
   (with_embedding follows the dedup switch);
 - Migration 015 guard: tsv generated column + GIN(tsv) + expression index
@@ -12,6 +13,7 @@ migration guard.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -144,6 +146,39 @@ async def test_lazy_path_requests_no_embedding_and_dedup_works() -> None:
     print("PASS test_lazy_path_requests_no_embedding_and_dedup_works")
 
 
+async def test_lazy_path_pages_fetch_on_long_duplicate_run() -> None:
+    """Long near-duplicate run: dropped rows do not count toward top_k, so
+    the dedup loop is pushed past the head chunk and pages in further
+    vectors on demand -- beyond-window near-duplicates keep being deduped
+    instead of silently kept (review regression)."""
+    rows = [
+        _row(f"r{i}", 0.9 if i == 0 else 0.8, _NOW - timedelta(days=10, minutes=i))
+        for i in range(20)
+    ]
+    dup_vec = _vec_str([1.0, 0.0, 0.0])
+    uniq_vec = _vec_str([0.0, 1.0, 0.0])
+    embed_by_id = {r["id"]: dup_vec for r in rows}
+    embed_by_id[rows[18]["id"]] = uniq_vec  # only this one breaks the run
+    db = _LazyCaptureDB(rows=rows, embed_by_id=embed_by_id)
+    kernel = _make_kernel(db)
+    items = await kernel.search(query="猫", session_id="s1", top_k=2)
+    assert db.search_kwargs is not None
+    assert db.search_kwargs["with_embedding"] is False
+    assert len(db.fetch_calls) == 2, "头部 16 行一块 + 越窗续取一块"
+    assert db.fetch_calls[0] == [r["id"] for r in rows[:16]], "首块为头部 16 行"
+    assert db.fetch_calls[1] == [r["id"] for r in rows[16:20]], "续取覆盖到池尾"
+    # r1..r17 are near-duplicates of r0 (dropped; drops do not fill top_k, so
+    # the loop crosses the head chunk boundary); r16/r17 sit beyond the head
+    # chunk yet are still compared and dropped thanks to the paged fetch;
+    # r18 (unique direction) fills the second top_k slot, r19 is never
+    # scanned (early stop)
+    assert [i.id for i in items] == ["r0", "r18"], (
+        "beyond-window near-duplicates (r16/r17) must be dropped via the "
+        "paged fetch, and r18 kept as the second distinct memory"
+    )
+    print("PASS test_lazy_path_pages_fetch_on_long_duplicate_run")
+
+
 async def test_lazy_path_fetch_failure_fail_open() -> None:
     """Fetch failure fails open: dedup degrades to missing-vector semantics
     and recall is not blocked."""
@@ -209,3 +244,17 @@ def test_migration_015_materializes_tsv() -> None:
     assert "USING GIN (tsv)" in sql
     assert "DROP INDEX IF EXISTS idx_mcs_fts" in sql
     print("PASS test_migration_015_materializes_tsv")
+
+
+async def main() -> None:
+    await test_lazy_path_requests_no_embedding_and_dedup_works()
+    await test_lazy_path_pages_fetch_on_long_duplicate_run()
+    await test_lazy_path_fetch_failure_fail_open()
+    await test_lazy_path_missing_vector_keeps_row()
+    await test_legacy_db_keeps_old_behavior()
+    test_migration_015_materializes_tsv()
+    print("ALL PASS")
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

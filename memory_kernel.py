@@ -1202,11 +1202,12 @@ class LocalMemoryKernel:
 
         # Lazy embedding fetch (perf P2): when not per_user and the DB exposes
         # fetch_embeddings_by_ids, the retrieval SELECT carries no embedding --
-        # dedup only consumes the vectors of the truncated head rows, fetched
-        # precisely by id after threshold filtering (avoiding transfer + JSON
-        # parsing of 2 x n_candidates rows x ~18KB of vector text). Older DB
-        # implementations/test stubs without this method keep the old behavior
-        # (rows ship their own embedding) for cross-version compatibility.
+        # dedup consumes vectors only for the rows it actually visits, fetched
+        # precisely by id in paged chunks (head chunk up front, further chunks
+        # on demand; avoiding transfer + JSON parsing of 2 x n_candidates rows
+        # x ~18KB of vector text). Older DB implementations/test stubs without
+        # this method keep the old behavior (rows ship their own embedding) for
+        # cross-version compatibility.
         fetch_embeddings_by_id = getattr(self.db, "fetch_embeddings_by_ids", None)
         lazy_embeddings = not is_per_user and fetch_embeddings_by_id is not None
 
@@ -1318,40 +1319,39 @@ class LocalMemoryKernel:
         # 双视角摘要）保留其一即可。
         dedup_dropped = 0
         sim_threshold = self.config.dedup_similarity_threshold
-        # Lazy embedding injection: attach embeddings to the truncated head
-        # rows for dedup comparison (P2). Scan window = top_k*4 (at least 16,
-        # covering consecutive near-duplicate runs); rows outside the window
-        # fetch no vector and follow the existing "missing vector" semantics
-        # (not compared, never dropped). The fetch goes through the shared
-        # guarded call (failures count toward the circuit breaker, same as
-        # the retrieval leg); any failure fails open and does not block
-        # recall.
+        # Lazy embedding loading (P2, paged): the retrieval SELECT carries no
+        # embedding; dedup fetches vectors by id only for the rows it actually
+        # consumes, chunk by chunk (chunk = top_k*4, min 16). The head chunk
+        # is loaded up front; dropped rows do not count toward top_k, so a
+        # long near-duplicate run can push the loop past the loaded boundary
+        # -- further chunks are then fetched on demand, so beyond-window
+        # near-duplicates still get deduped instead of silently kept. Rows
+        # whose vector is missing or failed to fetch follow the existing
+        # "missing vector" semantics (not compared, never dropped); fetch
+        # failures fail open via the shared guarded call (breaker accounting
+        # same as the retrieval leg) and do not block recall.
+        dedup_chunk = max(top_k * 4, 16)
+        loaded_upto = 0
         if lazy_embeddings and sim_threshold > 0 and rows:
-            scan_bound = min(len(rows), max(top_k * 4, 16))
-            head_ids = [
-                r["id"] for r in rows[:scan_bound] if r.get("id") is not None
-            ]
-            if head_ids:
-                embed_by_id = (
-                    await self._guarded_call(
-                        lambda: fetch_embeddings_by_id(ids=head_ids),
-                        description="去重向量取回",
-                    )
-                    or {}
-                )
-                for row in rows[:scan_bound]:
-                    embedding = (
-                        embed_by_id.get(row.get("id")) if embed_by_id else None
-                    )
-                    if embedding is not None:
-                        row["embedding"] = embedding
+            await self._load_dedup_vectors(
+                rows, 0, dedup_chunk, fetch_embeddings_by_id
+            )
+            loaded_upto = min(len(rows), dedup_chunk)
         keep_bound = len(rows) if is_per_user else top_k
         if sim_threshold > 0 and rows:
             kept_rows: list[dict] = []
             kept_unit_vecs: list[list[float]] = []
-            for row in rows:
+            for idx, row in enumerate(rows):
                 if len(kept_rows) >= keep_bound:
                     break
+                if lazy_embeddings and idx >= loaded_upto:
+                    await self._load_dedup_vectors(
+                        rows,
+                        loaded_upto,
+                        idx + dedup_chunk,
+                        fetch_embeddings_by_id,
+                    )
+                    loaded_upto = min(idx + dedup_chunk, len(rows))
                 vec = parse_vector(row.get("embedding"))
                 is_dup = False
                 if vec:
@@ -2507,6 +2507,48 @@ class LocalMemoryKernel:
             row["score"] = row.get("rrf", row["relevance"])
         rows.sort(key=lambda r: float(r["score"]), reverse=True)
         return rows
+
+    async def _load_dedup_vectors(
+        self,
+        rows: list[dict],
+        start: int,
+        end: int,
+        fetch_embeddings_by_id: Callable[..., Awaitable[dict[int, object]]] | None,
+    ) -> None:
+        """Attach embeddings to rows[start:end] in place, fetched by primary
+        key in one batch (lazy dedup loading, perf P2).
+
+        Fail-open: the fetch goes through the shared guarded call; a failure
+        (circuit-open included, which returns None) or an id missing from the
+        returned mapping leaves the row vector-less -- "missing vector"
+        semantics (not compared in dedup, never dropped), recall unblocked.
+        Rows with a None id cannot be fetched and stay vector-less.
+
+        Args:
+            rows: recall candidate rows (mutated in place).
+            start/end: half-open row index range to load (end is clamped to
+                len(rows); a degenerate range is a no-op).
+            fetch_embeddings_by_id: the backend's fetch_embeddings_by_ids
+                coroutine (the caller only invokes this helper on the lazy
+                path, where it is not None).
+        """
+        end = min(end, len(rows))
+        if end <= start:
+            return
+        ids = [r["id"] for r in rows[start:end] if r.get("id") is not None]
+        if not ids:
+            return
+        embed_by_id = (
+            await self._guarded_call(
+                lambda: fetch_embeddings_by_id(ids=ids),
+                description="去重向量取回",
+            )
+            or {}
+        )
+        for row in rows[start:end]:
+            embedding = embed_by_id.get(row.get("id")) if embed_by_id else None
+            if embedding is not None:
+                row["embedding"] = embedding
 
     async def _guarded_call(
         self, operation: Callable[[], Awaitable[_T]], description: str
