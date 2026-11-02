@@ -452,7 +452,7 @@ def _build_config(raw: dict) -> LocalMemoryConfig:
         decay_interval_days=_cfg_int(raw, "decay_interval_days", 14),
         recent_expire_days=_cfg_int(raw, "recent_expire_days", 30),
         recent_promote_threshold=_cfg_float(raw, "recent_promote_threshold", 4.0),
-        naming_promote_threshold=_cfg_float(raw, "naming_promote_threshold", 3.0),
+        naming_promote_threshold=_cfg_float(raw, "naming_promote_threshold", None),
         naming_prompt_enabled=_cfg_bool(raw, "naming_prompt_enabled", True),
         commitment_expire_days=_cfg_int(raw, "commitment_expire_days", 60),
         decay_requires_activity=_cfg_bool(raw, "decay_requires_activity", True),

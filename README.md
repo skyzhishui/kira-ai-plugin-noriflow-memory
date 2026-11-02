@@ -150,7 +150,7 @@ flowchart TD
 | score_cap / promote_threshold / demote_threshold | float | 10 / 6 / 2 | 分数封顶 / 进画像阈值 / 降级迟滞下界（迟滞带 = promote − demote 不得小于单条证据最大加分 `max(score_start_high, score_start_medium)`，否则降档簇一条证据即可回档、画像反复翻转；promote 不得大于 score_cap（相等允许），否则晋升静默停摆；均由 `model_validator` 装配期强制校验，非法组合保存即被拒） |
 | decay_factor / decay_interval_days | float / integer | 0.9 / 14 | 每周期衰减系数与周期天数（interval 兼缺席冻结窗口粒度；pending 死亡窗口由 pending_dead_days 独立控制） |
 | recent_expire_days / recent_promote_threshold | integer / float | 30 / 4 | 近期维度过期天数与进画像阈值 |
-| naming_promote_threshold | float | 3.0 | 称呼偏好维度进画像阈值（本人明确称呼要求单次即晋档；需 ≤ score_start_high） |
+| naming_promote_threshold | float | 派生 | 称呼偏好维度进画像阈值（留空从 score_start_high 派生，缺省刻度即 3.0：本人明确称呼要求单次晋档；显式设置不得大于 score_cap） |
 | naming_prompt_enabled | bool | true | 编码提示词附加称呼偏好判定节（关闭后退回基础规则） |
 | commitment_expire_days | integer | 60 | 约定维度过期天数：最近一次被确认后超此天数无新证据，降待定出画像（簇体保留可复活；持续被提起的约定自动续期） |
 | decay_requires_activity | bool | true | 缺席冻结（衰减/降级仅作用于本周期活跃用户） |

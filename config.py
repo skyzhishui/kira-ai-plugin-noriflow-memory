@@ -6,7 +6,7 @@ connection pool / embedding / backfill / breaker fields; recall, merge
 agent, and scoring-state-machine fields land with M3-M5 milestones.
 """
 
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -132,12 +132,15 @@ class LocalMemoryConfig(BaseModel):
     decay_interval_days: int = Field(default=14, ge=1, description="衰减周期（天），兼缺席冻结窗口粒度")
     recent_expire_days: int = Field(default=30, ge=1, description="recent 维度过期天数")
     recent_promote_threshold: float = Field(default=4.0, description="recent 维度进画像阈值")
-    naming_promote_threshold: float = Field(
-        default=3.0,
+    naming_promote_threshold: Optional[float] = Field(
+        default=None,
         gt=0,
-        description="naming（称呼偏好）维度进画像阈值：本人明确称呼要求"
-        "（confidence=high，起步分 score_start_high=3.0）单次即可晋档入画像；"
-        "该承诺前提为本值 ≤ score_start_high，否则退化为需二次证据累积",
+        description="naming（称呼偏好）维度进画像阈值：缺省（None/不设）从"
+        " score_start_high 派生——本人明确称呼要求（confidence=high，起步分"
+        "即 score_start_high）单次即可晋档入画像，该承诺在任何评分刻度下按"
+        "构造成立（缺省刻度下即 3.0）；显式设置时按本值生效（高于 "
+        "score_start_high 则退化为需二次证据累积，属合法保守配置），且不得"
+        "大于 score_cap（装配期校验）",
     )
     naming_prompt_enabled: bool = Field(
         default=True,
@@ -505,6 +508,22 @@ class LocalMemoryConfig(BaseModel):
                     "score_start_high", "score_start_medium",
                 ),
             )
+        return self
+
+    @model_validator(mode="after")
+    def _resolve_naming_threshold_default(self) -> "LocalMemoryConfig":
+        """naming 阈值缺省派生：None -> score_start_high。
+
+        派生缺省让「本人明确表态（high 证据，起步分 = score_start_high）
+        单次晋档」承诺在任何评分刻度下按构造成立，也避免升级级联：缩放
+        刻度的既有部署（score_start_high 已随刻度缩放）不设新键时派生值
+        天然合法，不会触发跨字段回退把合法的显式评分键连坐复位。显式
+        设置时按本值生效（含高于 score_start_high 的保守形态）。校验器
+        定义顺序在本文件先于 _promote_thresholds_within_cap，保证 cap
+        上界校验读到的是解析后的值。
+        """
+        if self.naming_promote_threshold is None:
+            self.naming_promote_threshold = float(self.score_start_high)
         return self
 
     @model_validator(mode="after")
