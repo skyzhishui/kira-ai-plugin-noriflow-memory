@@ -318,7 +318,7 @@ def _build_config(raw: dict) -> LocalMemoryConfig:
         max_persona_profiles=_cfg_int(raw, "max_persona_profiles", 3),
         topic_blacklist=_cfg_strlist(raw, "topic_blacklist"),
         rerank_enabled=_cfg_bool(raw, "rerank_enabled", True),
-        rerank_candidates=_cfg_int(raw, "rerank_candidates", 50),
+        rerank_candidates=_cfg_int(raw, "rerank_candidates", 20),
         recall_expansion_enabled=_cfg_bool(raw, "recall_expansion_enabled", True),
         recall_expansion_recent_batches=_cfg_int(
             raw, "recall_expansion_recent_batches", 20

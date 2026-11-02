@@ -840,6 +840,35 @@ class SQLiteMemoryDatabase(MemoryBackend):
             rows = await conn.fetch(sql, *params)
         return _decode_rows(rows)
 
+    async def fetch_embeddings_by_ids(self, *, ids: list[int]) -> dict[int, object]:
+        """Fetch embeddings by primary key in one batch (lazy recall dedup,
+        perf P2).
+
+        The retrieval SELECT no longer ships the vector BLOB with every row;
+        near-duplicate dedup only consumes the truncated head rows, fetched
+        precisely here by id. Rows whose embedding is NULL do not appear in
+        the returned dict; callers treat them as missing vectors (excluded
+        from comparisons, never dropped).
+
+        Args:
+            ids: primary keys of the rows whose vectors are needed.
+
+        Returns:
+            {id: embedding} mapping (embedding decoded to a float list, the
+            same shape ``_decode_row`` produces for SELECTs).
+        """
+        clean = sorted({int(i) for i in ids if i is not None})
+        if not clean:
+            return {}
+        placeholders = ", ".join(f"${n}" for n in range(1, len(clean) + 1))
+        sql = (
+            f"SELECT id, embedding FROM {CHAT_SUMMARY_TABLE} "  # noqa: S608
+            f"WHERE id IN ({placeholders}) AND embedding IS NOT NULL"
+        )
+        async with self.pool.acquire() as conn:
+            rows = _decode_rows(await conn.fetch(sql, *clean))
+        return {row["id"]: row["embedding"] for row in rows}
+
     async def fetch_recent_summary_scores(
         self, *, query_vec: list[float], session_id: str, limit: int, platform: str = ""
     ) -> list[dict]:

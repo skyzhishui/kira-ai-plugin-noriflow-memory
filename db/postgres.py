@@ -500,12 +500,15 @@ class MemoryDatabase(MemoryBackend):
 
         Hybrid search (hybrid=True with non-empty query_text, plan A):
         - Vector leg: cosine order LIMIT limit (the original path);
-        - BM25 leg: same where + to_tsvector('simple', search_text) @@
-          to_tsquery('simple', OR-joined token query) (AND-joining a whole
-          sentence's bigrams would only match near-verbatim repeats), in
-          ts_rank order LIMIT limit; legacy rows with NULL search_text
-          simply skip the BM25 leg (no impact until the backfill pass fills
-          them);
+        - BM25 leg: same where + tsv @@ to_tsquery('simple', OR-joined token
+          query) (AND-joining a whole sentence's bigrams would only match
+          near-verbatim repeats), in ts_rank(tsv, ...) order LIMIT limit.
+          tsv is the stored generated column introduced by migration 015
+          (GENERATED ALWAYS AS to_tsvector('simple', search_text) STORED):
+          filtering and ranking both read the column, eliminating per-row
+          re-tokenization (13.5k rows measured: ~160ms -> ~30ms per leg).
+          Legacy rows with NULL search_text have a NULL tsv and simply skip
+          the BM25 leg (no impact until the backfill pass fills them);
         - The two legs fuse via RRF (score = Σ 1/(rrf_k + rank), merged and
           deduplicated by id); the fused score lands in the "rrf" field and
           rows return in its descending order. With rerank enabled the fused
@@ -777,9 +780,8 @@ class MemoryDatabase(MemoryBackend):
                 f"SELECT {select_cols} "
                 f"FROM {CHAT_SUMMARY_TABLE} "
                 f"WHERE embedding IS NOT NULL AND ({where}) "
-                f"AND to_tsvector('simple', search_text) @@ "
-                f"to_tsquery('simple', {q_ph}) "
-                f"ORDER BY ts_rank(to_tsvector('simple', search_text), "
+                f"AND tsv @@ to_tsquery('simple', {q_ph}) "
+                f"ORDER BY ts_rank(tsv, "
                 f"to_tsquery('simple', {q_ph})) DESC LIMIT {limit_ph}"
             )
             bm25_rows = [dict(r) for r in await conn.fetch(bm25_sql, *p.values)]
@@ -816,6 +818,38 @@ class MemoryDatabase(MemoryBackend):
                 *([platform] if platform else []),
             )
         return [dict(r) for r in rows]
+
+    async def fetch_embeddings_by_ids(self, *, ids: list[int]) -> dict[int, object]:
+        """Fetch embeddings by primary key in one batch (lazy recall dedup,
+        perf P2).
+
+        The retrieval SELECT no longer ships the vector text with every row
+        (with asyncpg's pgvector codec unregistered that is ~18KB of
+        '[...]' text per row; two legs x rerank_candidates is ~1.8MB of
+        transfer plus JSON parsing). Near-duplicate dedup only consumes the
+        vectors of the truncated head rows, so they are fetched precisely
+        here by id
+        (~1ms localhost RTT). Rows whose embedding is NULL do not appear in
+        the returned dict; callers treat them as missing vectors (excluded
+        from comparisons, never dropped).
+
+        Args:
+            ids: primary keys of the rows whose vectors are needed.
+
+        Returns:
+            {id: embedding} mapping (embedding is the underlying transport
+            form, str or list, normalized by parse_vector).
+        """
+        clean = sorted({int(i) for i in ids if i is not None})
+        if not clean:
+            return {}
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT id, embedding FROM {CHAT_SUMMARY_TABLE} "  # noqa: S608 -- whitelist constant table names
+                "WHERE id = ANY($1) AND embedding IS NOT NULL",
+                clean,
+            )
+        return {r["id"]: r["embedding"] for r in rows}
 
     async def fetch_recent_summary_scores(
         self, *, query_vec: list[float], session_id: str, limit: int, platform: str = ""

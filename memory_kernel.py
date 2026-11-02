@@ -1200,6 +1200,16 @@ class LocalMemoryKernel:
             # 用户的行占满时配额无法凭空补位（放大缓解，非保底）
             n_candidates = max(n_candidates, top_k * 4 * len(uids))
 
+        # Lazy embedding fetch (perf P2): when not per_user and the DB exposes
+        # fetch_embeddings_by_ids, the retrieval SELECT carries no embedding --
+        # dedup only consumes the vectors of the truncated head rows, fetched
+        # precisely by id after threshold filtering (avoiding transfer + JSON
+        # parsing of 2 x n_candidates rows x ~18KB of vector text). Older DB
+        # implementations/test stubs without this method keep the old behavior
+        # (rows ship their own embedding) for cross-version compatibility.
+        fetch_embeddings_by_id = getattr(self.db, "fetch_embeddings_by_ids", None)
+        lazy_embeddings = not is_per_user and fetch_embeddings_by_id is not None
+
         # 单池检索（per_user 同路——完整管线过滤/扩选/排除/混合在此生效，
         # 配额只在截断阶段引入；with_participants 供归属判定）
         rows = await self._guarded_call(
@@ -1223,7 +1233,10 @@ class LocalMemoryKernel:
                 hybrid=self.config.hybrid_search_enabled,
                 rrf_k=self.config.hybrid_rrf_k,
                 exclude_document_ids=self._rollout_excluded_ids(session_id),
-                with_embedding=self.config.dedup_similarity_threshold > 0,
+                with_embedding=(
+                    self.config.dedup_similarity_threshold > 0
+                    and not lazy_embeddings
+                ),
                 with_participants=is_per_user,
             ),
             description="recall 检索",
@@ -1305,6 +1318,32 @@ class LocalMemoryKernel:
         # 双视角摘要）保留其一即可。
         dedup_dropped = 0
         sim_threshold = self.config.dedup_similarity_threshold
+        # Lazy embedding injection: attach embeddings to the truncated head
+        # rows for dedup comparison (P2). Scan window = top_k*4 (at least 16,
+        # covering consecutive near-duplicate runs); rows outside the window
+        # fetch no vector and follow the existing "missing vector" semantics
+        # (not compared, never dropped). Fetch failures fail open and do not
+        # block recall.
+        if lazy_embeddings and sim_threshold > 0 and rows:
+            scan_bound = min(len(rows), max(top_k * 4, 16))
+            head_ids = [
+                r["id"] for r in rows[:scan_bound] if r.get("id") is not None
+            ]
+            if head_ids:
+                try:
+                    embed_by_id = await fetch_embeddings_by_id(ids=head_ids)
+                except Exception:
+                    logger.warning(
+                        "去重向量惰性取回失败（本轮头部行不参与去重比对）",
+                        exc_info=True,
+                    )
+                    embed_by_id = {}
+                for row in rows[:scan_bound]:
+                    embedding = (
+                        embed_by_id.get(row.get("id")) if embed_by_id else None
+                    )
+                    if embedding is not None:
+                        row["embedding"] = embedding
         keep_bound = len(rows) if is_per_user else top_k
         if sim_threshold > 0 and rows:
             kept_rows: list[dict] = []

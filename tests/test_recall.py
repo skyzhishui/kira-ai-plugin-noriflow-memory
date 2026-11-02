@@ -968,7 +968,11 @@ async def test_hybrid_two_legs_rrf_fusion() -> None:
     assert len(pool.conn.queries) == 2, "须发出向量+BM25 两路查询"
     vec_sql, bm25_sql = pool.conn.queries[0][0], pool.conn.queries[1][0]
     assert "ORDER BY embedding <=> $1::vector" in vec_sql
-    assert "to_tsvector('simple', search_text)" in bm25_sql
+    assert "tsv @@ to_tsquery('simple', $" in bm25_sql
+    assert "ORDER BY ts_rank(tsv, " in bm25_sql
+    assert "to_tsvector('simple', search_text)" not in bm25_sql, (
+        "migration 015 materializes tsv; the BM25 leg must read the column"
+    )
     assert "to_tsquery('simple', $" in bm25_sql, "OR 连接用 to_tsquery"
     assert "plainto_tsquery" not in bm25_sql, "AND 语义（plainto）须废弃"
     for sql_i, params_i in pool.conn.queries:
