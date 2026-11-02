@@ -1,6 +1,31 @@
 # Changelog
 
-## Unreleased
+## v1.18.1 (2026-11-02)
+
+### perf(recall): BM25 物化 tsv 生成列 + 去重向量按 id 惰性取回
+
+- **BM25 物化（P1）**：新增 `migrations/015_bm25_materialize.sql`（仅 PostgreSQL，
+  编号跳过 014 预留 nori-core 侧 `014_cross_session_time_index` 移植位）——
+  `memory_chat_summary` 增加 stored 生成列 `tsv = to_tsvector('simple', search_text)`
+  （to_tsvector(regconfig, text) 为 immutable，PG12+ 可用于生成列），BM25 腿的
+  过滤与 `ts_rank` 排序均改读该列，表达式 GIN 索引 `idx_mcs_fts` 退役、由
+  `GIN(tsv)`（`idx_mcs_tsv`）接管。实测 13,515 行语料：BM25 腿 ~160ms → ~30ms
+  （原 ORDER BY `ts_rank(to_tsvector(...))` 对每条命中行重复分词 ~400 字正文，
+  高选择率下 planner 弃 GIN 走 Parallel Seq Scan；拆分测量 GIN 过滤单独 24ms、
+  预截断 token 后 2.4ms——~135ms 为重复分词）。回滚兼容：旧代码（表达式形态）
+  在无 `idx_mcs_fts` 时退化为 Seq Scan，变慢但结果正确；SQLite 路径不涉及；
+- **去重向量惰性取回（P2）**：召回检索 SELECT 不再随行携带向量（asyncpg 未注册
+  pgvector codec 时每行 ~18KB `'[...]'` 文本，两路 × rerank_candidates 约 1.8MB
+  传输 + JSON 解析）——近重复去重只消费截断头部行的向量，改为阈值过滤后按主键
+  批量取回：PG/SQLite 双后端新增 `fetch_embeddings_by_ids`（PG 走
+  `id = ANY($1)` 精确批量，SQLite 走 `IN` 占位符批查，均跳过 NULL embedding 行）。
+  `memory_kernel` 侧扫描窗 = `top_k * 4`（至少 16 行，覆盖连续近重复段），窗外行
+  取不到向量、沿用既有"缺向量不比对、永不误删"语义；取回失败 fail-open（告警 +
+  本轮头部行不参与去重比对，不阻断召回）。旧版 DB 实现/测试桩无该方法时自动保持
+  旧行为（检索行自带向量），跨版本兼容；
+- **`rerank_candidates` 缺省 50→20**：`config.py` 模型缺省、`main.py` 宿主配置
+  兜底、`schema.json` 维护页展示与 README 配置表四处口径一致。已显式配置该键的
+  部署不受影响（宿主配置优先于模型缺省），仅新装/缺键部署生效。
 
 ### feat(config): 画像评分缺省值对齐长周期陪伴场景（promote 10→6 / demote 3→2 / decay 0.8→0.9）
 
