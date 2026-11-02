@@ -310,8 +310,13 @@ class ForceGraph {
     const ns = this.nodes, es = this.edges;
     const a = this._alpha;
     const REP = 5200, SPR = 0.03, L = 132, FRICTION = 0.86, GRAV = 0.05;
-    for (let i = 0; i < ns.length; i++) {
-      for (let j = i + 1; j < ns.length; j++) {
+    // Repulsion is O(n²); with big graphs (e.g. hundreds of disjoint edges)
+    // the pair loop alone can freeze the tab. Above the node threshold the
+    // loop strides so ~the same pair budget is spent per tick (skipped nodes
+    // still get spring + centering forces, layout stays readable).
+    const stride = ns.length > 160 ? Math.ceil(ns.length / 160) : 1;
+    for (let i = 0; i < ns.length; i += stride) {
+      for (let j = i + stride; j < ns.length; j += stride) {
         let dx = ns[j].x - ns[i].x, dy = ns[j].y - ns[i].y;
         let d2 = dx * dx + dy * dy;
         if (d2 < 1) { dx = Math.random() + 0.1; dy = Math.random() + 0.1; d2 = dx * dx + dy * dy; }
@@ -710,9 +715,16 @@ const Page = {
         class: "btn",
         onclick: async () => {
           try {
+            // Empty or non-numeric score means "leave unchanged": an empty
+            // string must not become Number("") === 0, which would silently
+            // reset the score and demote the cluster out of the profile.
+            const body = { canonical_statement: stmt.value, status: status.value };
+            const rawScore = score.value.trim();
+            const parsedScore = Number(rawScore);
+            if (rawScore !== "" && !Number.isNaN(parsedScore)) body.score = parsedScore;
             await UI.api(`/clusters/${c.id}`, {
               method: "PUT",
-              body: JSON.stringify({ canonical_statement: stmt.value, score: Number(score.value), status: status.value }),
+              body: JSON.stringify(body),
             });
             UI.toast("簇已修正", "ok");
             refresh();
@@ -1410,6 +1422,9 @@ const Page = {
     const d = await UI.api("/config");
     const schema = d.schema;
     const controls = {}; // field -> input 节点
+    // Initial (masked) value per field: the "user touched it" baseline used to
+    // omit untouched secrets from the save payload.
+    const initialValues = {};
 
     const buildControl = (name) => {
       const f = schema[name], v = d.values[name];
@@ -1437,6 +1452,7 @@ const Page = {
       const f = schema[name];
       const ctl = buildControl(name);
       controls[name] = ctl;
+      initialValues[name] = ctl.value;
       return this.el("div", { class: "cfg-field" + (f.type === "list" || f.type === "str" ? " wide" : "") }, [
         this.el("label", {}, [
           this.el("span", { class: "mono" }, [name]),
@@ -1485,6 +1501,12 @@ const Page = {
           out[name] = n;
         }
         else if (t === "list") out[name] = ctl.value.split("\n").map((s) => s.trim()).filter(Boolean);
+        else if (schema[name].sensitive && ctl.value === initialValues[name]) {
+          // Untouched secret (still showing the mask sentinel) is not sent
+          // back; the backend then keeps the stored value, so the mask can
+          // never overwrite the real secret.
+          continue;
+        }
         else out[name] = ctl.value;
       }
       return out;
