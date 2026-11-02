@@ -543,6 +543,7 @@ const Page = {
         stat(d.clusters_pending, "待定簇"),
         stat(d.profile_rows, "画像投影行"),
       ]),
+      d.summaries_unsummarized ? this.el("p", { class: "muted" }, [`${d.summaries_unsummarized} 条原文待补编码（暂不参与召回）`]) : null,
       d.summaries_no_vec ? this.el("p", { class: "muted" }, [`${d.summaries_no_vec} 条摘要向量待补算`]) : null,
     ]));
     if (d.kv && d.kv.length) {
@@ -1186,7 +1187,15 @@ const Page = {
           this.el("td", {}, [UI.badge(s.kind, s.kind === "bot_self" ? "pink" : "sky")]),
           this.el("td", { class: "wrap", style: "max-width:520px" }, [s.content]),
           this.el("td", {}, [UI.fmtTime(s.occurred_at)]),
-          this.el("td", {}, [s.has_embedding ? UI.badge("已向量化", "ok") : UI.badge("待补算", "warn")]),
+          // Priority: un-encoded rows first ("awaiting encode", not in
+          // recall yet), then vector state -- restored from the old page
+          // (a raw row shown as "awaiting vector" misleads recall-gap
+          // debugging into looking at the wrong pipeline stage).
+          this.el("td", {}, [
+            s.unsummarized
+              ? UI.badge("待补编码", "warn")
+              : (s.has_embedding ? UI.badge("已向量化", "ok") : UI.badge("待补算", "warn")),
+          ]),
           this.el("td", { style: "white-space:nowrap" }, [
             this.el("button", { class: "btn small ghost", onclick: () => this.editSummary(s, refresh) }, [UI.svg("EditPen")]),
             " ",
