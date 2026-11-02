@@ -1020,13 +1020,15 @@ class _NoTsvConn:
 
     async def fetch(self, sql, *params):
         self.queries.append((sql, params))
-        if "embedding <=> " in sql:
-            return self._vec_results.pop(0) if self._vec_results else []
-        if "tsv @@" in sql:
-            raise asyncpg.UndefinedColumnError('column "tsv" does not exist')
+        # Route by FTS shape: both legs' SELECT list carries the cosine
+        # distance expression ("embedding <=>"), so the leg can only be told
+        # apart by its FTS clauses. The legacy form is checked first (it also
+        # contains "@@ to_tsquery", but never "tsv @@" / "ts_rank(tsv").
         if "to_tsvector('simple', search_text) @@" in sql:
             return self._legacy_results.pop(0) if self._legacy_results else []
-        return []
+        if "@@ to_tsquery" in sql:
+            raise asyncpg.UndefinedColumnError('column "tsv" does not exist')
+        return self._vec_results.pop(0) if self._vec_results else []
 
 
 async def test_bm25_tsv_missing_falls_back_and_latches() -> None:
@@ -1559,6 +1561,7 @@ async def main() -> None:
     await test_insert_writes_search_text()
     await test_update_encoded_rewrites_search_text()
     await test_hybrid_two_legs_rrf_fusion()
+    await test_bm25_tsv_missing_falls_back_and_latches()
     await test_hybrid_disabled_single_leg()
     await test_exclude_document_ids_clause()
     await test_hybrid_fallback_threshold_scale_guard()

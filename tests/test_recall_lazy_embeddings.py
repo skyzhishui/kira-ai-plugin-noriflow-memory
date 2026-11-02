@@ -5,6 +5,9 @@ migration guard.
   SELECT carries no embedding (with_embedding=False) and the dedup rows get
   their vectors attached by precise id fetches, paged as the dedup loop
   consumes them (head chunk up front, further chunks on demand);
+- Paging failure: the first failed chunk stops further fetches for the
+  round (at most one breaker failure per round); un-fetched rows keep
+  missing-vector semantics;
 - Compatibility path: a DB without that method keeps the old behavior
   (with_embedding follows the dedup switch);
 - Migration 015 guard: tsv generated column + GIN(tsv) + expression index
@@ -85,11 +88,15 @@ class _LazyCaptureDB:
 
 
 class _FakeBreaker(MemoryDBCircuitBreaker):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.record_failure_calls = 0
+
     async def is_available(self) -> bool:  # noqa: D102
         return True
 
     async def record_failure(self) -> None:  # noqa: D102
-        pass
+        self.record_failure_calls += 1
 
     async def record_success(self) -> None:  # noqa: D102
         pass
@@ -179,6 +186,46 @@ async def test_lazy_path_pages_fetch_on_long_duplicate_run() -> None:
     print("PASS test_lazy_path_pages_fetch_on_long_duplicate_run")
 
 
+async def test_lazy_paging_stops_after_first_failure() -> None:
+    """A failing paged chunk stops further fetches for the round: the dedup
+    loop cannot accumulate multiple breaker failures within one round
+    (which would trip the shared breaker and silence the whole recall on
+    the next round), and un-fetched rows keep missing-vector semantics."""
+    rows = [
+        _row(f"r{i}", 0.9 if i == 0 else 0.8, _NOW - timedelta(days=10, minutes=i))
+        for i in range(20)
+    ]
+    dup_vec = _vec_str([1.0, 0.0, 0.0])
+    embed_by_id = {r["id"]: dup_vec for r in rows}
+    db = _LazyCaptureDB(rows=rows, embed_by_id=embed_by_id)
+
+    real_fetch = db.fetch_embeddings_by_ids
+
+    async def flaky_fetch(*, ids):
+        if db.fetch_calls:  # fail from the second call onward
+            db.fetch_calls.append(list(ids))
+            raise RuntimeError("stub fetch failure on paged chunk")
+        return await real_fetch(ids=ids)
+
+    db.fetch_embeddings_by_ids = flaky_fetch  # type: ignore[method-assign]
+    kernel = _make_kernel(db)
+    items = await kernel.search(query="猫", session_id="s1", top_k=2)
+    # chunk = max(top_k*4, 16) = 16: chunk 1 (rows[:16]) fetched OK; chunk 2
+    # (rows[16:20]) failed once and paging stopped for the round -- no third
+    # attempt
+    assert len(db.fetch_calls) == 2, "首块成功 + 续取失败一次即止损"
+    assert db.fetch_calls[0] == [r["id"] for r in rows[:16]], "首块为头部 16 行"
+    assert db.fetch_calls[1] == [r["id"] for r in rows[16:20]], "续取覆盖到池尾"
+    assert kernel.circuit_breaker.record_failure_calls == 1, (
+        "one round counts at most one fetch failure toward the breaker"
+    )
+    # r1..r15 dropped as near-duplicates of r0 via the head chunk; r16..r19
+    # have no vector (chunk 2 failed, paging latched) -> r16 kept via
+    # missing-vector semantics, loop early-stops once top_k is filled
+    assert [i.id for i in items] == ["r0", "r16"]
+    print("PASS test_lazy_paging_stops_after_first_failure")
+
+
 async def test_lazy_path_fetch_failure_fail_open() -> None:
     """Fetch failure fails open: dedup degrades to missing-vector semantics
     and recall is not blocked."""
@@ -249,6 +296,7 @@ def test_migration_015_materializes_tsv() -> None:
 async def main() -> None:
     await test_lazy_path_requests_no_embedding_and_dedup_works()
     await test_lazy_path_pages_fetch_on_long_duplicate_run()
+    await test_lazy_paging_stops_after_first_failure()
     await test_lazy_path_fetch_failure_fail_open()
     await test_lazy_path_missing_vector_keeps_row()
     await test_legacy_db_keeps_old_behavior()
