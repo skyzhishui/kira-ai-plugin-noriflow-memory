@@ -630,6 +630,7 @@ class TestHysteresisBandValidation(unittest.TestCase):
             score_cap=1.5, promote_threshold=1.5, demote_threshold=0.5,
             score_start_high=1, score_start_medium=1,
             recent_promote_threshold=1.0,
+            naming_promote_threshold=1.0,
         )
         self.assertEqual(cfg.promote_threshold, 1.5)
 
@@ -666,6 +667,18 @@ class TestHysteresisBandValidation(unittest.TestCase):
     def test_16_recent_promote_above_cap_is_rejected(self):
         with self.assertRaises(Exception):
             self.LocalMemoryConfig(score_cap=3.5)  # recent 缺省 4.0 > 3.5
+
+    def test_16b_naming_promote_above_cap_is_rejected(self):
+        # naming 维度同口径（v1.18.2）：阈值 > 封顶 = 称呼偏好静默进不了画像
+        with self.assertRaises(Exception) as ctx:
+            self.LocalMemoryConfig(score_cap=2.5)  # naming 缺省 3.0 > 2.5
+        self.assertIn("不得大于 score_cap", str(ctx.exception))
+        # ≤ score_start_high 是单次晋档承诺的生效前提而非合法性约束：
+        # 高于它（但 ≤ cap）是合法的保守配置（退化为二次证据累积），不拒
+        cfg = self.LocalMemoryConfig(
+            score_cap=10.0, score_start_high=3.0, naming_promote_threshold=5.0
+        )
+        self.assertEqual(cfg.naming_promote_threshold, 5.0)
 
     def test_17_promote_equal_to_cap_is_accepted(self):
         # 相等允许：分数经 min(cap, ...) 可达封顶（旧缺省 promote=10==cap=10 形态）
@@ -4594,6 +4607,7 @@ class TestConfigConstraints(unittest.TestCase):
             score_cap=1.5, promote_threshold=1.5, demote_threshold=0.5,
             score_start_high=1, score_start_medium=1,
             recent_promote_threshold=1.0,
+            naming_promote_threshold=1.0,
             failure_threshold=1, embedding_dims=1024,
         )
         self.assertEqual(cfg.score_cap, 1.5)

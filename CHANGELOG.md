@@ -47,7 +47,14 @@
   提取且最高 medium（b 档，bot 行仅作语境）；自称/对 bot 的叫法/纯关系
   身份称谓（"主人""爸爸"类）/推断一律不提取；模板缺失自动降级跳过并告警；
 - 维度阈值经 `apply_fact_merge` / `promote_pass` 全链路下渗（主动写入、
-  合并处置、晋档遍三处调用点），PG 与 SQLite 行为逐字对齐。
+  合并处置、晋档遍三处调用点），PG 与 SQLite 行为逐字对齐；`naming_promote_threshold`
+  纳入 `_promote_thresholds_within_cap` 装配期校验与 `CROSS_FIELD_VALIDATED_KEYS`
+  （> `score_cap` 即拒——单次晋档与晋档遍两路都够不到阈值，称呼偏好会静默
+  进不了画像）；`≤ score_start_high` 是单次晋档承诺的生效前提而非合法性约束
+  （高于它属合法保守配置，退化为二次证据累积），不硬拒。**升级注记**：评分
+  刻度整体缩放过（`score_cap < 3.0`）的既有部署须同步显式设置
+  `naming_promote_threshold`（随刻度缩放），否则装配期按既有级联回退机制
+  将评分组复位为缺省并告警；
 
 ### fix(encoder): 编码摘要半句截断防护（同步 nori #26）
 

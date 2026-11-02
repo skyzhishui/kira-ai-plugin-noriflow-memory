@@ -567,6 +567,11 @@ const Page = {
       relation_audit_fail_count: { label: "审计连续失败计数", kind: "audit-fails" },
       relation_audit_fail_mark: { label: "审计跳批标记", kind: "raw" },
       alias_sync_watermark: { label: "别名同步水位", kind: "alias-watermark" },
+      // Restored from the old page: these markers are still written by the
+      // backend-migration / kira-memory import paths.
+      _backend_migration_done: { label: "后端数据迁移", kind: "migration" },
+      kira_memory_import_last_run: { label: "Kira 记忆数据迁入", kind: "kira_memory" },
+      kira_memory_host_import_last_run: { label: "Kira 宿主库迁入", kind: "kira_memory" },
     })[key];
   },
 
@@ -619,6 +624,27 @@ const Page = {
       if (n > 0) tone = "warn";
       val.append(UI.badge(n > 0 ? "注意" : "正常", n > 0 ? "warn" : "ok"),
         n > 0 ? "连续失败 " + n + " / 3（满 3 跳批）" : "无连续失败");
+    } else if (meta.kind === "migration") {
+      // Restored from the old page (backend data migration marker).
+      let m; try { m = JSON.parse(raw); } catch (e) { m = null; }
+      if (m && m.migrated_at) {
+        const total = m.copied && typeof m.copied === "object"
+          ? Object.values(m.copied).reduce((a, b) => a + (Number(b) || 0), 0) : null;
+        val.append(UI.badge("已完成", "ok"),
+          "已从 " + (m.source || "?") + " 迁入" + (total != null ? " " + total + " 行" : "")
+          + "（" + UI.fmtTime(m.migrated_at) + "）");
+      } else { tone = "warn"; val.append(UI.badge("注意", "warn"), "值无法解析：" + raw); }
+    } else if (meta.kind === "kira_memory") {
+      // Restored from the old page (kira-memory import last-run markers).
+      let m; try { m = JSON.parse(raw); } catch (e) { m = null; }
+      if (m && m.finished_at) {
+        const parts = [];
+        if (m.summary_rows != null) parts.push("摘要 +" + m.summary_rows);
+        if (m.fact_rows != null) parts.push("事实 +" + m.fact_rows);
+        if (m.aliases_upserted != null) parts.push("别名 +" + m.aliases_upserted);
+        val.append(UI.badge("已完成", "ok"),
+          (parts.length ? parts.join(" / ") : "完成") + "（" + UI.fmtTime(m.finished_at) + "）");
+      } else { tone = "warn"; val.append(UI.badge("注意", "warn"), "值无法解析：" + raw); }
     } else {
       val.append(raw.length > 80 ? raw.slice(0, 80) + "…" : raw);
     }
