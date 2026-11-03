@@ -811,8 +811,9 @@ async def main_async() -> None:
         promote_threshold=9.0, recent_promote_threshold=4.0,
         occurred_at=now,
     )
-    # start_score(9.0) 已达维度阈值(9.0)：建簇即时晋档并同事务写画像行
-    # （v1.18.2 移植 nori 96214f4），晋档遍不再有事可做
+    # start_score (9.0) already meets the dimension threshold (9.0): promote
+    # at cluster creation with the profile row in the same transaction (port
+    # of nori 96214f4 in v1.18.2), so the promotion pass has nothing to do
     check(
         "regress_promote_create",
         out["action"] == "create" and out["status"] == "profiled",
