@@ -1361,6 +1361,12 @@ class LocalMemoryKernel:
         # counter), and the un-fetched rows keep missing-vector semantics.
         dedup_fetch_dead = False
         if lazy_embeddings and sim_threshold > 0 and rows:
+            # A failed FIRST chunk cannot trigger paging in any reachable
+            # state: the lazy path only runs on the non-per-user branch
+            # (keep_bound = top_k < dedup_chunk) and vector-less rows are
+            # always kept, so kept_rows reaches top_k before idx crosses
+            # the chunk boundary. The latch below therefore only ever
+            # engages for genuine mid-pool paging failures.
             await self._load_dedup_vectors(
                 rows, 0, dedup_chunk, fetch_embeddings_by_id
             )
@@ -2135,10 +2141,13 @@ class LocalMemoryKernel:
     def refresh_cross_session_memo(self, session_id: str, document_ids: list[str]) -> None:
         """Replace this round's cross-session injected ids; empty clears.
 
-        Synchronous (no await): the injection hook calls it twice per round
-        -- entry (clear) and after assembling (register the ids actually
-        rendered, budget-dropped rows stay retrievable). Mirrors the rollout
-        memo TTL/capacity semantics.
+        Synchronous (no await). The injection hook calls it unconditionally
+        at entry (clear -- so no early return can leave stale exclusions)
+        and again after a *successful* injection (register only the ids
+        actually rendered; budget-dropped rows stay retrievable). With the
+        feature disabled the register call never fires -- the clear at entry
+        is the only per-round call. Mirrors the rollout memo TTL/capacity
+        semantics.
         """
         if not session_id or not document_ids:
             self._cross_session_memo.pop(session_id, None)

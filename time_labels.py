@@ -76,6 +76,28 @@ def relative_time_part(days: int) -> str:
     return f"约{max(days // 365, 1)}年前"
 
 
+def relative_time_precise(occurred_at: datetime | None, now: datetime) -> str:
+    """Fine-grained relative label (N seconds/minutes/hours/days ago) for
+    near-horizon events (day-granularity relative_time_part is too coarse
+    there); None or future timestamps return an empty string."""
+    if occurred_at is None:
+        return ""
+    delta = (now - occurred_at).total_seconds()
+    if delta < 0:
+        return ""
+    seconds = int(delta)
+    if seconds < 60:
+        return f"{seconds}秒前"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}分前" if seconds == 0 else f"{minutes}分{seconds}秒前"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}小时前" if minutes == 0 else f"{hours}小时{minutes}分前"
+    days, hours = divmod(hours, 24)
+    return f"{days}天前" if hours == 0 else f"{days}天{hours}小时前"
+
+
 def absolute_time_part(local: datetime, days: int, now_local: datetime) -> str:
     """Absolute time anchor (layered precision): within 7 days include time, older only the date, cross-year includes the year."""
     # 年份前缀先算：days<7 的近事分支也可能跨年（元旦回溯上月），

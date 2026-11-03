@@ -243,13 +243,46 @@ def test_build_cross_session_block_budget() -> None:
     )
     assert tiny_block == "" and tiny_ids == []
 
-    # 首条截断后正文残留过短 -> 整条放弃（不注入不登记）
-    short_block, short_ids = plugin_main.build_cross_session_block(
-        [row_new], now=_NOW, tz=timezone.utc, budget=260,
+    # 预算按条目实际结构动态构造，钉死装配器的两个截断分支（评审 B1：
+    # 原硬编码 260 与 120 走同一 room<=0 分支，截断分支零覆盖）
+    preamble = plugin_main._CROSS_SESSION_PREAMBLE
+    used = len(preamble) + 2
+    entry = plugin_main._format_cross_session_entry(
+        row_new, now=_NOW, tz=timezone.utc, limit=1500
     )
-    assert short_block == "" and short_ids == [], (
+    numbered = f"1. {entry}"
+    pos = numbered.find(plugin_main._CROSS_SESSION_CONTENT_MARKER)
+
+    # 分支一（room > 0 且正文残留 < 10）：截断后整条放弃（不注入不登记）
+    room_abandon = pos  # 截断点落在内容标记之前 -> 残留恒 < 10
+    b1, i1 = plugin_main.build_cross_session_block(
+        [row_new], now=_NOW, tz=timezone.utc,
+        budget=used + plugin_main._CROSS_SESSION_TRUNCATE_SUFFIX_LEN + room_abandon,
+    )
+    assert b1 == "" and i1 == [], (
         "截断至元数据-only 的条目必须放弃（防注入+登记造成召回盲区）"
     )
+
+    # 分支二（room > 0 且正文残留 >= 10）：截断注入并登记
+    room_keep = pos + len(plugin_main._CROSS_SESSION_CONTENT_MARKER) + 12
+    b2, i2 = plugin_main.build_cross_session_block(
+        [row_new], now=_NOW, tz=timezone.utc,
+        budget=used + plugin_main._CROSS_SESSION_TRUNCATE_SUFFIX_LEN + room_keep,
+    )
+    assert b2 != "" and i2 == ["d1"], "截断但仍保留正文切片的条目应注入并登记"
+    assert b2.rstrip().endswith("..."), "截断注入的条目应以省略号收尾"
+
+    # 中间态 memo 契约：预算只容得下首条 -> 次条预算裁剪不登记（保持可检索）
+    entry_old = plugin_main._format_cross_session_entry(
+        row_old, now=_NOW, tz=timezone.utc, limit=1500
+    )
+    numbered_old = f"2. {entry_old}"
+    b3, i3 = plugin_main.build_cross_session_block(
+        [row_new, row_old], now=_NOW, tz=timezone.utc,
+        budget=used + len(numbered) + 2 + len(numbered_old) - 5,
+    )
+    assert i3 == ["d1"], "预算裁剪的次条不得登记 memo"
+    assert "摘要内容：用户在另一" in b3 and "摘要内容：更早" not in b3
 
     # 空内容行跳过
     empty = dict(row_new, content="   ")
@@ -352,7 +385,6 @@ async def test_naming_create_immediate_promotion_sqlite() -> None:
                 naming_promote_threshold=3.0,
             )
             assert promoted == 1, "active naming 簇达 3.0 应经 naming 臂晋档"
-            await db.close()
         finally:
             await db.close()
     print("PASS test_naming_create_immediate_promotion_sqlite")

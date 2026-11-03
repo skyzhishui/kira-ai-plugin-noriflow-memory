@@ -700,6 +700,22 @@ class TestHysteresisBandValidation(unittest.TestCase):
         self.assertEqual(scaled.naming_promote_threshold, 1.0)
         self.assertEqual(scaled.score_cap, 1.5)
 
+    def test_16d_naming_derive_rejects_zero_start_high(self):
+        # score_start_high=0 is field-legal (ge=0) but cannot derive a
+        # positive naming threshold: a derived 0 would bypass gt=0 and
+        # promote every naming extraction at cluster creation (review D4).
+        with self.assertRaises(Exception) as ctx:
+            self.LocalMemoryConfig(
+                score_start_high=0, score_start_medium=1, demote_threshold=0.5
+            )
+        self.assertIn("naming_promote_threshold", str(ctx.exception))
+        # Explicit naming stays the escape hatch for that (degenerate) scale
+        cfg = self.LocalMemoryConfig(
+            score_start_high=0, score_start_medium=1, demote_threshold=0.5,
+            naming_promote_threshold=1.0,
+        )
+        self.assertEqual(cfg.naming_promote_threshold, 1.0)
+
     def test_17_promote_equal_to_cap_is_accepted(self):
         # 相等允许：分数经 min(cap, ...) 可达封顶（旧缺省 promote=10==cap=10 形态）
         cfg = self.LocalMemoryConfig(score_cap=6.0)  # promote 缺省 6.0 == cap

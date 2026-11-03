@@ -83,10 +83,10 @@ def _looks_truncated(summary: str) -> bool:
     """摘要是否疑似被上游提前终止（半句截断）。
 
     判定口径（见上方模块注释，反向白名单）：
-    - 多行摘要（首行【话题】锚点 + 分节正文）：末字为汉字/逗号族/开括号
-      → 判截断；
+    - 逗号族/开括号收尾的检查先于行数分支，对单行与多行**同时**生效；
+    - 多行摘要（首行【话题】锚点 + 分节正文）：末字为汉字 → 判截断；
     - 单行摘要：提示词规定的纯锚点形态「【话题】XXX」合法，仅当末字为
-      逗号族、或锚点为空（连话题都没写出）时判截断。
+      逗号族/开括号族、或锚点为空（连话题都没写出）时判截断。
 
     已知残余（有意取舍）：截断恰落在首行锚点中间的单行结果与合法纯锚点
     形态文本上不可区分，按设计放行——nori 生产 12495 行中锚点中途截断
@@ -268,7 +268,9 @@ class MemoryEncoder:
         return (conversation_text, [], [], False) with a warning logged, and
         the caller takes the single-channel old behavior (raw text written
         to the summary table marked summarized=false, not participating in
-        recall). encoded_ok=False lets the caller distinguish "encoded
+        recall). A summary that still looks half-sentence-truncated after
+        one retry follows the same degrade path (truncation guard, nori #26).
+        encoded_ok=False lets the caller distinguish "encoded
         product" from "degraded raw text": degraded-raw rows get re-encoded
         by the merge agent's backfill pass after the LLM recovers (relations
         are lost alongside facts and restored on backfill).

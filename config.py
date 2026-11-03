@@ -512,17 +512,33 @@ class LocalMemoryConfig(BaseModel):
 
     @model_validator(mode="after")
     def _resolve_naming_threshold_default(self) -> "LocalMemoryConfig":
-        """naming 阈值缺省派生：None -> score_start_high。
+        """Derive the naming threshold default: None -> score_start_high.
 
-        派生缺省让「本人明确表态（high 证据，起步分 = score_start_high）
-        单次晋档」承诺在任何评分刻度下按构造成立，也避免升级级联：缩放
-        刻度的既有部署（score_start_high 已随刻度缩放）不设新键时派生值
-        天然合法，不会触发跨字段回退把合法的显式评分键连坐复位。显式
-        设置时按本值生效（含高于 score_start_high 的保守形态）。校验器
-        定义顺序在本文件先于 _promote_thresholds_within_cap，保证 cap
-        上界校验读到的是解析后的值。
+        A derived default keeps the promise "one explicit naming statement
+        (high evidence, start score = score_start_high) promotes in a single
+        step" true by construction at any score scale, and avoids the
+        upgrade cascade: scaled legacy deployments (score_start_high already
+        scaled) stay valid without setting the new key, so no cross-field
+        fallback wipes their legal explicit scoring keys. Explicit values
+        win as-is (including conservative forms above score_start_high).
+        Defined before _promote_thresholds_within_cap so the cap check sees
+        the resolved value.
+
+        Derivation lower bound (review D4): score_start_high <= 0 is a legal
+        field value (ge=0), but deriving 0 would bypass this field's gt=0 --
+        every naming extraction (0-score starts included) would promote into
+        the profile at cluster creation. Reject and demand an explicit
+        naming threshold; the self-reported key fallback (both keys reset:
+        3.0 / None -> derived 3.0) always converges.
         """
         if self.naming_promote_threshold is None:
+            if self.score_start_high <= 0:
+                raise CrossFieldConfigError(
+                    f"score_start_high ({self.score_start_high}) <= 0 时无法派生"
+                    " naming_promote_threshold（派生值 0 会绕过 gt=0，任何 naming"
+                    " 提取建簇即晋档入画像）——请显式设置 naming_promote_threshold",
+                    ("naming_promote_threshold", "score_start_high"),
+                )
             self.naming_promote_threshold = float(self.score_start_high)
         return self
 

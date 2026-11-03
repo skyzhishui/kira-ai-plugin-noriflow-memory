@@ -485,6 +485,14 @@ class MemoryBackend(ABC):
         """Latest N session-summary batches that rolled out of the host window (rolling restore)."""
 
     @abstractmethod
+    async def fetch_recent_cross_session_summaries(self, **kwargs) -> list[dict]:
+        """Recent encoded summaries of the user's other sessions (cross-session injection source)."""
+
+    @abstractmethod
+    async def fetch_embeddings_by_ids(self, **kwargs) -> dict[int, object]:
+        """Fetch embeddings by primary key in one batch (lazy recall dedup)."""
+
+    @abstractmethod
     async def fetch_pending_facts(self, limit: int) -> list[dict]:
         """Fetch a batch of unprocessed raw facts (merge-agent normalization pass)."""
 

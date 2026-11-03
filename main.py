@@ -79,7 +79,8 @@ from .circuit_breaker import MemoryDBCircuitBreaker
 from .clients import FastLlmExit, KiraEmbeddingClient, KiraRerankClient
 from .config import CROSS_FIELD_VALIDATED_KEYS, LocalMemoryConfig
 from .contracts import PersonaCandidate
-from .db import MemoryDatabase, SQLiteMemoryDatabase, resolve_backend_name
+from .db import MemoryDatabase, SQLiteMemoryDatabase, resolve_backend_name, sqlite_parse_ts
+from .time_labels import relative_time_precise
 from .entity_edge import relation_statement_line
 from .envelope import (
     HISTORY_BATCH_SEPARATOR,
@@ -152,7 +153,6 @@ _MEMORY_TOOLS_GUIDANCE = (
 # 裁剪/空内容丢弃的行保持可检索，否则本轮既看不到又召不回）
 # ---------------------------------------------------------------------------
 _CROSS_SESSION_SECTION_TITLE = "# 该用户在其他会话的近期摘要（非本会话内容，仅供参考）"
-_CROSS_SESSION_UNNAMED_SESSION = "（未命名会话）"
 _CROSS_SESSION_PREAMBLE_LINES = [
     _CROSS_SESSION_SECTION_TITLE,
     "以下是当前用户在其他会话中的近期对话摘要，仅用于补充背景，不属于当前消息记录。",
@@ -165,50 +165,16 @@ _CROSS_SESSION_PREAMBLE_LINES = [
 ]
 _CROSS_SESSION_PREAMBLE = "\n".join(_CROSS_SESSION_PREAMBLE_LINES)
 _CROSS_SESSION_CONTENT_MARKER = "摘要内容："
+# Minimum chars that must remain after the content marker for a truncated
+# first entry to stay injectable. NOTE: the residual count includes the
+# 3-char "..." suffix, so the real-content floor on the truncation path
+# is MIN - 3 = 7 chars.
 _CROSS_SESSION_MIN_CONTENT_CHARS = 10
 _CROSS_SESSION_TRUNCATE_SUFFIX_LEN = 3
 
 
-
-
-def _cross_session_parse_ts(value: object) -> Optional[datetime]:
-    """occurred_at（PG aware datetime / SQLite '...Z' TEXT）-> aware datetime。
-
-    解析失败返回 None（条目退化为无时间标注，不阻断注入）。
-    """
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    if isinstance(value, str) and value.strip():
-        try:
-            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-    return None
-
-
-def _cross_session_relative_label(occurred_at: Optional[datetime], now: datetime) -> str:
-    """相对时间标注（x秒/分/小时/天前）；未来时间返回空串。"""
-    if occurred_at is None:
-        return ""
-    delta = (now - occurred_at).total_seconds()
-    if delta < 0:
-        return ""
-    seconds = int(delta)
-    if seconds < 60:
-        return f"{seconds}秒前"
-    minutes, seconds = divmod(seconds, 60)
-    if minutes < 60:
-        return f"{minutes}分前" if seconds == 0 else f"{minutes}分{seconds}秒前"
-    hours, minutes = divmod(minutes, 60)
-    if hours < 24:
-        return f"{hours}小时前" if minutes == 0 else f"{hours}小时{minutes}分前"
-    days, hours = divmod(hours, 24)
-    return f"{days}天前" if hours == 0 else f"{days}天{hours}小时前"
-
-
 def _cross_session_clean(value: object, limit: int) -> str:
-    """清洗（防信封伪造/防拟态）+ 截断（尾部 '...'，预留后缀 3 字符）。"""
+    """Sanitize (anti envelope-forgery / anti mimicry) + truncate ('...' tail)."""
     text = sanitize_envelope_field(break_packet_mimicry(str(value or "").strip()))
     if len(text) > limit:
         keep = max(0, limit - _CROSS_SESSION_TRUNCATE_SUFFIX_LEN)
@@ -217,12 +183,17 @@ def _cross_session_clean(value: object, limit: int) -> str:
 
 
 def _format_cross_session_entry(row: dict, *, now: datetime, tz, limit: int) -> str:
-    """单条摘要条目（session_name/session_id/发生时间/内容 四行）。"""
-    occurred = _cross_session_parse_ts(row.get("occurred_at"))
+    """Render one summary entry (three lines: session_id / time / content).
+
+    No session-name line: the Kira host exposes no session catalog, the DB
+    layer never returns a name, and a constant "unnamed session" line would
+    only burn budget (review D1).
+    """
+    occurred = sqlite_parse_ts(row.get("occurred_at"))
     if occurred is not None:
         local = occurred.astimezone(tz)
         absolute = format_datetime(local)
-        relative = _cross_session_relative_label(occurred, now)
+        relative = relative_time_precise(occurred, now)
         time_text = (
             f"{absolute}（{relative}）" if absolute and relative else absolute or relative
         )
@@ -231,14 +202,9 @@ def _format_cross_session_entry(row: dict, *, now: datetime, tz, limit: int) -> 
     content = _cross_session_clean(row.get("content"), limit)
     if not content:
         return ""
-    name = (
-        _cross_session_clean(row.get("session_name") or "", 30)
-        or _CROSS_SESSION_UNNAMED_SESSION
-    )
     session_id = _cross_session_clean(row.get("session_id"), 200)
     lines = [
-        f"session_name：{name}",
-        f"   session_id：{session_id}",
+        f"session_id：{session_id}",
         f"   对话发生时间：{time_text}",
         f"   摘要内容：{content}",
     ]
@@ -246,8 +212,13 @@ def _format_cross_session_entry(row: dict, *, now: datetime, tz, limit: int) -> 
 
 
 def _cross_session_keeps_content_slice(numbered: str) -> bool:
-    """截断后的条目是否仍保留有信息量的正文切片（正文残留 < 10 字符的
-    条目退化为元数据-only，注入并登记 memo 反而造成召回盲区）。"""
+    """Whether a truncated entry still keeps an informative content slice.
+
+    Entries whose residual after the content marker drops below
+    _CROSS_SESSION_MIN_CONTENT_CHARS (the "..." suffix included) degrade to
+    metadata-only; injecting and memo-registering those would create a
+    recall blind spot instead.
+    """
     pos = numbered.find(_CROSS_SESSION_CONTENT_MARKER)
     return pos != -1 and (
         len(numbered) - pos - len(_CROSS_SESSION_CONTENT_MARKER)
@@ -362,7 +333,7 @@ def _cfg_int(raw: dict, key: str, default: int) -> int:
         return default
 
 
-def _cfg_float(raw: dict, key: str, default: float) -> float:
+def _cfg_float(raw: dict, key: str, default: Optional[float]) -> Optional[float]:
     try:
         value = raw.get(key)
         if value in (None, ""):
