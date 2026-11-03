@@ -29,6 +29,8 @@ from types import SimpleNamespace
 TESTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(TESTS_DIR))
 
+# Importing performs the stub assembly (reuses test_noriflow_memory's
+# plugin-level stubs) -- do not reorder this import after first use of tnm.
 import test_noriflow_memory as tnm  # noqa: E402  reuses plugin-level stubs
 
 mod = tnm.mod

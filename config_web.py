@@ -50,7 +50,10 @@ _RESTART_FIELDS = frozenset({
     "embedding_model", "embedding_dims",
     "recall_log_enabled", "recall_log_path",
     "alias_enabled", "alias_variant_cap", "alias_stopwords",
-    "rerank_enabled",  # assembled at startup; runtime off->on needs re-init
+    # Assembled at startup: the kernel does read this switch per operation
+    # at runtime, but flipping off->on still requires re-initializing the
+    # client -- it looks like a hot-reloadable field but is not.
+    "rerank_enabled",
 })
 
 # Settings-panel groups (aligned with the upstream nori version;
