@@ -334,6 +334,49 @@ async def main_async() -> None:
         str(summary),
     )
 
+    # 未来时间戳钳制 + 幂等键取原始入参日期（同步 nori 上游 #34 评审）：
+    # 落库 occurred_at 钳到 now（防 recent 时间优先排序下钉栏顶），
+    # 幂等键用原始入参（钳后 now 跨日漂移会击穿同日去重）
+    async def _cluster_occurred(cid: int):
+        async with db.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT occurred_at FROM memory_fact_cluster WHERE id = $1",
+                cid,
+            )
+        return row["occurred_at"]
+
+    future_ts = datetime.now() + timedelta(days=10)
+    kernel.embedding_service.embed_one = _fake_vec
+    summary = await kernel.write_fact(
+        statement="小周在学冲浪", category="stable",
+        platform="napcat", session_id="s1", group_id="", user_id="u3",
+        occurred_at=future_ts,
+    )
+    stored = await _cluster_occurred(summary["cluster_id"])
+    stored_dt = (
+        datetime.fromisoformat(stored) if isinstance(stored, str) else stored
+    )
+    # sqlite 层存回的可能是 aware 口径：取同口径 now 再比较
+    now_cmp = (
+        datetime.now(stored_dt.tzinfo) if stored_dt.tzinfo else datetime.now()
+    )
+    check(
+        "kernel_write_fact_future_ts_clamped",
+        summary.get("action") == "create"
+        and abs((stored_dt - now_cmp).total_seconds()) < 60,
+        f"stored={stored} summary={summary}",
+    )
+    summary = await kernel.write_fact(
+        statement="小周在学冲浪", category="stable",
+        platform="napcat", session_id="s1", group_id="", user_id="u3",
+        occurred_at=future_ts,
+    )
+    check(
+        "kernel_write_fact_future_ts_idempotent",
+        summary.get("action") == "skipped",
+        str(summary),
+    )
+
     # ---- 摘要生命周期 ----
     async def _insert_summary(doc_id: str, written_days_ago: float, recalled_days_ago: float | None):
         await db.insert_chat_summary(

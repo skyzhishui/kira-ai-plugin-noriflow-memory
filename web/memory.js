@@ -696,7 +696,7 @@ const Page = {
     el.appendChild(this.filterBar([
       ["user_id", "用户 ID", "裸 uid"],
       ["session_id", "会话 ID", "按证据键前缀"],
-      ["category", "分类", "", [["", "全部"], ["identity", "identity"], ["stable", "stable"], ["interaction", "interaction"], ["naming", "naming"], ["recent", "recent"], ["uncertain", "uncertain"]]],
+      ["category", "分类", "", [["", "全部"], ["identity", "identity"], ["stable", "stable"], ["preference", "preference"], ["commitment", "commitment"], ["interaction", "interaction"], ["naming", "naming"], ["recent", "recent"], ["uncertain", "uncertain"]]],
       ["status", "状态", "", [["", "全部"], ["active", "active"], ["profiled", "profiled"], ["pending_uncertain", "pending_uncertain"], ["replaced", "replaced"], ["dead", "dead"]]],
       ["q", "内容包含", "陈述关键词"],
     ], (vals) => { query = Object.assign({}, vals, { page: 1 }); refresh(); }));
@@ -790,7 +790,7 @@ const Page = {
     el.appendChild(this.filterBar([
       ["user_id", "用户 ID", "裸 uid"],
       ["session_id", "会话 ID", ""],
-      ["category", "分类", "", [["", "全部"], ["identity", "identity"], ["stable", "stable"], ["interaction", "interaction"], ["naming", "naming"], ["recent", "recent"], ["uncertain", "uncertain"]]],
+      ["category", "分类", "", [["", "全部"], ["identity", "identity"], ["stable", "stable"], ["preference", "preference"], ["commitment", "commitment"], ["interaction", "interaction"], ["naming", "naming"], ["recent", "recent"], ["uncertain", "uncertain"]]],
       ["confidence", "确信度", "", [["", "全部"], ["high", "high"], ["medium", "medium"]]],
       ["extracted", "处理状态", "", [["", "全部"], ["0", "待处理"], ["1", "已入簇"]]],
       ["q", "内容包含", "事实关键词"],
@@ -911,7 +911,7 @@ const Page = {
       try {
         const d = await UI.api(`/profile/${encodeURIComponent(platform)}/${encodeURIComponent(userId)}`);
         profileCard.innerHTML = "";
-        const sectionNames = { identity: "基本信息", naming: "称呼偏好", stable: "已知事实", interaction: "互动偏好", recent: "近期动态" };
+        const sectionNames = { identity: "基本信息", naming: "称呼偏好", stable: "已知事实", preference: "喜好偏好", commitment: "约定承诺", interaction: "互动偏好", recent: "近期动态" };
         const sectionCards = Object.entries(sectionNames).map(([cat, title]) =>
           this.el("div", { class: "card", style: "margin:0" }, [
             this.el("h3", {}, [title]),
