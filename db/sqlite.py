@@ -2461,7 +2461,9 @@ class SQLiteMemoryDatabase(MemoryBackend):
         """Per-section profile rows (data source for the first five
         sections), statement + occurred_at (via cluster_id join; None
         when the cluster row is missing — the assembler then omits the
-        time label). Ownership and ordering identical to the PG version."""
+        time label). Ownership and ordering identical to the PG version
+        (NULLS LAST needs SQLite 3.30 — no extra floor here: connect()
+        already enforces >= 3.35 for RETURNING)."""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """

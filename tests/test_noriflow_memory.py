@@ -1299,6 +1299,8 @@ class TestPersonaService(unittest.TestCase):
             for sql in sqls:
                 self.assertIn("CASE WHEN m.category = 'recent'", sql)
                 self.assertIn("COALESCE(c.occurred_at, m.updated_at)", sql)
+                # 护栏先行：首键缺失时给断言失败而非 index 抛 ValueError
+                self.assertIn("END DESC NULLS LAST", sql)
                 tail = sql[sql.index("END DESC NULLS LAST"):]
                 self.assertIn(
                     "m.score DESC, m.updated_at DESC, m.id ASC", tail
