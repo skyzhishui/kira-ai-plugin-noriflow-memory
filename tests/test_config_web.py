@@ -25,7 +25,8 @@ from pathlib import Path
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN_DIR))
 
-# config_web 用包内相对导入：先挂包桩再加载（与主测试 _load_plugin_module 同法）
+# config_web uses package-relative imports: install the package stub
+# first, then load (same as _load_plugin_module in the main tests)
 import types  # noqa: E402
 
 _pkg = types.ModuleType("noriflow_memory_pkg")
@@ -50,22 +51,23 @@ class TestSchema(unittest.TestCase):
     def test_schema_covers_all_fields_with_annotations(self):
         self.assertEqual(set(config_schema()), set(LocalMemoryConfig.model_fields))
         s = config_schema()
-        # restart 标注：装配期展开 vs 运行时读
+        # restart annotation: expanded at assembly time vs read at runtime
         self.assertTrue(s["dsn"]["restart"])
         self.assertTrue(s["pool_max"]["restart"])
         self.assertTrue(s["alias_stopwords"]["restart"])
         self.assertFalse(s["recall_top_k"]["restart"])
-        self.assertFalse(s["backfill_interval_seconds"]["restart"])  # 运行时读（热加载批）
-        self.assertFalse(s["failure_threshold"]["restart"])  # 熔断器运行时读
+        self.assertFalse(s["backfill_interval_seconds"]["restart"])  # read at runtime (hot-reload batch)
+        self.assertFalse(s["failure_threshold"]["restart"])  # circuit breaker reads it at runtime
         self.assertFalse(s["tool_scope_locked"]["restart"])
-        # sensitive：dsn 命中；非敏感不受影响
+        # sensitive: dsn matches; non-sensitive keys are unaffected
         self.assertTrue(s["dsn"]["sensitive"])
         self.assertFalse(s["recall_top_k"]["sensitive"])
-        # 类型映射
+        # type mapping
         self.assertEqual(s["topic_blacklist"]["type"], "list")
         self.assertEqual(s["recall_relevance_threshold"]["type"], "float")
         self.assertEqual(s["recall_time_decay_enabled"]["type"], "bool")
-        # default_factory 字段（topic_blacklist）默认值可 JSON 序列化且非哨兵
+        # default_factory field (topic_blacklist): its default is
+        # JSON-serializable and is not a sentinel
         json.dumps(s["topic_blacklist"]["default"])
         self.assertEqual(s["topic_blacklist"]["default"], [])
 
@@ -83,7 +85,7 @@ class TestMask(unittest.TestCase):
         masked = mask_values(vals)
         self.assertEqual(masked["dsn"], _MASK)
         self.assertEqual(masked["recall_top_k"], 5)
-        # 哨兵还原取现值；空串不掩码
+        # sentinel restore uses current values; empty string is not masked
         self.assertEqual(mask_values({"dsn": ""})["dsn"], "")
         out = unmask_values(masked, vals)
         self.assertEqual(out["dsn"], "postgres://u:p@h/db")
@@ -94,7 +96,7 @@ class TestPayload(unittest.TestCase):
         d = build_payload({"dsn": "postgres://u:p@h/db", "pool_max": 8})
         self.assertEqual(d["values"]["dsn"], _MASK)
         self.assertEqual(d["values"]["pool_max"], 8)
-        self.assertEqual(d["values"]["recall_top_k"], 5)  # 缺键补默认
+        self.assertEqual(d["values"]["recall_top_k"], 5)  # missing key filled with the default
         self.assertEqual(d["groups"][0]["key"], "conn")
 
 
@@ -103,7 +105,7 @@ class TestPrepareSave(unittest.TestCase):
 
     def test_partial_submit_keeps_current_values(self):
         r = prepare_save({"recall_top_k": 7}, self.HOST)
-        # 未提交字段沿用现值（不落模型默认）
+        # unsubmitted fields keep current values (not model defaults)
         self.assertEqual(r["validated"].dsn, self.HOST["dsn"])
         self.assertEqual(r["validated"].pool_max, 8)
         self.assertEqual(r["changed"], {"recall_top_k": 7})
@@ -142,10 +144,10 @@ class TestPersistHostConfig(unittest.TestCase):
             )
             self.assertEqual(on_disk["dsn"], "postgres://new")
             self.assertEqual(on_disk["recall_top_k"], 7)
-            self.assertTrue(on_disk["enabled"])  # 非配置字段不被触碰
+            self.assertTrue(on_disk["enabled"])  # non-config fields are left untouched
 
 
-# ---------------- handler 编排（复用主测试文件的桩链路） ----------------
+# -------- handler orchestration (reuses the main test stubs) --------
 
 
 class TestConfigApi(unittest.TestCase):
@@ -183,8 +185,9 @@ class TestConfigApi(unittest.TestCase):
             async def set_plugin_enabled(self, pid, enabled):
                 self.enabled[pid] = enabled
 
-        # handler 内延迟 import core.plugin.manager：测试环境 core
-        # 是桩包，预注一个带 PLUGIN_CONFIG_DIR 的桩模块（指向临时目录）
+        # The handler lazily imports core.plugin.manager: core is a stub
+        # package in tests, so pre-inject a stub module carrying
+        # PLUGIN_CONFIG_DIR (pointing at the temp directory)
         core_pkg = sys.modules.get("core")
         if core_pkg is not None and "core.plugin.manager" not in sys.modules:
             reg_stub = types.ModuleType("core.plugin.manager")
@@ -217,13 +220,13 @@ class TestConfigApi(unittest.TestCase):
         inst = self._make_inst(host)
         pm = inst.ctx.plugin_mgr
 
-        # GET：schema + 掩码值
+        # GET: schema + masked values
         d = asyncio.run(inst.api_memory_config_get())
         self.assertEqual(d["groups"][0]["key"], "conn")
         self.assertEqual(d["values"]["dsn"], _MASK)
         self.assertEqual(d["values"]["recall_top_k"], 5)
 
-        # PUT：热字段 + restart 字段
+        # PUT: hot field + restart field
         reg_stub = sys.modules.get("core.plugin.manager")
         if reg_stub is not None:
             reg_stub.PLUGIN_CONFIG_DIR = Path(self._tmp_config_dir.name)
@@ -238,10 +241,10 @@ class TestConfigApi(unittest.TestCase):
         self.assertTrue(r["saved"])
         self.assertEqual(r["changes"], 2)
         self.assertEqual(r["restart_required"], ["pool_max"])
-        # 运行时实例热更新
+        # runtime instance hot-update
         self.assertEqual(inst._config.recall_top_k, 7)
         self.assertEqual(inst._config.pool_max, 16)
-        # 宿主真相源（内存 + 磁盘）
+        # host source of truth (memory + disk)
         self.assertEqual(pm.plugin_configs["kira-ai-plugin-noriflow-memory"]["recall_top_k"], 7)
         on_disk = json.loads(
             (Path(self._tmp_config_dir.name) / "kira-ai-plugin-noriflow-memory.json")
@@ -258,7 +261,7 @@ class TestConfigApi(unittest.TestCase):
         with self.assertRaises(self.HTTPException) as cm2:
             asyncio.run(inst.api_memory_config_put({"values": {"dsn": ""}}))
         self.assertEqual(cm2.exception.status_code, 400)
-        # 无变化短路
+        # no-change short-circuit
         host_now = dict(inst.ctx.plugin_mgr.get_plugin_config("kira-ai-plugin-noriflow-memory"))
         r = asyncio.run(inst.api_memory_config_put({"values": host_now}))
         self.assertFalse(r["saved"])

@@ -1,20 +1,28 @@
--- 011_summary_lifecycle.sql：摘要记忆生命周期（归档态 + 访问强化计数）。
+-- 011_summary_lifecycle.sql: summary memory lifecycle (archive state + access reinforcement counts).
 --
--- 背景：摘要表此前只进不出——recall 时间衰减仅改排序不过滤，行永久留在
--- 候选池里，陈年低价值行持续稀释 BM25/向量候选并推高检索扫描集。
--- 本迁移引入三组状态列（语义对齐 iris 遗忘算法的 access 元数据 +
--- livingmemory 记忆原子的 TTL/访问强化模型）：
--- - archived/archived_at：归档态。archived 行结构性退出召回（检索 SQL
---   无条件 NOT archived），原文保留、按 id 仍可读、WebUI 可恢复——
---   归档是状态转移不是删除；
--- - last_recall_at：访问强化时间戳。召回最终注入集命中即刷新（续命：
---   归档遍对强化窗口内的行豁免）；
--- - recall_count：累计被召回次数（热记忆信号，WebUI 观测用；v0.10.6
---   归档判据不消费，留作后续频次感知淘汰的输入）。
+-- Background: the summary table previously only grew — recall time decay
+-- only re-ranked without filtering, so rows stayed in the candidate pool
+-- forever; aged low-value rows kept diluting BM25/vector candidates and
+-- inflating the search scan set. This migration introduces three groups of
+-- state columns (semantics aligned with the access metadata of the iris
+-- forgetting algorithm + the TTL/access reinforcement model of livingmemory
+-- memory atoms):
+-- - archived/archived_at: archive state. Archived rows structurally exit
+--   recall (the search SQL unconditionally excludes archived); the row body
+--   is kept, still readable by id, restorable via WebUI — archiving is a
+--   state transition, not deletion;
+-- - last_recall_at: access reinforcement timestamp. Refreshed whenever a row
+--   hits the final recall injection set (life extension: the archive pass
+--   exempts rows reinforced within the window);
+-- - recall_count: cumulative recall hits (hot-memory signal, for WebUI
+--   observability; not consumed by the archive predicate as of v0.10.6,
+--   kept as input for later frequency-aware eviction).
 --
--- 归档判据由 merge agent 归档遍执行（kv 周期门控，summary_lifecycle_*
--- 配置组）：written_at 距今超过归档时限 且 最近召回早于强化窗口。
--- 存量行 last_recall_at 为 NULL（视作从未被强化，按 written_at 判定）。
+-- The archive predicate runs in the merge agent archive pass (kv-gated
+-- periodically, summary_lifecycle_* config group): written_at older than
+-- the archive deadline AND last recall earlier than the reinforcement
+-- window. Legacy rows have last_recall_at NULL (treated as never
+-- reinforced, judged by written_at).
 
 ALTER TABLE memory_chat_summary
     ADD COLUMN IF NOT EXISTS archived BOOLEAN NOT NULL DEFAULT false;
@@ -25,8 +33,9 @@ ALTER TABLE memory_chat_summary
 ALTER TABLE memory_chat_summary
     ADD COLUMN IF NOT EXISTS recall_count INT NOT NULL DEFAULT 0;
 
--- 归档遍扫描索引：未归档行按 written_at 升序扫描，归档比例升高后
--- 扫描集持续收敛（partial index 只含活跃行）。
+-- Archive-pass scan index: non-archived rows scanned by written_at ascending;
+-- the scan set keeps shrinking as the archived ratio rises (the partial
+-- index only contains active rows).
 CREATE INDEX IF NOT EXISTS idx_mcs_lifecycle
     ON memory_chat_summary (written_at)
     WHERE NOT archived;

@@ -43,7 +43,7 @@ fetch_relation_graph = _webui_store.fetch_relation_graph
 
 
 # ---------------------------------------------------------------------------
-#  桩件
+#  Stubs
 # ---------------------------------------------------------------------------
 
 
@@ -138,7 +138,7 @@ def _backfill_of(db, router, batch_size=40):
 
 
 # ---------------------------------------------------------------------------
-#  用例
+#  Test cases
 # ---------------------------------------------------------------------------
 
 PASS = 0
@@ -178,7 +178,8 @@ async def t_happy_path():
     assert row["platform"] == "qq"
     assert row["subject_uid"] == "100" and row["object_uid"] == "200"
     assert row["evidence_key"] == "backfill|101"
-    # 回填通道：命中已有边只刷新不计分（线上提取不传，默认照常计分）
+    # Backfill channel: hitting an existing edge only refreshes without
+    # scoring (live extraction does not pass it, default still scores)
     assert row["count_on_conflict"] is False
     assert row["occurred_at"] == datetime(2026, 9, 1, 12, 0, 0)
     assert row["is_bot_edge"] is False and row["min_evidence"] == 3
@@ -275,7 +276,8 @@ async def t_batch_skip_and_fail():
 
 
 async def t_watermark_and_full():
-    # 增量：水位止步失败批，重跑自动补；之后空转零 LLM
+    # Incremental: the watermark stops at the failed batch, a re-run fills
+    # it in; afterwards idle runs make zero LLM calls
     db = _FakeDB(
         [
             _cluster(1, "100", "小张说他的姐姐是小李"),
@@ -295,12 +297,12 @@ async def t_watermark_and_full():
     assert summary1["relations_written"] == 2
     assert db.kv["relation_backfill_watermark"] == "2"
     assert len(router.calls) == 2
-    # 重跑：水位 2 之后无新簇 → 空转不调 LLM
+    # Re-run: no new clusters after watermark 2 -> idle, no LLM call
     summary2 = await bf.run()
     assert summary2["clusters_total"] == 0 and summary2["batches_total"] == 0
     assert db.last_after_id == 2
     assert len(router.calls) == 2, "水位后无新簇：空转不调 LLM"
-    # 新簇 3 到来：增量只处理 3
+    # New cluster 3 arrives: incremental processes only 3
     db.clusters.append(_cluster(3, "500", "小张说他的表姐是小李"))
     router.responses.append(json.dumps({"relations": [_relation(
         3, "500", "200", label="表姐", statement="小张说他的表姐是小李",
@@ -308,18 +310,22 @@ async def t_watermark_and_full():
     )]}))
     summary3 = await bf.run()
     assert summary3["clusters_total"] == 1 and summary3["relations_written"] == 1
-    # 分页流式：增量窗口从水位 2 起（不重取旧簇），批后末次空探测推到 3
+    # Paged streaming: the incremental window starts at watermark 2 (old
+    # clusters not refetched); the final empty probe after the batch pushes
+    # it to 3
     assert db.last_after_id == 3
     assert db.kv["relation_backfill_watermark"] == "3"
-    # 全量：忽略水位重取全部（router2 无响应——全量重跑会尝试调 LLM，
-    # 这里只验证取簇面，批次在 LLM 前失败即停不影响断言）
+    # Full: ignores the watermark and refetches everything (router2 has no
+    # responses -- a full re-run would attempt LLM calls; here we only
+    # verify the cluster-fetch surface, and a batch failing before the LLM
+    # call stops without affecting the assertions)
     router2 = _FakeRouter([])
     bf2 = _backfill_of(db, router2, batch_size=1)
     summary_full = await bf2.run(force_full=True)
     assert summary_full["mode"] == "full"
     assert summary_full["clusters_total"] == 3
     assert db.last_after_id == 0
-    # kv 读取失败退化为全量
+    # kv read failure degrades to full mode
     db3 = _FakeDB([_cluster(1, "100", "小张说他的姐姐是小李")], [("qq", "200", "小李")])
 
     async def _boom(key):
@@ -380,7 +386,8 @@ def _graph_pool(edge_rows, alias_rows):
             return alias_rows
 
         async def fetchval(self, sql, *args):
-            # fetch_relation_graph 的全表计数（截断提示的分母）
+            # fetch_relation_graph's full-table count (the denominator of
+            # the truncation notice)
             assert "count(*)" in sql and "memory_entity_edge" in sql
             return len(edge_rows)
 
@@ -429,13 +436,14 @@ async def t_graph_canonical_names():
     ]
     alias_rows = [
         {"platform": "qq", "user_id": "1", "name": "张三"},
-        {"platform": "qq", "user_id": "3", "name": "未知"},  # 占位名不作规范名
+        # placeholder names never become canonical
+        {"platform": "qq", "user_id": "3", "name": "未知"},
     ]
     d = await fetch_relation_graph(_graph_pool(edges, alias_rows), bot_user_id="")
     by_uid = {n["uid"]: n["name"] for n in d["nodes"]}
-    assert by_uid["1"] == "张三"      # 别名表顶替"未知"
-    assert by_uid["2"] == "小李"      # 非占位边名保留
-    assert by_uid["3"] == "3"        # 别名占位 + 边名占位 -> 回退 uid
+    assert by_uid["1"] == "张三"      # alias beats the "unknown" placeholder
+    assert by_uid["2"] == "小李"      # non-placeholder edge name kept
+    assert by_uid["3"] == "3"        # both placeholders -> fall back to uid
     assert d["edges"][1]["object_name"] == "3"
     _ok("fetch_relation_graph 规范名解析（别名>边名>uid，占位名出局）")
 
@@ -450,7 +458,7 @@ async def t_backfill_placeholder_names():
         async def __call__(self, system_prompt, user_prompt):
             return json.dumps(self.payload)
 
-    # subject/object 都是占位名 -> 双双取目录名
+    # subject/object are both placeholder names -> both take directory names
     db = _FakeDB(
         [_cluster(101, "100", "小张说他的姐姐是小李")],
         [("qq", "100", "小张"), ("qq", "200", "小李")],
@@ -465,7 +473,8 @@ async def t_backfill_placeholder_names():
     assert db.edge_rows[0]["subject_name"] == "小张"
     assert db.edge_rows[0]["object_name"] == "小李"
 
-    # subject 无目录名 -> 留空（upsert 保旧名），object 正常
+    # subject has no directory name -> left empty (upsert keeps the old
+    # name); object is normal
     db2 = _FakeDB(
         [_cluster(101, "100", "小张说他的姐姐是小李")],
         [("qq", "200", "小李")],
@@ -477,7 +486,7 @@ async def t_backfill_placeholder_names():
     assert db2.edge_rows[0]["subject_name"] == ""
     assert db2.edge_rows[0]["object_name"] == "小李"
 
-    # 真名原样透传
+    # real names pass through unchanged
     db3 = _FakeDB(
         [_cluster(101, "100", "小张说他的姐姐是小李")],
         [("qq", "200", "小李")],

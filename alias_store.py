@@ -30,12 +30,13 @@ try:  # kira host: route through the host logging manager so records reach
     from core.logging_manager import get_logger as _get_logger
 
     logger = _get_logger("noriflow_memory.alias", "cyan")
-except ImportError:  # kira 宿主（模块与上游 nori 版保持同构）
+except ImportError:  # kira host (isomorphic to the upstream nori version)
     import logging
 
     logger = logging.getLogger(__name__)
 
-# 括号对（全角/半角混用均可命中），拆主干与内段
+# Bracket pairs (full-width/half-width mixed forms all match): split the
+# stem and the inner segments
 _BRACKETS_OPEN = "（(【〔[《<"
 _BRACKETS_CLOSE = "）)】〕]》>"
 _FALLBACK_NAME_RE = re.compile(r"^用户\d+$")
@@ -57,11 +58,14 @@ def normalize_alias_text(text: str) -> str:
     return unicodedata.normalize("NFKC", text or "").casefold()
 
 
-# 事实陈述中的「用户<uid>（<代号>）」模式（原文直接匹配，括号全角/
-# 半角通吃；uid 4 位起防误伤泛指；代号不含括号、长度有界防 LLM 长句
-# 误裹）。典型来源：编码提示词要求关系陈述写
-# 「用户3429924750（xxy）关系亲密」——括号内代号是群聊真实称呼，
-# 与名片可能完全不同形（名片 undefined𝕩𝕩𝕪 vs 群称 xxy）。
+# "User<uid> (code)" pattern in fact statements (matched directly on the
+# original text, full-width/half-width brackets both work; uid is 4+ digits
+# to avoid hitting generic references; the code excludes brackets and is
+# length-bounded against the LLM wrapping long sentences). Typical source:
+# the encode prompt requires relation statements like
+# "User3429924750 (xxy) close relation" — the code inside brackets is the
+# real group-chat nickname, which may look completely different from the
+# card name (card undefined𝕩𝕩𝕪 vs group name xxy).
 _FACT_CODE_RE = re.compile(r"用户(\d{4,})\s*[（(]\s*([^()（）]{1,24}?)\s*[）)]")
 
 
@@ -162,15 +166,19 @@ def clean_alias_name(name: str) -> str:
     return cleaned
 
 
-# 占位名精确形（unknown/undefined 为 LLM 输出泄漏词形）；纯数字 = LLM 拿
-# uid 当名字；"未知"系只收 未知/未知用户 及其数字编号变体——前缀泛匹配
-# 会误伤真名（实测有群成员的真实昵称即以"未知"开头）
+# Exact placeholder forms (unknown/undefined are LLM output leakage word
+# forms); pure digits = the LLM using the uid as a name; the CJK "unknown"
+# family only covers the bare unknown word / unknown-user word and their
+# numbered variants — a broader prefix match would hit real names (a real
+# group member's nickname verifiably starts with the CJK unknown word)
 _PLACEHOLDER_EXACT = frozenset({"unknown", "undefined"})
 _PLACEHOLDER_RE = re.compile(r"^(?:用户\d+|\d+|未知(?:用户)?\d*)$")
 
-# SQL 单源常量：占位名规则的 POSIX 正则（db 层 upsert 守卫 / 结构自检
-# stale_names 三处 SQL 内联副本一律由此常量插值——Python 判定与 SQL 判定
-# 永不漂移，这正是本文件 docstring 警示的"双实现失守"面的根治）。
+# SQL single-source constant: POSIX regex of the placeholder-name rule.
+# The three SQL-inline copies (db-layer upsert guard / structural self-check
+# stale_names) are all interpolated from this constant, so the Python
+# verdict and the SQL verdict never drift — the root cure for the
+# "dual-implementation breach" surface this file's docstring warns about.
 PLACEHOLDER_NAME_SQL = r"^(unknown|undefined|用户[0-9]+|[0-9]+|未知(用户)?[0-9]*)$"
 
 
@@ -232,13 +240,14 @@ def split_name_variants(name: str) -> list[str]:
         else:
             buf.append(ch)
     if depth > 0:
-        # 未闭合括号（截断名片）：缓冲区按外段处理
+        # Unclosed brackets (truncated card name): flush as an outer segment
         _flush_outer()
     else:
         _flush_outer()
 
     for candidate in [raw, " ".join(outer).replace(" ", ""), *outer, *inner]:
-        # 多段外名（"傲娇喵  (猫娘)" 中空格归一）后统一清洗
+        # Multi-segment outer names (inner spaces normalized) then uniformly
+        # cleaned
         cleaned = clean_alias_name(candidate)
         if cleaned and cleaned not in variants:
             variants.append(cleaned)
@@ -314,20 +323,28 @@ class AliasStore:
         """Args: when db is None only the apply_rows-driven in-memory view is available (for tests)."""
         self._db = db
         self._variant_cap = variant_cap
-        # 停用词同样以归一化形态比对（视图键是归一化名，口径一致）
+        # Stopwords also compare in normalized form (view keys are
+        # normalized names, same convention)
         self._stopwords = {normalize_alias_text(w) for w in (stopwords or []) if w}
-        # 归一化名 -> [(platform, uid, last_seen epoch)]（匹配键 = NFKC +
-        # casefold；DB 与展示保留原名，见 normalize_alias_text）
+        # Normalized name -> [(platform, uid, last_seen epoch)] (match key =
+        # NFKC + casefold; DB and display keep the original name, see
+        # normalize_alias_text)
         self._names: dict[str, list[tuple[str, str, float]]] = {}
-        # 归一化名 -> 首个观测原名（命中条目的展示名，画像标题与聊天
-        # 称呼一致；同键多原名时保最先入视图者）
+        # Normalized name -> first observed original (display name for hit
+        # entries, keeping profile titles consistent with chat addressing;
+        # with multiple originals on one key the first one entering the view
+        # wins)
         self._display: dict[str, str] = {}
-        # (归一化名, platform, uid) -> 该 uid 自己的观测原名——同键多 uid
-        # 时命中条目各带各的称呼，不串贴他人原名（_display 仅作键级兜底
-        # 与歧义跳过名单展示）
+        # (normalized name, platform, uid) -> the uid's own observed
+        # original — when one key maps to multiple uids, each hit carries
+        # its own addressing instead of pasting someone else's name
+        # (_display only serves as the key-level fallback and the ambiguity
+        # skip-list display)
         self._display_by_pair: dict[tuple[str, str, str], str] = {}
-        # (platform, uid) -> (最新非占位名, epoch)——写侧守卫/读侧规范名
-        # 解析的反向视图，与 _names 同源同步（refresh/apply 两口）
+        # (platform, uid) -> (latest non-placeholder name, epoch) — reverse
+        # view of the write-side guard / read-side canonical-name
+        # resolution, kept in sync from the same source as _names (refresh/
+        # apply entries)
         self._by_owner: dict[tuple[str, str], tuple[str, float]] = {}
         self._loaded_at = 0.0
 
@@ -361,9 +378,12 @@ class AliasStore:
             if not key or key in self._stopwords:
                 continue
             epoch = _to_epoch(row.get("last_seen_epoch"))
-            # uid 统一 str（与 apply_rows/_by_owner 及 _display_by_pair 键同
-            # 口径）——DB 返回非 str uid（整数列）时 match 以 _names 原值查
-            # _display_by_pair 会落空回退键级兜底，串贴复发
+            # uid coerced to str (same key convention as apply_rows/
+            # _by_owner and _display_by_pair) — when the DB returns a
+            # non-str uid (integer column), match would look up
+            # _display_by_pair with _names' original value, miss, and fall
+            # back to the key-level fallback, reintroducing the wrong-name
+            # paste
             pair = (row["platform"], str(row["user_id"]))
             names.setdefault(key, []).append((pair[0], pair[1], epoch))
             if key not in display:

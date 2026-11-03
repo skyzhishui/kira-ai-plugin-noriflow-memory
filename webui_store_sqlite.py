@@ -88,8 +88,9 @@ async def fetch_users_data(backend, keyword: str, page: int, size: int) -> dict:
             (page - 1) * size,
             size,
         )
-        # 名字映射只查当前页用户；DISTINCT ON 等价改写：row_number 取
-        # (platform, user_id) 分组内 occurred_at DESC, id DESC 首行
+        # Name mapping only queries users on the current page; DISTINCT ON
+        # equivalent rewrite: row_number takes the first row by
+        # occurred_at DESC, id DESC within each (platform, user_id) group
         pairs = [(r["platform"], r["user_id"]) for r in rows]
         names = []
         if pairs:

@@ -86,18 +86,21 @@ from .vector_ops import EmbeddingService
 
 logger = get_logger("noriflow_memory.merge", "cyan")
 
-# 裁定/审计 payload 的陈述截断上限（对齐关系通道 _STATEMENT_MAX_CHARS 的
-# 量级：防极端长陈述放大簇 canonical_statement 与 prompt 体积；存储侧由
-# memory_encoder._parse_fact 同步截断）
+# Statement truncation cap for adjudication/audit payloads (aligned with
+# the order of magnitude of _STATEMENT_MAX_CHARS on the relation channel:
+# keeps extreme statements from inflating cluster canonical_statement and
+# prompt size; the storage side truncates in sync in
+# memory_encoder._parse_fact)
 _PAYLOAD_STATEMENT_MAX_CHARS = 300
 
-# 裁定提示词模板名（不含 .prompt 后缀）
+# Adjudication prompt template name (without the .prompt suffix)
 _ADJUDICATE_PROMPT_NAME = "fact_adjudicate"
-# 四分类值域
+# Four-class verdict domain
 _VALID_VERDICTS = frozenset({"same", "drift", "correction", "unrelated"})
 
-# 裁定结果 JSON Schema（tool calling 强制出口；与提示词输出格式及
-# _parse_verdicts 校验字段一致——校验仍以 _parse_verdicts 为准）
+# Adjudication result JSON Schema (tool-calling forced exit; consistent
+# with the prompt output format and the _parse_verdicts validation
+# fields -- _parse_verdicts remains the authority for validation)
 _ADJUDICATE_RESULT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -125,13 +128,14 @@ _ADJUDICATE_RESULT_SCHEMA = {
     "required": ["verdicts", "unsure"],
 }
 
-# 强制调用的提交工具名（LLM 将裁定结果放入其 arguments）
+# Forced-call submit tool name (the LLM puts its verdicts in arguments)
 _ADJUDICATE_TOOL_NAME = "submit_fact_verdicts"
 
-# 关系边语义审计提示词模板名与边判定值域
+# Relation-edge semantic audit prompt name + edge verdict domain
 _RELATION_AUDIT_PROMPT_NAME = "relation_audit"
 _EDGE_VERDICTS = frozenset({"ok", "bad"})
-# 关系边审计结果 JSON Schema（tool calling 强制出口；校验仍以解析层为准）
+# Relation-edge audit result JSON Schema (tool-calling forced exit;
+# validation still defers to the parser layer)
 _RELATION_AUDIT_RESULT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -159,38 +163,51 @@ _RELATION_AUDIT_RESULT_SCHEMA = {
     "required": ["edges", "unsure"],
 }
 _RELATION_AUDIT_TOOL_NAME = "submit_edge_verdicts"
-# 语义审计遍水位 kv 键（值为已判定批的最大边 id；清空即全量重扫）
+# Semantic audit pass watermark kv key (value = max edge id already
+# judged; clearing it triggers a full rescan)
 _RELATION_AUDIT_KV_KEY = "relation_audit_edge_id"
-# 毒丸批防护：同一水位批连续失败/unsure 达此数即跳批推水位（内容型毒丸
-# 边不得永久钉死水位——其后所有边永无审计之日且每周期白烧 LLM 调用；
-# 跳批记 warning，人工全量重审入口 = 清空 _RELATION_AUDIT_KV_KEY）
+# Poison-batch guard: this many consecutive failures/unsure verdicts on
+# the same watermark batch skip the batch and advance the watermark (a
+# content-level poison edge must never pin the watermark forever --
+# every later edge would never be audited and each cycle would burn LLM
+# calls for nothing; a skipped batch logs a warning, and the manual
+# full-rescan entry point is clearing _RELATION_AUDIT_KV_KEY)
 _RELATION_AUDIT_MAX_BATCH_FAILS = 3
 _RELATION_AUDIT_FAIL_MARK_KEY = "relation_audit_fail_mark"
 _RELATION_AUDIT_FAIL_COUNT_KEY = "relation_audit_fail_count"
-# 语义审计遍每周期 LLM 调用上限（独立于事实合并预算，防互相挤占；
-# 边增量为 trickle，常态一轮即清完积压）
+# Semantic audit pass per-cycle LLM call cap (independent of the fact
+# merge budget so the two cannot crowd each other out; edge increments
+# are a trickle, so one normal round drains the backlog)
 _RELATION_AUDIT_MAX_CALLS = 3
-# 结构自检的 pending 边超龄阈值（天；bot 边长期未达双证据门槛观测）
+# Age threshold for pending edges in the structural self-check (days;
+# watches bot edges that never reach the two-evidence threshold)
 _PENDING_STALE_DAYS = 14
 
-# 衰减遍上次执行时间的 kv 键
+# kv key holding the last decay pass execution time
 _DECAY_KV_KEY = "last_decay_at"
-# 摘要归档遍上次执行时间的 kv 键（011 生命周期；与衰减遍独立周期）
+# kv key holding the last summary-archive pass time (011 lifecycle; its
+# own period, independent of the decay pass)
 _SUMMARY_LIFECYCLE_KV_KEY = "last_summary_lifecycle_at"
-# 补编码遍连续失败熔断阈值（视为 LLM 整体不可用，提前结束本遍）
+# Consecutive-failure circuit-breaker threshold for the re-encode pass
+# (treated as the LLM being wholly unavailable; ends the pass early)
 _REENCODE_FAIL_LIMIT = 3
-# 毒丸行重试上限（差分计数：仅当同一周期/遍内存在其他成功处理时才累计
-# ——排除 LLM/DB 整体不可用期的误伤；超限进入跳过名单不再重试，
-# 防 ORDER BY id 队首钉死饿死后续行）
+# Poison-row retry cap (differential counting: only accumulated when
+# other rows were processed successfully in the same cycle/pass -- this
+# rules out false positives while the LLM/DB is wholly unavailable; over
+# the cap the row enters the skip list and is never retried, so an
+# ORDER BY id queue head cannot starve later rows)
 _ADJUD_MAX_ATTEMPTS = 5
 _REENCODE_MAX_ATTEMPTS = 5
-# 跳过名单容量上限（超出对半 FIFO 截断，防 kv 值无界增长）
+# Skip-list capacity cap (beyond it, drop the older half FIFO so the kv
+# value cannot grow without bound)
 _SKIP_STATE_MAX_ENTRIES = 500
-# 跳过状态 kv 键（JSON：{"<行id>": 连续失败次数, ...}）
+# Skip-state kv key (JSON: {"<row id>": consecutive failure count, ...})
 _ADJUD_SKIP_KV_KEY = "adjudicate_skip_state"
 _REENCODE_SKIP_KV_KEY = "reencode_skip_state"
-# 冷启动首周期延迟（秒）：启动缓冲后先跑一轮（新装库尽早建簇；衰减遍
-# 首次运行只初始化时间戳不衰减，存量数据安全）
+# Cold-start first-cycle delay (seconds): run one cycle after a startup
+# buffer (fresh installs create clusters early; on its first run the
+# decay pass only initializes the timestamp without decaying, so the
+# existing data stays safe)
 _INITIAL_DELAY_SECONDS = 60.0
 
 
@@ -302,9 +319,10 @@ class FactAdjudicator:
             cluster_id = (
                 item.get("cluster_id") if isinstance(item, dict) else None
             )
-            # bool 置空（JSON true == 1 错配成员校验）；整值浮点（1.0）按
-            # 基线归一宽度落回真实 id，非整值（1.9）置空防 int() 静默
-            # 截断错配到错误簇
+            # Null out bools (JSON true == 1 would pass the membership
+            # check); whole floats (1.0) are normalized back to the real
+            # id by baseline width, non-whole ones (1.9) are nulled so
+            # int() cannot silently truncate into the wrong cluster
             if isinstance(cluster_id, bool):
                 cluster_id = None
             elif (
@@ -424,7 +442,8 @@ class RelationAuditor:
             return None
         for item in items:
             edge_id = item.get("id") if isinstance(item, dict) else None
-            # bool 置空；整值浮点归一、非整值置空（同 FactAdjudicator）
+            # Null out bools; normalize whole floats, null non-whole ones
+            # (same as FactAdjudicator)
             if isinstance(edge_id, bool):
                 edge_id = None
             elif isinstance(edge_id, float) and not edge_id.is_integer():
@@ -530,7 +549,8 @@ class FactMergeAgent:
         self._bot_forms_provider = bot_forms_provider
         self._alias_name_resolver = alias_name_resolver
         self._alias_store = alias_store
-        # 周期参数运行时读 self._config（维护页保存配置后热生效，无需重启）
+        # Cycle params read self._config at runtime (saving config on the
+        # maintenance page takes effect live, no restart needed)
         self._task: Optional[asyncio.Task] = None
         self._last_decay_at: Optional[datetime] = None
         self._last_summary_lifecycle_at: Optional[datetime] = None
@@ -706,9 +726,11 @@ class FactMergeAgent:
             "fact_alias": 0,
         }
 
-        # 熔断拒绝期整周期跳过（peek 非消费式，不占恢复探测名额）：DB
-        # 故障期行状态不翻、下周期自动重试，避免先烧 LLM 预算再全部
-        # 写失败的白空转
+        # Skip the whole cycle while the breaker rejects (peek does not
+        # consume, so it does not use up a recovery probe slot): row state
+        # is not flipped during a DB outage and the next cycle retries
+        # automatically, avoiding a futile spin that burns the LLM budget
+        # and then fails every write
         if (
             self._circuit_breaker is not None
             and not await self._circuit_breaker.peek_available()
@@ -716,11 +738,15 @@ class FactMergeAgent:
             logger.warning("记忆库熔断中，跳过本合并周期")
             return stats
 
-        # 补编码遍预算保留：存在可补编码的积压时预留 1/4 预算——归一化遍
-        # 持续满载会把补编码遍饿死为恒 0（summarized=false 行不参与召回，
-        # 无界期无法恢复）；无积压时不预留，预算全给归一化遍。预留上限
-        # budget-1：极小预算（1-3）时归一化遍至少保 1 次调用，不被 floor(1)
-        # 的预留吃成恒 0
+        # Re-encode pass budget reservation: when a re-encodable backlog
+        # exists, reserve 1/4 of the budget -- a normalization pass at
+        # full load would otherwise starve the re-encode pass to a
+        # constant 0 (summarized=false rows are not recallable, so they
+        # can never recover during an unbounded period); with no backlog
+        # nothing is reserved and the whole budget goes to the
+        # normalization pass. The reservation caps at budget-1 so that
+        # with a tiny budget (1-3) the normalization pass keeps at least
+        # 1 call instead of being eaten to a constant 0 by floor(1)
         reserve = 0
         if self._encoder is not None and await self._reencode_backlog_exists():
             reserve = min(
@@ -729,10 +755,12 @@ class FactMergeAgent:
             )
         budget = cfg.llm_budget_per_cycle - reserve
 
-        # ---- 归一化遍 ----
-        # 超采样 + 跳过名单过滤：fetch 按 id 升序拉 3 倍候选，剔除已达
-        # 重试上限的 unsure 毒丸行后再截回批量——防毒丸行占据队首使后续
-        # 新事实永远进不了处理窗口
+        # ---- Normalization pass ----
+        # Oversample + skip-list filter: fetch 3x candidates in ascending
+        # id order, drop unsure poison rows that already hit the retry
+        # cap, then cut back to the batch size -- keeps poison rows from
+        # holding the queue head and locking later new facts out of the
+        # processing window
         skip_state = await self._load_skip_state(_ADJUD_SKIP_KV_KEY)
         try:
             # Stage isolation: a failed fact fetch skips the normalization
@@ -755,9 +783,13 @@ class FactMergeAgent:
             ][: cfg.merge_batch_size]
             llm_seen_ok = False
             for fact in facts:
-                # 预算耗尽在候选检索前短路：省掉无谓的 HNSW 候选查询；同时
-                # 不得走无裁定的建簇路径——本条可能存在候选簇，跳过检索直接
-                # create 等于盲目建簇，违反模块契约（顺延下周期重审）
+                # Short-circuit before candidate search once the budget
+                # is exhausted: saves a pointless HNSW candidate query;
+                # also, we must never take the un-adjudicated
+                # cluster-creation path -- this fact may have candidate
+                # clusters, so skipping the search and going straight to
+                # create means blind cluster creation, which violates
+                # the module contract (defer to the next cycle)
                 if budget <= 0:
                     stats["deferred"] += 1
                     continue
@@ -788,8 +820,10 @@ class FactMergeAgent:
                     result = await self._adjudicator.adjudicate(fact, candidates)
                     if result is None or result["unsure"]:
                         stats["skipped_unsure"] += 1
-                        # 差分计数：本周期裁定器已有有效输出（LLM 健康），
-                        # 该行对确定性输入仍反复 unsure 才计为毒丸尝试
+                        # Differential counting: the adjudicator already
+                        # produced valid output this cycle (LLM healthy),
+                        # so only a row that keeps returning unsure for
+                        # deterministic input counts as a poison attempt
                         if llm_seen_ok:
                             _bump_skip(skip_state, str(fact["id"]))
                         continue
@@ -802,10 +836,14 @@ class FactMergeAgent:
                         if llm_seen_ok:
                             _bump_skip(skip_state, str(fact["id"]))
                         continue
-                    # 已解析出 ≥1 条有效 verdict 即 LLM 健康（模型确有
-                    # 输出，可能只是漏候选）；若等完整覆盖才置位，批内首条
-                    # fact 长期部分覆盖时 llm_seen_ok 恒假，毒丸计数永不
-                    # 累加，跳过名单防队首钉死的设计即失效
+                    # Any >= 1 parsed valid verdict means the LLM is
+                    # healthy (the model did produce output, it may just
+                    # have missed candidates); if we waited for full
+                    # coverage, llm_seen_ok would stay false while the
+                    # first fact in a batch is only partially covered for
+                    # a long time, the poison count would never
+                    # accumulate, and the skip-list design against a
+                    # pinned queue head would be dead
                     llm_seen_ok = True
                     covered_ids = {cid for cid, _ in result["verdicts"]}
                     missing_ids = [
@@ -830,8 +868,11 @@ class FactMergeAgent:
                     verdicts = result["verdicts"]
 
                 action, cluster_id = self._choose_action(fact, candidates, verdicts)
-                # 矛盾标记目标：correction/drift 裁定簇 + same 命中 replaced 簇的
-                # 继任簇（重申旧说法 = 推翻此前的更正，继任簇豁免证据地板出清）
+                # Contradiction-mark targets: correction/drift adjudicated
+                # clusters + the successor cluster of a same-hit replaced
+                # cluster (restating the old claim = overturning the prior
+                # correction; the successor's evidence-floor exemption is
+                # cleared)
                 contradict_ids = [
                     cid for cid, verdict in (verdicts or [])
                     if verdict in ("correction", "drift")
@@ -854,8 +895,9 @@ class FactMergeAgent:
                         contradict_cluster_ids=contradict_ids or None,
                     )
                 except Exception:
-                    # 合并侧 DB 失败同样喂熔断器（learn merge-only failure modes;
-                    # the periodic peek alone never records them）
+                    # DB-side merge failures feed the breaker too (learn
+                    # merge-only failure modes; the periodic peek alone
+                    # never records them)
                     await self._record_db_failure()
                     logger.warning(
                         "事实合并处置失败（fact_id=%s，顺延下周期）",
@@ -866,9 +908,13 @@ class FactMergeAgent:
                 await self._record_db_success()
                 stats["facts"] += 1
                 skip_state.pop(str(fact["id"]), None)
-                # 复活簇登记回填待办（P2-9）：merge 复活 pending/dead 簇后，其
-                # 存量陈述未经关系回填（水位已推过）——登记待办让下轮增量回填
-                # 按id 精取补提取（backfill|{id} evidence_key 幂等，重复无害）
+                # Revived clusters register a backfill todo (P2-9): after
+                # merge revives a pending/dead cluster, its existing
+                # statements never went through relation backfill (the
+                # watermark has moved past them) -- registering a todo lets
+                # the next incremental pass re-extract by exact id
+                # (backfill|{id} evidence_key is idempotent, retries are
+                # harmless)
                 if (
                     summary.get("action") == "merge"
                     and cluster_id is not None
@@ -893,7 +939,7 @@ class FactMergeAgent:
                     stats[key] += 1
                 logger.debug("事实处置: fact_id=%s -> %s", fact["id"], summary)
 
-            # ---- 衰减遍 + 晋档遍 ----
+            # ---- decay pass + promotion pass ----
             # Stage isolation: a decay/promote failure feeds the breaker
             # and skips that pass only; the rest of the cycle continues.
             try:
@@ -912,17 +958,20 @@ class FactMergeAgent:
                 logger.warning("晋档遍失败（跳过，下周期重试）", exc_info=True)
                 stats["promoted"] = 0
 
-            # ---- 摘要归档遍（011 生命周期；周期/开关门控见方法内）----
-            # fail-open（与 _fact_code_alias_pass 同款）：归档遍是可选功能且
-            # 默认关闭，其异常不应中断本周期后续各遍（补编码/关系自检/语义
-            # 审计/别名回填）——失败仅告警，下周期重试
+            # ---- summary archival pass (011 lifecycle; cadence/toggle
+            # gating inside the method) ----
+            # fail-open (same as _fact_code_alias_pass): the archival pass
+            # is optional and off by default; its exceptions must not abort
+            # the rest of this cycle (encode backfill / relation self-check
+            # / semantic audit / alias backfill) -- failures only warn and
+            # retry next cycle
             try:
                 stats["summaries_archived"] = await self._maybe_summary_lifecycle()
             except Exception:
                 logger.warning("摘要归档遍失败（跳过，下周期重试）", exc_info=True)
                 stats["summaries_archived"] = 0
 
-            # ---- 补编码遍（剩余预算 + 保留份额内处理降级原文行）----
+            # ---- encode backfill pass (remaining budget + degraded-raw rows within the retained share) ----
             try:
                 stats["reencoded"] = await self._reencode_pass(budget + reserve)
             except Exception:
@@ -930,9 +979,12 @@ class FactMergeAgent:
                 logger.warning("补编码遍失败（跳过，下周期重试）", exc_info=True)
                 stats["reencoded"] = 0
 
-            # ---- 关系遍：结构自检（零 LLM）+ 语义审计（开关，LLM）----
-            # 自检遍内部已对 DB 调用设守卫，外层同款包裹对齐 docstring
-            # 的 relation passes 阶段隔离契约（防御未来新增未守卫路径）
+            # ---- relation passes: structural self-check (zero LLM) +
+            # semantic audit (toggle, LLM) ----
+            # The self-check pass already guards its DB calls internally;
+            # the same outer wrapper aligns with the docstring's
+            # per-relation-pass isolation contract (defensive against
+            # future unguarded paths)
             try:
                 await self._relation_integrity_check()
             except Exception:
@@ -949,7 +1001,7 @@ class FactMergeAgent:
             stats["edges_audited"] = audited
             stats["edges_superseded"] = superseded
 
-            # ---- 事实代号别名回填遍（零 LLM；retain 通道的周期兜底）----
+            # ---- fact code-alias backfill pass (zero LLM; periodic fallback for the retain channel) ----
             stats["fact_alias"] = await self._fact_code_alias_pass()
             return stats
         finally:
@@ -1026,15 +1078,17 @@ class FactMergeAgent:
         """
         if self._encoder is None or budget <= 0:
             return 0
-        # 熔断拒绝期跳过本遍（与周期入口同判——补编码遍写库同样吃池）
+        # Skip this pass while the breaker is rejecting (same check as the cycle entry -- this pass writes to the DB and hits the pool too)
         if (
             self._circuit_breaker is not None
             and not await self._circuit_breaker.peek_available()
         ):
             logger.warning("记忆库熔断中，补编码遍跳过")
             return 0
-        # 超采样 + 跳过名单过滤（对齐归一化遍）：防超长降级行反复失败
-        # 占据 ORDER BY id 队首，阻塞其后正常行的重编码
+        # Oversampling + skip-list filtering (aligned with the
+        # normalization pass): keeps repeatedly-failing overlong degraded
+        # rows from camping the head of the ORDER BY id queue and blocking
+        # re-encoding of healthy rows behind them
         skip_state = await self._load_skip_state(_REENCODE_SKIP_KV_KEY)
         target = min(budget, self._config.merge_batch_size)
         rows = await self._db.fetch_unsummarized_summaries(target * 3)
@@ -1053,7 +1107,7 @@ class FactMergeAgent:
             if budget <= 0:
                 logger.info("补编码遍预算耗尽（本周期顺延）")
                 break
-            budget -= 1  # 调用即扣（异常路径同样消耗了 LLM 配额）
+            budget -= 1  # charged per call (exception paths consumed LLM quota too)
             try:
                 summary, facts, relations, encoded_ok = await self._encoder.encode(
                     row["content"], self._bot_nickname, bot_user_id=self._bot_id
@@ -1067,9 +1121,12 @@ class FactMergeAgent:
                 encode_failed_ids.append(str(row["id"]))
                 continue
             if not encoded_ok:
-                # LLM 仍不可用：不翻状态，连续失败达阈值则结束本遍。降级行
-                # 同样计入毒丸名单（差分计数见函数尾——本遍有成功行时才累计；
-                # encoder 是 fail-open 的，持续解析失败的行不会走异常路径）
+                # LLM still unavailable: do not flip state; end this pass
+                # once consecutive failures reach the threshold. Degraded
+                # rows also count toward the poison list (differential
+                # counting at function tail -- only accrues when this pass
+                # had a success; the encoder is fail-open, so rows that
+                # keep failing to parse never take the exception path)
                 fail_streak += 1
                 encode_failed_ids.append(str(row["id"]))
                 if fail_streak >= _REENCODE_FAIL_LIMIT:
@@ -1082,13 +1139,15 @@ class FactMergeAgent:
                 continue
 
             fail_streak = 0
-            # facts -> relations -> 回写 summary，与 retain 路径同序（summary
-            # 殿后，失败方向安全）：任一写入失败即跳过回写，行保持
-            # summarized=false 由下周期重试再产出——facts/边表幂等键保证
-            # 重试不重复，事实不永久丢失
+            # facts -> relations -> summary write-back, same order as
+            # the retain path (summary last, failing safe): any write
+            # failure skips the write-back, the row stays
+            # summarized=false and is re-produced by next cycle's retry
+            # -- the facts/edge idempotency keys make retries
+            # non-duplicating, no fact is permanently lost
             try:
                 await self._reingest_facts(facts, row)
-                # P2 关系通道（提取开关开启时随补编码恢复）
+                # P2 relation channel (restored with encode backfill when the extraction toggle is on)
                 if relations and self._config.relation_extract_enabled:
                     await self._reingest_relations(relations, row)
             except Exception:
@@ -1117,8 +1176,10 @@ class FactMergeAgent:
             skip_state.pop(str(row["id"]), None)
             logger.info("补编码完成: row_id=%s，摘要 %d 字，事实 %d 条",
                         row["id"], len(summary), len(facts))
-        # 差分计数：本遍存在成功行（LLM 健康）时，失败行才计为毒丸尝试；
-        # 回写失败（DB 侧）不计——那是瞬时故障不是内容问题
+        # Differential counting: failed rows only count as poison attempts
+        # when this pass had successes (LLM healthy); write-back failures
+        # (DB side) do not count -- that is a transient fault, not a
+        # content problem
         if done > 0:
             for row_id in encode_failed_ids:
                 _bump_skip(skip_state, row_id)
@@ -1149,9 +1210,11 @@ class FactMergeAgent:
         """
         if not facts:
             return
-        # 确定性防线：bot 自身不得成为画像主体，related 集合同步剔除 bot
-        # （对齐 retain_encoded——bot uid 经 related 进簇表后会参与候选
-        # 检索的关系感知归属匹配面）
+        # Deterministic guardrail: the bot itself must never become a
+        # profile subject; the related set drops the bot too (aligned with
+        # retain_encoded -- once the bot uid enters the cluster table via
+        # related, it would join the relation-aware attribution matching
+        # surface of candidate retrieval)
         if self._bot_id:
             facts = [
                 f for f in facts if f.user_id.strip() != self._bot_id
@@ -1172,10 +1235,12 @@ class FactMergeAgent:
         else:
             vectors = [None] * len(facts)
 
-        # 幂等键日期口径与 retain 路径对齐（本地时区）：asyncpg 对
-        # timestamptz 恒返回 UTC aware 值，直接 strftime 在 UTC+8 的
-        # 00:00-07:59 会与 kernel 侧 naive 本地日期差一天，跨路径
-        # 幂等键失配（同语句重复入库/簇重复计分）。列值仍写原 instant。
+        # Idempotency-key date basis aligned with the retain path (local
+        # timezone): asyncpg always returns UTC-aware values for
+        # timestamptz; a direct strftime at UTC+8 00:00-07:59 drifts a day
+        # from the kernel-side naive local date, breaking cross-path
+        # idempotency keys (duplicate rows / double cluster scoring). The
+        # column still stores the original instant.
         occurred_local = self._to_local(row["occurred_at"])
         ev_key = evidence_key(row["session_id"], occurred_local)
         for fact, embedding in zip(facts, vectors):
@@ -1457,7 +1522,7 @@ class FactMergeAgent:
                 continue
             cluster = cluster_map.get(cid)
             if cluster is None or cluster.get("status") == "replaced":
-                # 对已替代墓碑的更正无处置意义（说法已被推翻），跳过目标
+                # Corrections targeting an already-replaced tombstone are moot (the claim was overturned); skip the target
                 continue
             if fact["confidence"] == "high" and fact["occurred_at"] >= cluster["occurred_at"]:
                 return "replace", cid
@@ -1824,8 +1889,10 @@ class FactMergeAgent:
                         "摘要归档遍时间戳损坏（忽略并重置）: %r", stored
                     )
             if self._last_summary_lifecycle_at is None:
-                # 首遍延后：初始时间戳前推，首跑打点后 max(window, interval)
-                # - interval 天才实际执行（见 docstring）
+                # First pass deferred: the initial timestamp is pushed
+                # forward; once the first run stamps the marker, actual
+                # execution waits max(window, interval) - interval days
+                # (see docstring)
                 first_delay_days = max(
                     self._config.summary_lifecycle_reinforce_window_days,
                     self._config.summary_lifecycle_interval_days,

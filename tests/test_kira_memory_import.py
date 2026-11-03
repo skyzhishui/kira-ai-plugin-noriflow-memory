@@ -89,8 +89,9 @@ def _load(mod_name: str):
     return mod
 
 
-# 崩溃兜底：aiosqlite 后台线程非常驻守护线程，断言失败未走 db.close() 时
-# 进程会挂着不退——统一在 main() finally 里强制收尾
+# Crash fallback: the aiosqlite background thread is a non-daemon thread;
+# if an assertion fails before db.close() runs, the process would hang --
+# shutdown is forced in main()'s finally
 _DBS: list = []
 
 
@@ -103,7 +104,7 @@ def _shutdown_dbs() -> None:
 
 
 # ---------------------------------------------------------------------------
-#  源目录 fixture
+#  Source-dir fixture
 # ---------------------------------------------------------------------------
 
 
@@ -113,8 +114,9 @@ def _write_toml(path: Path, body: str) -> None:
 
 
 def build_source(root: Path) -> None:
-    # chat_memory.json：dm（带 sender + 内嵌时间戳）、gm（无 sender）、sm 跳过；
-    # 含宿主系统通知（Notice + system_* 伪账号，应跳过）与真实消息转储（保留）
+    # chat_memory.json: dm (with sender + embedded timestamp), gm (no
+    # sender), sm skipped; includes host system notices (Notice + system_*
+    # pseudo accounts, should be skipped) and real message dumps (kept)
     chat = {
         "seki:dm:10086": {
             "title": "私聊",
@@ -163,7 +165,8 @@ def build_source(root: Path) -> None:
         json.dumps(chat, ensure_ascii=False), encoding="utf-8"
     )
 
-    # 实体 TOML：用户事实（importance 8 -> high）、用户洞察、群事实
+    # Entity TOML: user facts (importance 8 -> high), user reflections,
+    # group facts
     _write_toml(
         root / "entities" / "user_seki%3A10086" / "facts" / "hates_css.toml",
         "\n".join([
@@ -199,19 +202,19 @@ def build_source(root: Path) -> None:
             "importance = 6",
         ]) + "\n",
     )
-    # global/self（bot 自我觉察）+ global/facts
+    # global/self (bot self-awareness) + global/facts
     _write_toml(
         root / "global" / "self" / "facts" / "self1.toml",
         "\n".join(['id = "self1"', 'type = "fact"', 'text = "AI 喜欢用喵结尾"']) + "\n",
     )
-    # archive / skills：按语义不迁入
+    # archive / skills: skipped by semantics (not migrated in)
     _write_toml(
         root / "archive" / "user_seki%3A10086__facts__old.toml",
         'id = "old"\ntext = "已遗忘的记忆"\n',
     )
     _write_toml(root / "global" / "skills" / "skill1.toml", 'id = "skill1"\ntext = "技能"\n')
 
-    # 画像
+    # Profile
     profile = {
         "entity_id": "seki:10086", "entity_type": "user",
         "name": "小明", "nickname": "明哥", "aliases": ["明哥", "小明同学", ""],
@@ -231,7 +234,7 @@ def _snapshot_source(root: Path) -> dict[str, tuple[bytes, float]]:
 
 
 # ---------------------------------------------------------------------------
-#  用例
+#  Test cases
 # ---------------------------------------------------------------------------
 
 
@@ -245,7 +248,7 @@ async def main_async() -> None:
     LocalMemoryConfig = config_mod.LocalMemoryConfig
     SQLiteMemoryDatabase = db_pkg.SQLiteMemoryDatabase
 
-    # ---- 纯函数单测 ----
+    # ---- pure-function unit checks ----
     s = ki.parse_kira_memory_session("seki:dm:10086")
     check("session_dm", s == {"platform": "seki", "session_id": "10086",
                               "group_id": "", "user_id": "10086"}, str(s))
@@ -276,7 +279,7 @@ async def main_async() -> None:
     check("compose_no_fake_attribution", "系统通知" in content and 'uid=' not in
           content.split("系统通知")[0].rsplit("\n", 1)[-1], content)
 
-    # 系统通知过滤：Notice + system_* 伪账号签名
+    # System notice filtering: Notice + system_* pseudo-account signature
     check("notice_detected", ki.is_system_notice(
         {"role": "user", "sender_id": "",
          "content": "[Sep 10 2026 11:00 Thu] Notice [user_id: system_qzone_task] | 任务"}))
@@ -301,7 +304,7 @@ async def main_async() -> None:
     check("compose_drops_notice", "评论任务" not in notice_content
           and "真实消息" in notice_content, notice_content)
 
-    # ---- 起库 + 源目录 ----
+    # ---- db setup + source dir ----
     tmp = tempfile.TemporaryDirectory(prefix="noriflow_kira_memory_import_")
     db_path = str(Path(tmp.name) / "memory.sqlite3")
     source = Path(tmp.name) / "kira_memory_source"
@@ -322,7 +325,7 @@ async def main_async() -> None:
           and preview["profiles"] == 1 and preview["archive_files"] == 1,
           str(preview))
 
-    # ---- 第一次迁入 ----
+    # ---- first import ----
     stats = await ki.run_kira_memory_import(
         db, source_path=source, bot_uid="99999", bot_nickname="Kira",
     )
@@ -338,7 +341,8 @@ async def main_async() -> None:
 
     conn = db.pool.conn
 
-    # 摘要行映射（同会话多 chunk 行，ORDER BY id 取首个=信封最全的 dm 批次）
+    # Summary row mapping (multiple chunk rows per session; ORDER BY id
+    # takes the first = the dm batch with the fullest envelope)
     dm = dict(await conn.fetchrow(
         "SELECT * FROM memory_chat_summary WHERE session_id='10086' AND group_id='' "
         "ORDER BY id LIMIT 1"))
@@ -364,13 +368,14 @@ async def main_async() -> None:
     check("gm_participants_empty", gm["participants"] in ("[]", "", None),
           str(gm["participants"]))
 
-    # 系统通知不落库；真实消息转储（正文带真实 user_id）保留
+    # System notices are not stored; real message dumps (body carries the
+    # real user_id) are kept
     check("notice_content_absent", await conn.fetchval(
         "SELECT count(*) FROM memory_chat_summary WHERE content LIKE '%评论任务%'") == 0)
     check("real_dump_kept", await conn.fetchval(
         "SELECT count(*) FROM memory_chat_summary WHERE content LIKE '%群通知内容%'") == 1)
 
-    # 事实行映射
+    # Fact row mapping
     fact = dict(await conn.fetchrow(
         "SELECT * FROM memory_persona_fact_raw WHERE statement='小明讨厌写 CSS'"))
     check("fact_owner", fact["user_id"] == "10086" and fact["platform"] == "seki",
@@ -407,7 +412,7 @@ async def main_async() -> None:
     check("skills_not_imported", await conn.fetchval(
         "SELECT count(*) FROM memory_persona_fact_raw WHERE statement='技能'") == 0)
 
-    # 别名行
+    # Alias rows
     aliases = await conn.fetch(
         "SELECT name, source FROM memory_entity_alias WHERE user_id='10086' "
         "ORDER BY name")
@@ -416,7 +421,7 @@ async def main_async() -> None:
     check("alias_source_tag", all(a["source"] == "kira_memory_import" for a in aliases),
           str([dict(a) for a in aliases]))
 
-    # kv 标记
+    # kv marker
     last = await ki.read_last_run(db)
     check("kv_marker", last is not None and last["summary_rows"] == 3
           and last["fact_rows"] == 4, str(last))
@@ -436,7 +441,7 @@ async def main_async() -> None:
     legacy_left = await db.get_kv("kiraos_import_last_run")
     check("legacy_kv_dropped", legacy_left is None, str(legacy_left))
 
-    # ---- 幂等重跑：实插量 0 ----
+    # ---- idempotent re-run: 0 rows actually inserted ----
     stats2 = await ki.run_kira_memory_import(
         db, source_path=source, bot_uid="99999", bot_nickname="Kira",
     )
@@ -446,7 +451,7 @@ async def main_async() -> None:
           and stats2["facts_skipped"] == 4, str(stats2))
     check("rerun_aliases_stable", stats2["aliases_upserted"] == 3, str(stats2))
 
-    # ---- 源目录只读性 ----
+    # ---- source dir read-only guarantee ----
     snap_after = _snapshot_source(source)
     check("source_untouched", snap_before == snap_after,
           str(set(snap_before.items()) ^ set(snap_after.items())))
@@ -456,7 +461,7 @@ async def main_async() -> None:
           and file_marker_before_host.get("source_path") != "host_db",
           str(file_marker_before_host))
 
-    # ---- 缺 chat_memory.json 且无 entities/ 的目录拒绝 ----
+    # ---- dir without chat_memory.json and entities/ is rejected ----
     bogus = Path(tmp.name) / "bogus"
     bogus.mkdir()
     try:
@@ -470,7 +475,8 @@ async def main_async() -> None:
     except FileNotFoundError:
         check("missing_dir_rejected", True)
 
-    # ---- 宿主数据库迁入（v3 会话入库；Session 对象与 record dict 两形态）----
+    # ---- host db import (v3 session ingestion; both Session objects and
+    # record dicts) ----
     fallback_dt = datetime(2026, 9, 12, 12, 0, tzinfo=timezone.utc)
     fallback = ki._host_session_fallback_time({"updated_at": fallback_dt})
     check("host_fallback_datetime", fallback == fallback_dt.astimezone().replace(tzinfo=None),

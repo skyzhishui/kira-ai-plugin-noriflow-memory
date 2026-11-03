@@ -1,14 +1,16 @@
--- 008_entity_alias.sql：持久实体别名层（P1，2026-09 关系图谱方案）
--- 名字流（宿主 messages 对账 / 回合批次 upsert）-> 变体拆分后的别名行，
--- 供实体命中匹配（窗口词典之后的持久层）与 recall 实体路 / 画像候选共用。
+-- 008_entity_alias.sql: persistent entity alias layer (P1, 2026-09 relation graph plan)
+-- Name stream (host messages reconciliation / turn-batch upsert) -> alias
+-- rows after variant splitting, shared by entity hit matching (the
+-- persistent layer after the window dictionary) and the recall entity leg /
+-- profile candidates.
 
 CREATE TABLE IF NOT EXISTS memory_entity_alias (
     id         BIGSERIAL PRIMARY KEY,
     platform   TEXT NOT NULL DEFAULT '',
     user_id    TEXT NOT NULL,
-    name       TEXT NOT NULL,                        -- 变体拆分后的候选名（>=2 词字符）
-    first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),   -- 行创建时间（非语义首见时间）
-    last_seen  TIMESTAMPTZ NOT NULL DEFAULT now(),   -- 该名字最近被观察到的时间
+    name       TEXT NOT NULL,                        -- candidate name after variant splitting (>=2 word chars)
+    first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),   -- row creation time (not the semantic first-seen time)
+    last_seen  TIMESTAMPTZ NOT NULL DEFAULT now(),   -- when this name was last observed
     source     TEXT NOT NULL DEFAULT 'batch',        -- backfill | reconcile | batch
     UNIQUE (platform, user_id, name)
 );

@@ -204,7 +204,8 @@ def _hint_row(row_id: int, content: str, *, relevance: float = 0.9, **extra) -> 
 
 
 def _make_kernel(db, *, window_batches=None, rerank=None, **cfg_over) -> LocalMemoryKernel:
-    # 时间标注既有断言锁旧纯相对形态；mode 专项覆盖见 test_time_label.py
+    # Existing assertions pin the time label to the old purely-relative
+    # form; mode-specific coverage lives in test_time_label.py
     cfg_over.setdefault("recall_time_label_mode", "relative")
     config = LocalMemoryConfig(dsn="postgresql://stub", **cfg_over)
     provider = None if window_batches is None else (lambda: window_batches)
@@ -300,11 +301,15 @@ async def test_dedup_early_stop_at_top_k() -> None:
 
 
 async def test_write_dedup_skips_mismatched_vector_dims() -> None:
-    """M4 维度跳过：换 embedding 模型后同库新旧维度向量共存（SQLite 后端
-    无固定维度列）——维度不匹配的比对对不构成去重证据。原先 zip 静默截断
-    产生的无意义分数可能 ≥ 阈值假命中：读侧丢召回行、写侧静默丢摘要。"""
-    # 读侧守卫（len(unit) != len(kept_vec) -> continue）：3 维与 4 维同向
-    # "近重复"对必须双双保留（若仍 zip 截断比对，cosine=1.0 假命中会丢行）
+    """M4 dimension skip: after an embedding model swap, old- and new-dim
+    vectors coexist in the same db (the SQLite backend has no fixed dim
+    column) -- dimension-mismatched comparison pairs do not constitute
+    dedup evidence. Meaningless scores from the previous silent zip
+    truncation could fake-hit the threshold: dropping recall rows on the
+    read side, silently losing summaries on the write side."""
+    # Read-side guard (len(unit) != len(kept_vec) -> continue): a 3-dim and
+    # a 4-dim same-direction "near-duplicate" pair must both be kept (if
+    # zip-truncated comparison remains, the cosine=1.0 false hit drops rows)
     a = _row("a", 0.9, _NOW - timedelta(days=10), _vec_str([1.0, 0.0, 0.0]))
     b = _row("b", 0.8, _NOW - timedelta(days=11), _vec_str([1.0, 0.0, 0.0, 0.0]))
     db = _CaptureDB(rows=[a, b])
@@ -313,9 +318,11 @@ async def test_write_dedup_skips_mismatched_vector_dims() -> None:
         "维度不匹配 = 非重复，不得作为读侧去重证据"
     )
 
-    # 写侧端到端（ingest 走 apply_write_dedup=True）：窗口比对用真
-    # SQLite 打分逻辑（fetch_recent_summary_scores 的 _cosine 维度过滤），
-    # 连接层用既有 _FetchSeqConn 桩喂同会话窗口行
+    # Write side end-to-end (ingest with apply_write_dedup=True): the
+    # window comparison uses the real SQLite scoring logic
+    # (fetch_recent_summary_scores's _cosine dim filter); the connection
+    # layer uses the existing _FetchSeqConn stub to feed same-session
+    # window rows
     inserted: list[str] = []
 
     def _kernel_with_window(window_vec: list[float]) -> LocalMemoryKernel:
@@ -336,8 +343,9 @@ async def test_write_dedup_skips_mismatched_vector_dims() -> None:
 
         return _make_kernel(_WindowDB())
 
-    # 窗口内是旧模型 4 维向量；新批次经 _StubEmbedding 产出 1 维向量——
-    # 维度不匹配的窗口行不产生分数（best=0），摘要必须正常落库
+    # The window holds old-model 4-dim vectors; the new batch goes through
+    # _StubEmbedding producing 1-dim vectors -- dimension-mismatched window
+    # rows yield no score (best=0), so the summary must land normally
     doc_id = await _kernel_with_window([1.0, 0.0, 0.0, 0.0]).ingest(
         "新模型批次摘要", "s1", "u1", platform="napcat",
         apply_write_dedup=True,
@@ -346,8 +354,10 @@ async def test_write_dedup_skips_mismatched_vector_dims() -> None:
         "维度不匹配不构成写侧去重证据，新批次必须正常落库"
     )
 
-    # 对照组：窗口行同为 1 维且与新批次向量同向（cosine=1.0 ≥ 0.85）——
-    # 写入去重照常命中跳过（document_id 幂等返回但行不落库）
+    # Control group: the window row is also 1-dim and same-direction as the
+    # new batch vector (cosine=1.0 >= 0.85) -- write dedup hits and skips
+    # as usual (document_id is returned idempotently but the row is not
+    # stored)
     inserted.clear()
     doc_id2 = await _kernel_with_window([0.5]).ingest(
         "对照组摘要", "s1", "u1", platform="napcat",
@@ -1204,10 +1214,12 @@ async def test_rollout_memo_ttl_expiry() -> None:
 
 
 async def test_rollout_no_commit_keeps_row_recallable() -> None:
-    """L6 两阶段 memo 的 no-commit 可见性：build 只把 ids 暂存
-    _rollout_pending（recall 排除只读 _rollout_memo）——未 commit 时该批次
-    行必须仍可被 search 召回（prompt 组装被丢弃时不得双通道失踪），
-    commit 后才进入排除。一测锁两态。"""
+    """L6 no-commit visibility of the two-phase memo: build only stashes
+    ids into _rollout_pending (recall exclusion reads only _rollout_memo)
+    -- before commit, the batch's rows must still be recallable by search
+    (they must not vanish from both channels when the prompt assembly is
+    discarded); exclusion kicks in only after commit. One test locks both
+    states."""
     db = _RolloutDB(
         rows=[_leg_row(1, "bridge-batch", 0.9)],
         rollout_rows=[_rollout_row("bridge-batch", "窗口外桥接批摘要", 4)],
@@ -1217,7 +1229,8 @@ async def test_rollout_no_commit_keeps_row_recallable() -> None:
     text = await kernel.build_recent_rollout_text("s1")
     assert "窗口外桥接批摘要" in text, "build 须返回包含该批次行"
 
-    # 未 commit：pending 不泄漏进 recall 排除，行仍可被召回
+    # No commit yet: pending does not leak into recall exclusion, the row
+    # stays recallable
     items = await kernel.search(query="Q", session_id="s1")
     assert db.search_kwargs.get("exclude_document_ids") is None, (
         "build 后未 commit，pending ids 不得送进召回排除"
@@ -1226,7 +1239,7 @@ async def test_rollout_no_commit_keeps_row_recallable() -> None:
         "未 commit 时该批次行必须仍可被 search 召回"
     )
 
-    # commit 后：同一会话的 recall 才排除该行
+    # After commit: recall for the same session excludes the row
     kernel.commit_rollout_memo("s1")
     await kernel.search(query="Q", session_id="s1")
     assert db.search_kwargs.get("exclude_document_ids") == ["bridge-batch"], (

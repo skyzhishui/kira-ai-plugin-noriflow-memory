@@ -12,11 +12,13 @@
 -- - recall_count: cumulative recall hits (hot-memory signal, WebUI
 --   observability; the archive predicate does not consume it yet).
 
--- 刻意不加 ADD COLUMN IF NOT EXISTS：该语法需 SQLite 3.35+，而本地
--- macOS 自带 sqlite（开发者环境）低于此版本会直接语法报错。重复执行
--- 防护由 apply_migrations 的事务原子性承担（脚本语句与版本记录同事务，
--- 异常中断整体回滚不产生半应用状态；手工清版本记录属运维自伤，不在
--- 防护范围）。
+-- Deliberately no ADD COLUMN IF NOT EXISTS: that syntax requires SQLite
+-- 3.35+, and the sqlite bundled with macOS (developer environments) is
+-- older and fails with a syntax error. Re-execution protection is handled
+-- by apply_migrations transaction atomicity (script statements and the
+-- version record share one transaction; an interrupted run rolls back as a
+-- whole and never leaves a half-applied state; manually wiping version
+-- records is self-inflicted ops damage, outside this protection).
 ALTER TABLE memory_chat_summary
     ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE memory_chat_summary

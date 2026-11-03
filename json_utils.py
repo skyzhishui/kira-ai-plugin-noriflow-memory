@@ -19,7 +19,8 @@ import json_repair
 
 logger = get_logger("noriflow_memory.json", "cyan")
 
-# json_repair 版本差异：旧版本导出 repair()，新版本为 repair_json()
+# json_repair version drift: older versions export repair(), newer ones
+# export repair_json()
 _JSON_REPAIR = getattr(json_repair, "repair", None) or getattr(
     json_repair, "repair_json", None
 )
@@ -50,7 +51,7 @@ def safe_parse_llm_json(text: str) -> dict[str, Any] | list[Any] | None:
         return None
 
     cleaned = text.strip()
-    # 去除 markdown 代码块标记
+    # Strip markdown code-fence markers
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s*```$", "", cleaned)
     # Stage 1: perfectly valid JSON parses as-is; the regex repairs must
@@ -60,8 +61,9 @@ def safe_parse_llm_json(text: str) -> dict[str, Any] | list[Any] | None:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
-    # Stage 2: 提取 JSON 主体：整体是数组时优先按数组提取（避免内层对象遮蔽），
-    # 否则优先对象，其次数组
+    # Stage 2: extract the JSON body: prefer array slicing when the whole
+    # text is an array (an inner object would shadow it), otherwise object
+    # first, then array
     cleaned_body = cleaned.strip()
     if cleaned_body.startswith("[") and cleaned_body.endswith("]"):
         arr_start = cleaned_body.find("[")
@@ -77,7 +79,7 @@ def safe_parse_llm_json(text: str) -> dict[str, Any] | list[Any] | None:
             cleaned = cleaned[obj_start : obj_end + 1]
         elif arr_start != -1 and arr_end != -1 and arr_end > arr_start:
             cleaned = cleaned_body[arr_start : arr_end + 1]
-    # 修复常见错误
+    # Repair common errors
     cleaned = re.sub(r",\s*}", "}", cleaned)
     cleaned = re.sub(r",\s*]", "]", cleaned)
     cleaned = re.sub(r":\s*True\b", ": true", cleaned)
@@ -88,7 +90,8 @@ def safe_parse_llm_json(text: str) -> dict[str, Any] | list[Any] | None:
     except json.JSONDecodeError:
         pass
 
-    # json_repair 兜底：修复截断、单引号、缺失引号等 json.loads 无法处理的情况
+    # json_repair fallback: repairs truncation, single quotes, missing
+    # quotes and other cases json.loads cannot handle
     if _JSON_REPAIR is None:
         logger.warning("json_repair 不可用，无法兜底修复: %s", text[:200])
         return None

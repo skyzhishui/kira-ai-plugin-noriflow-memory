@@ -33,23 +33,31 @@ from .config import LocalMemoryConfig
 if TYPE_CHECKING:
     from pathlib import Path
 
-# 掩码哨兵与敏感键判定（与 KiraAI 宿主 WebUI / 上游 nori 版同构）
+# Mask sentinel and sensitive-key judgment (isomorphic to the KiraAI
+# host WebUI / upstream nori version)
 _MASK = "••••••"
 _SENSITIVE_KEY_RE = re.compile(r"password|api_key|apikey|token|secret|dsn|cookie", re.I)
 
-# 装配期展开（组件构造时取值）的字段：改后需重初始化插件/重启进程才生效。
-# 其余字段 kernel/merge_agent/encoder/熔断器运行时按次读同一 LocalMemoryConfig
-# 实例，保存后立即生效（2026-09-11 热加载批改造）。
+# Fields expanded at assembly time (values read when components are
+# constructed): changing them requires re-initializing the plugin or
+# restarting the process. Other fields are read per operation at runtime
+# by kernel/merge_agent/encoder/circuit breaker from the same
+# LocalMemoryConfig instance, so saving takes effect immediately
+# (2026-09-11 hot-reload batch rework).
 _RESTART_FIELDS = frozenset({
     "storage_backend", "sqlite_path",
     "dsn", "pool_min", "pool_max", "db_command_timeout",
     "embedding_model", "embedding_dims",
     "recall_log_enabled", "recall_log_path",
     "alias_enabled", "alias_variant_cap", "alias_stopwords",
-    "rerank_enabled",  # 客户端装配于启动；kernel 运行时虽读开关，关→开仍需重初始化
+    # Assembled at startup: the kernel does read this switch per operation
+    # at runtime, but flipping off->on still requires re-initializing the
+    # client -- it looks like a hot-reloadable field but is not.
+    "rerank_enabled",
 })
 
-# 设置栏分组（与上游 nori 版对齐；KiraAI 特有字段并入对应组）
+# Settings-panel groups (aligned with the upstream nori version;
+# KiraAI-specific fields merged into the matching group)
 _CONFIG_GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
     ("conn", "连接与存储", (
         "storage_backend", "sqlite_path", "dsn", "pool_min", "pool_max",
@@ -132,8 +140,9 @@ def _field_type(annotation) -> str:
     if annotation is str:
         return "str"
     if get_origin(annotation) is Literal:
-        # Literal["a", "b"] 是枚举字符串，不是列表——按 str 控件渲染，
-        # 可选值经 config_schema 的 options 透出（见 _literal_options）
+        # Literal["a", "b"] is an enum string, not a list — rendered as a
+        # str control; options are exposed via config_schema (see
+        # _literal_options)
         return "str"
     return "list"
 
@@ -264,9 +273,11 @@ def prepare_save(submitted: dict, host_values: dict) -> dict:
     merged = unmask_values(
         {k: v for k, v in submitted.items() if k in schema}, host_values
     )
-    # dsn 非空守卫（双后端语义）：postgres 后端必须保留 dsn；auto 下
-    # 现值 dsn 非空说明实际运行在 postgres，清空会静默切到 sqlite，同样
-    # 拦截。仅 sqlite 后端（显式声明，或 auto 且本就无 dsn）放行。
+    # Non-empty dsn guard (dual-backend semantics): the postgres backend
+    # must keep its dsn; under auto, a non-empty current dsn means we are
+    # actually running on postgres — clearing it would silently switch to
+    # sqlite, so it is blocked too. Only the sqlite backend (explicitly
+    # declared, or auto with no dsn in the first place) passes.
     effective_backend = str(
         merged.get("storage_backend")
         if merged.get("storage_backend") not in (None, "")
@@ -281,8 +292,10 @@ def prepare_save(submitted: dict, host_values: dict) -> dict:
         raise SaveBlocked("dsn 不能清空（当前存储后端以数据库连接为存在前提；"
                           "停用请用插件总开关，或切换 storage_backend=sqlite）")
 
-    # 校验/热更新口径 = 现值 ∪ 缺键默认值，再叠提交值（partial 语义：
-    # 未提交字段沿用现值，模型默认值不得覆盖宿主与运行时现状）
+    # Validation / hot-update scope = current values ∪ defaults for
+    # missing keys, then overlaid with submitted values (partial
+    # semantics: unsubmitted fields keep current values; model defaults
+    # must not override host and runtime state)
     baseline = {k: f["default"] for k, f in schema.items()}
     baseline.update({k: v for k, v in host_values.items() if k in schema})
     try:

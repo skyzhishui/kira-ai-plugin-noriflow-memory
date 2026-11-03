@@ -1,5 +1,5 @@
--- 002_fact_merge.sql：合并 agent 支撑（M4，见开发方案 §8）
--- kv 表：插件内部持久化状态（衰减遍上次执行时间等），进程重启不丢。
+-- 002_fact_merge.sql: merge agent support (M4, see dev plan §8)
+-- kv table: plugin-internal persistent state (last decay-pass run time etc.), survives process restarts.
 
 CREATE TABLE IF NOT EXISTS _memory_local_kv (
     key        TEXT PRIMARY KEY,
@@ -7,7 +7,9 @@ CREATE TABLE IF NOT EXISTS _memory_local_kv (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- demoted_at：簇进入 pending_uncertain 的时刻（降级/过期时写入，复活时清空）。
--- 迟滞退出的"再一个衰减周期无新证据 -> dead"以此为起算点，避免刚降级即死亡。
+-- demoted_at: the moment the cluster entered pending_uncertain (written on
+-- demotion/expiry, cleared on revival). The hysteresis exit "one more decay
+-- cycle with no new evidence -> dead" counts from this point, so a freshly
+-- demoted cluster does not die immediately.
 ALTER TABLE memory_fact_cluster ADD COLUMN IF NOT EXISTS demoted_at TIMESTAMPTZ;
 

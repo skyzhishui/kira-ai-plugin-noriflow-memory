@@ -91,13 +91,13 @@ class PersonProfile:
     user_id: str
     primary_name: str = ""
     aliases: list[str] = field(default_factory=list)
-    persona_backdrop: list[str] = field(default_factory=list)  # 基本信息
-    addressing_style: list[str] = field(default_factory=list)  # 称呼偏好
-    established_notes: list[str] = field(default_factory=list)  # 已知事实（preference 并入）
-    memory_points: list[str] = field(default_factory=list)  # 记忆要点（commitment 并入）
-    rapport_rules: list[str] = field(default_factory=list)  # 互动偏好
-    recent_updates: list[str] = field(default_factory=list)  # 近期动态
-    unverified_notes: list[str] = field(default_factory=list)  # 待定信息
+    persona_backdrop: list[str] = field(default_factory=list)  # basic info
+    addressing_style: list[str] = field(default_factory=list)  # how to address
+    established_notes: list[str] = field(default_factory=list)  # known facts
+    memory_points: list[str] = field(default_factory=list)  # memory points
+    rapport_rules: list[str] = field(default_factory=list)  # interaction prefs
+    recent_updates: list[str] = field(default_factory=list)  # recent updates
+    unverified_notes: list[str] = field(default_factory=list)  # pending info
 
 
 @dataclass

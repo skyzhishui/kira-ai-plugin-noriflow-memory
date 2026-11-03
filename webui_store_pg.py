@@ -79,8 +79,9 @@ async def fetch_users_data(backend, keyword: str, page: int, size: int) -> dict:
             (page - 1) * size,
             size,
         )
-        # 名字映射只查当前页用户（原全表 DISTINCT ON 在大库上是与分页
-        # 查询不成比例的整表扫描）
+        # Name mapping only queries users on the current page (the original
+        # whole-table DISTINCT ON was a scan disproportionate to the paged
+        # query on a large DB)
         pairs = [(r["platform"], r["user_id"]) for r in rows]
         names = []
         if pairs:
@@ -148,8 +149,9 @@ async def fetch_clusters_data(
     if filters["status"]:
         add("status = ${n}", filters["status"])
     if filters["session_id"]:
-        # 簇无 session 列：按证据键 {session}|{date} 前缀匹配（元字符转义
-        # 而非剥离——含 _/% 的会话 ID 也能如实匹配）
+        # Clusters have no session column: prefix-match on the evidence key
+        # {session}|{date} (metacharacters escaped rather than stripped —
+        # session IDs containing _/% still match faithfully)
         add(
             "EXISTS (SELECT 1 FROM unnest(evidence_keys) e WHERE e LIKE ${n})",
             filters["session_evidence_prefix"],

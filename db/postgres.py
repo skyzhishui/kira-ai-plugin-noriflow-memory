@@ -1993,9 +1993,11 @@ class MemoryDatabase(MemoryBackend):
             )
         return [
             (r["platform"], r["canonical_statement"],
-             # None 仅在两时间列双 NULL 时出现（当前 schema occurred_at NOT
-             # NULL 不可达）；兜底最旧防 None 流入 alias_upsert 抛错毒化整
-             # 批——与 sqlite 版 fetch_fact_code_sources 口径一致
+             # None only appears when both time columns are NULL (unreachable
+             # under the current schema, occurred_at NOT NULL); the oldest-
+             # time fallback keeps None out of alias_upsert, where a raised
+             # error would poison the whole batch — same semantics as the
+             # sqlite fetch_fact_code_sources
              r["last_seen"] or datetime.min.replace(tzinfo=timezone.utc))
             for r in rows
         ]
@@ -2021,7 +2023,8 @@ class MemoryDatabase(MemoryBackend):
                 for graph write-side directory builds etc.).
         """
         async with self.pool.acquire() as conn:
-            # None=全表(原语义);空列表/过滤后空=无待解析 owner 返回 {}
+            # None = whole table (original semantics); empty list / empty
+            # after filtering = no owners to resolve, return {}
             if owners is not None:
                 pairs = [(str(p or ""), str(u or "")) for p, u in owners if u]
                 if not pairs:
@@ -2343,9 +2346,11 @@ class MemoryDatabase(MemoryBackend):
             Edge rows (id/platform/endpoints/names/label/statement/
             evidence_count/last_seen/occurred_at).
         """
-        # 字符串/字节串会被逐元素迭代成 ['q','q',':',...] 静默空结果——
-        # 静默 miss 正是本函数要根除的形态，故 fail fast 而非归一兼容
-        # （空串 falsy 天然迭代为空，保持旧容忍）
+        # A str/bytes would be iterated element-wise into ['q','q',':',...]
+        # yielding a silently empty result — silent misses are exactly what
+        # this function exists to eradicate, so fail fast instead of
+        # normalizing for compatibility (empty strings are falsy and
+        # naturally iterate to empty; old tolerance kept)
         if (isinstance(node_keys, (str, bytes)) and node_keys) or (
             isinstance(bot_keys, (str, bytes)) and bot_keys
         ):

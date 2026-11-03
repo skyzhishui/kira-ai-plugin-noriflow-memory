@@ -101,7 +101,8 @@ def install_core_stubs() -> None:
 
         def page(self, route, menu=None):
             def wrap(func):
-                # 宿主 route 注册为键控（重复加载主模块不重复记账）
+                # Host route registration is keyed (reloading the main
+                # module does not double-count)
                 if not any(p["route"] == route for p in self.pages):
                     self.pages.append({"route": route, "menu": menu,
                                        "func": func.__name__})

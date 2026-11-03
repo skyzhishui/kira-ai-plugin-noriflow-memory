@@ -123,7 +123,7 @@ def test_utc_ts_converts_to_local() -> None:
     """Aware UTC timestamps convert to the local timezone before labeling (cross-day boundaries use the local date)."""
     kernel = _make_kernel(recall_time_label_mode="both")
     utc = datetime(2026, 9, 28, 22, 16, tzinfo=dt_timezone.utc)
-    # UTC 22:16 = 上海 9月29日 06:16 → days=2
+    # UTC 22:16 = 06:16 on Sep 29 in Shanghai -> days=2
     assert kernel._relative_time_label(utc) == "2天前 · 9月29日 06:16"
 
 
@@ -144,7 +144,8 @@ def test_future_ts_no_label() -> None:
     """
     kernel = _make_kernel(recall_time_label_mode="both")
     assert kernel._relative_time_label(_NOW + timedelta(days=2)) == ""
-    # _NOW=22:16，+1h=23:16 仍是同一天——只比日期差会漏掉这种未来时刻
+    # _NOW=22:16, +1h=23:16 is still the same day -- comparing only the
+    # date would miss this future instant
     assert kernel._relative_time_label(_NOW + timedelta(hours=1)) == ""
     kernel.config.recall_time_label_mode = "absolute"
     assert kernel._relative_time_label(_NOW + timedelta(hours=3)) == ""
@@ -154,9 +155,11 @@ def test_invalid_mode_rejected_at_config() -> None:
     """Invalid modes are rejected at assembly time by the Literal whitelist, no longer silently degrading."""
     import pydantic
 
-    # 断言收窄到具体错误位/类型：dsn 等字段均有默认值（零参构造成功），
-    # 当前唯一错误即 mode 的 literal_error；宽泛 except ValidationError
-    # 在未来新增必填字段时会误把它们当通过依据（假阳性）
+    # Assertions narrowed to the exact error location/type: fields such as
+    # dsn all have defaults (zero-arg construction succeeds), so the only
+    # current error is the mode literal_error; a broad
+    # except ValidationError would treat future required fields as passing
+    # evidence (false positive)
     try:
         LocalMemoryConfig(recall_time_label_mode="hmm")
     except pydantic.ValidationError as exc:

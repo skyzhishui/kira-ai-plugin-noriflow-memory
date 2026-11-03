@@ -48,15 +48,17 @@ if TYPE_CHECKING:
 
 logger = get_logger("noriflow_memory.encoder", "cyan")
 
-# category 值域（画像 8 维度：主动 6（identity/stable/preference/commitment/
-# interaction/naming）+ 系统 2（recent/uncertain，编码器按证据强度/时间性落））
+# category value domain (8 profile dimensions: 6 active
+# (identity/stable/preference/commitment/interaction/naming) + 2 system
+# (recent/uncertain; the encoder assigns by evidence strength /
+# timeliness))
 _VALID_CATEGORIES = frozenset(
     {
         "identity", "stable", "preference", "commitment",
         "interaction", "naming", "recent", "uncertain",
     }
 )
-# confidence 值域
+# confidence value domain
 _VALID_CONFIDENCES = frozenset({"high", "medium"})
 
 # ---------------------------------------------------------------------------
@@ -121,18 +123,22 @@ def _looks_truncated(summary: str) -> bool:
         # never written, so it must be truncated
         return text.rstrip("】").endswith("【话题")
     return bool(_CJK_IDEOGRAPH_RE.match(last_char))
-# 事实陈述长度上限（截断保留，对照关系通道 ≤200 的量级；簇
-# canonical_statement 直接继承该值，不设限会放大簇表与裁定 prompt 体积）
+# Fact statement length cap (truncate and keep; cf. the relation
+# channel's <=200 magnitude; cluster canonical_statement inherits this
+# value directly -- an uncapped value would bloat the cluster table and
+# the arbitration prompt size)
 _FACT_STATEMENT_MAX_CHARS = 200
 
-# 解码提示词模板文件（不含 .prompt 后缀）
+# Encoding prompt template file (without the .prompt suffix)
 _ENCODE_PROMPT_NAME = "memory_encode"
-# P2 关系提取扩展节模板（relations_enabled 时附加在编码提示词尾部）
+# P2 relation-extraction extension section template (appended after the
+# encoding prompt tail when relations_enabled is on)
 _RELATIONS_PROMPT_NAME = "memory_relations"
 _NAMING_PROMPT_NAME = "memory_encode_naming"
 
-# 编码结果 JSON Schema（tool calling 强制出口；与提示词输出格式及
-# _parse_payload 校验字段一致——校验仍以 _parse_payload 为准）
+# Encoding-result JSON schema (forced exit via tool calling; fields match
+# the prompt output format and the _parse_payload validation --
+# _parse_payload remains the authority for validation)
 _ENCODE_RESULT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -187,7 +193,8 @@ _ENCODE_RESULT_SCHEMA = {
     "required": ["summary", "facts"],
 }
 
-# 强制调用的提交工具名（LLM 将编码结果放入其 arguments）
+# Forced-call submission tool name (the LLM puts the encoding result
+# into its arguments)
 _ENCODE_TOOL_NAME = "submit_memory_encoding"
 
 
@@ -229,11 +236,16 @@ class MemoryEncoder:
                 encoding prompt tail (an independent relations array); when
                 off, the prompt is verbatim-identical to existing behavior
                 (grayscale regression guarantee).
-            naming_enabled: naming 称呼偏好扩展段开关，开启时在编码提示词
-                尾部追加 memory_encode_naming 判定节（证据分级 a-f：仅记录
-                本人希望被如何称呼/明确反感的称呼，他人称呼习惯须有本人
-                接受迹象才可提取，自称/对 bot 的叫法/纯关系称谓一律不提
-                取）；关闭时提示词不含该段，naming 提取退回基础规则行为。
+            naming_enabled: naming (address preference) extension-section
+                switch; when on, a memory_encode_naming verdict section is
+                appended after the encoding prompt tail (evidence grades
+                a-f: record only how the person wants to be addressed /
+                forms they explicitly dislike; another person's naming
+                habit is extractable only with signs the person accepted
+                it; self-address / how others call the bot / pure relation
+                titles are never extracted). When off, the prompt carries
+                no such section and naming extraction falls back to the
+                base-rules behavior.
             config: Plugin runtime config (optional): when provided,
                 input_max_chars / relations_enabled / naming_enabled read
                 this instance per call at runtime, taking effect immediately
@@ -313,8 +325,10 @@ class MemoryEncoder:
         if not conversation_text:
             return "", [], [], False
 
-        # 超长输入截断（尾部丢弃 + 标记行告知 LLM）：防用户粘贴超长文本
-        # 造成编码必败 → 降级原文入库 → 补编码遍毒丸行队首阻塞
+        # Over-long input truncation (tail dropped + a marker line tells
+        # the LLM): prevents user-pasted over-long text from making
+        # encoding certain to fail -> degrade to raw-text storage -> the
+        # backfill pass's poison-pill row blocking the queue head
         if self.input_max_chars and len(conversation_text) > self.input_max_chars:
             dropped = len(conversation_text) - self.input_max_chars
             conversation_text = (
@@ -415,7 +429,8 @@ class MemoryEncoder:
 
         summary, facts, relations = self._parse_payload(parsed)
         if not summary:
-            # summary 缺失时降级为原文（chat_summary 通道永不丢原材料）
+            # Degrade to raw text when summary is missing (the
+            # chat_summary channel never loses the raw material)
             logger.warning("记忆编码未产出 summary，降级为原文单通道")
             return None
         return summary, facts, relations
