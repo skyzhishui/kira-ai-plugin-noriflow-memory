@@ -706,7 +706,7 @@ class LocalMemoryKernel:
         scoring.
 
         Semantic constraints (caller-guaranteed): category is limited to the
-        active six dimensions (system dimensions recent/uncertain do not go
+        active dimensions (system dimensions recent/uncertain do not go
         through this channel); ownership is pinned to the parameter user_id
         (the tool layer locks the scope to the trigger user, preventing
         unauthorized proxy writes).
@@ -718,9 +718,23 @@ class LocalMemoryKernel:
         if not await self.circuit_breaker.peek_available():
             raise MemoryDBUnavailable("记忆库熔断拒绝期，主动事实写入被拒绝")
         occurred = self._to_local(occurred_at or datetime.now())
-        evidence_key = self._build_evidence_key(session_id, occurred)
+        # 未来时间戳钳制到当前：工具入参不可信，recent 栏按 occurred_at
+        # 时间优先排序后未来值会钉在栏顶直到墙钟追上。幂等键（evidence_key
+        # / document_id 前缀）保留原始入参时间——若拿钳后的 now 参与键，
+        # 同一未来时间戳两次调用跨日会得到不同键，幂等去重失效重复计分；
+        # 钳后值只用于落库与画像排序（naive 本地与 aware 本地两口径
+        # 分别取同口径 now 比较）
+        key_occurred = occurred
+        now_local = (
+            datetime.now(tz=self._local_tz())
+            if occurred.tzinfo is not None
+            else datetime.now()
+        )
+        if occurred > now_local:
+            occurred = now_local
+        evidence_key = self._build_evidence_key(session_id, key_occurred)
         embedding = await self.embedding_service.embed_one(statement)
-        base_prefix = fact_document_id([user_id], session_id, occurred)
+        base_prefix = fact_document_id([user_id], session_id, key_occurred)
         content_hash = hashlib.md5(statement.encode()).hexdigest()[:12]
         document_id = f"{base_prefix}-{content_hash}"
         if embedding is None:

@@ -1275,10 +1275,34 @@ class TestPersonaService(unittest.TestCase):
         db._pool = pool
         asyncio.run(db.fetch_profile_sections("napcat", "90001", 5))
         asyncio.run(db.fetch_uncertain_statements("napcat", "90001", 5))
-        sqls = [s[2] for s in pool.conn.sqls if s[0] == "fetch"]
+        # FakeConn 记录 ("fetch", sql, args)：取 s[1] 才是 SQL 文本
+        # （原 s[2] 取到 args 元组，断言恒真空转）
+        sqls = [s[1] for s in pool.conn.sqls if s[0] == "fetch"]
         self.assertEqual(len(sqls), 2)
         for sql in sqls:
             self.assertNotIn("ANY(related_user_ids)", sql)
+
+    def test_31c_profile_recent_time_priority_sql(self):
+        # 近期动态栏时间优先排序防漂移（同步 nori 上游 #34）：双后端
+        # 单键/multi 四处查询须同构携带时间首键，其余分栏保持旧序
+        # （非 recent 分区 CASE 首键恒 NULL 被跳过——确定性契约不变）
+        for cls in (mod.MemoryDatabase, mod.SQLiteMemoryDatabase):
+            pool = FakePool()
+            db = cls(mod._build_config({"dsn": "x"}))
+            db._pool = pool
+            asyncio.run(db.fetch_profile_sections("napcat", "90001", 5))
+            asyncio.run(
+                db.fetch_profile_sections_multi(["napcat"], ["90001"], 5)
+            )
+            sqls = [s[1] for s in pool.conn.sqls if s[0] == "fetch"]
+            self.assertEqual(len(sqls), 2)
+            for sql in sqls:
+                self.assertIn("CASE WHEN m.category = 'recent'", sql)
+                self.assertIn("COALESCE(c.occurred_at, m.updated_at)", sql)
+                tail = sql[sql.index("END DESC NULLS LAST"):]
+                self.assertIn(
+                    "m.score DESC, m.updated_at DESC, m.id ASC", tail
+                )
 
     def test_29c_recent_and_uncertain_time_labels(self):
         # 时效栏（近期动态/待定信息）条目带发生时间尾注（与 recall 记忆块

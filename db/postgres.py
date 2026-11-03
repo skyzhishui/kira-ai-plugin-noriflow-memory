@@ -2720,9 +2720,13 @@ class MemoryDatabase(MemoryBackend):
         injecting the related side's profile would drop the subject and
         misattribute; the related side's profile is covered by facts
         previously extracted about them from the owner's viewpoint). The
-        ordering is fixed: score DESC -> updated_at DESC -> id ASC (the id
-        tiebreaker guarantees identical output order for identical table
-        contents — part of profile determinism), capped per section.
+        ordering is fixed: the recent section sorts time-first
+        (COALESCE(cluster.occurred_at, updated_at) DESC — cluster
+        occurred_at is the latest-mention time, advanced by GREATEST on
+        re-merge), every other section keeps score DESC -> updated_at DESC
+        -> id ASC (the id tiebreaker guarantees identical output order for
+        identical table contents — part of profile determinism), capped
+        per section.
 
         Args:
             platform: platform tag.
@@ -2741,7 +2745,10 @@ class MemoryDatabase(MemoryBackend):
                            c.occurred_at AS occurred_at,
                            row_number() OVER (
                                PARTITION BY m.category
-                               ORDER BY m.score DESC, m.updated_at DESC, m.id ASC
+                               ORDER BY CASE WHEN m.category = 'recent'
+                                        THEN COALESCE(c.occurred_at, m.updated_at)
+                                   END DESC NULLS LAST,
+                                        m.score DESC, m.updated_at DESC, m.id ASC
                            ) AS rn
                     FROM memory_user_profile m
                     LEFT JOIN memory_fact_cluster c ON c.id = m.cluster_id
@@ -2808,10 +2815,10 @@ class MemoryDatabase(MemoryBackend):
         Keys pair up as parallel arrays (platforms[i], user_ids[i]);
         ownership matching is owner-only (same as the single-key version;
         related ids do not join injection); ordering and per-section caps
-        match the single-key version (global score DESC -> updated_at DESC
-        -> id ASC ordering, then per-section caps), and identical statement
-        texts across keys dedup order-preservingly with non-null
-        occurred_at preferred.
+        match the single-key version (global window ordering — recent
+        time-first, others score DESC -> updated_at DESC -> id ASC — then
+        per-section caps), and identical statement texts across keys dedup
+        order-preservingly with non-null occurred_at preferred.
 
         Args:
             platforms: platform tag array (paired 1:1 with user_ids).
@@ -2830,7 +2837,10 @@ class MemoryDatabase(MemoryBackend):
                            c.occurred_at AS occurred_at,
                            row_number() OVER (
                                PARTITION BY m.category
-                               ORDER BY m.score DESC, m.updated_at DESC, m.id ASC
+                               ORDER BY CASE WHEN m.category = 'recent'
+                                        THEN COALESCE(c.occurred_at, m.updated_at)
+                                   END DESC NULLS LAST,
+                                        m.score DESC, m.updated_at DESC, m.id ASC
                            ) AS rn
                     FROM memory_user_profile m
                     LEFT JOIN memory_fact_cluster c ON c.id = m.cluster_id

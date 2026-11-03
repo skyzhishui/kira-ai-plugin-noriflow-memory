@@ -3,9 +3,10 @@
 Design (essential difference from hindsight):
 - persona == a **deterministic projection** of table content: field
   template (8 dimensions + conditional "other names" slot) + fixed ordering
-  (score DESC -> updated_at DESC -> id ASC) + per-slot cap; identical table
-  content produces byte-identical persona text; no LLM involvement, no
-  full rewrite, persona change iff cluster state changes;
+  (recent time-first via COALESCE(cluster.occurred_at, updated_at) DESC,
+  every other slot score DESC -> updated_at DESC -> id ASC) + per-slot cap;
+  identical table content produces byte-identical persona text; no LLM
+  involvement, no full rewrite, persona change iff cluster state changes;
 - data source: the first five slots come from the profile table (projection
   rows of profiled clusters); the pending-info slot from the cluster table
   (pending_uncertain plus halved replaced scores, so swaying/degraded

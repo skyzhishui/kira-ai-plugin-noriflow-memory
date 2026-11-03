@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.18.3 (2026-11-03)
+
+同步 nori 上游 #34：用户画像「近期动态」栏改时间优先排序——窗口首键
+`COALESCE(cluster.occurred_at, updated_at) DESC`（occurred_at 为最近提及
+时间，合并 GREATEST 推进），其余分栏保持 `score DESC -> updated_at DESC
+-> id ASC` 旧序（CASE 首键恒 NULL 被跳过，确定性契约不变），早期高分
+recent 条目不再挤占每栏 5 条限量、把新近动态顶出画像。随带：双后端
+（PG/SQLite）单键与 multi 四处查询同构修改；`write_fact` 未来时间戳
+钳制到 now 且幂等键（evidence_key / document_id 前缀）保留原始入参
+日期（钳后 now 跨日漂移会击穿同日去重，上游评审二轮结论）；维护页
+簇/事实筛选下拉与画像栏卡片补 preference/commitment；修正
+test_31b owner-only SQL 断言取错位（原取 args 元组，恒真空转）。存量
+数据核查：本部署 SQLite 库 1399 簇 future occurred_at = 0，无需迁移。
+
 ## v1.18.2 (2026-11-02)
 
 同步 nori 上游（nori_plugin_noriflow_memory）四项：跨会话近期摘要注入（#31）、

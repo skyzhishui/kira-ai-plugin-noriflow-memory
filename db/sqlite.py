@@ -2470,7 +2470,10 @@ class SQLiteMemoryDatabase(MemoryBackend):
                            c.occurred_at AS occurred_at,
                            row_number() OVER (
                                PARTITION BY m.category
-                               ORDER BY m.score DESC, m.updated_at DESC, m.id ASC
+                               ORDER BY CASE WHEN m.category = 'recent'
+                                        THEN COALESCE(c.occurred_at, m.updated_at)
+                                   END DESC NULLS LAST,
+                                        m.score DESC, m.updated_at DESC, m.id ASC
                            ) AS rn
                     FROM memory_user_profile m
                     LEFT JOIN memory_fact_cluster c ON c.id = m.cluster_id
@@ -2532,7 +2535,10 @@ class SQLiteMemoryDatabase(MemoryBackend):
                            c.occurred_at AS occurred_at,
                            row_number() OVER (
                                PARTITION BY m.category
-                               ORDER BY m.score DESC, m.updated_at DESC, m.id ASC
+                               ORDER BY CASE WHEN m.category = 'recent'
+                                        THEN COALESCE(c.occurred_at, m.updated_at)
+                                   END DESC NULLS LAST,
+                                        m.score DESC, m.updated_at DESC, m.id ASC
                            ) AS rn
                     FROM memory_user_profile m
                     LEFT JOIN memory_fact_cluster c ON c.id = m.cluster_id
