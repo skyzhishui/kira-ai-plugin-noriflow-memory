@@ -919,8 +919,9 @@ class MemoryDatabase(MemoryBackend):
 
         The retrieval SELECT no longer ships the vector text with every row
         (with asyncpg's pgvector codec unregistered that is ~18KB of
-        '[...]' text per row; two legs x rerank_candidates is ~1.8MB of
-        transfer plus JSON parsing). Near-duplicate dedup only consumes the
+        '[...]' text per row; two legs x rerank_candidates is ~0.7MB at the
+        default 20 candidates, ~1.8MB at the old default 50 -- transfer plus
+        JSON parsing). Near-duplicate dedup only consumes the
         vectors of the truncated head rows, so they are fetched precisely
         here by id
         (~1ms localhost RTT). Rows whose embedding is NULL do not appear in

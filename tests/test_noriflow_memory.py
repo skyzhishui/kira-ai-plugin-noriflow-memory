@@ -669,34 +669,39 @@ class TestHysteresisBandValidation(unittest.TestCase):
             self.LocalMemoryConfig(score_cap=3.5)  # recent 缺省 4.0 > 3.5
 
     def test_16b_naming_promote_above_cap_is_rejected(self):
-        # naming 维度同口径（v1.18.2）：阈值 > 封顶 = 称呼偏好静默进不了画像。
-        # 只让 naming 越界（cap=10 下 promote/recent 缺省合法）——若只给
-        # cap=2.5，promote 缺省 6.0 会先触发同一校验器，删掉 naming 分支
-        # 测试照样绿（评审指出的假阳性）
+        # naming dimension, same rule (v1.18.2): threshold > cap means the
+        # naming preference silently never reaches the profile.
+        # Only naming goes out of range here (promote/recent defaults are legal
+        # at cap=10) -- with cap=2.5 alone the promote default 6.0 would trip
+        # the same validator first, so the test stayed green even with the
+        # naming branch deleted (the false positive review flagged)
         with self.assertRaises(Exception) as ctx:
             self.LocalMemoryConfig(
                 score_cap=10.0, naming_promote_threshold=11.0
             )
         self.assertIn("naming_promote_threshold", str(ctx.exception))
         self.assertIn("不得大于 score_cap", str(ctx.exception))
-        # 显式高于 score_start_high（但 ≤ cap）是合法的保守配置
-        # （退化为二次证据累积），不拒
+        # Explicitly above score_start_high (but <= cap) is a legal
+        # conservative setup (degrades to second-evidence accumulation), not
+        # rejected
         cfg = self.LocalMemoryConfig(
             score_cap=10.0, score_start_high=3.0, naming_promote_threshold=5.0
         )
         self.assertEqual(cfg.naming_promote_threshold, 5.0)
 
     def test_16c_naming_threshold_derives_from_scale(self):
-        # 缺省（None/不设）从 score_start_high 派生：单次晋档承诺在任何
-        # 评分刻度下按构造成立；缩放刻度的既有部署不设新键时天然合法，
-        # 不触发跨字段回退连坐复位合法显式评分键（升级级联修复）
+        # Default (None/unset) derives from score_start_high: the
+        # single-evidence promotion promise holds by construction on any score
+        # scale; existing deployments on a scaled ruler stay legal without the
+        # new key, so no cross-field rollback drags valid explicit score keys
+        # into a reset (the upgrade cascade fix)
         cfg = self.LocalMemoryConfig(score_start_high=1.0)
         self.assertEqual(cfg.naming_promote_threshold, 1.0)
         scaled = self.LocalMemoryConfig(
             score_cap=1.5, promote_threshold=1.5, demote_threshold=0.5,
             score_start_high=1, score_start_medium=1,
             recent_promote_threshold=1.0,
-        )  # 老部署形态：未设 naming，派生 1.0 <= cap 1.5，原样通过
+        )  # legacy shape: naming unset, derived 1.0 <= cap 1.5, passes
         self.assertEqual(scaled.naming_promote_threshold, 1.0)
         self.assertEqual(scaled.score_cap, 1.5)
 
@@ -1283,25 +1288,17 @@ class TestPersonaService(unittest.TestCase):
         text = asyncio.run(svc.build_multi_profile_text(candidates=candidates, session_id="s"))
         self.assertEqual(text.count("小明："), 1)
 
-    def test_31b_profile_fetch_owner_only_sql(self):
-        # 画像分栏/待定栏读侧 owner-only：related 不参与注入
-        # （关系语句以 owner 视角写成，注入 related 方画像会张冠李戴）
-        pool = FakePool()
-        db = mod.MemoryDatabase(mod._build_config({"dsn": "x"}))
-        db._pool = pool
-        asyncio.run(db.fetch_profile_sections("napcat", "90001", 5))
-        asyncio.run(db.fetch_uncertain_statements("napcat", "90001", 5))
-        # FakeConn 记录 ("fetch", sql, args)：取 s[1] 才是 SQL 文本
-        # （原 s[2] 取到 args 元组，断言恒真空转）
-        sqls = [s[1] for s in pool.conn.sqls if s[0] == "fetch"]
-        self.assertEqual(len(sqls), 2)
-        for sql in sqls:
-            self.assertNotIn("ANY(related_user_ids)", sql)
-
-    def test_31c_profile_recent_time_priority_sql(self):
-        # 近期动态栏时间优先排序防漂移（同步 nori 上游 #34）：双后端
-        # 单键/multi 四处查询须同构携带时间首键，其余分栏保持旧序
-        # （非 recent 分区 CASE 首键恒 NULL 被跳过——确定性契约不变）
+    def test_31b_profile_fetch_sql_shape(self):
+        # Profile/uncertain read side is owner-only: related rows never take
+        # part in injection (relation statements are written from the owner's
+        # point of view, so injecting the related side's profile would
+        # misattribute them).
+        # Recent-section time-first ordering anti-drift (synced with nori
+        # upstream #34): on both backends the single-key and multi queries must
+        # carry the time-first key, while the other sections keep the old order
+        # (the non-recent CASE lead key is always NULL and gets skipped, so the
+        # determinism contract is unchanged).
+        # One capture covers the three read methods on both backends.
         for cls in (mod.MemoryDatabase, mod.SQLiteMemoryDatabase):
             pool = FakePool()
             db = cls(mod._build_config({"dsn": "x"}))
@@ -1310,12 +1307,22 @@ class TestPersonaService(unittest.TestCase):
             asyncio.run(
                 db.fetch_profile_sections_multi(["napcat"], ["90001"], 5)
             )
+            asyncio.run(db.fetch_uncertain_statements("napcat", "90001", 5))
+            # FakeConn records ("fetch", sql, args): s[1] is the SQL text
+            # (s[2] used to pick up the args tuple, so the assertion was
+            # vacuous)
             sqls = [s[1] for s in pool.conn.sqls if s[0] == "fetch"]
-            self.assertEqual(len(sqls), 2)
+            self.assertEqual(len(sqls), 3)
             for sql in sqls:
+                # Owner-only: no related-side widening in any of the three
+                # (PG ANY form / SQLite json_each form)
+                self.assertNotIn("ANY(related_user_ids)", sql)
+                self.assertNotIn("json_each(related_user_ids)", sql)
+            for sql in sqls[:2]:  # the two profile-section queries
                 self.assertIn("CASE WHEN m.category = 'recent'", sql)
                 self.assertIn("COALESCE(c.occurred_at, m.updated_at)", sql)
-                # 护栏先行：首键缺失时给断言失败而非 index 抛 ValueError
+                # Guard first: a missing lead key fails the assertion here
+                # rather than raising ValueError from index()
                 self.assertIn("END DESC NULLS LAST", sql)
                 tail = sql[sql.index("END DESC NULLS LAST"):]
                 self.assertIn(
@@ -4091,8 +4098,9 @@ class TestBuildConfigReflection(unittest.TestCase):
                 f.default_factory() if f.default_factory is not None else f.default
             )
             ann = f.annotation
-            # Optional[float] 解包：按 float 探测；None 缺省（派生字段）用
-            # 缺省刻度下的派生值作探测基准（保证探针值 != 缺省）
+            # Optional[float] is unwrapped and probed as float; for a None
+            # default (derived field) use the value derived at the default
+            # scale as the probe baseline (so the probe differs from it)
             if ann == Optional[float]:
                 ann = float
                 if default is None:

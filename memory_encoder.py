@@ -60,19 +60,28 @@ _VALID_CATEGORIES = frozenset(
 _VALID_CONFIDENCES = frozenset({"high", "medium"})
 
 # ---------------------------------------------------------------------------
-# 半句截断防护（移植自 nori #26）。上游 LLM 在 response_format=json_object
-# 引导解码下会间歇性提前终止：摘要停在半句，JSON 由上游自行闭合，
-# finish_reason 仍为 stop（无截断信号、预算未耗尽）——半句 JSON 合法，
-# 解析层无从察觉，照单写入即成为「可召回的残缺记忆」（该轮 facts 全丢）。
-# 判定为反向白名单口径（误杀完整摘要的代价〔重试 + 可能整轮降级〕高于
-# 漏杀半句，宁可少判）：
-# - 末字为汉字：中文半句切断几乎必落在汉字上（nori 生产 186 例末字全是
-#   汉字/逗号族/开括号：发/说/称/的/侃/（/喊/梗…）；
-# - 末字为逗号族（，、：；,;:）：任何脚本下逗号结尾必是半句；
-# - 末字为开括号/开引号（（「『“‘《【(['）：开而不闭必是半句。
-# 反之，句末标点（。！？…”』」～!?.)）、ASCII 字母/数字（"查ID"、
-# "version 2"）、半角 ~、emoji 等结尾一律不判截断（nori 生产 190 条疑似
-# 中旧白名单口径曾误杀 4 条完整摘要：末字 ~ ×3、ASCII 字母 ×1）。
+# Half-sentence truncation guard (ported from nori #26). Under guided
+# decoding with response_format=json_object the upstream LLM occasionally stops
+# early: the summary breaks mid-sentence, the JSON closes itself, and
+# finish_reason is still stop (no truncation signal, budget not exhausted) --
+# the half-sentence JSON is valid, so the parse layer cannot notice, and
+# writing it as-is yields a "recallable but broken memory" (that turn's facts
+# are all lost).
+# The check is a reverse whitelist (killing a complete summary costs a retry
+# plus a possible whole-turn downgrade, which outweighs missing a
+# half-sentence, so it prefers under-detecting):
+# - Last char is a CJK ideograph: a cut Chinese half-sentence almost always
+#   lands on one (all 186 nori production cases ended on an ideograph / comma
+#   family / opening bracket: 发/说/称/的/侃/（/喊/梗...);
+# - Last char is in the comma family (，、：；,;:): a trailing comma is always
+#   a half-sentence, in any script;
+# - Last char is an opening bracket/quote (（「『“‘《【(['): opened but never
+#   closed is always a half-sentence.
+# Conversely, sentence-final punctuation (。！？…”』」～!?.)), ASCII letters or
+# digits ("查ID", "version 2"), half-width ~, emoji and the like are never
+# treated as truncation (the old whitelist wrongly killed 4 complete summaries
+# among the 190 suspect nori production rows: 3 ending on ~, 1 on ASCII
+# letters).
 # ---------------------------------------------------------------------------
 _CJK_IDEOGRAPH_RE = re.compile(r"[一-鿿]")
 _CLAUSE_MID_PUNCT = frozenset("，、：；,;:")
@@ -80,17 +89,23 @@ _OPENING_BRACKETS = frozenset("（「『“‘《【(['")
 
 
 def _looks_truncated(summary: str) -> bool:
-    """摘要是否疑似被上游提前终止（半句截断）。
+    """Whether the summary looks stopped early (half-sentence truncation).
 
-    判定口径（见上方模块注释，反向白名单）：
-    - 逗号族/开括号收尾的检查先于行数分支，对单行与多行**同时**生效；
-    - 多行摘要（首行【话题】锚点 + 分节正文）：末字为汉字 → 判截断；
-    - 单行摘要：提示词规定的纯锚点形态「【话题】XXX」合法，仅当末字为
-      逗号族/开括号族、或锚点为空（连话题都没写出）时判截断。
+    Rules (see the module comment above; reverse whitelist):
+    - The comma-family / opening-bracket check runs before the line-count
+      branch and applies to single-line **and** multi-line summaries alike;
+    - Multi-line summary (first line "【话题】" anchor + sectioned body): a
+      trailing CJK ideograph -> truncated;
+    - Single-line summary: the pure anchor form "【话题】XXX" the prompt asks
+      for is legal; truncation only when the last char is in the comma or
+      opening-bracket family, or the anchor is empty (not even the topic was
+      written).
 
-    已知残余（有意取舍）：截断恰落在首行锚点中间的单行结果与合法纯锚点
-    形态文本上不可区分，按设计放行——nori 生产 12495 行中锚点中途截断
-    0 例，为消此残余对每次合法锚点摘要重试 learner 得不偿失。
+    Known residual (deliberate trade-off): a single-line result truncated
+    exactly inside the first-line anchor is indistinguishable from the legal
+    pure-anchor form, so it is let through by design -- 0 anchor-mid
+    truncations in 12495 nori production lines, and retrying the learner for
+    every legal anchor summary is not worth removing this residual.
     """
     text = (summary or "").strip()
     if not text:
@@ -102,7 +117,8 @@ def _looks_truncated(summary: str) -> bool:
     if last_char in _CLAUSE_MID_PUNCT or last_char in _OPENING_BRACKETS:
         return True
     if len(lines) == 1:
-        # 空锚点（"【话题】" 或仅前缀）：话题本身没写出来，必是残缺
+        # Empty anchor ("【话题】" or the prefix only): the topic itself was
+        # never written, so it must be truncated
         return text.rstrip("】").endswith("【话题")
     return bool(_CJK_IDEOGRAPH_RE.match(last_char))
 # 事实陈述长度上限（截断保留，对照关系通道 ≤200 的量级；簇
@@ -311,9 +327,11 @@ class MemoryEncoder:
                 self.input_max_chars,
             )
 
-        # 半句截断防护（nori #26 移植）：疑似截断重试一次，仍截断则降级
-        # 原文单通道（summarized=false 不参与召回，由合并 agent 补编码遍
-        # 重编码）——半句摘要绝不作为完整记忆写入
+        # Half-sentence truncation guard (ported from nori #26): retry once on
+        # suspicion; a second truncation degrades to the raw-text-only channel
+        # (summarized=false, not recallable, re-encoded by the merge agent's
+        # backfill pass) -- a half-sentence summary is never written as a
+        # complete memory
         for attempt in (1, 2):
             result = await self._encode_once(conversation_text, bot_nickname, bot_user_id)
             if result is None:
@@ -362,8 +380,10 @@ class MemoryEncoder:
                     bot_user_id=bot_user_id or "未知",
                 )
             if self.naming_enabled:
-                # naming 判定节是可选增强：模板缺失降级跳过并告警（主编码
-                # 行为不受影响，退回基础规则），与 relations 段同模式
+                # The naming verdict section is optional: a missing template
+                # degrades to skip + warning (main encoding is unaffected and
+                # falls back to the base rules), same pattern as the relations
+                # section
                 try:
                     system_prompt += "\n\n" + self._loader.render(
                         _NAMING_PROMPT_NAME,

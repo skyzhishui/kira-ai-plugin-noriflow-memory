@@ -148,9 +148,12 @@ _MEMORY_TOOLS_GUIDANCE = (
 )
 
 # ---------------------------------------------------------------------------
-# 跨会话近期摘要注入（移植自 nori #31：私聊回合前置当前用户其他会话的
-# 近期摘要；预算整块计（前言+条目），memo 只登记实际注入行——被预算
-# 裁剪/空内容丢弃的行保持可检索，否则本轮既看不到又召不回）
+# Cross-session recent-summary injection (ported from nori #31: for DM
+# turns, prepend the current user's recent summaries from other sessions; the
+# budget covers the whole block (preamble + entries) and the memo only records
+# the rows actually injected -- rows dropped by the budget or for empty
+# content stay recallable, otherwise they are invisible to this turn and to
+# recall alike)
 # ---------------------------------------------------------------------------
 _CROSS_SESSION_SECTION_TITLE = "# 该用户在其他会话的近期摘要（非本会话内容，仅供参考）"
 _CROSS_SESSION_PREAMBLE_LINES = [
@@ -229,21 +232,24 @@ def _cross_session_keeps_content_slice(numbered: str) -> bool:
 def build_cross_session_block(
     rows: list[dict], *, now: datetime, tz, budget: int
 ) -> tuple[str, list[str]]:
-    """把跨会话摘要行装配为注入块（前言计入预算）。
+    """Assemble cross-session summary rows into the injection block (the
+    preamble counts against the budget).
 
     Args:
-        rows: fetch_recent_cross_session_summaries 的返回行（新→旧）。
-        now: 当前时间（aware）。
-        tz: 展示时区。
-        budget: 整块字符预算（前言 + 条目区；来自
-            cross_session_summary_max_chars）。
+        rows: rows returned by fetch_recent_cross_session_summaries
+            (newest -> oldest).
+        now: current time (aware).
+        tz: display timezone.
+        budget: whole-block character budget (preamble + entry area; from
+            cross_session_summary_max_chars).
 
     Returns:
-        (block_text, injected_document_ids)：无有效条目时 ("", [])。
-        injected_document_ids 只含实际呈现给模型的行（预算裁剪行保持
-        可检索），调用方据此登记去重 memo。
+        (block_text, injected_document_ids); ("", []) when no valid entry.
+        injected_document_ids holds only the rows actually shown to the
+        model (budget-trimmed rows stay recallable), and the caller uses it
+        to register the dedup memo.
     """
-    used = len(_CROSS_SESSION_PREAMBLE) + 2  # 前言 + 与条目区的空行分隔
+    used = len(_CROSS_SESSION_PREAMBLE) + 2  # preamble + blank-line separator
     entries: list[str] = []
     injected_ids: list[str] = []
     for row in rows:
@@ -255,7 +261,8 @@ def build_cross_session_block(
         if used + join_cost + len(numbered) > budget:
             if entries:
                 break
-            # 首条放不下：截到恰好用满预算；截断后正文残留过短则整条放弃
+            # First entry does not fit: trim to exactly fill the budget;
+            # drop it whole when the remaining body is too short
             room = budget - used - _CROSS_SESSION_TRUNCATE_SUFFIX_LEN
             if room <= 0:
                 break
@@ -845,8 +852,9 @@ class NoriflowMemoryPlugin(BasePlugin):
                 # 编码行为与现状逐字一致）；kernel 侧另有提取开关兜底；
                 # 传 config 让两项运行时读（维护页配置热生效）
                 relations_enabled=config.relation_extract_enabled,
-                # naming 判定节：开关只控制提示词扩展节附加与否（nori
-                # #32 移植，模板缺失自动降级跳过）
+                # naming verdict section: the switch only decides whether the
+                # prompt extension is appended (ported from nori #32; a missing
+                # template degrades to a skipped section)
                 naming_enabled=config.naming_prompt_enabled,
                 config=config,
             )
@@ -1418,21 +1426,30 @@ class NoriflowMemoryPlugin(BasePlugin):
         # 前缀缓存。persist=False：仅本轮生效，不写回会话历史。
         inject_prompts: list[Prompt] = []
 
-        # 跨会话近期摘要（nori #31 移植）：私聊回合前置当前用户在其他会话
-        # 的近期摘要，时间线置于滚动补回/召回之前。入口**无条件清空**本轮
-        # memo——任何提前返回（开关关/非私聊/无身份/取回失败）都不残留上
-        # 轮排除项；残留项会在 TTL 窗口内把 recall/主动检索结果错误排除。
-        # 身份归并：宿主暂无跨平台身份服务，退化为单复合键（platform:uid），
-        # 与 nori 侧身份未命中时的回退同构。memo 在 recall 之前登记，同轮
-        # 检索即排除已注入行（双通道不重复暴露）。
+        # Cross-session recent summaries (ported from nori #31): DM turns get
+        # the current user's recent summaries from other sessions prepended,
+        # on the timeline before rolling rollout fill-back/recall. The entry
+        # point **unconditionally clears** this turn's memo -- any early
+        # return (switch off / not DM / no identity / fetch failed) leaves no
+        # stale exclusion; stale entries would wrongly exclude recall and
+        # proactive-search hits for the whole TTL window.
+        # Identity merging: no cross-platform identity service on the host
+        # yet, so it degrades to one composite key (platform:uid), matching
+        # nori's fallback on an identity miss. The memo is registered before
+        # recall so same-turn retrieval excludes injected rows (no double
+        # exposure through two channels).
         if hasattr(kernel, "refresh_cross_session_memo"):
             kernel.refresh_cross_session_memo(session.session_id, [])
-        # 白名单（== "dm"）而非黑名单（!= "gm"）：跨会话摘要是隐私敏感
-        # 注入（本人其他会话内容），宿主契约当前仅 {dm, gm}（session_tools
-        # 强校验）两者等价，但未来出现第三种会话类型时白名单 fail-closed
-        # （不注入）而黑名单会把本人跨会话内容暴露给非私聊上下文。
-        # getattr 缺省取 ""（而非 "dm"）：session_type 字段缺失/改名的
-        # 会话对象一律不注入——缺省方向同样 fail-closed（评审意见）
+        # Whitelist (== "dm") rather than blacklist (!= "gm"): cross-session
+        # summaries are a privacy-sensitive injection (the user's own other
+        # sessions). The host contract currently has only {dm, gm} (enforced
+        # by session_tools) so the two are equivalent, but a future third
+        # session type would fail closed under the whitelist (no injection)
+        # while a blacklist would leak the user's cross-session content into
+        # non-DM contexts.
+        # getattr defaults to "" (not "dm"): a session object whose
+        # session_type is missing/renamed is never injected -- the default
+        # direction fails closed too (review feedback)
         if (
             self._config.cross_session_summary_enabled
             and getattr(session, "session_type", "") == "dm"
@@ -1465,20 +1482,27 @@ class NoriflowMemoryPlugin(BasePlugin):
                                 persist=False,
                             )
                         )
-                        # 防重契约：只登记实际呈现给模型的行——被预算裁剪/
-                        # 空内容丢弃的行未注入，保持可检索（否则本轮既看不
-                        # 到又召不回，形成召回盲区）。
+                        # Dedup contract: register only the rows actually shown
+                        # to the model -- budget-trimmed / empty-content rows
+                        # were not injected, so they stay recallable
+                        # (otherwise this turn could neither see them nor
+                        # recall them, i.e. a recall blind spot).
                         #
-                        # 与滚动补回两阶段契约的关系（评审两轮重提，此处
-                        # 固化论证）：两阶段的实义是「先把块真正 append 进
-                        # 本轮 prompt pieces，再落实 memo」——本路径的
-                        # append → register 顺序即该性质（两者之间仅隔纯
-                        # 内存 list.append，不存在可失败间隙）。宿主是否
-                        # 最终采纳本轮装配对插件不可观测（无中止回调），
-                        # 该残余对滚动补回（commit 亦已在 append 后执行）
-                        # 与本路径完全对称，且都被下一轮 llm_request 入口
-                        # 的无条件清空兜住（至多一轮间隔）——不存在本路径
-                        # 独有的盲区窗口。
+                        # Relation to the rolling rollout fill-back two-phase
+                        # contract (raised twice in review, argument fixed
+                        # here): the real meaning of the two phases is "append
+                        # the block into this turn's prompt pieces first, then
+                        # commit the memo" -- this path's append -> register
+                        # order is exactly that property (only a pure in-memory
+                        # list.append sits between the two, with no failable
+                        # gap). Whether the host finally adopts this turn's
+                        # assembly is unobservable to the plugin (no abort
+                        # callback); that residual is fully symmetric with
+                        # rolling fill-back (whose commit also runs after
+                        # append) and both are covered by the unconditional
+                        # clear at the next turn's llm_request entry (at most
+                        # one turn of lag) -- so there is no blind-spot window
+                        # unique to this path.
                         kernel.refresh_cross_session_memo(
                             session.session_id, cs_injected_ids
                         )
