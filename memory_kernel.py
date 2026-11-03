@@ -330,9 +330,12 @@ class LocalMemoryKernel:
         # 滚动补回去重 memo：{session_id: (已注入 document_id 列表, monotonic 时间)}
         # 同轮 recall/主动检索据此排除已注入行；TTL 覆盖单轮 pipeline 时长
         self._rollout_memo: dict[str, tuple[list[str], float]] = {}
-        # 跨会话注入去重 memo（同构）：{session_id: (已注入 document_id, 时间)}
-        # 与滚动补回共用检索排除通道；入口统一清空，任何提前返回不残留
-        # 上轮排除项（TTL 窗口内错误排除会造成召回盲区）
+        # Cross-session injection dedup memo (same shape):
+        # {session_id: (injected document_ids, monotonic time)}
+        # Shares the retrieval exclusion channel with rolling fill-back; the
+        # entry point always clears it so no early return leaves the previous
+        # turn's exclusions behind (wrong exclusion within the TTL blinds
+        # recall)
         self._cross_session_memo: dict[str, tuple[list[str], float]] = {}
         # 两阶段提交的暂存区（build_recent_rollout_text 写入，commit_
         # rollout_memo 落实）：构建与最终注入之间 prompt 装配可能被丢弃，
@@ -718,12 +721,15 @@ class LocalMemoryKernel:
         if not await self.circuit_breaker.peek_available():
             raise MemoryDBUnavailable("记忆库熔断拒绝期，主动事实写入被拒绝")
         occurred = self._to_local(occurred_at or datetime.now())
-        # 未来时间戳钳制到当前：工具入参不可信，recent 栏按 occurred_at
-        # 时间优先排序后未来值会钉在栏顶直到墙钟追上。幂等键（evidence_key
-        # / document_id 前缀）保留原始入参时间——若拿钳后的 now 参与键，
-        # 同一未来时间戳两次调用跨日会得到不同键，幂等去重失效重复计分；
-        # 钳后值只用于落库与画像排序（naive 本地与 aware 本地两口径
-        # 分别取同口径 now 比较）
+        # Timestamp clamping: future tool input is untrusted, and the recent
+        # section orders by occurred_at first, so a future value would pin
+        # itself to the top until the wall clock catches up. The idempotency
+        # key (evidence_key / document_id prefix) keeps the original input
+        # time -- using the clamped now in the key would give two calls with
+        # the same future timestamp different keys across days, breaking
+        # idempotent dedup and double-scoring. The clamped value is used only
+        # for storage and profile ordering (naive-local and aware-local paths
+        # each compare against a now of the same kind)
         key_occurred = occurred
         now_local = (
             datetime.now(tz=self._local_tz())
@@ -1361,6 +1367,12 @@ class LocalMemoryKernel:
         # counter), and the un-fetched rows keep missing-vector semantics.
         dedup_fetch_dead = False
         if lazy_embeddings and sim_threshold > 0 and rows:
+            # A failed FIRST chunk cannot trigger paging in any reachable
+            # state: the lazy path only runs on the non-per-user branch
+            # (keep_bound = top_k < dedup_chunk) and vector-less rows are
+            # always kept, so kept_rows reaches top_k before idx crosses
+            # the chunk boundary. The latch below therefore only ever
+            # engages for genuine mid-pool paging failures.
             await self._load_dedup_vectors(
                 rows, 0, dedup_chunk, fetch_embeddings_by_id
             )
@@ -2135,10 +2147,13 @@ class LocalMemoryKernel:
     def refresh_cross_session_memo(self, session_id: str, document_ids: list[str]) -> None:
         """Replace this round's cross-session injected ids; empty clears.
 
-        Synchronous (no await): the injection hook calls it twice per round
-        -- entry (clear) and after assembling (register the ids actually
-        rendered, budget-dropped rows stay retrievable). Mirrors the rollout
-        memo TTL/capacity semantics.
+        Synchronous (no await). The injection hook calls it unconditionally
+        at entry (clear -- so no early return can leave stale exclusions)
+        and again after a *successful* injection (register only the ids
+        actually rendered; budget-dropped rows stay retrievable). With the
+        feature disabled the register call never fires -- the clear at entry
+        is the only per-round call. Mirrors the rollout memo TTL/capacity
+        semantics.
         """
         if not session_id or not document_ids:
             self._cross_session_memo.pop(session_id, None)

@@ -1,5 +1,59 @@
 # Changelog
 
+## v1.18.4 (2026-11-03)
+
+v1.18.0→v1.18.3 增量的自主评审批（缺陷/注释合规/测试精简/冗余/一致性五维）。
+
+### fix: 评审确认的三项缺陷
+
+- **跨会话条目 session_name 死字段**（D1）：DB 层从不返回该列，条目恒渲染
+  「（未命名会话）」白耗预算——条目收敛为三行（session_id/时间/内容），
+  移除死常量与死分支；
+- **MemoryBackend ABC 契约缺口**（D3）：补 `fetch_recent_cross_session_
+  summaries` / `fetch_embeddings_by_ids` 两条 @abstractmethod 声明（其余
+  53 个 fetch_* 均在案，唯二漏声明；缺方法时被 fail-open 静默掩盖）；
+- **naming 派生下界守卫**（D4）：`score_start_high<=0`（字段级合法）时派生
+  0 绕过 `gt=0`、任何 naming 提取建簇即晋档——改为拒绝并要求显式设置
+  （自报键 `("naming_promote_threshold","score_start_high")` 回退后必然
+  收敛），新增 test_16d 双分支；
+- **评审 D2 复核证伪**：懒向量首块失败续取在所有可达状态不可达
+  （`lazy_embeddings = not is_per_user`；非 per-user 路径 keep_bound=top_k
+  < chunk 且缺向量行必 kept）——原「每轮至多一次取回失败」不变式成立，
+  成立依据固化进注释（不加死防御代码）。
+
+### refactor: 冗余收敛（R1/R2）
+
+- 细粒度相对时间标注下沉 `time_labels.relative_time_precise`（该模块自述
+  使命即避免实现漂移），main.py 删除平行实现；
+- `_cross_session_parse_ts` 删除，复用 `db.base.sqlite_parse_ts`
+  （`db/__init__` 已再出口；naive 分支实际不可达，严格解析足够）。
+
+### docs: 新增注释英文化（175 块）
+
+v1.18.0→1.18.3 增量新增注释/docstring 违反工作区规则（All new code
+comments must be written in English）——全部译为英文（web 62 + Python
+113），术语统一（promote/profile/recall/rolling rollout fill-back/
+circuit breaker/dedup 等），引用标记保留；有意保留 7 行字符集数据样例
+（截断守卫的逗号族/开括号族/【话题】锚点字面量，即 regex 匹配对象本身）。
+既有历史中文注释（范围外）不在本批处理。
+
+### test: 精简与加固（B1-B5）
+
+- B1：装配器预算用例动态构造——钉死「截断后放弃」「截断保留」两分支
+  （原硬编码 260 与 120 同走 room<=0 分支，截断分支零覆盖），补中间态
+  memo 契约（次条预算裁剪不登记）；
+- B3：fail_open 补熔断计数断言（原断言对失败路径不敏感）；
+- B4/B5：懒向量两用例合并、31b/31c 合并为 `test_31b_profile_fetch_sql_
+  shape`（一次捕获三方法×两后端，断言零丢失并补齐 SQLite 形式）；
+- B2：重复 `db.close()` 删除；test_16d 新增。
+
+### docs: 注释与代码一致性修正（A2-A7）
+
+「每轮两次调用」措辞修正、残量阈值注明含省略号、单行截断口径补开括号族、
+migration 015 头注更新（014 已落地）、encode() 降级枚举补截断路径、
+`_cfg_float` 注解 `float | None`、fetch_embeddings_by_ids 传输量估算随
+rerank 缺省 50→20 更新。
+
 ## v1.18.3 (2026-11-03)
 
 同步 nori 上游 #34：用户画像「近期动态」栏改时间优先排序——窗口首键

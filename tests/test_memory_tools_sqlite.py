@@ -334,9 +334,11 @@ async def main_async() -> None:
         str(summary),
     )
 
-    # 未来时间戳钳制 + 幂等键取原始入参日期（同步 nori 上游 #34 评审）：
-    # 落库 occurred_at 钳到 now（防 recent 时间优先排序下钉栏顶），
-    # 幂等键用原始入参（钳后 now 跨日漂移会击穿同日去重）
+    # Future timestamp clamping + idempotency key from the original input
+    # date (synced with the nori upstream #34 review): stored occurred_at
+    # is clamped to now (so time-priority ordering in recent cannot pin it
+    # to the top), while the idempotency key uses the original input (a
+    # clamped now drifts across days and would break same-day dedup)
     async def _cluster_occurred(cid: int):
         async with db.pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -356,7 +358,7 @@ async def main_async() -> None:
     stored_dt = (
         datetime.fromisoformat(stored) if isinstance(stored, str) else stored
     )
-    # sqlite 层存回的可能是 aware 口径：取同口径 now 再比较
+    # sqlite may hand back an aware datetime: compare against an aware now
     now_cmp = (
         datetime.now(stored_dt.tzinfo) if stored_dt.tzinfo else datetime.now()
     )

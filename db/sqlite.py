@@ -1376,8 +1376,10 @@ class SQLiteMemoryDatabase(MemoryBackend):
                     raise RuntimeError(f"建簇来源事实不存在: fact_id={fact_id}")
 
                 if action == "create":
-                    # 维度阈值（recent/naming 各自低阈值，其余通用）——
-                    # 起步分已达即建簇晋档（见 INSERT 后的画像行写入）
+                    # Dimension thresholds (recent/naming have their own lower
+                    # values, others use the generic one) -- a start score that
+                    # already meets it promotes at cluster creation (see the
+                    # profile row write after the INSERT)
                     create_threshold = (
                         float(recent_promote_threshold)
                         if raw["category"] == "recent"
@@ -1410,10 +1412,14 @@ class SQLiteMemoryDatabase(MemoryBackend):
                         raw["embedding"], now,
                     )
                     if create_status == "profiled":
-                        # 建簇即时晋档（与 PG 版同款，nori 96214f4）：起步分
-                        # 已达维度阈值（naming 单次明确表态）时建簇即晋档并
-                        # 同事务写画像行，不依赖晋档遍（规避同周期衰减遍的
-                        # 时序窗口）；未达标建簇行为不变（active）
+                        # Immediate promote on cluster creation (PG parity,
+                        # nori 96214f4): a start score already meeting the
+                        # dimension threshold (single explicit naming
+                        # statement) promotes at creation with the profile
+                        # row written in the same transaction, no promotion
+                        # pass needed (avoids the same-cycle decay timing
+                        # window); below-threshold creation is unchanged
+                        # (active)
                         await conn.execute(
                             PROFILE_UPSERT_SQL.format(
                                 source="VALUES ($1, $2, $3, $4, $5, $6, $7)",

@@ -919,8 +919,9 @@ class MemoryDatabase(MemoryBackend):
 
         The retrieval SELECT no longer ships the vector text with every row
         (with asyncpg's pgvector codec unregistered that is ~18KB of
-        '[...]' text per row; two legs x rerank_candidates is ~1.8MB of
-        transfer plus JSON parsing). Near-duplicate dedup only consumes the
+        '[...]' text per row; two legs x rerank_candidates is ~0.7MB at the
+        default 20 candidates, ~1.8MB at the old default 50 -- transfer plus
+        JSON parsing). Near-duplicate dedup only consumes the
         vectors of the truncated head rows, so they are fetched precisely
         here by id
         (~1ms localhost RTT). Rows whose embedding is NULL do not appear in
@@ -1501,12 +1502,17 @@ class MemoryDatabase(MemoryBackend):
                     if row is None:
                         raise RuntimeError(f"建簇来源事实不存在: fact_id={fact_id}")
                     if row["status"] == "profiled":
-                        # 建簇即时晋档（nori 96214f4 同款）：起步分已达维度
-                        # 阈值（naming 单次明确表态即 3.0）时建簇即 profiled
-                        # 并同事务写画像行，不依赖晋档遍——规避同周期衰减遍
-                        # 先把分数打到阈值之下的时序窗口（run_cycle 顺序：
-                        # 事实处置 → 衰减 → 晋档）。未达标建簇行为不变
-                        # （active，待晋档遍）
+                        # Immediate promote on cluster creation (nori
+                        # 96214f4 parity): when the start score already
+                        # meets the dimension threshold (one explicit naming
+                        # statement scores 3.0) the cluster is created as
+                        # profiled and its profile row is written in the same
+                        # transaction, without relying on the promotion
+                        # pass. This avoids the timing window where the same
+                        # cycle's decay pass first pushes the score below the
+                        # threshold (run_cycle order: fact disposition ->
+                        # decay -> promote). Below-threshold creation is
+                        # unchanged (active)
                         await conn.execute(
                             PROFILE_UPSERT_SQL.format(
                                 source=(

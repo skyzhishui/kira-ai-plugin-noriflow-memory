@@ -94,7 +94,7 @@ async def test_cross_session_pg_sql_shape() -> None:
     assert "occurred_at >= now() - make_interval(days => $3)" in sql, "陈旧窗口"
     assert sql.rstrip().endswith("ORDER BY occurred_at DESC, id DESC LIMIT $4")
     assert params == ("s1", ["qq:u1", "qq:u2"], 30, 2)
-    # 空键过滤（None/空白不进数组绑定）
+    # Empty-key filtering (None/blank never enter the array binding)
     conn2 = _CaptureConn([])
     db._pool = _CapturePool(conn2)
     await db.fetch_recent_cross_session_summaries(
@@ -112,8 +112,9 @@ async def test_cross_session_pg_sql_shape() -> None:
 
 async def test_cross_session_sqlite_fetch() -> None:
     SQLiteMemoryDatabase = _db_pkg.SQLiteMemoryDatabase
-    # 用墙钟相对时间构造数据：查询侧 max_age_days 截止值按 now() 计算，
-    # 固定时间戳会在 ~30 天后让断言腐烂（评审指出的 flaky）
+    # Build data relative to the wall clock: the query side computes the
+    # max_age_days cutoff from now(), so fixed timestamps rot after ~30 days
+    # (the flakiness review flagged)
     wall_now = datetime.now(timezone.utc)
     with tempfile.TemporaryDirectory(prefix="nm_cs_") as tmp:
         config = LocalMemoryConfig(
@@ -173,7 +174,11 @@ class _SearchCaptureDB:
 
 
 async def test_cross_session_memo_excludes_from_search() -> None:
-    """跨会话 memo 并入共享检索排除通道：登记行被排除、清空后恢复。"""
+    """Cross-session memo joins the shared recall exclusion channel.
+
+    Registered rows are excluded from search; clearing the memo restores
+    them.
+    """
     circuit_breaker_mod = load_modules("circuit_breaker")[0]
     kernel_mod = load_modules("memory_kernel")[0]
 
@@ -237,21 +242,59 @@ def test_build_cross_session_block_budget() -> None:
         "新->旧排列"
     )
 
-    # 极小预算：前言占满 -> 无条目（既不注入也不登记，行保持可检索）
+    # Tiny budget: the preamble eats it -> no entries (neither injected nor
+    # registered, rows stay recallable)
     tiny_block, tiny_ids = plugin_main.build_cross_session_block(
         [row_new], now=_NOW, tz=timezone.utc, budget=120,
     )
     assert tiny_block == "" and tiny_ids == []
 
-    # 首条截断后正文残留过短 -> 整条放弃（不注入不登记）
-    short_block, short_ids = plugin_main.build_cross_session_block(
-        [row_new], now=_NOW, tz=timezone.utc, budget=260,
+    # Budgets are derived from the real entry structure to pin down both
+    # truncation branches of the assembler (review B1: the old hardcoded 260
+    # and 120 both hit the same room<=0 branch, leaving truncation uncovered)
+    preamble = plugin_main._CROSS_SESSION_PREAMBLE
+    used = len(preamble) + 2
+    entry = plugin_main._format_cross_session_entry(
+        row_new, now=_NOW, tz=timezone.utc, limit=1500
     )
-    assert short_block == "" and short_ids == [], (
+    numbered = f"1. {entry}"
+    pos = numbered.find(plugin_main._CROSS_SESSION_CONTENT_MARKER)
+
+    # Branch 1 (room > 0 and body residue < 10): drop the entry whole after
+    # truncation (neither injected nor registered)
+    room_abandon = pos  # cut lands before the content marker -> residue < 10
+    b1, i1 = plugin_main.build_cross_session_block(
+        [row_new], now=_NOW, tz=timezone.utc,
+        budget=used + plugin_main._CROSS_SESSION_TRUNCATE_SUFFIX_LEN + room_abandon,
+    )
+    assert b1 == "" and i1 == [], (
         "截断至元数据-only 的条目必须放弃（防注入+登记造成召回盲区）"
     )
 
-    # 空内容行跳过
+    # Branch 2 (room > 0 and body residue >= 10): inject the truncated entry
+    # and register it
+    room_keep = pos + len(plugin_main._CROSS_SESSION_CONTENT_MARKER) + 12
+    b2, i2 = plugin_main.build_cross_session_block(
+        [row_new], now=_NOW, tz=timezone.utc,
+        budget=used + plugin_main._CROSS_SESSION_TRUNCATE_SUFFIX_LEN + room_keep,
+    )
+    assert b2 != "" and i2 == ["d1"], "截断但仍保留正文切片的条目应注入并登记"
+    assert b2.rstrip().endswith("..."), "截断注入的条目应以省略号收尾"
+
+    # Intermediate memo contract: the budget fits only the first entry -> the
+    # second is budget-trimmed and not registered (stays recallable)
+    entry_old = plugin_main._format_cross_session_entry(
+        row_old, now=_NOW, tz=timezone.utc, limit=1500
+    )
+    numbered_old = f"2. {entry_old}"
+    b3, i3 = plugin_main.build_cross_session_block(
+        [row_new, row_old], now=_NOW, tz=timezone.utc,
+        budget=used + len(numbered) + 2 + len(numbered_old) - 5,
+    )
+    assert i3 == ["d1"], "预算裁剪的次条不得登记 memo"
+    assert "摘要内容：用户在另一" in b3 and "摘要内容：更早" not in b3
+
+    # Empty-content rows are skipped
     empty = dict(row_new, content="   ")
     b, i = plugin_main.build_cross_session_block(
         [empty], now=_NOW, tz=timezone.utc, budget=1500,
@@ -291,7 +334,8 @@ async def test_naming_create_immediate_promotion_sqlite() -> None:
     with tempfile.TemporaryDirectory(prefix="nm_naming_") as tmp:
         db = await _make_sqlite_db(tmp)
         try:
-            # naming：high 起步分 3.0 >= naming 阈值 3.0 -> 建簇即晋档 + 画像行
+            # naming: high start score 3.0 >= naming threshold 3.0 -> promote
+            # at cluster creation + profile row
             rid = await _seed_raw(db, uid="u1", cat="naming",
                                   statement="希望被称为“阿青”")
             out = await db.apply_fact_merge(
@@ -308,7 +352,7 @@ async def test_naming_create_immediate_promotion_sqlite() -> None:
             assert prow is not None, "建簇晋档须同事务写画像行"
             assert prow["statement"] == "希望被称为“阿青”"
 
-            # stable：同样 3.0 < 通用阈值 6.0 -> active，无画像行
+            # stable: same 3.0 < generic threshold 6.0 -> active, no row
             rid2 = await _seed_raw(db, uid="u2", cat="stable", statement="小周不吃辣")
             out2 = await db.apply_fact_merge(
                 fact_id=rid2, action="create", start_score=3.0, score_cap=10.0,
@@ -323,7 +367,8 @@ async def test_naming_create_immediate_promotion_sqlite() -> None:
                 )
             assert n == 0
 
-            # promote_pass 的 naming 臂：active naming 簇 3.0 -> 晋档；stable 3.0 不动
+            # naming arm of promote_pass: an active naming cluster at 3.0 gets
+            # promoted; stable at 3.0 is untouched
             async with db.pool.acquire() as conn:
                 await conn.execute(
                     "UPDATE memory_fact_cluster SET score = 3.0 WHERE id = $1",
@@ -352,7 +397,6 @@ async def test_naming_create_immediate_promotion_sqlite() -> None:
                 naming_promote_threshold=3.0,
             )
             assert promoted == 1, "active naming 簇达 3.0 应经 naming 臂晋档"
-            await db.close()
         finally:
             await db.close()
     print("PASS test_naming_create_immediate_promotion_sqlite")

@@ -1,13 +1,13 @@
 /* ============================================================
-   记忆管理维护页（插件自包含，无构建工具）
-   API 走本插件贡献的 /api/plugin/kira-ai-plugin-noriflow-memory/memory/*；
-   认证复用同源会话 Cookie（宿主 WebUI 登录态），
-   主题由宿主 plugin-bridge 贴 [data-theme] 并随宿主切换。
+   Memory maintenance page (self-contained plugin, no build tooling)
+   API: this plugin's contributed /api/plugin/kira-ai-plugin-noriflow-memory/memory/*;
+   Auth reuses the same-origin session cookie (host WebUI login state);
+   theme: host plugin-bridge stamps [data-theme] and follows host switches.
    ============================================================ */
 
 const API_BASE = "/api/plugin/kira-ai-plugin-noriflow-memory/memory";
 
-/* ---------------- 图标（element-plus path 内联，随文字着色） ---------------- */
+/* ---------------- Icons (inline element-plus paths, text color) ---------------- */
 const ICON_PATHS = {
   Search: ["m795.9 750.7 125 125a32 32 0 0 1-45.3 45.2l-125-125a416 416 0 1 1 45.3-45.2zM480 832a352 352 0 1 0 0-704 352 352 0 0 0 0 704"],
   EditPen: ["m199 672.6 194 112 224-388-193.9-112-224 388.1zm-23.8 60.2L208 881.1 353 835.4zM455 229.2l194 112 56.7-98-194-112zM104.3 708.8l384-665 304.8 176-384 665h.1l-248.4 78.3zm384 254.3v-64h448v64z"],
@@ -48,7 +48,7 @@ const UI = {
     return node;
   },
 
-  // 认证：同源会话 Cookie（credentials: same-origin），无需手动携带令牌
+  // Auth: same-origin session cookie (credentials: same-origin), no manual token
   async api(path, opts = {}) {
     const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
     let resp;
@@ -58,7 +58,7 @@ const UI = {
       throw new Error("网络错误：" + e.message);
     }
     let body = null;
-    try { body = await resp.json(); } catch (e) { /* 非 JSON */ }
+    try { body = await resp.json(); } catch (e) { /* not JSON */ }
     if (resp.status === 401) {
       throw new Error((body && body.detail) || "登录已过期，请刷新页面重新登录");
     }
@@ -175,7 +175,7 @@ class ForceGraph {
     this.host = host;
     this.onSelect = opts.onSelect || (() => {});
     this.W = 1000; this.H = 560;
-    // 初始/重置缩放：面板大而点簇小，按视口预放大（宽屏 1.35，窄屏 2.2）
+    // Initial/reset zoom: pre-zoom by viewport (wide 1.35, narrow 2.2)
     this.baseScale = window.matchMedia("(max-width: 720px)").matches ? 2.2 : 1.35;
     this.scale = this.baseScale; this.tx = 0; this.ty = 0;
     this.showActive = true; this.showPending = true; this.showSuperseded = true;
@@ -221,7 +221,7 @@ class ForceGraph {
   }
 
   resetView() {
-    // 跨断点后构造期的 baseScale 已过期：重置时按当前视口重读
+    // baseScale from build time goes stale across breakpoints: re-read here
     this.baseScale = window.matchMedia("(max-width: 720px)").matches ? 2.2 : 1.35;
     this.scale = this.baseScale; this.tx = 0; this.ty = 0;
     this._applyTransform();
@@ -230,7 +230,7 @@ class ForceGraph {
 
   reheat() { this._alpha = 1; this._still = 0; this._loop(); }
 
-  // ---------------- 数据与渲染 ----------------
+  // ---------------- Data and rendering ----------------
 
   _applyFilter(fresh) {
     const vis = (s) => s === "active" ? this.showActive
@@ -318,7 +318,7 @@ class ForceGraph {
     }
   }
 
-  // ---------------- 力模拟（全部力 × alpha，线性降温归零 → 静止悬浮） ----------------
+  // ---------------- Force sim (forces x alpha, cool to 0 -> rest) ----------------
 
   _tick() {
     const ns = this.nodes, es = this.edges;
@@ -353,8 +353,9 @@ class ForceGraph {
         n.y += Math.max(-28, Math.min(28, n.vy));
       }
     }
-    // 线性降温到 0：所有力同步消失（此前斥力不随 alpha 衰减、重力衰减，
-    // 合力恒向外 → 布局收敛后仍缓慢漂移）；归零后摩擦力把残余速度耗尽
+    // Linear cooling to 0: all forces vanish together (repulsion used to
+    // ignore alpha decay while gravity decayed -> net drift; friction then
+    // drains the residual speed)
     this._alpha = Math.max(0, a - 0.006);
   }
 
@@ -391,7 +392,7 @@ class ForceGraph {
     this._raf = requestAnimationFrame(step);
   }
 
-  // ---------------- 交互 ----------------
+  // ---------------- Interaction ----------------
 
   _clientToWorld(ev) {
     const pt = this.svg.createSVGPoint();
@@ -481,7 +482,7 @@ const Page = {
       this.el("div", { class: "tb-cap" }, ["MEMORY ATLAS // RECALL ENGINE"]),
     ]));
     const tabs = this.el("div", { class: "tab-row" });
-    // 星轨导航：每个 tab 一颗星（.tab-node 装饰节点 + 文字），纯视觉
+    // Orbit nav: one star per tab (.tab-node decoration + label), visual only
     const TAB_ICONS = { overview: "✦", clusters: "◈", facts: "✧", profile: "☾", graph: "❋", summaries: "✶", settings: "◉" };
     for (const [key, label] of [["overview", "总览"], ["clusters", "事实簇（确信度）"], ["facts", "原始事实"], ["profile", "用户画像"], ["graph", "关系图谱"], ["summaries", "注入语料"], ["settings", "设置"]]) {
       tabs.appendChild(this.el("div", {
@@ -496,7 +497,8 @@ const Page = {
 
     const body = this.el("div");
     content.appendChild(body);
-    // 顶层错误卡带重试：此前失败只留一条死文案，刷新必须整页 F5
+    // Top-level error card retries: failures used to leave only dead text, so a
+    // refresh meant a full F5
     const renderTab = async () => {
       body.innerHTML = "";
       try {
@@ -521,7 +523,7 @@ const Page = {
 
   el(...args) { return UI.el(...args); },
 
-  // ---------------- 总览 ----------------
+  // ---------------- Overview ----------------
   async renderOverview(el) {
     const d = await UI.api("/overview");
     const stat = (num, lbl) => this.el("div", { class: "dash-pod" }, [
@@ -557,7 +559,7 @@ const Page = {
     }
   },
 
-  // kv 状态机字段 → 友好卡片（语义与经典维护页保持一致）
+  // kv state-machine field -> friendly card (semantics match the classic page)
   kvMeta(key) {
     return ({
       adjudicate_skip_state: { label: "裁定遍 · 毒丸行名单", kind: "skip" },
@@ -654,7 +656,7 @@ const Page = {
     return item;
   },
 
-  // ---------------- 过滤器通用 ----------------
+  // ---------------- Shared filters ----------------
   filterBar(fields, onSearch) {
     const inputs = {};
     const bar = this.el("div", { class: "filter-row" }, fields.map(([key, label, ph, options]) => {
@@ -689,7 +691,7 @@ const Page = {
     ]);
   },
 
-  // ---------------- 事实簇 ----------------
+  // ---------------- Fact clusters ----------------
   async renderClusters(el) {
     let query = { page: 1 };
     const listBox = this.el("div");
@@ -744,8 +746,9 @@ const Page = {
     const stmt = this.el("textarea", {}, [c.statement]);
     const score = this.el("input", { type: "number", step: "0.5", min: "0", max: "10", value: String(c.score) });
     const status = this.el("select");
-    // replaced 是合并管线专属墓碑：Kira 侧不允许人工迁出，故不作为可选状态，
-    // 且当前已是 replaced 时锁定下拉，避免同状态提交被误读为迁移。
+    // replaced is a merge-pipeline-only tombstone: the Kira side forbids
+    // manual move-out, so it is not selectable; when already replaced the
+    // dropdown is locked, so a same-status submit is not read as a migration.
     const statusOpts = c.status === "replaced"
       ? ["replaced", "active", "profiled", "pending_uncertain", "dead"]
       : ["active", "profiled", "pending_uncertain", "dead"];
@@ -783,7 +786,7 @@ const Page = {
     ]);
   },
 
-  // ---------------- 原始事实 ----------------
+  // ---------------- Raw facts ----------------
   async renderFacts(el) {
     let query = { page: 1 };
     const listBox = this.el("div");
@@ -843,7 +846,7 @@ const Page = {
     await refresh();
   },
 
-  // ---------------- 用户画像 ----------------
+  // ---------------- User profile ----------------
   async renderProfile(el) {
     const pickerCard = this.el("div", { class: "card" });
     const profileCard = this.el("div");
@@ -944,11 +947,11 @@ const Page = {
     await loadUsers();
   },
 
-  // ---------------- 关系图谱 ----------------
+  // ---------------- Relation graph ----------------
   async renderGraph(el) {
     const d = await UI.api("/relations/graph");
 
-    // 统计 + 回填卡片
+    // Stats + backfill cards
     const stat = (num, lbl) => this.el("div", { class: "dash-pod" }, [
       this.el("div", { class: "lbl" }, [lbl]),
       this.el("div", { class: "num" }, [String(num)]),
@@ -973,11 +976,12 @@ const Page = {
     bfFullBtn.addEventListener("click", () => startBackfill(true));
     const reload = async () => {
       el.innerHTML = "";
-      try { await this.renderGraph(el); } catch (e) { /* 切页竞态忽略 */ }
+      try { await this.renderGraph(el); } catch (e) { /* tab race */ }
     };
     let pollTimer = null;
-    // 只在「本次驻留期间出现的新完成」时整页刷新——首次轮询把已完成的
-    // finished_at 记为基线，否则每次进 tab 都会重渲染造成画面闪动
+    // Full-page refresh only on new completions seen during this stay: the
+    // first poll records finished_at as a baseline, otherwise every tab entry
+    // would re-render and flicker the screen
     let seenFinished = null;
     let pollFails = 0;
     const pollBackfill = async () => {
@@ -993,7 +997,7 @@ const Page = {
         return;
       }
       pollFails = 0;
-      if (!bfStatus.isConnected) return; // 已切页，停止轮询
+      if (!bfStatus.isConnected) return; // tab switched away, stop polling
       if (seenFinished === null) seenFinished = s.running ? "" : s.finished_at;
       if (s.running) {
         bfBtn.disabled = true;
@@ -1035,13 +1039,14 @@ const Page = {
       el.appendChild(this.el("div", { class: "card" }, [
         this.el("div", { class: "empty" }, ["暂无边数据：开启 P2 关系提取开关积累增量，或点上方按钮从已确认事实回填存量。"]),
       ]));
-      // 空边库也启动轮询：别处（另开页签/另一会话）启动的回填进度
-      // 同样需要刷新（提前 return 会把轮询挂起在回填启动之前）
+      // Poll even with an empty edge store: a backfill started elsewhere
+      // (another tab or session) still needs a refresh (an early return would
+      // park the poller before the backfill starts)
       pollBackfill();
       return;
     }
 
-    // 图 + 侧栏
+    // Graph + sidebar
     const edgeStatusColor = { active: "ok", pending: "warn", superseded: "gray" };
     const side = this.el("div", { class: "graph-side" });
     const graphHost = this.el("div", { class: "graph-box" });
@@ -1088,7 +1093,8 @@ const Page = {
       } else {
         const e = d.edges.find((x) => String(x.id) === String(sel.id));
         if (!e) return;
-        // 状态修正（墓碑保护：置 superseded 后新证据不再自动激活）+ 物理删除
+        // Status fix (tombstone guard: once superseded, new evidence never
+        // auto-reactivates) + hard delete
         const statusSel = this.el("select");
         for (const s of ["active", "pending", "superseded"]) {
           statusSel.appendChild(this.el("option", Object.assign({ value: s }, s === e.status ? { selected: "" } : {}), [s]));
@@ -1159,7 +1165,7 @@ const Page = {
       this.el("div", { class: "graph-wrap" }, [graphHost, side]),
     ]));
 
-    // 边表（客户端过滤，点击行联动选中）
+    // Edge table (client-side filter, row click links the selection)
     const listBox = this.el("div");
     const q = this.el("input", { type: "text", placeholder: "label / 名字 / uid / 陈述关键词" });
     const refreshTable = () => {
@@ -1194,7 +1200,7 @@ const Page = {
     pollBackfill();
   },
 
-  // ---------------- 注入语料（摘要） ----------------
+  // ---------------- Injected corpus (summaries) ----------------
   async renderSummaries(el) {
     let query = { page: 1 };
     const listBox = this.el("div");
@@ -1521,11 +1527,11 @@ const Page = {
     return card;
   },
 
-  // ---------------- 设置（插件配置） ----------------
+  // ---------------- Settings (plugin config) ----------------
   async renderSettings(el) {
     const d = await UI.api("/config");
     const schema = d.schema;
-    const controls = {}; // field -> input 节点
+    const controls = {}; // field -> input node
     // Initial (masked) value per field: the "user touched it" baseline used to
     // omit untouched secrets from the save payload.
     const initialValues = {};
@@ -1630,7 +1636,7 @@ const Page = {
           if (!r.saved) { UI.toast("配置没有变化", ""); return; }
           UI.toast(`已保存 ${r.changes} 项配置`, "ok");
           if (r.persistence_error) {
-            // 已热生效但落盘失败：重启后会回退，必须显式告知
+            // Applied live but failed to persist: reverts on restart, surface it
             UI.toast(`已热生效但落盘失败，重启后将回退：${r.persistence_error}`, "err");
           }
           if (r.restart_required && r.restart_required.length) {

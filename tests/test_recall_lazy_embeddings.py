@@ -227,10 +227,15 @@ async def test_lazy_paging_stops_after_first_failure() -> None:
 
 
 async def test_lazy_path_fetch_failure_fail_open() -> None:
-    """Fetch failure fails open: dedup degrades to missing-vector semantics
-    and recall is not blocked."""
+    """Fetch failure fails open (dedup degrades to missing-vector semantics,
+    recall not blocked) and a row merely missing from the fetched dict stays
+    visible -- from the dedup loop's perspective both collapse to the same
+    row state, so both stub shapes are asserted in one place."""
     a = _row("a", 0.9, _NOW - timedelta(days=10))
     b = _row("b", 0.8, _NOW - timedelta(days=11))
+
+    # 1. Whole fetch fails: breaker counts exactly one failure (the head
+    #    chunk -- paging never fires after a head failure on this path)
     db = _LazyCaptureDB(rows=[a, b], fail_fetch=True)
     kernel = _make_kernel(db)
     items = await kernel.search(query="猫", session_id="s1")
@@ -238,22 +243,21 @@ async def test_lazy_path_fetch_failure_fail_open() -> None:
         "on fetch failure, missing-vector semantics apply: not compared and "
         "not dropped"
     )
-    print("PASS test_lazy_path_fetch_failure_fail_open")
+    assert kernel.circuit_breaker.record_failure_calls == 1, (
+        "fail-open must still count toward the breaker (exactly once)"
+    )
 
-
-async def test_lazy_path_missing_vector_keeps_row() -> None:
-    """A row missing from the fetched dict stays visible (never dropped)."""
-    a = _row("a", 0.9, _NOW - timedelta(days=10))
-    b = _row("b", 0.8, _NOW - timedelta(days=11))
-    db = _LazyCaptureDB(
+    # 2. Fetch succeeds but only a's vector is supplied: b is missing yet
+    #    stays visible (never dropped)
+    db2 = _LazyCaptureDB(
         rows=[a, b],
-        # Only a's vector is supplied: b is missing but stays visible
         embed_by_id={a["id"]: _vec_str([1.0, 0.0, 0.0])},
     )
-    kernel = _make_kernel(db)
-    items = await kernel.search(query="猫", session_id="s1")
-    assert [i.id for i in items] == ["a", "b"]
-    print("PASS test_lazy_path_missing_vector_keeps_row")
+    kernel2 = _make_kernel(db2)
+    items2 = await kernel2.search(query="猫", session_id="s1")
+    assert [i.id for i in items2] == ["a", "b"]
+    assert kernel2.circuit_breaker.record_failure_calls == 0
+    print("PASS test_lazy_path_fetch_failure_fail_open")
 
 
 async def test_legacy_db_keeps_old_behavior() -> None:
@@ -298,7 +302,6 @@ async def main() -> None:
     await test_lazy_path_pages_fetch_on_long_duplicate_run()
     await test_lazy_paging_stops_after_first_failure()
     await test_lazy_path_fetch_failure_fail_open()
-    await test_lazy_path_missing_vector_keeps_row()
     await test_legacy_db_keeps_old_behavior()
     test_migration_015_materializes_tsv()
     print("ALL PASS")

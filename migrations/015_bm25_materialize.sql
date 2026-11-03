@@ -1,6 +1,7 @@
 -- 015_bm25_materialize.sql: materialize the BM25 token column (recall perf P1).
--- (Numbering stays aligned with the nori-core side: 014 is reserved for a
--- future port of nori's 014_cross_session_time_index, so this lands as 015.)
+-- (Numbering stays aligned with the nori-core side: at the time this landed
+-- 014 was reserved for the cross-session time index port; that port has
+-- since landed in this repo as 014_cross_session_time_index.sql in v1.18.2.)
 --
 -- Problem (measured 2026-11-02 on a 13,515-row corpus): the BM25 leg calls
 -- to_tsvector('simple', search_text) twice, once for filtering and once for

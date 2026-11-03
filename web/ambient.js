@@ -1,18 +1,21 @@
 /* ============================================================
-   记忆星图 · 环境氛围层（纯装饰，不参与任何业务逻辑/API）
-   - 星尘画布：漂移的记忆微尘 + 偶发星座连线，指针轻微扰动
-   - 页脚碎念轮播：纯文案装饰
-   - 性能与礼貌：DPR ≤ 1.5、粒子按面积封顶、~30fps 节流、
-     页签隐藏时暂停、prefers-reduced-motion 时只画一帧静物、
-     移动断点双向切换时同步启停（画布隐藏期间不跑 rAF）
+   Memory star map - ambient layer (pure decoration, no logic/API)
+   - Stardust canvas: drifting memory motes + occasional constellation lines,
+     nudged by the pointer
+   - Footer quip carousel: text-only decoration
+   - Performance and politeness: DPR <= 1.5, particles capped by area,
+     ~30fps throttle, paused while the tab is hidden, a single still frame
+     under prefers-reduced-motion, start/stop in sync on both-way mobile
+     breakpoint switches (no rAF while the canvas is hidden)
    ============================================================ */
 (function () {
   "use strict";
   var canvas = document.getElementById("fx-canvas");
   if (!canvas) return;
-  // 移动端改用 CSS 静态星场（memory.css 末尾的稳定性规则会 display:none
-  // 隐藏画布）：实时 canvas 在地址栏收放/滚动时会重设尺寸并清屏。
-  // 不在此提前 return：断点双向切换由下方 onMobile 监听同步启停。
+  // Mobile falls back to the CSS static starfield (the stability rules at
+  // the end of memory.css set display:none): a live canvas is resized and
+  // cleared as the address bar expands/collapses or the page scrolls.
+  // No early return here: the onMobile listener below drives both directions.
   var mobileFx = window.matchMedia(
     "(max-width: 900px), (hover: none) and (pointer: coarse)"
   );
@@ -22,7 +25,7 @@
 
   var reducedMq = window.matchMedia("(prefers-reduced-motion: reduce)");
   var DPR_CAP = 1.5;
-  var FRAME_GAP = 1000 / 30; // 氛围效果 30fps 足够
+  var FRAME_GAP = 1000 / 30; // 30fps is plenty for an ambient effect
   var W = 0, H = 0, dpr = 1;
   var motes = [];
   var rafId = 0;
@@ -38,7 +41,7 @@
     return parts.length === 3 ? parts : fallback;
   }
 
-  // 取色跟随主题变量（index.html 在宿主切换主题时改 data-theme）
+  // Colors follow theme vars (index.html flips data-theme on host switch)
   function readPalette() {
     try {
       var cs = getComputedStyle(document.documentElement);
@@ -46,13 +49,13 @@
       pal.line = parseTriplet(cs.getPropertyValue("--fx-line"), pal.line);
       var s = parseFloat(cs.getPropertyValue("--fx-strength"));
       pal.strength = isNaN(s) ? pal.strength : Math.max(0, Math.min(1.5, s));
-    } catch (e) { /* 变量不可读时沿用默认色 */ }
+    } catch (e) { /* keep default colors when unreadable */ }
   }
 
   function rgba(c, a) { return "rgba(" + c[0] + "," + c[1] + "," + c[2] + "," + a + ")"; }
 
   function spawn(x, y) {
-    var depth = 0.35 + Math.random() * 0.65; // 远近层次：影响速度/亮度/扰动幅度
+    var depth = 0.35 + Math.random() * 0.65; // depth: speed/brightness/jitter
     return {
       x: x, y: y,
       r: (0.5 + Math.random() * 1.3) * (0.6 + depth * 0.7),
@@ -88,10 +91,11 @@
   function stepMotion(k) {
     for (var i = 0; i < motes.length; i++) {
       var m = motes[i];
-      // 指针轻微扰动：靠近的微尘被温柔推开（远层几乎不动）
+      // Gentle pointer nudge: nearby motes get pushed softly away (far layers
+      // barely move)
       var dx = m.x - pointer.x, dy = m.y - pointer.y;
       var d2 = dx * dx + dy * dy;
-      if (d2 < 19600 && d2 > 0.01) { // 140px 半径
+      if (d2 < 19600 && d2 > 0.01) { // 140px radius
         var d = Math.sqrt(d2);
         var push = (1 - d / 140) * 0.045 * m.depth * k;
         m.x += (dx / d) * push;
@@ -108,7 +112,7 @@
     ctx.clearRect(0, 0, W, H);
     var ns = motes;
     var linkD = 110, linkD2 = linkD * linkD;
-    // 偶发星座连线：仅近距离、极低透明度
+    // Occasional constellation links: close pairs only, very low alpha
     for (var i = 0; i < ns.length; i++) {
       var a = ns[i];
       for (var j = i + 1; j < ns.length; j++) {
@@ -135,7 +139,7 @@
       ctx.beginPath();
       ctx.arc(m.x, m.y, m.r, 0, 6.2832);
       ctx.fill();
-      // 少数亮星带一点光晕
+      // A few bright stars carry a faint halo
       if (m.r > 1.35) {
         ctx.fillStyle = rgba(pal.dot, Math.min(0.12, al * 0.18));
         ctx.beginPath();
@@ -182,7 +186,8 @@
     if (document.hidden) stop(); else start();
   });
 
-  // 减少动效：开 → 停并画一帧静物；关 → 重新拉起（start 内有三重守卫）
+  // Reduced motion: on -> stop and draw a still frame; off -> restart
+  // (start has three guards)
   var onReduced = function () {
     if (reducedMq.matches) { stop(); drawFrame(0, true); }
     else start();
@@ -190,8 +195,9 @@
   if (reducedMq.addEventListener) reducedMq.addEventListener("change", onReduced);
   else if (reducedMq.addListener) reducedMq.addListener(onReduced);
 
-  // 跨断点/设备形态变化时同步启停：画布被 CSS 隐藏期间不跑 rAF，
-  // 回到桌面形态时撤销内联隐藏、按当前尺寸重建并重新拉起
+  // Start/stop in sync across breakpoints/device shapes: no rAF while CSS
+  // hides the canvas; back on desktop, drop the inline hide, rebuild at the
+  // current size and restart
   var onMobile = function () {
     if (mobileFx.matches) {
       canvas.style.display = "none";
@@ -205,7 +211,7 @@
   if (mobileFx.addEventListener) mobileFx.addEventListener("change", onMobile);
   else if (mobileFx.addListener) mobileFx.addListener(onMobile);
 
-  // 主题切换时换一次取色（静物模式下顺带重绘一帧）
+  // Re-read colors on theme switch (also redraws a frame in still mode)
   new MutationObserver(function () {
     readPalette();
     if (reducedMq.matches) drawFrame(0, true);
@@ -213,12 +219,12 @@
 
   readPalette();
   resize();
-  if (mobileFx.matches) return; // 移动端：CSS 静态星场接管，不启动实时画布
+  if (mobileFx.matches) return; // mobile: CSS starfield takes over, no canvas
   if (reducedMq.matches) drawFrame(0, true);
   else start();
 })();
 
-/* ---------------- 页脚碎念轮播（纯装饰） ---------------- */
+/* ---------------- Footer quip carousel (pure decoration) ---------------- */
 (function () {
   "use strict";
   var el = document.getElementById("foot-quip");
