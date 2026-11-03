@@ -162,7 +162,7 @@ def test_relation_document_id_deterministic() -> None:
 
 
 # ---------------------------------------------------------------------------
-#  场景裁决（纯函数）
+#  Scenario decisions (pure functions)
 # ---------------------------------------------------------------------------
 
 
@@ -183,8 +183,9 @@ _STOP = ["朋友", "认识", "熟人", "网友"]
 
 def _select(edges, text, nodes, *, bot=BOT, addressed=False, neighbors=2,
             lines=3, stopwords=None, session_platform="qq"):
-    # 节点匹配为复合键（"platform:uid"）：裸 uid 入参由助手按 _edge 的
-    # platform（qq）补前缀，调用侧保持简洁
+    # Node matching uses composite keys ("platform:uid"): bare uid args
+    # get the qq prefix (per _edge's platform) added by the helper,
+    # keeping call sites concise
     node_keys = [n if ":" in n else f"qq:{n}" for n in nodes]
     return select_relation_edges(
         text=text, edges=edges, node_keys=node_keys, bot_uid=bot,
@@ -198,26 +199,27 @@ def test_scenario_a_node_plus_label() -> None:
     edges = [_edge(1, "u1", "u2", "姐姐", sname="小张", oname="小李")]
     hit = _select(edges, "小张的姐姐最近怎么样", ["u1"])
     assert [e["_scenario"] for e in hit] == ["A"] and hit[0]["_anchor"] == "qq:u1"
-    assert _select(edges, "小张最近怎么样", ["u1"]) == []          # 场景 B
-    assert _select(edges, "群里谁是姐姐", []) == []                 # 无名字锚
+    assert _select(edges, "小张最近怎么样", ["u1"]) == []          # scenario B
+    assert _select(edges, "群里谁是姐姐", []) == []                 # no name anchor
 
 
 def test_scenario_a_cross_platform_uid_collision() -> None:
     """Composite-key matching: identical numeric uids on different platforms must not cross-match (P3-p fix surface)."""
     edge_qq = _edge(21, "u1", "u2", "姐姐", sname="小张")
-    # tg:u1 是另一个平台的人：qq 边不作为其节点关系注入
+    # tg:u1 is on another platform: the qq edge is not injected as their
+    # node relation
     assert _select([edge_qq], "小张的姐姐", ["tg:u1"]) == []
-    # 同平台命中正常
+    # same platform hits as usual
     assert [e["_scenario"] for e in _select([edge_qq], "小张的姐姐", ["qq:u1"])] == ["A"]
 
 
 def test_scenario_c_bot_edge_hard_gate() -> None:
     bot_edge = _edge(9, "u1", BOT, "姐姐", sname="小张")
-    assert _select([bot_edge], "你姐姐是谁", []) == []              # 未 AT/引用
+    assert _select([bot_edge], "你姐姐是谁", []) == []              # not AT/replied
     hit = _select([bot_edge], "@Kira 你姐姐是谁", [], addressed=True)
     assert [e["_scenario"] for e in hit] == ["C"]
     hit2 = _select([bot_edge], "小张的姐姐", ["u1"], addressed=False)
-    assert [e["_scenario"] for e in hit2] == ["A"]                  # 真名锚优先
+    assert [e["_scenario"] for e in hit2] == ["A"]  # real-name anchor wins
 
 
 def test_select_budgets_and_stopwords() -> None:
@@ -241,7 +243,9 @@ def test_statement_line_and_neighbors() -> None:
     assert relation_statement_line(edge2, bot_uid=BOT, session_platform="qq",
                                    bot_nickname="Kira",
                                    time_qualifier="") == "u1(u1)的室友是u2(u2)"
-    # 跨平台撞号：web 边端点裸 uid 恰等 bot uid 的真人不渲染成 bot 昵称
+    # Cross-platform uid collision: a real person whose web-edge endpoint
+    # bare uid exactly equals the bot uid is not rendered with the bot
+    # nickname
     web_edge = dict(_edge(3, "u1", BOT, "姐姐", sname="小张"))
     web_edge["platform"] = "web"
     line3 = relation_statement_line(web_edge, bot_uid=BOT, session_platform="qq",
@@ -255,7 +259,8 @@ def test_statement_line_and_neighbors() -> None:
     assert neighbor_profile_uids(
         hit_bot, [], BOT, session_platform="qq", max_profiles=2,
     ) == [("qq", "u1", "小张")]
-    # 跨平台撞号：web 边端点裸 uid 撞号 bot uid 的真人照常进邻居画像
+    # Cross-platform uid collision: a real person whose web-edge endpoint
+    # bare uid collides with the bot uid still enters neighbor profiles
     hit_web = _select([web_edge], "小张的姐姐", ["web:u1"])
     assert neighbor_profile_uids(
         hit_web, ["web:u1"], BOT, session_platform="qq", max_profiles=2,
@@ -263,7 +268,7 @@ def test_statement_line_and_neighbors() -> None:
 
 
 # ---------------------------------------------------------------------------
-#  db 层 SQL
+#  db-layer SQL
 # ---------------------------------------------------------------------------
 
 
@@ -319,16 +324,21 @@ async def test_upsert_entity_edge_sql_and_params() -> None:
     assert "$11::text = ANY(memory_entity_edge.evidence_keys)" in sql
     assert "array_append(" in sql and sql.count("$11::text") >= 4
     assert "WHEN $12::bool" in sql and ">= $13::int" in sql
-    # occurred_at 单调不回退（pending 重放旧批次/回填旧簇不倒退发生时间）；
-    # SQL 多行排版，去空白后匹配
+    # occurred_at is monotonically non-regressing (pending replay of an
+    # old batch / backfill of an old cluster never rolls the occurrence
+    # time backwards); the SQL spans multiple lines, match after stripping
+    # whitespace
     assert (
         "occurred_at=GREATEST(memory_entity_edge.occurred_at,EXCLUDED.occurred_at)"
         in "".join(sql.split())
     )
     assert payload[0][7] == "active" and payload[1][7] == "pending"
     assert payload[1][11] is True and payload[1][12] == 2
-    # 端点占位名守卫：冲突路径占位名不覆盖旧名（双侧端点各一段 CASE）；
-    # "未知"系为精确形（未知/未知用户+数字），前缀泛匹配误伤真名已废除
+    # Endpoint placeholder-name guard: on the conflict path placeholder
+    # names do not overwrite old names (one CASE per endpoint on each
+    # side); the "unknown" family is matched as exact forms (unknown /
+    # unknown-user+digits) -- prefix wildcard matching that hit real names
+    # was removed
     assert sql.count("~* '^(unknown|undefined|用户[0-9]+|[0-9]+|未知(用户)?[0-9]*)$'") == 2
     assert "LIKE '未知%'" not in sql
     pool.batches.clear()
@@ -355,7 +365,7 @@ async def test_upsert_reverse_echo_skipped() -> None:
          "evidence_key": "s1|2026-09-09", "is_bot_edge": False, "min_evidence": 2},
     ])
     assert len(pool.batches) == 1 and len(pool.batches[0][1]) == 1
-    assert pool.batches[0][1][0][1] == "u8"  # subject_uid 参数序 $2
+    assert pool.batches[0][1][0][1] == "u8"  # subject_uid is param $2
 
 
 async def test_fetch_active_edges_params() -> None:
@@ -365,17 +375,18 @@ async def test_fetch_active_edges_params() -> None:
     sql, args = pool.queries[0]
     assert "FROM memory_entity_edge" in sql and "status = 'active'" in sql
     assert "platform || ':' || subject_uid" in sql, "复合键匹配（平台感知）"
-    # 空入参 -> 空列表（ANY(cardinality>0) 分支不取边）
+    # empty args -> empty list (ANY(cardinality>0) branch fetches no edges)
     assert args == [["qq:u1", "qq:u2"], []]
     await db.fetch_active_edges([], ["qq:bot-1"])
     assert pool.queries[1][1] == [[], ["qq:bot-1"]]
-    # 双形态集合：任一形态复合键命中 bot 端点边
+    # dual-form set: either form's composite key hits a bot-endpoint edge
     await db.fetch_active_edges([], ["qq:9900000004", "qq:bot-1"])
     assert pool.queries[2][1] == [[], ["qq:9900000004", "qq:bot-1"]]
-    # 非空字符串入参 fail fast（空串 falsy 保持旧容忍，上文已覆盖）
+    # non-empty string args fail fast (empty strings stay falsy-tolerant
+    # as before, covered above)
     await await_raises(TypeError, db.fetch_active_edges("qq:123"))
     await await_raises(TypeError, db.fetch_active_edges([], "qq:bot-1"))
-    # bytes 迭代出 int 同样静默落空，一并 fail fast
+    # bytes iterate into ints and also silently no-op; fail fast for these
     await await_raises(TypeError, db.fetch_active_edges(b"qq:123"))
 
 
@@ -391,29 +402,29 @@ async def test_fetch_alias_names_by_owner_owners_contract() -> None:
     ])
     db = _make_db(pool)
 
-    # None = 全表：无参数、无复合键过滤
+    # None = full table: no params, no composite-key filter
     assert await db.fetch_alias_names_by_owner(None) == {("qq", "u1"): "新昵称"}
     assert len(pool.queries) == 1
     sql, args = pool.queries[0]
     assert not args and "memory_entity_alias" in sql
 
-    # 空列表 = 短路，不发任何查询
+    # empty list = short-circuit, no query issued
     pool.queries.clear()
     assert await db.fetch_alias_names_by_owner([]) == {}
     assert pool.queries == []
 
-    # 全空 uid 过滤后为空 = 短路
+    # all-empty uids after filtering = short-circuit
     assert await db.fetch_alias_names_by_owner([("qq", ""), ("", "")]) == {}
     assert pool.queries == []
 
-    # 命中行按 (platform, uid) 归位
+    # hit rows are keyed back by (platform, uid)
     assert await db.fetch_alias_names_by_owner([("qq", "u1")]) == {
         ("qq", "u1"): "新昵称"
     }
 
 
 # ---------------------------------------------------------------------------
-#  kernel 写通道
+#  kernel write channel
 # ---------------------------------------------------------------------------
 
 
@@ -514,7 +525,7 @@ async def test_retain_relations_failure_no_half_commit() -> None:
         raise AssertionError("应上抛 MemoryDBUnavailable")
     except _kernel.MemoryDBUnavailable:
         pass
-    assert db.summaries == []  # 无半提交
+    assert db.summaries == []  # no half commit
 
 
 async def test_encoder_relations_prompt_and_schema() -> None:
@@ -540,12 +551,13 @@ async def test_encoder_relations_prompt_and_schema() -> None:
     _, _, relations, ok = await enc2.encode("对话", "Kira", BOT)
     assert ok is True and relations == []
     assert "关系提取（relations 扩展数组" in llm2.prompts[0]
-    # 结构化出口 schema 含 relations 数组（tool calling 强制出口能产出）
+    # structured-output schema includes a relations array (the forced
+    # tool-calling output must be able to produce it)
     assert "relations" in llm2.schemas[0]["properties"]
 
 
 # ---------------------------------------------------------------------------
-#  build_injection_text 边小节
+#  build_injection_text edge section
 # ---------------------------------------------------------------------------
 
 
@@ -669,11 +681,12 @@ async def test_injection_scenario_c_and_gate() -> None:
 def test_select_relation_edges_dual_bot_forms() -> None:
     """Bot uid set semantics: a hit on either form (session id / platform uid) marks a bot-endpoint edge."""
     plat_edge = _edge(12, "9900000004", "u1", "姐姐", oname="小张")
-    # 双形态集合：平台 uid 端点边照常走场景 C
+    # dual-form set: platform-uid endpoint edges go through scenario C
     hit = _select([plat_edge], "你姐姐是谁", [], bot=[BOT, "9900000004"], addressed=True)
     assert [e["_scenario"] for e in hit] == ["C"]
     assert hit[0]["_anchor"] == "qq:9900000004"
-    # 仅会话标识（旧单形态）：平台 uid 端点边不认 -> 不注入
+    # session id only (old single form): platform-uid endpoint edges are
+    # not recognized -> no injection
     assert _select([plat_edge], "你姐姐是谁", [], bot=BOT, addressed=True) == []
 
 
@@ -705,8 +718,9 @@ async def test_injection_scenario_c_platform_uid_form() -> None:
         query="你姐姐是谁", session_id="s1", platform="qq", hints=hints,
     )
     assert "Kira(9900000004)的姐姐是小张(u1)" in text
-    # 边检索按复合键下发（bot 形态 × 会话平台 qq；显式平台 uid 优先 +
-    # bot_id 兜底双形态）
+    # edge search is issued with composite keys (bot form x session
+    # platform qq; explicit platform uid first + bot_id fallback, both
+    # forms)
     assert db.edge_calls and db.edge_calls[0]["bot_keys"] == [
         "qq:9900000004", f"qq:{BOT}",
     ]
@@ -785,29 +799,29 @@ def _bare_plugin():
 
 def test_bot_addressed_at_and_reply() -> None:
     plugin = _bare_plugin()
-    # AT bot（pid 命中）
+    # AT bot (pid hit)
     assert plugin._bot_addressed(
         [_Msg([elements.Text("你姐姐是谁"), elements.At(pid=BOT, nickname="Kira")])],
         "qq:gm:1",
     ) is True
-    # @all 不算
+    # @all does not count
     assert plugin._bot_addressed(
         [_Msg([elements.At(pid="all")])], "qq:gm:1"
     ) is False
-    # AT 他人不算；裸"你"不算
+    # AT others does not count; a bare "you" does not count
     assert plugin._bot_addressed(
         [_Msg([elements.At(pid="u9"), elements.Text("你姐姐是谁")])], "qq:gm:1"
     ) is False
-    # Reply 命中 bot 出站消息 ID 追踪集
+    # Reply hits the bot outbound message ID trace set
     plugin._track_bot_message_id("qq:gm:1", "M-100")
     assert plugin._bot_addressed(
         [_Msg([elements.Reply(message_id="M-100")])], "qq:gm:1"
     ) is True
-    # Reply 指向他人消息不算
+    # Reply pointing at someone else's message does not count
     assert plugin._bot_addressed(
         [_Msg([elements.Reply(message_id="M-999")])], "qq:gm:1"
     ) is False
-    # 未学到 bot uid（首条消息前）：恒 False
+    # bot uid not learned yet (before the first message): always False
     plugin2 = _bare_plugin()
     plugin2._bot_user_id = ""
     assert plugin2._bot_addressed(
@@ -821,14 +835,14 @@ def test_track_bot_message_ids_bounded() -> None:
         plugin._track_bot_message_id("s1", f"M-{i}")
     assert len(plugin._bot_message_ids["s1"]) == _main._BOT_MESSAGE_ID_LIMIT
     assert "M-119" in plugin._bot_message_ids["s1"]
-    # 会话数 LRU 上限
+    # LRU cap on the session count
     for i in range(_main._SESSION_CACHE_MAX_SESSIONS + 5):
         plugin._track_bot_message_id(f"s{i}", "M-x")
     assert len(plugin._bot_message_ids) == _main._SESSION_CACHE_MAX_SESSIONS
 
 
 # ---------------------------------------------------------------------------
-#  运行器
+#  Runner
 # ---------------------------------------------------------------------------
 
 

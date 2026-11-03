@@ -1,12 +1,16 @@
--- P2：结构化关系边表（memory_entity_edge）。
--- 写入：编码 pass relations 数组零 LLM 结构键合并（P2 只写不查，
--- 审计期达标后由 P3 注入消费）。
--- 状态机：人-人边插入即 active；bot 端点边插入 pending，
--- evidence_count（含本次证据）达 relation_bot_edge_min_evidence 时由
--- upsert 语句内联 CASE 转 active（零 LLM）；superseded 保留状态位但
--- 不自动置位（label 存在多值语义，零 LLM 无法判互斥——决策 8）。
--- 端点名（subject_name/object_name）：P3 注入陈述行的显示名来源，
--- 随每次证据刷新为最新（完整名字史在 memory_entity_alias）。
+-- P2: structured relation edge table (memory_entity_edge).
+-- Writes: zero-LLM structural-key merge of the encoder pass relations array
+-- (P2 writes without reading; consumed by P3 injection once the audit-phase
+-- threshold is met).
+-- State machine: person-person edges are active on insert; bot-endpoint
+-- edges insert as pending, and once evidence_count (including this piece of
+-- evidence) reaches relation_bot_edge_min_evidence, an inline CASE in the
+-- upsert statement promotes them to active (zero LLM); superseded keeps the
+-- state slot but is never set automatically (label carries multi-value
+-- semantics; zero LLM cannot judge mutual exclusivity — decision 8).
+-- Endpoint names (subject_name/object_name): display-name source for P3
+-- injected statement rows, refreshed to the latest on every evidence update
+-- (full name history lives in memory_entity_alias).
 
 CREATE TABLE IF NOT EXISTS memory_entity_edge (
     id             BIGSERIAL PRIMARY KEY,

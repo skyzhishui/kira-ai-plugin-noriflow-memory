@@ -58,7 +58,7 @@ class MemoryDBCircuitBreaker:
         self._failure_count = 0
         self._state: Literal["CLOSED", "OPEN", "HALF_OPEN"] = "CLOSED"
         self._trip_until = 0.0
-        self._probe_inflight = False  # HALF_OPEN 探测请求是否在进行中
+        self._probe_inflight = False  # whether a HALF_OPEN probe request is in flight
         self._lock = asyncio.Lock()
 
     @property
@@ -93,9 +93,9 @@ class MemoryDBCircuitBreaker:
                     return False
                 self._probe_inflight = True
                 return True
-            # OPEN 状态
+            # OPEN state
             if time.time() >= self._trip_until:
-                # 熔断到期，允许一次探测（转为 HALF_OPEN）
+                # Circuit breaker expired; allow one probe (switch to HALF_OPEN)
                 self._state = "HALF_OPEN"
                 self._probe_inflight = True
                 return True

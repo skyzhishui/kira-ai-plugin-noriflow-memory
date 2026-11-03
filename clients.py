@@ -32,7 +32,7 @@ class KiraEmbeddingClient:
     """Embedding adapter (single-call interface wrapping a batch backend)."""
 
     def __init__(self, client) -> None:
-        # KiraAI EmbeddingModelClient：embed(texts: list[str]) -> list[list[float]]
+        # KiraAI EmbeddingModelClient: embed(texts: list[str]) -> list[list[float]]
         self._client = client
 
     async def embed(self, text: str) -> list[float]:
@@ -90,7 +90,8 @@ class FastLlmExit:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ) -> str:
-        # 延迟解析客户端：initialize 时 provider 可能尚未就绪（如热重载序）
+        # Lazily resolved client: the provider may not be ready at initialize
+        # time (e.g. hot-reload ordering)
         client = self._ctx.get_default_fast_llm_client()
         if client is None:
             raise RuntimeError("fast LLM 未配置（default_fast_llm）")
@@ -98,7 +99,8 @@ class FastLlmExit:
 
         extra: dict = {}
         if schema:
-            # 结构化出口：强制调用唯一的提交工具，arguments 即结果 JSON
+            # Structured exit: force the single commit tool; arguments are
+            # the result JSON
             extra["tools"] = [{
                 "type": "function",
                 "function": {
@@ -121,7 +123,8 @@ class FastLlmExit:
                 fn = (call or {}).get("function") or {}
                 if fn.get("name") == tool_name and fn.get("arguments"):
                     return fn["arguments"]
-            # 无 tool_call：走提示词 JSON 兜底（一次性告警，避免刷日志）
+            # No tool_call: fall back to prompt JSON (warn once, avoid log
+            # spam)
             if (response.text_response or "").strip() and not self._warned_no_tool_call:
                 self._warned_no_tool_call = True
                 logger.warning(

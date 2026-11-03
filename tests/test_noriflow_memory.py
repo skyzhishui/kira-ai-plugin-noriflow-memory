@@ -41,13 +41,14 @@ from pathlib import Path
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# 桩设施统一入口（review 2026-09-12 冗余项 1）
+# Single entry for stub facilities (review 2026-09-12 redundancy item 1)
 from plugin_env import install_host_stubs, load_modules, load_plugin_module  # noqa: E402
 
 # ---------------------------------------------------------------------------
-#  core.* 桩模块（先于加载插件主模块注入）
+#  core.* stub modules (injected before the plugin main module is loaded)
 # ---------------------------------------------------------------------------
-#  core.* 桩与插件主模块加载（已统一至 tests/plugin_env，review 冗余项 1）
+#  core.* stubs and plugin main module loading (unified into
+#  tests/plugin_env; review redundancy item 1)
 # ---------------------------------------------------------------------------
 
 
@@ -62,7 +63,7 @@ def _load_plugin_module():
 
 
 # ---------------------------------------------------------------------------
-#  替身：数据库 / 向量服务 / ctx
+#  Stand-ins: database / vector service / ctx
 # ---------------------------------------------------------------------------
 
 
@@ -82,7 +83,7 @@ class FakeConn:
     async def fetchrow(self, sql, *args):
         self.sqls.append(("fetchrow", sql, args))
         if "DELETE FROM memory_persona_fact_raw" in sql:
-            return None  # 404 路径
+            return None  # 404 path
         if "DELETE FROM memory_chat_summary" in sql:
             return None
         return None
@@ -126,18 +127,18 @@ class FakeDB:
         self.pool = FakePool()
         self.inserted_summaries = []
         self.inserted_facts = []
-        self.applied_merges = []     # memory_write 直写路径的 apply 调用记录
+        self.applied_merges = []     # memory_write direct-path apply log
         self.deleted_ids = []
         self.connect_calls = 0
         self.migrations = None
         self.closed = False
-        self.unsummarized_rows = []   # 补编码遍预设行
-        self.encoded_updates = []     # update_chat_summary_encoded 调用记录
-        self.cluster_owner_result = None  # fetch_cluster_owner 可配置返回
-        self.merge_outcomes = []         # apply_fact_merge 可配置结果队列
-        self.summary_search_rows = []     # memory_lookup summary 检索桩
+        self.unsummarized_rows = []   # pre-seeded rows for the re-encode pass
+        self.encoded_updates = []     # update_chat_summary_encoded call log
+        self.cluster_owner_result = None  # fetch_cluster_owner override
+        self.merge_outcomes = []         # apply_fact_merge result queue
+        self.summary_search_rows = []     # memory_lookup summary search stub
         self.summary_search_kwargs = None
-        self.fact_search_rows = []        # memory_lookup fact 检索桩
+        self.fact_search_rows = []        # memory_lookup fact search stub
         self.fact_search_kwargs = None
         self.edges = []
         self.alias_names = {}
@@ -175,7 +176,8 @@ class FakeDB:
         self.summary_search_kwargs = kwargs
         rows = list(self.summary_search_rows)
         if kwargs.get("only_archived"):
-            # 模拟 db 侧 only_archived 下推（真库在 SQL WHERE 过滤）
+            # Emulate the db-side only_archived push-down (the real DB
+            # filters in the SQL WHERE clause)
             rows = [r for r in rows if r.get("archived")]
         return rows
 
@@ -183,7 +185,8 @@ class FakeDB:
         self.fact_search_kwargs = kwargs
         rows = list(self.fact_search_rows)
         if kwargs.get("only_inactive"):
-            # 模拟 db 侧 only_inactive 下推（真库在 SQL 状态集过滤）
+            # Emulate the db-side only_inactive push-down (the real DB
+            # filters on the SQL status set)
             rows = [
                 r for r in rows
                 if str(r["status"]) in
@@ -228,7 +231,8 @@ class FakeDB:
     async def apply_fact_merge(self, **kwargs):
         self.applied_merges.append(kwargs)
         if self.merge_outcomes:
-            # 可配置出队：模拟乐观锁 skipped / 正常 create|replace 序列
+            # Configurable dequeue: emulates the optimistic-lock
+            # "skipped" vs normal create|replace sequence
             return self.merge_outcomes.pop(0)
         return {
             "action": kwargs.get("action"),
@@ -265,7 +269,8 @@ class FakeReq:
 
 
 class FakeSession:
-    # sid 形参存的是裸 session_id（对齐真实 Session）；复合 sid 由 .sid 派生
+    # The sid argument holds the bare session_id (mirrors the real
+    # Session); the composite sid is derived via the .sid property
     def __init__(self, sid="10086", stype="gm", adapter="napcat"):
         self.session_id = sid
         self.session_type = stype
@@ -362,8 +367,9 @@ def _ready_plugin(mod, cfg=None, ctx=None):
     """
     cfg = cfg if cfg is not None else {
         "dsn": "postgres://u:p@127.0.0.1:5432/db",
-        # 既有用例锁定改动前的逐轮 retain 语义（私聊默认攒批由
-        # tests/test_memory_retain_batch.py 单独覆盖）
+        # Existing cases pin the pre-change per-turn retain semantics
+        # (private-chat default batching is covered separately by
+        # tests/test_memory_retain_batch.py)
         "retain_interval_private": 1,
     }
     ctx = ctx or FakeCtx()
@@ -380,9 +386,10 @@ def _ready_plugin(mod, cfg=None, ctx=None):
             if inst._merge_agent is not None:
                 await inst._merge_agent.stop()
             if inst._retain_sweep_task is not None:
-                # 取消后必须 await 掉：cancel() 只是把取消回调排进 ready
-                # 队列，不 await 的话协程在 loop 关闭时仍是 pending →
-                # "Task was destroyed but it is pending!" 警告
+                # Must await after cancel(): cancel() only queues the
+                # cancel callback into the ready queue; without an await
+                # the coroutine is still pending when the loop closes ->
+                # "Task was destroyed but it is pending!" warning
                 sweep = inst._retain_sweep_task
                 inst._retain_sweep_task = None
                 sweep.cancel()
@@ -396,7 +403,7 @@ def _ready_plugin(mod, cfg=None, ctx=None):
 
 
 # ---------------------------------------------------------------------------
-#  用例（按名称排序执行）
+#  Test cases (executed in name order)
 # ---------------------------------------------------------------------------
 
 
@@ -461,8 +468,11 @@ class TestConfigBuilder(unittest.TestCase):
         self.assertTrue(cfg.summary_recall_session_scoped)
         self.assertTrue(cfg.decay_requires_activity)
         self.assertEqual(cfg.sticky_evidence_count, 4)
-        # 画像评分缺省值：迟滞带（promote - demote = 4）不得小于单条证据最大加分 3，
-        # 否则降档簇一条证据即可回档（翻转）——模型级校验强制该不变量
+        # Profile scoring defaults: the hysteresis band
+        # (promote - demote = 4) must not be smaller than the max
+        # single-evidence increment 3, otherwise a demoted cluster could
+        # be promoted back (flip) with one piece of evidence; the
+        # model-level validation enforces this invariant
         self.assertEqual(cfg.promote_threshold, 6.0)
         self.assertEqual(cfg.demote_threshold, 2.0)
         self.assertEqual(cfg.decay_factor, 0.9)
@@ -486,21 +496,27 @@ class TestConfigBuilder(unittest.TestCase):
         self.assertEqual(cfg.topic_blacklist, ["a", "b"])
 
     def test_15_out_of_range_falls_back_to_defaults(self):
-        # 数值越界触发 pydantic 校验异常 -> 兜底层回退默认参数并保留 dsn
+        # Out-of-range values raise a pydantic validation error -> the
+        # fallback layer restores defaults and keeps dsn
         cfg = mod._try_build_config({
             "dsn": "postgres://u:p@127.0.0.1:5432/db",
-            "pool_min": 0,  # ge=1 越界
+            "pool_min": 0,  # out of ge=1 range
         })
         self.assertEqual(cfg.dsn, "postgres://u:p@127.0.0.1:5432/db")
         self.assertEqual(cfg.pool_min, 2)
 
 
 class TestHysteresisBandValidation(unittest.TestCase):
-    """迟滞带强制校验：band < 单条证据最大加分时降档簇一条证据即可回档。
+    """Hysteresis band enforcement tests.
 
-    band = promote_threshold - demote_threshold；降档判定是严格
-    `score < demote_threshold`，故降档簇分数上界为 demote - ε，
-    band 恰等于单条证据加分时仍安全（demote-ε+加分 < promote）。
+    When band < the max single-evidence increment, a demoted cluster
+    can be promoted back with a single piece of evidence.
+
+    band = promote_threshold - demote_threshold; the demote check is a
+    strict `score < demote_threshold`, so a demoted cluster's score
+    upper bound is demote - epsilon; a band exactly equal to the
+    single-evidence increment is still safe
+    (demote - epsilon + increment < promote).
     """
 
     def setUp(self):
@@ -515,7 +531,8 @@ class TestHysteresisBandValidation(unittest.TestCase):
         )
 
     def test_02_band_equal_to_one_evidence_is_accepted(self):
-        # band == 加分（6/3）：降档簇最高 2.999+3=5.999 < 6，一条证据无法回档
+        # band == increment (6/3): a demoted cluster caps at
+        # 2.999+3=5.999 < 6, so one piece of evidence cannot promote back
         cfg = self.LocalMemoryConfig(promote_threshold=6.0, demote_threshold=3.0)
         self.assertEqual(cfg.promote_threshold - cfg.demote_threshold, 3.0)
 
@@ -529,7 +546,8 @@ class TestHysteresisBandValidation(unittest.TestCase):
             self.LocalMemoryConfig(demote_threshold=0.0)
 
     def test_05_medium_start_score_above_high_uses_the_max(self):
-        # 单条证据最大加分取 max(high, medium)：medium 配得比 high 高时按 medium 判
+        # The max single-evidence increment takes max(high, medium):
+        # judge by medium when medium is configured above high
         with self.assertRaises(Exception):
             self.LocalMemoryConfig(
                 promote_threshold=6.0,
@@ -539,8 +557,11 @@ class TestHysteresisBandValidation(unittest.TestCase):
             )
 
     def test_06_unsafe_band_falls_back_to_defaults(self):
-        # 非法组合走兜底层：插件不因单个配置项起不来；跨字段校验失败只回退
-        # 涉及的评分键，其余用户配置保留（评审意见：不得整份回退）
+        # Invalid combos go through the fallback layer: the plugin must
+        # not fail to start over a single config key; a cross-field
+        # validation failure only falls back the scoring keys involved
+        # and keeps the rest of the user config (review: no wholesale
+        # fallback)
         cfg = mod._try_build_config({
             "dsn": "postgres://u:p@127.0.0.1:5432/db",
             "promote_threshold": 5.0,
@@ -552,37 +573,42 @@ class TestHysteresisBandValidation(unittest.TestCase):
         self.assertEqual(cfg.promote_threshold, 6.0)
         self.assertEqual(cfg.demote_threshold, 2.0)
         self.assertEqual(cfg.decay_factor, 0.9)
-        # 无关配置不被清掉
+        # Unrelated config keys are not wiped
         self.assertEqual(cfg.recall_top_k, 7)
         self.assertEqual(cfg.merge_interval_hours, 12.0)
 
     def test_09_pool_bounds_cross_field_fallback_keeps_other_keys(self):
-        # 另一条跨字段校验（pool_min > pool_max）同走分组回退：整组复位，
-        # pool_max 也回缺省（8）而非入参 6——入参故意取 != 缺省，避免断言歧义
+        # Another cross-field check (pool_min > pool_max) follows the
+        # same group fallback: the whole group resets, and pool_max also
+        # returns to the default (8) rather than the input 6 -- the input
+        # is deliberately != the default to avoid assertion ambiguity
         cfg = mod._try_build_config({
             "pool_min": 9, "pool_max": 6,
             "recall_top_k": 7,
         })
         self.assertEqual(cfg.pool_min, 2)
-        self.assertEqual(cfg.pool_max, 8)  # 整组复位 -> 缺省值，非入参 6
+        self.assertEqual(cfg.pool_max, 8)  # reset -> default, not input 6
         self.assertEqual(cfg.recall_top_k, 7)
 
     def test_10_pool_invalid_keeps_valid_explicit_scoring(self):
-        # 评审场景：池边界非法不得牵连合法且有意调参的评分显式配置
-        # （promote=8/demote=3 band=5 >= 3 合法）——按校验器自报键精确回退该组
+        # Review scenario: invalid pool bounds must not drag down legal,
+        # deliberately-tuned explicit scoring config
+        # (promote=8/demote=3 band=5 >= 3 is legal) -- fall back exactly
+        # the group the validator self-reports
         cfg = mod._try_build_config({
             "pool_min": 9, "pool_max": 6,
             "promote_threshold": 8.0, "demote_threshold": 3.0,
             "recall_top_k": 7,
         })
         self.assertEqual(cfg.pool_min, 2)
-        self.assertEqual(cfg.pool_max, 8)  # 整组复位 -> 缺省值，非入参 6
+        self.assertEqual(cfg.pool_max, 8)  # reset -> default, not input 6
         self.assertEqual(cfg.promote_threshold, 8.0)
         self.assertEqual(cfg.demote_threshold, 3.0)
         self.assertEqual(cfg.recall_top_k, 7)
 
     def test_11_band_invalid_keeps_valid_explicit_pool(self):
-        # 反向场景：迟滞带非法时，合法的显式池参数不被重置
+        # Reverse scenario: when the hysteresis band is invalid, legal
+        # explicit pool params are not reset
         cfg = mod._try_build_config({
             "promote_threshold": 5.0, "demote_threshold": 3.0,
             "pool_min": 4, "pool_max": 6,
@@ -593,29 +619,32 @@ class TestHysteresisBandValidation(unittest.TestCase):
         self.assertEqual(cfg.pool_max, 6)
 
     def test_12_both_groups_invalid_resets_both_keeps_rest(self):
-        # 两组同时非法：pydantic 只报第一个失败校验器，逐轮回退到两组全清、
-        # 其余用户配置保留
+        # Both groups invalid: pydantic reports only the first failing
+        # validator, so fallback loops per validator until both groups
+        # are cleared while the rest of the user config is kept
         cfg = mod._try_build_config({
             "pool_min": 9, "pool_max": 6,
             "promote_threshold": 5.0, "demote_threshold": 3.0,
             "recall_top_k": 7,
         })
         self.assertEqual(cfg.pool_min, 2)
-        self.assertEqual(cfg.pool_max, 8)  # 整组复位 -> 缺省值，非入参 6
+        self.assertEqual(cfg.pool_max, 8)  # reset -> default, not input 6
         self.assertEqual(cfg.promote_threshold, 6.0)
         self.assertEqual(cfg.demote_threshold, 2.0)
         self.assertEqual(cfg.recall_top_k, 7)
 
     def test_19_negative_start_scores_are_rejected(self):
-        # 评审场景：负起步分让 max_inc 为负、迟滞带校验形同虚设（可配出
-        # promote=1/demote=5 倒挂）——ge=0 直接拒
+        # Review scenario: negative start scores make max_inc negative
+        # and hollow out the band check (an inverted promote=1/demote=5
+        # becomes configurable) -- ge=0 rejects outright
         with self.assertRaises(Exception):
             self.LocalMemoryConfig(score_start_high=-5, score_start_medium=-5,
                                    promote_threshold=1.0, demote_threshold=5.0)
 
     def test_20_inverted_or_zero_band_is_rejected(self):
-        # 显式倒挂守卫：promote <= demote 一律拒（含零迟滞的相等情形，
-        # ge=0 下仅剩的漏网组合）
+        # Explicit inversion guard: promote <= demote is always rejected
+        # (including equality, i.e. zero hysteresis -- the last leaky
+        # combo left under ge=0)
         with self.assertRaises(Exception) as ctx:
             self.LocalMemoryConfig(
                 promote_threshold=6.0, demote_threshold=6.0,
@@ -624,8 +653,9 @@ class TestHysteresisBandValidation(unittest.TestCase):
         self.assertIn("必须大于", str(ctx.exception))
 
     def test_07_scaled_down_score_system_is_accepted(self):
-        # 迟滞带按配置的证据加分换算（不写死 3 分）：整体缩放的刻度同样成立
-        # （recent_promote_threshold 也须随刻度缩到 cap 之内）
+        # The band scales with the configured evidence increment (not
+        # hard-coded at 3): an overall scaled ruler is equally valid
+        # (recent_promote_threshold must also shrink within cap)
         cfg = self.LocalMemoryConfig(
             score_cap=1.5, promote_threshold=1.5, demote_threshold=0.5,
             score_start_high=1, score_start_medium=1,
@@ -635,7 +665,8 @@ class TestHysteresisBandValidation(unittest.TestCase):
         self.assertEqual(cfg.promote_threshold, 1.5)
 
     def test_08_promote_must_exceed_one_evidence_increment(self):
-        # demote > 0 + band >= 单条证据加分 => promote_threshold 必然大于该加分
+        # demote > 0 + band >= one-evidence increment => promote_threshold
+        # is necessarily larger than that increment
         with self.assertRaises(Exception):
             self.LocalMemoryConfig(
                 promote_threshold=3.0, demote_threshold=0.5,
@@ -643,8 +674,10 @@ class TestHysteresisBandValidation(unittest.TestCase):
             )
 
     def test_13_float_boundary_equal_band_is_accepted(self):
-        # 浮点表示误差不得把"数学上 band 恰等于加分"的组合误判为非法：
-        # 6.1 - 3.1 == 2.9999999999999996（二进制浮点），数学上 band=3 应安全
+        # Float representation error must not misjudge the "band exactly
+        # equals the increment" combo as invalid:
+        # 6.1 - 3.1 == 2.9999999999999996 (binary float); band=3 is
+        # mathematically safe
         self.assertEqual(6.1 - 3.1, 2.9999999999999996)
         cfg = self.LocalMemoryConfig(
             promote_threshold=6.1, demote_threshold=3.1,
@@ -652,21 +685,23 @@ class TestHysteresisBandValidation(unittest.TestCase):
         self.assertEqual(cfg.promote_threshold, 6.1)
 
     def test_14_float_tolerance_still_rejects_truly_smaller_band(self):
-        # 容差只吸收表示误差：真非法（band=2.0，远超 1e-9）仍被拒
+        # The tolerance only absorbs representation error: truly invalid
+        # (band=2.0, far beyond 1e-9) is still rejected
         with self.assertRaises(Exception):
             self.LocalMemoryConfig(
                 promote_threshold=5.1, demote_threshold=3.1,
             )
 
     def test_15_promote_above_cap_is_rejected(self):
-        # 晋升阈值 > 封顶 = 晋升静默停摆，装配期直接拒（此前无任何拦截）
+        # promote threshold > cap = promotion silently stalls; rejected
+        # at assembly time (no interception existed before)
         with self.assertRaises(Exception) as ctx:
-            self.LocalMemoryConfig(score_cap=1.5)  # promote 缺省 6.0 > 1.5
+            self.LocalMemoryConfig(score_cap=1.5)  # promote default 6.0 > 1.5
         self.assertIn("不得大于 score_cap", str(ctx.exception))
 
     def test_16_recent_promote_above_cap_is_rejected(self):
         with self.assertRaises(Exception):
-            self.LocalMemoryConfig(score_cap=3.5)  # recent 缺省 4.0 > 3.5
+            self.LocalMemoryConfig(score_cap=3.5)  # recent default 4.0 > 3.5
 
     def test_16b_naming_promote_above_cap_is_rejected(self):
         # naming dimension, same rule (v1.18.2): threshold > cap means the
@@ -722,13 +757,16 @@ class TestHysteresisBandValidation(unittest.TestCase):
         self.assertEqual(cfg.naming_promote_threshold, 1.0)
 
     def test_17_promote_equal_to_cap_is_accepted(self):
-        # 相等允许：分数经 min(cap, ...) 可达封顶（旧缺省 promote=10==cap=10 形态）
-        cfg = self.LocalMemoryConfig(score_cap=6.0)  # promote 缺省 6.0 == cap
+        # Equality is allowed: the score can reach the cap via
+        # min(cap, ...) (the old promote=10==cap=10 default shape)
+        cfg = self.LocalMemoryConfig(score_cap=6.0)  # default 6.0 == cap
         self.assertEqual(cfg.score_cap, 6.0)
 
     def test_18_band_fallback_cascades_to_cap_group(self):
-        # 评审级联场景：小刻度 cap + band 非法 -> band 组复位后 promote=6 > cap=1.5
-        # -> cap 组再复位，终态刻度自洽，晋升不会静默停摆；其余配置保留
+        # Review cascade scenario: small-scale cap + invalid band ->
+        # after the band group resets, promote=6 > cap=1.5 -> the cap
+        # group resets too; the final scale is self-consistent and
+        # promotion will not silently stall; other config is kept
         cfg = mod._try_build_config({
             "score_cap": 1.5, "promote_threshold": 1.5, "demote_threshold": 0.5,
             "score_start_high": 2, "score_start_medium": 1,
@@ -1063,9 +1101,12 @@ class TestKernel(unittest.TestCase):
         self.assertEqual(db.inserted_facts[0]["user_id"], "u1")
 
     def test_27b_fact_failure_raises_and_summary_not_written(self):
-        # P1-1：facts 通道失败上抛（facts 先行——summary 尚未落库，调用方
-        # 回滚水位线后下轮从零重编码，无半提交残留；旧"跳过该条"语义在
-        # 熔断期会静默永久丢失整批事实）
+        # P1-1: a facts-channel failure raises (facts go first -- the
+        # summary is not yet persisted, so after the caller rolls back
+        # the watermark the next round re-encodes from scratch with no
+        # half-committed residue; the old "skip this row" semantics
+        # would silently lose the whole fact batch during
+        # circuit-breaker periods)
         class FactFailDB(FakeDB):
             async def insert_persona_fact_raw(self, **kwargs):
                 raise RuntimeError("db down")
@@ -1088,9 +1129,11 @@ class TestKernel(unittest.TestCase):
         self.assertEqual(db.inserted_summaries, [])
 
     def test_27d_retain_evidence_key_aware_tz_normalized(self):
-        # 幂等键日期口径：aware UTC 时间戳归一到本地日期（与补编码路径
-        # merge_agent._to_local 对齐）——直接 strftime 得 UTC 日期，
-        # UTC+8 的 00:00-07:59 与补编码路径差一天，同批事实重复入库计分
+        # Idempotency-key date convention: aware UTC timestamps are
+        # normalized to the local date (aligned with the re-encode
+        # path's merge_agent._to_local) -- a direct strftime yields the
+        # UTC date, so for UTC+8 00:00-07:59 the two paths differ by
+        # one day and the same facts get inserted/scored twice
         class Enc:
             async def encode(self, conversation_text, bot_nickname, bot_user_id=""):
                 return "保真摘要", [
@@ -1116,12 +1159,14 @@ class TestKernel(unittest.TestCase):
             )
 
         asyncio.run(run())
-        # UTC 2026-08-18 20:00 == 上海 2026-08-19 04:00（日期翻转样本）
+        # UTC 2026-08-18 20:00 == Shanghai 2026-08-19 04:00
+        # (a date-rollover sample)
         self.assertEqual(db.inserted_facts[0]["evidence_key"], "sess|2026-08-19")
 
     def test_27c_bot_id_stripped_from_related(self):
-        # P3：bot 硬过滤同步剔除 related 集合中的 bot ID（防其复合键随簇
-        # 传播进候选检索匹配）
+        # P3: the bot hard filter also strips bot IDs from the related
+        # set (keeps their composite keys from spreading into candidate
+        # search matching via clusters)
         class Enc:
             async def encode(self, conversation_text, bot_nickname, bot_user_id=""):
                 return "摘要", [
@@ -1146,7 +1191,8 @@ class TestKernel(unittest.TestCase):
         )
 
     def test_28b_forget_summary_scope_pinned(self):
-        # 作用域锁定：删除下推会话/用户归属限定（DAL 侧 WHERE 追加）
+        # Scope pinning: the delete push-down is limited to the
+        # session/user ownership (appended as WHERE on the DAL side)
         kernel, db = self._kernel()
 
         async def run():
@@ -1161,13 +1207,15 @@ class TestKernel(unittest.TestCase):
         )
 
     def _trip_breaker(self, kernel):
-        # 默认阈值 5 次连续失败进入 OPEN
+        # Default threshold: 5 consecutive failures -> OPEN
         for _ in range(5):
             asyncio.run(kernel.circuit_breaker.record_failure())
 
     def test_71_ingest_raises_during_breaker(self):
-        # 熔断拒绝期写入直接失败（旧契约拒绝后仍返回 document_id，批次
-        # 被标已消费而实际未落库——静默丢失）
+        # Writes fail directly during the circuit-breaker rejection
+        # period (the old contract still returned a document_id after
+        # rejecting, so the batch was marked consumed without ever being
+        # persisted -- a silent loss)
         KEXC = sys.modules["noriflow_memory_pkg.memory_kernel"].MemoryDBUnavailable
         kernel, db = self._kernel()
         self._trip_breaker(kernel)
@@ -1183,8 +1231,9 @@ class TestKernel(unittest.TestCase):
         self.assertEqual(db.inserted_summaries, [])
 
     def test_71b_retain_raises_during_breaker_before_encoding(self):
-        # 熔断拒绝期 retain 在编码 LLM 之前失败（不白烧调用），调用方
-        # （_do_retain）回滚水位线，本批留给下轮重编码
+        # During circuit-breaker rejection retain fails before the
+        # encoder LLM (no wasted call); the caller (_do_retain) rolls
+        # back the watermark and leaves this batch for the next round
         KEXC = sys.modules["noriflow_memory_pkg.memory_kernel"].MemoryDBUnavailable
 
         class BoomEncoder:
@@ -1202,7 +1251,8 @@ class TestKernel(unittest.TestCase):
         self.assertEqual(db.inserted_summaries, [])
 
     def test_71c_ingest_raises_on_write_failure(self):
-        # 熔断健康但写入执行失败：_guarded 返回 False 须上抛（不再静默成功）
+        # Breaker healthy but the write itself fails: _guarded returning
+        # False must raise (no more silent success)
         KEXC = sys.modules["noriflow_memory_pkg.memory_kernel"].MemoryDBUnavailable
 
         class FailingDB(FakeDB):
@@ -1258,14 +1308,16 @@ class TestPersonaService(unittest.TestCase):
         self.assertIn("可能在减肥", text)
 
     def test_29b_profile_sections_and_alias_row(self):
-        # 画像 8 维度（对齐 nori 侧）：preference/commitment 栏位落位 +
-        # "其他名称"栏（alias 层变体，排除当前称呼，置于基本信息之后）
+        # The profile's 8 dimensions (aligned with the nori side):
+        # preference/commitment sections land plus an "other names"
+        # section (alias-layer variants, excluding the current display
+        # name, placed after basic info)
         svc = self._svc()
         text = asyncio.run(svc.build_profile_text(user_id="u1", platform="napcat"))
         self.assertIn("## 喜好偏好\n- 不吃辣", text)
         self.assertIn("## 约定承诺\n- 9月12日和小林去爬山", text)
         self.assertIn("## 其他名称\n- 明明", text)
-        self.assertNotIn("- 小明\n", text)  # 当前称呼仅作抬头，不进其他名称栏
+        self.assertNotIn("- 小明\n", text)  # heading-only, not in other names
         order = [
             "## 基本信息", "## 其他名称", "## 称呼偏好", "## 已知事实",
             "## 喜好偏好", "## 约定承诺", "## 互动偏好", "## 近期动态",
@@ -1330,8 +1382,10 @@ class TestPersonaService(unittest.TestCase):
                 )
 
     def test_29c_recent_and_uncertain_time_labels(self):
-        # 时效栏（近期动态/待定信息）条目带发生时间尾注（与 recall 记忆块
-        # 逐字同款）；长期栏不加——过期事实冒充近况的时序幻觉修复
+        # Time-sensitive sections (recent updates / unverified notes)
+        # carry an occurrence-time suffix (verbatim parity with the
+        # recall memory block); long-term sections do not -- fixes the
+        # temporal hallucination of stale facts posing as recent news
         fixed_now = datetime(2026, 10, 8, 4, 0, tzinfo=timezone.utc)
         aug24 = datetime(2026, 8, 24, 1, 40, 16, tzinfo=timezone.utc)
 
@@ -1367,12 +1421,15 @@ class TestPersonaService(unittest.TestCase):
             "## 待定信息\n- 疑似早起困难（约1个月前 · 8月24日）\n- 常喝咖啡（已被更正）",
             text,
         )
-        # 长期栏：无尾注；commitment 按编码要求自带的日期原样保留
+        # Long-term sections: no suffix; a commitment's self-carried
+        # date from encoding is kept verbatim
         self.assertIn("## 约定承诺\n- 答应陪看电影（10月5日）\n", text)
 
     def test_29d_parse_profile_keeps_time_suffix(self):
-        # get_profile 解析零剥离：日期/相对时距形态与陈述自带内容不可
-        # 区分，剥离零收益换误删敞口——尾注原样保留（时距锚本身是信息）
+        # get_profile parsing strips nothing: date/relative-duration
+        # shapes are indistinguishable from statement-carried content,
+        # and stripping buys nothing while risking false deletions --
+        # suffixes are kept verbatim (the time anchor is information)
         markdown = (
             "## 近期动态\n"
             "- 最近在学滑雪（约1个月前 · 8月24日）\n"
@@ -1396,8 +1453,9 @@ class TestPersonaService(unittest.TestCase):
         )
 
     def test_29e_persona_local_tz_cached(self):
-        # persona 时区懒解析缓存：非法 timezone 只解析一次（防每次注入
-        # 重复落 warning），reset 后按新配置重解析
+        # persona timezone lazy-parse cache: an invalid timezone is
+        # parsed only once (prevents a repeated warning on every
+        # injection); after reset it re-parses per the new config
         svc = mod.LocalPersonaService(
             db=None,
             config=mod._build_config({"dsn": "x", "timezone": "Asia/Shanghai"}),
@@ -1411,8 +1469,11 @@ class TestPersonaService(unittest.TestCase):
         self.assertIsNone(svc._tz_cache)
 
     def test_29f_dedupe_keep_time_prefers_nonnull(self):
-        # 跨键同文去重：首条 None 后条非空补上时间锚，非空不被 None 覆盖
-        # 经插件模块树取共享 helper（mod 是插件包的 main 模块，db 是兄弟包）
+        # Cross-key same-text dedup: when the first entry is None and a
+        # later one is non-null, the time anchor is backfilled and a
+        # non-null value is never overwritten by None. The shared
+        # helper is fetched via the plugin module tree (mod is the
+        # package's main module; db is a sibling package)
         pkg = mod.__name__.rsplit(".", 1)[0]
         _dedupe_keep_time = sys.modules[f"{pkg}.db.base"]._dedupe_keep_time
 
@@ -1485,8 +1546,9 @@ class TestMergeAgentCycle(unittest.TestCase):
         )
 
     def test_cycle_skipped_during_breaker(self):
-        # P2-1：熔断拒绝期整周期跳过——不触 DB、不烧 LLM（行状态不翻，
-        # 下周期自动重试）
+        # P2-1: the whole cycle is skipped during circuit-breaker
+        # rejection -- no DB touch, no LLM burn (row states are not
+        # flipped, so the next cycle retries automatically)
         db = self.CycleDB()
         breaker = mod.MemoryDBCircuitBreaker()
         for _ in range(5):
@@ -1524,16 +1586,19 @@ class TestMergeAgentCycle(unittest.TestCase):
         self.assertEqual(db.kv["adjudicate_skip_state"], "{}")
 
     def test_cycle_oversamples_pending_fetch(self):
-        # P2-2b：归一化遍按 3 倍批量超采样拉取（配合跳过名单过滤，防
-        # unsure 毒丸行 ORDER BY id 队首钉死）
+        # P2-2b: the normalization pass oversamples fetches at 3x the
+        # batch size (paired with skip-list filtering, so unsure
+        # poison-pill rows cannot pin the ORDER BY id queue head)
         db = self.CycleDB()
         agent = self._agent(db)
         asyncio.run(agent.run_cycle())
-        self.assertEqual(db.pending_calls, [600])  # merge_batch_size(200) × 3
+        self.assertEqual(db.pending_calls, [600])  # merge_batch_size(200) x 3
 
     def test_cycle_probes_backlog_and_reencodes(self):
-        # P2-2c：存在降级原文积压时探测（超采样窗口 = merge_batch_size×3，
-        # 与补编码遍同款跳过名单过滤）并跑补编码遍
+        # P2-2c: probe when degraded raw-text backlog exists
+        # (oversampling window = merge_batch_size x 3, with the same
+        # skip-list filtering as the re-encode pass) and run the
+        # re-encode pass
         class Enc:
             async def encode(self, conversation_text, bot_nickname, bot_user_id=""):
                 return "补编码摘要", [], [], True
@@ -1541,16 +1606,18 @@ class TestMergeAgentCycle(unittest.TestCase):
         db = self.CycleDB()
         agent = self._agent(db, encoder=Enc())
         stats = asyncio.run(agent.run_cycle())
-        self.assertIn(600, db.unsummarized_calls)  # 积压探针（200×3）
+        self.assertIn(600, db.unsummarized_calls)  # backlog probe (200x3)
         self.assertEqual(stats["reencoded"], 1)
         self.assertEqual(db.encoded_updates, [
             (1, "补编码摘要", None),
         ])
 
     def test_backlog_probe_respects_reencode_skip_list(self):
-        # 积压探针过滤跳过名单：仅剩已达重试上限的毒丸积压时不预留补编码
-        # 预算（预留了也无处可花，白饿归一化遍 1/4 预算）；探针失败保守
-        # 视为无积压
+        # The backlog probe filters the skip list: when only poison-pill
+        # backlog at its retry cap remains, no re-encode budget is
+        # reserved (it would have nowhere to go and would starve a
+        # quarter of the normalization pass's budget); a probe failure
+        # conservatively counts as no backlog
         db = self.CycleDB()
         agent = self._agent(db, encoder=object())
         self.assertTrue(asyncio.run(agent._reencode_backlog_exists()))
@@ -1566,10 +1633,13 @@ class TestMergeAgentCycle(unittest.TestCase):
         self.assertFalse(asyncio.run(boom_agent._reencode_backlog_exists()))
 
     def test_reencode_fact_write_failure_keeps_row(self):
-        # 补编码 facts 写失败：不上抛、不翻状态（行保持 summarized=false
-        # 下周期重试，document_id 幂等保证重试不重复入表）——若翻状态则
-        # 该行不再被补编码扫描，失败条目的事实永久丢失；失败语义对齐
-        # retain 路径（facts 先行、summary 殿后）
+        # Re-encode facts write failure: no raise, no status flip (the
+        # row stays summarized=false for a retry next cycle, and the
+        # document_id idempotency guarantees a retry does not insert
+        # twice) -- if the status flipped, the row would no longer be
+        # scanned by the re-encode pass and the failed item's facts
+        # would be lost forever; failure semantics align with the
+        # retain path (facts first, summary last)
         class FactFailDB(self.CycleDB):
             async def insert_persona_fact_raw(self, **kwargs):
                 raise RuntimeError("db write boom")
@@ -1588,9 +1658,11 @@ class TestMergeAgentCycle(unittest.TestCase):
         self.assertEqual(db.encoded_updates, [], "facts 写失败不得翻状态（防事实永久丢失）")
 
     def test_reingest_facts_local_tz_keys(self):
-        # P1-2：补编码幂等键日期按本地时区换算——asyncpg 返回 UTC aware，
-        # 直接 strftime 在 UTC+8 的 00:00-07:59 与 retain 路径（naive 本地
-        # 日期）跨路径失配，同语句重复入库/重复计分
+        # P1-2: re-encode idempotency-key dates convert to the local
+        # timezone -- asyncpg returns UTC aware, so a direct strftime
+        # mismatches the retain path (naive local dates) for UTC+8
+        # 00:00-07:59, double-inserting/double-scoring the same
+        # statement
         from zoneinfo import ZoneInfo
         import hashlib as _hashlib
         db_mod = sys.modules["noriflow_memory_pkg.db"]
@@ -1598,7 +1670,7 @@ class TestMergeAgentCycle(unittest.TestCase):
         agent = self._agent(
             db, tz=lambda: ZoneInfo("Asia/Shanghai"),
         )
-        # UTC 2026-09-07 17:30 == 本地（+08）2026-09-08 01:30
+        # UTC 2026-09-07 17:30 == local (+08) 2026-09-08 01:30
         row = {
             "session_id": "sess", "group_id": "", "platform": "napcat",
             "occurred_at": datetime(2026, 9, 7, 17, 30, 0, tzinfo=timezone.utc),
@@ -1640,8 +1712,10 @@ class TestVectorOps(unittest.TestCase):
         self.assertEqual(asyncio.run(task.run_once()), 0)
 
     def test_34b_embed_batch_count_mismatch_fail_open(self):
-        # P2-3：网关返回条数不齐 → 整批置 None（后处理在 try 外，越界
-        # 异常会炸掉补算任务整轮且每周期复现）
+        # P2-3: the gateway returns a mismatched count -> the whole batch
+        # becomes None (post-processing sits outside the try, so an
+        # out-of-range error would blow up the whole backfill round and
+        # recur every cycle)
         class BadCount:
             async def embed(self, texts):
                 return [None]
@@ -1654,7 +1728,8 @@ class TestVectorOps(unittest.TestCase):
         self.assertEqual(out, [None, None])
 
     def test_34c_embed_batch_none_element(self):
-        # P2-3：返回含 null 元素 → 该行置 None，不抛 TypeError
+        # P2-3: a returned null element -> that row becomes None without
+        # raising TypeError
         class NullVec:
             async def embed(self, texts):
                 return [None]
@@ -1709,8 +1784,10 @@ class TestWebuiStore(unittest.TestCase):
         self.assertTrue(raised)
 
     def test_39b_delete_fact_cleans_cluster_references(self):
-        # P3 补遗：删除事实同步 array_remove 清理簇 source_fact_ids 悬挂
-        # 引用（簇页证据计数如实），与 DELETE 同一事务
+        # P3 addendum: deleting a fact also runs array_remove to clean
+        # dangling source_fact_ids references in clusters (so the
+        # cluster page's evidence count stays truthful), in the same
+        # transaction as the DELETE
         class DelConn(FakeConn):
             async def fetchrow(self, sql, *args):
                 self.sqls.append(("fetchrow", sql, args))
@@ -1742,8 +1819,10 @@ class TestWebuiStore(unittest.TestCase):
             asyncio.run(mod.webui_store.update_summary(FakePool(), 1, {"content": ""}))
 
     def test_40b_update_summary_rewrites_search_text(self):
-        # P3-1：管理员修正摘要须同步重算 search_text（补算任务只扫
-        # search_text IS NULL 的行，不重算会永久带着旧正文的 BM25 分词）
+        # P3-1: an admin-corrected summary must recompute search_text in
+        # sync (the backfill task only scans rows with
+        # search_text IS NULL; without recompute the row keeps the old
+        # text's BM25 tokens forever)
         bst = sys.modules["noriflow_memory_pkg.db"].build_search_text
         pool = FakePool()
 
@@ -1760,8 +1839,10 @@ class TestWebuiStore(unittest.TestCase):
         self.assertEqual(args[2], bst("柠檬喜欢明日方舟"))
 
     def test_40c_dt_display_local_timezone(self):
-        # _dt 展示口径：asyncpg 读 timestamptz 恒为 UTC aware，序列化前
-        # 须转本地时区（否则维护页展示 UTC）；naive 值原样、None 空串
+        # _dt display convention: asyncpg reads timestamptz as UTC aware,
+        # so it must convert to the local timezone before serialization
+        # (otherwise the maintenance page shows UTC); naive values pass
+        # through as-is and None maps to an empty string
         utc = datetime(2026, 9, 8, 2, 30, 0, tzinfo=timezone.utc)
         offset = datetime.now().astimezone().utcoffset() or timedelta(0)
         expected = (utc + offset).replace(tzinfo=None)
@@ -1775,9 +1856,10 @@ class TestWebuiStore(unittest.TestCase):
 
 class TestPluginLifecycle(unittest.TestCase):
     def test_41_dsn_missing_skips(self):
-        # 双后端语义：storage_backend=postgres 且 dsn 缺失才跳过装配；
-        # auto（默认）下 dsn 缺失会转选 sqlite 后端（真实 SQLite 装配由
-        # test_sqlite_backend.py 覆盖）
+        # Dual-backend semantics: assembly is skipped only when
+        # storage_backend=postgres and dsn is missing; under auto (the
+        # default) a missing dsn switches to the sqlite backend (real
+        # SQLite assembly is covered by test_sqlite_backend.py)
         inst, _ = _ready_plugin(mod, cfg={"storage_backend": "postgres"})
         self.assertFalse(inst._ready)
         self.assertIsNone(inst._memory_kernel)
@@ -1809,10 +1891,12 @@ class TestPluginLifecycle(unittest.TestCase):
         self.assertIsNone(inst._memory_kernel)
 
     def test_45_self_id_propagates_to_kernel_and_merge_agent(self):
-        # P2-1：真实 bot 平台 ID 首见定型并传播（bot 事实硬过滤/编码
-        # prompt 平台 ID 渲染/召回扩选 bot 剔除此前消费的是占位符 kira）
+        # P2-1: the real bot platform ID is pinned on first sight and
+        # propagated (the bot-fact hard filter / encoder prompt platform
+        # ID rendering / recall expansion bot exclusion previously
+        # consumed the "kira" placeholder)
         inst, _ = _ready_plugin(mod)
-        self.assertEqual(inst._memory_kernel.bot_id, "kira")  # 构造期占位符
+        self.assertEqual(inst._memory_kernel.bot_id, "kira")  # placeholder
         session = FakeSession(sid="10086")
         asyncio.run(inst.observe_message(types.SimpleNamespace(
             message=make_msg("u1", "你好", mid="q9", self_id="9900000001"),
@@ -1822,7 +1906,8 @@ class TestPluginLifecycle(unittest.TestCase):
         self.assertEqual(inst._memory_kernel.bot_id, "9900000001")
         if inst._merge_agent is not None:
             self.assertEqual(inst._merge_agent.bot_id, "9900000001")
-        # 首见定型：后续不同 self_id 不覆盖
+        # First sight pins it: a later different self_id does not
+        # overwrite
         asyncio.run(inst.observe_message(types.SimpleNamespace(
             message=make_msg("u2", "再问", mid="q10", self_id="other-bot"),
             session=session,
@@ -1830,10 +1915,14 @@ class TestPluginLifecycle(unittest.TestCase):
         self.assertEqual(inst._memory_kernel.bot_id, "9900000001")
 
     def test_69_bot_platform_retry_learn_after_empty_adapter(self):
-        # PR review：平台学习与 uid 学习解耦——首条 self_id 消息恰无
-        # adapter_name 时，平台此前会永久停留空串（uid 已定型不再进入
-        # 学习分支）；解耦后由后续任一消息补学平台并用已学 uid 重传播，
-        # Kira 迁入的全局事实归属不再依赖推断回退
+        # PR review: platform learning is decoupled from uid learning --
+        # when the first self_id message happens to lack adapter_name,
+        # the platform used to stay an empty string forever (the uid was
+        # already pinned and no longer entered the learning branch);
+        # after decoupling any later message back-fills the platform and
+        # re-propagates with the learned uid, so the attribution of
+        # facts migrated from Kira no longer depends on inference
+        # fallback
         inst, _ = _ready_plugin(mod)
         no_adapter = FakeSession(sid="10086", adapter="")
         asyncio.run(inst.observe_message(types.SimpleNamespace(
@@ -1841,10 +1930,12 @@ class TestPluginLifecycle(unittest.TestCase):
             session=no_adapter,
         )))
         self.assertEqual(inst._bot_user_id, "9900000001")
-        # 首条无 adapter：uid 已传播，平台仍为空
+        # First message has no adapter: the uid propagated, the platform
+        # is still empty
         self.assertEqual(inst._bot_platform, "")
         self.assertEqual(inst._memory_kernel.bot_platform, "")
-        # 后续消息（uid 已定型不覆盖）带 adapter_name：平台补学 + 重传播
+        # A later message (uid already pinned, not overwritten) carries
+        # adapter_name: the platform is back-filled + re-propagated
         with_adapter = FakeSession(sid="10086", adapter="onebot")
         asyncio.run(inst.observe_message(types.SimpleNamespace(
             message=make_msg("u2", "继续", mid="q91", self_id="other-bot"),
@@ -1852,13 +1943,17 @@ class TestPluginLifecycle(unittest.TestCase):
         )))
         self.assertEqual(inst._bot_platform, "onebot")
         self.assertEqual(inst._memory_kernel.bot_platform, "onebot")
-        # 重传播不回退 uid（uid 首见定型的语义保持）
+        # Re-propagation does not roll back the uid (first-sight pinning
+        # semantics preserved for the uid)
         self.assertEqual(inst._memory_kernel.bot_id, "9900000001")
 
     def test_46_persona_hot_switch_refreshes_nickname(self):
-        # persona 热切换：宿主每次请求从 DB 活读且无变更事件，插件靠
-        # TTL 限频活读刷新并传播（编码 prompt 的 bot 排除规则消费昵称，
-        # 旧名下新人格的 bot 信息可能被提取进用户画像）
+        # persona hot switch: the host live-reads from the DB on every
+        # request and emits no change event, so the plugin relies on a
+        # TTL-rate-limited live read to refresh and propagate (the
+        # encoder prompt's bot exclusion rule consumes the nickname;
+        # under the old name the new persona's bot info could be
+        # extracted into user profiles)
         inst, _ = _ready_plugin(mod)
 
         class MutablePersonaMgr:
@@ -1878,12 +1973,12 @@ class TestPluginLifecycle(unittest.TestCase):
 
         asyncio.run(refresh())
         self.assertEqual(mgr.calls, 1)
-        self.assertEqual(inst._bot_nickname, "Kira")  # 同名不传播
+        self.assertEqual(inst._bot_nickname, "Kira")  # same name: no change
         mgr.name = "夜灯"
-        asyncio.run(refresh())  # TTL 内：不再读宿主
+        asyncio.run(refresh())  # within TTL: no host read
         self.assertEqual(mgr.calls, 1)
         self.assertEqual(inst._bot_nickname, "Kira")
-        inst._persona_checked_at = 0.0  # 越过 TTL 模拟到期
+        inst._persona_checked_at = 0.0  # skip past TTL to simulate expiry
         asyncio.run(refresh())
         self.assertEqual(mgr.calls, 2)
         self.assertEqual(inst._bot_nickname, "夜灯")
@@ -1905,13 +2000,16 @@ class TestPluginRetain(unittest.TestCase):
         self.assertIn('uid="u1"', lines[0])
 
     def test_46_turn_signal_retain(self):
-        # 回合完成信号（session_memory_updated）到达一次 -> 恰好编码一次，
-        # 批次含全部 bot 段（工具回合拆段不再重复编码）；历史窗口 = 上一轮行
+        # One turn-complete signal (session_memory_updated) arrival ->
+        # exactly one encoding, and the batch includes every bot segment
+        # (tool-turn segmented sends are no longer encoded twice); the
+        # history window = the previous round's rows
         inst, ctx = _ready_plugin(mod)
         session = FakeSession()
 
         async def scenario():
-            # 前一回合（其行进入下一轮的历史窗口）
+            # Previous turn (its rows enter the next round's history
+            # window)
             await inst.observe_message(types.SimpleNamespace(
                 message=make_msg("u1", "昨晚我们聊过猫", mid="pre"), session=session
             ))
@@ -1924,7 +2022,9 @@ class TestPluginRetain(unittest.TestCase):
                 "session_memory_updated", {"session": session.sid}
             )
             await asyncio.gather(*inst._retain_tasks)
-            # 本轮批次两条 + bot 两段发送（工具回合拆段形态：回合只发一次信号）
+            # This turn's two batch rows + two bot segments sent
+            # (tool-turn segmentation shape: the turn fires the signal
+            # once)
             for i, text in enumerate(["今天天气不错", "出来玩吗"]):
                 await inst.observe_message(types.SimpleNamespace(
                     message=make_msg("u1", text, mid=f"in{i}"), session=session
@@ -1944,12 +2044,14 @@ class TestPluginRetain(unittest.TestCase):
 
         summaries = asyncio.run(scenario())
         self.assertEqual(len(summaries), 2)
-        # 库侧字段：复合 sid 解析出裸 session_id / 群号 / 参与者复合键
+        # DB-side fields: the composite sid parses into bare
+        # session_id / group number / participant composite keys
         self.assertEqual(summaries[1]["session_id"], "10086")
         self.assertEqual(summaries[1]["group_id"], "10086")
         self.assertIn("napcat:u1", summaries[1]["participants"])
         content = summaries[1]["content"]
-        # 历史（上一轮行）在前 + 分隔标记 + 批次行 + bot 回复行
+        # History (previous round's rows) first + separator + batch rows
+        # + bot reply lines
         self.assertIn(mod.HISTORY_BATCH_SEPARATOR, content)
         self.assertIn("昨晚我们聊过猫", content.rsplit(mod.HISTORY_BATCH_SEPARATOR, 1)[0])
         after_sep = content.rsplit(mod.HISTORY_BATCH_SEPARATOR, 1)[1]
@@ -1957,11 +2059,12 @@ class TestPluginRetain(unittest.TestCase):
         self.assertIn("稍等，检索一下喵", after_sep)
         self.assertIn("记忆功能正常", after_sep)
         self.assertIn('self="true"', after_sep)
-        # 批次行不得混入历史区
+        # Batch rows must not leak into the history section
         self.assertNotIn("今天天气不错", content.rsplit(mod.HISTORY_BATCH_SEPARATOR, 1)[0])
 
     def test_46b_watermark_repeat_signal_no_dup(self):
-        # 同回合信号重放 / 无新用户消息的后续信号：水位线防重复编码
+        # Same-turn signal replay / later signals without new user
+        # messages: the watermark prevents duplicate encoding
         inst, ctx = _ready_plugin(mod)
         session = FakeSession()
 
@@ -1974,7 +2077,7 @@ class TestPluginRetain(unittest.TestCase):
                 event, types.SimpleNamespace(chain=[mod.Text("正常的喵")]),
                 types.SimpleNamespace(is_notice=False),
             )
-            for _ in range(2):  # 信号重放（第二回合同会话、无新用户消息）
+            for _ in range(2):  # signal replay, no new user message
                 await ctx.event_bus.fire(
                     "session_memory_updated", {"session": session.sid}
                 )
@@ -1985,7 +2088,8 @@ class TestPluginRetain(unittest.TestCase):
         self.assertEqual(len(summaries), 1)
 
     def test_46c_watermark_incremental_next_turn(self):
-        # 下一轮信号只编码增量批次（上一轮消息不再入新批次）
+        # The next turn's signal encodes only the incremental batch
+        # (the previous round's messages no longer enter the new batch)
         inst, ctx = _ready_plugin(mod)
         session = FakeSession()
 
@@ -2016,12 +2120,15 @@ class TestPluginRetain(unittest.TestCase):
         after2 = summaries[1]["content"].rsplit(mod.HISTORY_BATCH_SEPARATOR, 1)[1]
         self.assertIn("第二个问题", after2)
         self.assertIn("第二个回答", after2)
-        # 第一轮批次消息不得再次进入第二轮的批次区（历史区作为上下文出现是预期）
+        # The first round's batch messages must not re-enter the second
+        # round's batch section (appearing in the history section as
+        # context is expected)
         self.assertNotIn("第一个问题", after2)
 
     def test_46d_rollback_on_retain_failure(self):
-        # retain_encoded 抛异常（代码契约允许的失败面）：回滚水位线，
-        # 下一轮信号重编码这批消息（内容不丢）
+        # retain_encoded raises (a failure surface allowed by the code
+        # contract): roll back the watermark so the next turn's signal
+        # re-encodes these messages (no content loss)
         inst, ctx = _ready_plugin(mod)
         session = FakeSession()
         kernel = inst._memory_kernel
@@ -2039,7 +2146,7 @@ class TestPluginRetain(unittest.TestCase):
                 "session_memory_updated", {"session": session.sid}
             )
             await asyncio.gather(*inst._retain_tasks)
-            kernel.retain_encoded = orig  # 恢复后同批消息应被重编码
+            kernel.retain_encoded = orig  # restored: batch re-encodes
             await ctx.event_bus.fire(
                 "session_memory_updated", {"session": session.sid}
             )
@@ -2051,7 +2158,8 @@ class TestPluginRetain(unittest.TestCase):
         self.assertIn("会失败的一句", summaries[0]["content"])
 
     def test_46e_sid_parsing_variants(self):
-        # dm 会话 group_id 为空；非会话型/畸形 sid 安全跳过
+        # dm sessions get an empty group_id; non-session-shaped or
+        # malformed sids are safely skipped
         inst, ctx = _ready_plugin(mod)
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
 
@@ -2079,7 +2187,8 @@ class TestPluginRetain(unittest.TestCase):
         self.assertEqual(ctx.event_bus.subs.get("session_memory_updated"), [])
 
     def test_47_notice_send_skipped(self):
-        # 主动通知（is_notice）不入行缓存：信号到达后摘要不含通知文本
+        # Proactive notices (is_notice) do not enter the line cache: the
+        # summary produced after the signal excludes notice text
         inst, ctx = _ready_plugin(mod)
         session = FakeSession()
 
@@ -2110,7 +2219,8 @@ class TestPluginRetain(unittest.TestCase):
         self.assertEqual(snap, ["line-a", "line-c"])
 
     def test_48b_multi_send_bot_lines_not_overwritten(self):
-        # 同一回合多次发送（拆条回复）：全部 bot 行进同一条摘要，一次编码
+        # Multiple sends within one turn (a reply split into segments):
+        # all bot lines go into the same summary with one encoding
         inst, ctx = _ready_plugin(mod)
         session = FakeSession()
         event = types.SimpleNamespace(event_id="ev-m", session=session)
@@ -2149,7 +2259,8 @@ class TestPluginInjection(unittest.TestCase):
         if cfg:
             base.update(cfg)
         inst, _ = _ready_plugin(mod, cfg=base)
-        # 注入桩 kernel/persona（FakeDB 无检索方法，真 kernel 会优雅返回空）
+        # Inject stub kernel/persona (FakeDB has no search methods; a
+        # real kernel would gracefully return empty)
         class StubKernel:
             async def build_injection_text(self, **kwargs):
                 self.kwargs = kwargs
@@ -2189,21 +2300,26 @@ class TestPluginInjection(unittest.TestCase):
         self.assertIn(f"{mod.PLUGIN_ID}:profile", names)
         recall = next(p for p in req.user_prompt if p.name.endswith(":recall"))
         self.assertIn("# 相关长期记忆", recall.content)
-        # 动态记忆块注入 user prompt（紧邻用户输入前，保 system+历史稳定
-        # 前缀命中缓存），且仅本轮生效不写回历史
+        # Dynamic memory blocks are injected into the user prompt
+        # (immediately before the user input, keeping the system +
+        # history stable prefix cache-friendly), effective for this turn
+        # only and never written back into history
         self.assertTrue(all(p.persist is False for p in req.user_prompt))
         for suffix in (":rollout", ":recall", ":profile"):
             self.assertNotIn(
                 f"{mod.PLUGIN_ID}{suffix}",
                 [p.name for p in req.system_prompt],
             )
-        # 静态工具准则仍留在可缓存前缀（system prompt）内
+        # Static tool guidelines stay inside the cacheable prefix
+        # (system prompt)
         self.assertIn(
             f"{mod.PLUGIN_ID}:tools",
             [p.name for p in req.system_prompt],
         )
-        # cross_session 与隔离开关联动（默认会话隔离——开关联动断言在
-        # 默认翻转后改为显式关隔离构造，见本类后续用例）
+        # cross_session is coupled with the isolation switch (session
+        # isolation by default -- the switch-coupling assertion in the
+        # default-flipped case below uses an explicit isolation-off
+        # construction; see later cases in this class)
         self.assertFalse(self._stub_kernel.kwargs["cross_session"])
         # whitelisted trigger user: ready + default config keeps all tools
         self.assertEqual(req.tool_set.names, set(mod.ALL_TOOLS))
@@ -2216,7 +2332,8 @@ class TestPluginInjection(unittest.TestCase):
         self.assertEqual(req.tool_set.names, {"memory_search"})
 
     def test_51b_enabled_tools_empty_disables_all(self):
-        # 显式空列表 = 全部禁用（schema "取消选择即禁用"语义）
+        # An explicit empty list = disable all (the schema's
+        # "deselect means disable" semantics)
         inst, req = self._inject(cfg={
             "dsn": "postgres://u:p@127.0.0.1:5432/db",
             "enabled_tools": [],
@@ -2248,8 +2365,9 @@ class TestPluginInjection(unittest.TestCase):
         self.assertEqual(req.tool_set.names, set())
 
     def test_52b_session_scoped_switch(self):
-        # 隔离开关翻转侧：显式关闭（false）→ cross_session=True（默认
-        # 隔离 → cross_session=False 的正路断言在 test_50）
+        # Isolation-switch flipped side: explicitly off (false) ->
+        # cross_session=True (the on-path assertion for the default
+        # isolation -> cross_session=False lives in test_50)
         inst, req = self._inject(cfg={
             "dsn": "postgres://u:p@127.0.0.1:5432/db",
             "summary_recall_session_scoped": False,
@@ -2257,7 +2375,8 @@ class TestPluginInjection(unittest.TestCase):
         self.assertTrue(self._stub_kernel.kwargs["cross_session"])
 
     def test_52c_rollout_prompt_prepended_before_recall(self):
-        # 滚动补回块注入为独立 Prompt，且时间线先于 recall 块
+        # The rolling rollout fill-back block is injected as a separate
+        # Prompt, and its timeline precedes the recall block
         inst, req = self._inject()
         names = [p.name for p in req.user_prompt]
         self.assertIn(f"{mod.PLUGIN_ID}:rollout", names)
@@ -2282,7 +2401,8 @@ class TestPluginInjection(unittest.TestCase):
         self.assertFalse(hasattr(self._stub_kernel, "rollout_session"))
 
     def test_52e_fallback_to_system_without_user_prompt(self):
-        # 旧宿主无 user_prompt 属性：回退 system prompt，注入不丢
+        # Older host without the user_prompt attribute: fall back to the
+        # system prompt, injection is not lost
         inst, req = self._inject(user_prompt=None)
         names = [p.name for p in req.system_prompt]
         self.assertIn(f"{mod.PLUGIN_ID}:rollout", names)
@@ -2291,7 +2411,8 @@ class TestPluginInjection(unittest.TestCase):
         self.assertFalse(hasattr(req, "user_prompt"))
 
     def test_52f_fallback_to_system_when_user_prompt_immutable(self):
-        # user_prompt 非 list（不可变类型）：同样回退，不抛 TypeError
+        # user_prompt is not a list (immutable type): same fallback,
+        # without raising TypeError
         inst, req = self._inject(user_prompt=())
         names = [p.name for p in req.system_prompt]
         self.assertIn(f"{mod.PLUGIN_ID}:recall", names)
@@ -2341,14 +2462,16 @@ class TestPluginTools(unittest.TestCase):
         self.assertIn("session_id 或 user_id", out)
 
     def test_53b_search_framework_dispatch_signature(self):
-        # 复现线上框架调用方式 func(event, **args)：旧签名（无 event 形参）
-        # 会抛 "got multiple values for argument 'query'"
+        # Reproduces the production framework dispatch func(event,
+        # **args): the old signature (no event parameter) would raise
+        # "got multiple values for argument 'query'"
         inst = self._inst()
         out = asyncio.run(inst.memory_search(self._tool_event(), query="猫", top_k=10))
         self.assertTrue(isinstance(out, str))
 
     def test_53c_search_scope_falls_back_to_event(self):
-        # LLM 未传 session_id/user_id 时，从触发事件兜底（session 范围）
+        # When the LLM passes no session_id/user_id, fall back to the
+        # triggering event (session scope)
         inst = self._inst()
         captured = {}
         inst._memory_kernel = self._scope_kernel(captured)
@@ -2358,8 +2481,9 @@ class TestPluginTools(unittest.TestCase):
         self.assertEqual(captured.get("user_id"), "9900000002")
 
     def test_53d_explicit_user_scope_not_overridden(self):
-        # 锁关闭时：LLM 显式只传 user_id → 保持跨会话 user 范围，不用
-        # event 覆盖（tool_scope_locked=false 的显式参数语义）
+        # Lock off: the LLM passes only user_id explicitly -> keep the
+        # cross-session user scope, do not override with the event (the
+        # explicit-argument semantics of tool_scope_locked=false)
         inst = self._inst(extra_cfg={"tool_scope_locked": False})
         captured = {}
         inst._memory_kernel = self._scope_kernel(captured)
@@ -2368,8 +2492,10 @@ class TestPluginTools(unittest.TestCase):
         self.assertEqual(captured.get("user_id"), "u9")
 
     def test_53d2_explicit_scope_overridden_when_locked(self):
-        # 锁开启（默认）：显式 session_id/user_id 被忽略，钉死为触发
-        # 会话/触发者——防白名单命中的调用方借参数横向检索他人记忆
+        # Lock on (default): explicit session_id/user_id are ignored and
+        # pinned to the triggering session/trigger user -- prevents a
+        # whitelist-passing caller from searching other people's memory
+        # sideways via arguments
         inst = self._inst()
         captured = {}
         inst._memory_kernel = self._scope_kernel(captured)
@@ -2567,27 +2693,32 @@ class TestPluginTools(unittest.TestCase):
 
     def test_54_search_with_session(self):
         inst = self._inst()
-        # 桩 db 无检索方法：kernel.search 会走 db.search_chat_summaries（FakeDB 无此方法 → 异常）
+        # The stub db has no search methods: kernel.search goes through
+        # db.search_chat_summaries (FakeDB lacks it -> exception)
         out = asyncio.run(inst.memory_search(self._bare_event(), query="猫", session_id="s"))
-        # FakeDB 缺方法 → 工具返回失败文本而非抛出
+        # FakeDB lacks the method -> the tool returns failure text
+        # instead of raising
         self.assertTrue(isinstance(out, str))
 
     def test_53j_search_cross_session_follows_config(self):
-        # A 修复：工具路径的跨会话姿态跟随 summary_recall_session_scoped
-        # （此前 search 硬默认 cross_session=False，配置只对注入路径生效）
+        # Fix A: the tool path's cross-session posture follows
+        # summary_recall_session_scoped (search previously hard-defaulted
+        # cross_session=False, so the config only affected the injection
+        # path)
         captured = {}
         inst = self._inst(extra_cfg={"summary_recall_session_scoped": False})
         inst._memory_kernel = self._scope_kernel(captured)
         asyncio.run(inst.memory_search(self._tool_event(), query="猫"))
         self.assertTrue(captured.get("cross_session"))
         captured2 = {}
-        inst2 = self._inst()  # 默认 summary_recall_session_scoped=True
+        inst2 = self._inst()  # default summary_recall_session_scoped=True
         inst2._memory_kernel = self._scope_kernel(captured2)
         asyncio.run(inst2.memory_search(self._tool_event(), query="猫"))
         self.assertFalse(captured2.get("cross_session"))
 
     def test_53k_entity_keys_passed_to_search(self):
-        # B 工具路径：query 实体命中并入 search 键组（recall_hint_enabled 门控）
+        # Tool-path B: query entity hits are merged into the search key
+        # groups (gated by recall_hint_enabled)
         captured = {}
 
         class EntKernel:
@@ -2605,7 +2736,8 @@ class TestPluginTools(unittest.TestCase):
         self.assertEqual(captured.get("entity_user_ids"), ["9900000003"])
 
     def test_53l_entity_match_skipped_when_hint_disabled(self):
-        # recall_hint_enabled=False：不触发实体匹配，键组恒空（None）
+        # recall_hint_enabled=False: no entity matching, key groups stay
+        # empty (None)
         captured = {}
 
         class EntKernel:
@@ -2626,7 +2758,8 @@ class TestPluginTools(unittest.TestCase):
         inst = self._inst()
         # tool-scope lock pins ownership to the triggering event; the event
         # must carry a session (bare events are rejected symmetrically with
-        # memory_remove — see test_55e). v2 语义：确定性事实直写（nori 对齐）
+        # memory_remove -- see test_55e). v2 semantics: deterministic
+        # facts are written directly (nori-aligned)
         out = asyncio.run(inst.memory_write(
             self._tool_event(), text="他最爱猫", category="preference",
             session_id="s", user_id="u1", platform="napcat",
@@ -2638,7 +2771,9 @@ class TestPluginTools(unittest.TestCase):
         )
 
     def test_55d_write_reports_failure_during_breaker(self):
-        # P2-2 连带：熔断拒绝期 memory_write 回报写入失败（旧契约假成功）
+        # P2-2 side effect: during circuit-breaker rejection
+        # memory_write reports the write failure (the old contract
+        # faked success)
         inst = self._inst()
         for _ in range(5):
             asyncio.run(inst._memory_kernel.circuit_breaker.record_failure())
@@ -2650,8 +2785,10 @@ class TestPluginTools(unittest.TestCase):
         self.assertEqual(inst._db.inserted_facts, [])
 
     def test_55e_write_rejects_when_scope_undervable(self):
-        # P3 对称性：作用域锁定 + 触发事件派生不出会话/用户 → 显式拒绝
-        # （旧行为是静默写一行空归属记忆，与 memory_remove 不对称）
+        # P3 symmetry: with scope lock on and no session/user derivable
+        # from the trigger event -> reject explicitly (the old behavior
+        # silently wrote a row with empty attribution, asymmetric with
+        # memory_remove)
         inst = self._inst()
         out = asyncio.run(inst.memory_write(
             self._bare_event(), text="他最爱猫", category="preference",
@@ -2661,8 +2798,10 @@ class TestPluginTools(unittest.TestCase):
         self.assertEqual(inst._db.inserted_facts, [])
 
     def test_55f_write_rejects_non_integer_replaces(self):
-        # LLM 把簇 id 传成非数字串（schema 是 integer 也拦不住）：
-        # 必须返回可读错误而非 ValueError 炸穿 handler
+        # The LLM passes the cluster id as a non-numeric string (the
+        # schema says integer but cannot stop it): it must return a
+        # readable error instead of letting ValueError blow through the
+        # handler
         inst = self._inst()
         out = asyncio.run(inst.memory_write(
             self._tool_event(), text="他最爱猫", category="preference",
@@ -2672,8 +2811,10 @@ class TestPluginTools(unittest.TestCase):
         self.assertEqual(inst._db.inserted_facts, [])
 
     def test_55g_write_replace_owner_opaque(self):
-        # 存在性泄露回归锁：replace 目标「不存在」与「属于他人」必须
-        # 同款输出——簇 id 自增可枚举，双文案即存在性预言机
+        # Existence-leak regression lock: "not found" and "owned by
+        # someone else" for the replace target must produce identical
+        # output -- cluster ids are auto-incremented and enumerable, so
+        # two different messages would be a existence oracle
         inst = self._inst()
         inst._db.cluster_owner_result = None
         out_a = asyncio.run(inst.memory_write(
@@ -2690,7 +2831,8 @@ class TestPluginTools(unittest.TestCase):
         self.assertEqual(inst._db.inserted_facts, [])
 
     def test_55b_write_scope_falls_back_to_event(self):
-        # LLM 只传 text：session/user/platform 从触发事件补齐
+        # The LLM passes only text: session/user/platform are filled in
+        # from the triggering event
         inst = self._inst()
         out = asyncio.run(inst.memory_write(
             self._tool_event(), text="他最爱猫", category="preference",
@@ -2707,13 +2849,15 @@ class TestPluginTools(unittest.TestCase):
             self._tool_event(uid="999"), text="他最爱猫", category="preference",
         ))
         self.assertIn("权限不足", out)
-        # 写路径已改为 raw upsert + apply_fact_merge，inserted_summaries
-        # 恒空（旧断言失效）；双空断言与 55d/55e 的 inserted_facts 口径对齐
+        # The write path now uses raw upsert + apply_fact_merge, so
+        # inserted_summaries stays empty (the old assertion is obsolete);
+        # the double-empty assertion aligns with the inserted_facts
+        # convention of 55d/55e
         self.assertEqual(inst._db.inserted_facts, [])
         self.assertEqual(inst._db.applied_merges, [])
 
     def _embed_kernel(self):
-        # memory_lookup 只用到 kernel.embedding_service.embed_one
+        # memory_lookup only uses kernel.embedding_service.embed_one
         class EmbSvc:
             async def embed_one(self, text):
                 return [1.0]
@@ -3131,9 +3275,12 @@ class TestPluginTools(unittest.TestCase):
         self.assertEqual(inst._db.edge_calls[1], ("alias_names", [("qq", "u2"), ("qq", "u3")]))
 
     def test_55h_write_replaces_same_day_revert(self):
-        # 同日改回旧说法回归锁：原语句当日已写入（行已消费，乐观锁
-        # skipped）时，带 replaces 的更正必须换幂等键重落一行完成替换，
-        # 不得把「更正没执行」报成「已记录」——库里生效的仍是错误说法
+        # Same-day revert regression lock: when the original statement
+        # was written today (its row consumed, optimistic lock skipped),
+        # a correction with replaces must land a new row under a fresh
+        # idempotency key to complete the replacement, and must not
+        # report "recorded" for an unexecuted correction -- the wrong
+        # statement would otherwise remain in effect in the DB
         inst = self._inst()
         inst._db.cluster_owner_result = ("napcat", self.ALLOWED_UID)
         inst._db.merge_outcomes = [
@@ -3146,7 +3293,8 @@ class TestPluginTools(unittest.TestCase):
             replaces_cluster_id=123,
         ))
         self.assertIn("已更正", out)
-        # 两次落行（原幂等键 + 更正作用域键），键不同、merge 均为 replace
+        # Two rows land (original idempotency key + correction scope
+        # key), keys differ, both merges are replace
         self.assertEqual(len(inst._db.inserted_facts), 2)
         doc_ids = [r["document_id"] for r in inst._db.inserted_facts]
         self.assertNotEqual(doc_ids[0], doc_ids[1])
@@ -3155,8 +3303,10 @@ class TestPluginTools(unittest.TestCase):
         )
 
     def test_55i_write_replaces_repeat_correction_idempotent(self):
-        # 同一更正当日重复执行：换键重试后仍 skipped → 如实报「更正
-        # 已执行过」；纯重复写入（无 replaces）维持「已记录」口径
+        # The same correction repeated within the day: after the
+        # fresh-key retry still returns skipped, report honestly that
+        # the correction already ran today; a plain duplicate write
+        # (without replaces) keeps the "already recorded" wording
         inst = self._inst()
         inst._db.cluster_owner_result = ("napcat", self.ALLOWED_UID)
         inst._db.merge_outcomes = [{"action": "skipped"}, {"action": "skipped"}]
@@ -3177,9 +3327,12 @@ class TestPluginTools(unittest.TestCase):
         self.assertEqual(len(inst2._db.inserted_facts), 1)
 
     def test_56_lookup_summary_only_archived(self):
-        # 契约回归锁：工具描述承诺只检索非激活记忆——生效摘要不得混入
-        # 结果（无标注的生效行会被模型按「失效检索」语义误读）。过滤由
-        # only_archived 下推 db 侧完成，工具层直取 top_k 不再放大池
+        # Contract regression lock: the tool description promises to
+        # search only inactive memories -- live summaries must not
+        # appear in the results (unlabeled live rows would be misread by
+        # the model under the "invalidated retrieval" semantics). The
+        # filter is pushed down to the db side via only_archived, and
+        # the tool layer takes top_k directly without enlarging the pool
         inst = self._inst()
         inst._memory_kernel = self._embed_kernel()
         inst._db.summary_search_rows = [
@@ -3193,10 +3346,11 @@ class TestPluginTools(unittest.TestCase):
         self.assertIn("[已归档]", out)
         self.assertNotIn("[id:1]", out)
         self.assertNotIn("生效摘要", out)
-        # 下推断言：真库在 SQL 侧过滤 + limit 直取 top_k（默认 5）
+        # Push-down assertion: the real DB filters in SQL + limit takes
+        # top_k directly (default 5)
         self.assertTrue(inst._db.summary_search_kwargs["only_archived"])
         self.assertEqual(inst._db.summary_search_kwargs["limit"], 5)
-        # 只有生效行时按契约报「没找到」
+        # With only live rows, report "nothing found" per the contract
         inst._db.summary_search_rows = [
             {"id": 1, "document_id": "d1", "archived": False,
              "relevance": 0.9, "content": "生效摘要"},
@@ -3205,9 +3359,12 @@ class TestPluginTools(unittest.TestCase):
         self.assertIn("没有找到已归档", out)
 
     def test_56b_lookup_fact_only_inactive(self):
-        # 契约回归锁：fact 分支由 only_inactive 在 SQL 侧只留 replaced/
-        # dead/pending_uncertain，active/profiled 生效簇不进候选窗——
-        # 固定倍数池 + 调用方过滤会在生效簇超池时把目标行挤出（假阴性）
+        # Contract regression lock: the fact branch keeps only
+        # replaced/dead/pending_uncertain via only_inactive on the SQL
+        # side -- active/profiled live clusters never enter the
+        # candidate window; a fixed-size pool + caller-side filtering
+        # would squeeze the target rows out when live clusters exceed
+        # the pool (false negative)
         inst = self._inst()
         inst._memory_kernel = self._embed_kernel()
         inst._db.fact_search_rows = [
@@ -3227,16 +3384,19 @@ class TestPluginTools(unittest.TestCase):
         )
         self.assertIn("[簇12][已失效]", out)
         self.assertIn("[簇13][待定]", out)
-        # 归属标注：消费行必须携带 owner uid（防 fact 无主语漂移）
+        # Ownership labeling: consumed rows must carry the owner uid
+        # (prevents fact subject drift)
         self.assertIn("（9900000002）", out)
         self.assertNotIn("[簇11]", out)
         self.assertNotIn("生效簇", out)
-        # 下推断言：SQL 侧过滤 + limit 直取 top_k
+        # Push-down assertion: SQL-side filtering + limit takes top_k
+        # directly
         self.assertTrue(inst._db.fact_search_kwargs["only_inactive"])
         self.assertEqual(inst._db.fact_search_kwargs["limit"], 5)
 
     def test_56_remove(self):
-        # 锁开启（默认）：删除下推触发会话/用户归属限定
+        # Lock on (default): the delete push-down is limited to the
+        # triggering session/user ownership
         inst = self._inst()
         out = asyncio.run(inst.memory_remove(self._tool_event(), document_id="doc-9"))
         self.assertEqual(out, "已删除")
@@ -3247,14 +3407,16 @@ class TestPluginTools(unittest.TestCase):
         )
 
     def test_56a_remove_bare_event_rejected_when_locked(self):
-        # 锁开启但事件无可推导作用域（裸批事件）：拒绝删除（fail-closed）
+        # Lock on but the event has no derivable scope (bare batch
+        # event): reject the delete (fail-closed)
         inst = self._inst()
         out = asyncio.run(inst.memory_remove(self._bare_event(), document_id="doc-9"))
         self.assertIn("拒绝删除", out)
         self.assertEqual(inst._db.deleted_ids, [])
 
     def test_56a2_remove_bare_event_allowed_when_unlocked(self):
-        # 锁关闭：无可推导作用域时按旧行为不限范围删除
+        # Lock off: with no derivable scope, delete without scoping per
+        # the old behavior
         inst = self._inst(extra_cfg={"tool_scope_locked": False})
         out = asyncio.run(inst.memory_remove(self._bare_event(), document_id="doc-9"))
         self.assertEqual(out, "已删除")
@@ -3277,7 +3439,8 @@ class TestPluginTools(unittest.TestCase):
         self.assertIn("memory_write", names)
         self.assertIn("memory_remove", names)
         pages = [p["route"] for p in reg.pages]
-        # 页面挂非空子路径：根路径挂载会被宿主 Mount rstrip 后残留（热重载 404）
+        # Pages mount on a non-empty subpath: mounting on the root path
+        # leaves residue after the host Mount rstrips (hot-reload 404)
         self.assertEqual(pages, ["/dashboard"])
         api_paths = {a["path"] for a in reg.apis}
         self.assertIn("/memory/overview", api_paths)
@@ -3303,7 +3466,8 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual([c.user_id for c in cands], ["u1"])
 
     def test_60b_batch_participants_carry_platform(self):
-        # 增量批次参与者去重保序（群聊画像完整性），触发者 = 首个发言者
+        # Incremental batch participant dedup preserves order (group
+        # profile completeness); the trigger user = first speaker
         inst, ctx = _ready_plugin(mod)
         inst._bot_user_id = "bot01"
         session = FakeSession()
@@ -3379,7 +3543,8 @@ class TestSummaryState(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(summary, "摘要")
         self.assertEqual(len(facts), 1)
-        # 编码器向结构化出口传入结果 schema 与提交工具名
+        # The encoder passes the result schema and the submit tool name
+        # to the structured exit
         self.assertIsNotNone(seen.get("schema"))
         self.assertEqual(seen.get("tool_name"), "submit_memory_encoding")
 
@@ -3441,7 +3606,7 @@ class TestSummaryState(unittest.TestCase):
         agent = self._agent(db, DegradedEncoder())
         done = asyncio.run(agent._reencode_pass(50))
         self.assertEqual(done, 0)
-        self.assertEqual(len(calls), 3)  # 连续 3 次降级熔断
+        self.assertEqual(len(calls), 3)  # break after 3 straight degradations
         self.assertEqual(db.encoded_updates, [])
 
     def test_35_reencode_success_updates_and_ingests_facts(self):
@@ -3460,7 +3625,8 @@ class TestSummaryState(unittest.TestCase):
         self.assertEqual(done, 1)
         row_id, content, emb = db.encoded_updates[0]
         self.assertEqual((row_id, content), (7, "重编码摘要"))
-        # bot 自身事实被硬过滤，仅 1 条入表；evidence_key 沿用原行 occurred_at
+        # The bot's own facts are hard-filtered, so only 1 row lands;
+        # evidence_key reuses the original row's occurred_at
         self.assertEqual(len(db.inserted_facts), 1)
         fact = db.inserted_facts[0]
         self.assertEqual(fact["user_id"], "u1")
@@ -3468,8 +3634,9 @@ class TestSummaryState(unittest.TestCase):
         self.assertEqual(fact["occurred_at"], self._unsummarized_row()["occurred_at"])
 
     def test_36_search_sql_fallback_filters_unsummarized(self):
-        # 宽召回路径（conds 为空，如 scope=session 未传 session_id）的
-        # where 兜底同样须排除未编码行
+        # The wide-recall path (empty conds, e.g. scope=session without
+        # a session_id) needs the same fallback WHERE exclusion of
+        # unencoded rows
         db = mod.MemoryDatabase(mod._build_config({"dsn": "x"}))
         db._pool = FakePool()
 
@@ -3639,18 +3806,23 @@ class TestEntityRecall(unittest.TestCase):
         return " ".join(s for _, s, _ in db.pool.conn.sqls)
 
     def test_entity_keys_join_primary_block_when_cross_session(self):
-        # 跨会话开放：实体键并入主键组（与发言者 OR 同池），无会话钉死块
+        # Cross-session open: entity keys merge into the primary key
+        # group (same pool as the speaker, OR-ed), with no
+        # session-pinned block
         sql = self._db_sql(
             cross_session=True,
             entity_user_keys=["seki:9900000003"], entity_user_ids=["9900000003"],
         )
         self.assertEqual(sql.count("participants &&"), 2)
         self.assertEqual(sql.count("user_id = ANY("), 2)
-        # 不出现「会话钉死」形态的块（隔离落点才有的形状）
+        # No "session-pinned" shaped block appears (the shape unique to
+        # the isolated landing point)
         self.assertNotIn("AND summarized AND session_id =", sql)
 
     def test_entity_keys_session_pinned_when_isolated(self):
-        # 会话隔离：实体键与扩选组同构钉死当前会话，主键组只剩发言者
+        # Session isolation: entity keys pin to the current session
+        # isomorphic with the expansion group; the primary key group
+        # keeps only the speaker
         sql = self._db_sql(
             cross_session=False,
             entity_user_keys=["seki:9900000003"], entity_user_ids=["9900000003"],
@@ -3659,7 +3831,8 @@ class TestEntityRecall(unittest.TestCase):
         self.assertIn("AND summarized AND session_id =", sql)
 
     def test_entity_keys_alone_still_form_blocks(self):
-        # 无发言者过滤（如 planner 不传 user）时实体键独立成组
+        # With no speaker filter (e.g. planner passes no user), entity
+        # keys form their own group
         sql = self._db_sql(
             cross_session=True, user_keys=None, user_ids=None,
             entity_user_keys=["seki:9900000003"], entity_user_ids=["9900000003"],
@@ -3668,7 +3841,8 @@ class TestEntityRecall(unittest.TestCase):
         self.assertEqual(sql.count("user_id = ANY("), 1)
 
     def test_no_entity_keys_unchanged_shape(self):
-        # 未传实体键：SQL 与既有形状一致（无第三块）
+        # No entity keys: the SQL matches the existing shape (no third
+        # block)
         sql = self._db_sql(cross_session=True)
         self.assertEqual(sql.count("participants &&"), 1)
         sql2 = self._db_sql(cross_session=False)
@@ -3697,7 +3871,8 @@ class TestEntityRecall(unittest.TestCase):
         return kernel
 
     def test_build_injection_consumes_hints_entity_keys(self):
-        # 注入路径：hints.entity_user_keys 原样传递（复合键 + 派生裸 uid）
+        # Injection path: hints.entity_user_keys pass through verbatim
+        # (composite keys + derived bare uids)
         captured = {}
         kernel = self._cap_kernel(captured)
         RecallHints = sys.modules[mod.LocalMemoryKernel.__module__].RecallHints
@@ -3709,7 +3884,8 @@ class TestEntityRecall(unittest.TestCase):
         self.assertEqual(captured.get("entity_user_ids"), ["9900000003"])
 
     def test_build_injection_fallback_matches_query(self):
-        # planner 兜底：hints 未携带键时对 query 自匹配（窗口词典路）
+        # planner fallback: when hints carry no keys, self-match the
+        # query (window-dictionary path)
         captured = {}
         kernel = self._cap_kernel(captured)
 
@@ -3723,7 +3899,7 @@ class TestEntityRecall(unittest.TestCase):
         self.assertEqual(captured.get("entity_user_ids"), ["9900000003"])
 
     def test_build_injection_no_fallback_when_disabled(self):
-        # recall_hint_enabled=False：不触发兜底匹配
+        # recall_hint_enabled=False: no fallback matching
         captured = {}
         kernel = self._cap_kernel(captured)
         kernel.config = mod._build_config({"dsn": "x", "recall_hint_enabled": False})
@@ -3791,8 +3967,8 @@ class TestWriteDedup(unittest.TestCase):
     def test_60_near_dup_summary_skipped(self):
         kernel, db = self._kernel(scores=[{"id": 1, "content": "旧", "score": 0.92}])
         doc_ids = self._retain(kernel)
-        self.assertEqual(db.inserted, [])  # summary 跳过写入
-        self.assertEqual(len(doc_ids), 1)  # 仍返回幂等 document_id
+        self.assertEqual(db.inserted, [])  # summary write skipped
+        self.assertEqual(len(doc_ids), 1)  # still returns an idempotent doc id
         self.assertEqual(db.fetch_kwargs["limit"], 8)
         self.assertEqual(db.fetch_kwargs["session_id"], "s1")
 
@@ -3820,7 +3996,7 @@ class TestWriteDedup(unittest.TestCase):
 
     def test_64_fetch_failure_fail_open(self):
         kernel, db = self._kernel(fail_fetch=True)
-        self._retain(kernel)  # 不抛异常
+        self._retain(kernel)  # must not raise
         self.assertEqual(len(db.inserted), 1)
 
     def test_65_window_config_passed(self):
@@ -3832,7 +4008,8 @@ class TestWriteDedup(unittest.TestCase):
         self.assertEqual(db.fetch_kwargs["limit"], 3)
 
     def test_66_tool_write_not_deduped(self):
-        # apply_write_dedup 默认 False：工具显式写入不参与去重
+        # apply_write_dedup defaults to False: explicit tool writes do
+        # not participate in dedup
         kernel, db = self._kernel(scores=[{"id": 1, "content": "旧", "score": 0.95}])
         asyncio.run(kernel.ingest(
             content="记住我爱猫", session_id="s1", user_id="u1", platform="qq",
@@ -3841,7 +4018,8 @@ class TestWriteDedup(unittest.TestCase):
         self.assertEqual(len(db.inserted), 1)
 
     def test_67_degraded_raw_not_deduped(self):
-        # 编码降级原文（summarized=False）不参与去重，留给补编码遍
+        # Degraded raw text (summarized=False) does not participate in
+        # dedup; it is left for the re-encode pass
         class BoomEncoder:
             async def encode(self, text, nickname, bot_user_id=""):
                 raise RuntimeError("编码失败")
@@ -3863,7 +4041,7 @@ class TestWriteDedup(unittest.TestCase):
         self.assertFalse(db.inserted[0]["summarized"])
 
     def test_68_recall_dedup_default_lowered(self):
-        # 召回侧近重复去重默认阈值 0.9 -> 0.85
+        # Recall-side near-duplicate dedup default threshold 0.9 -> 0.85
         self.assertEqual(
             mod._build_config({}).dedup_similarity_threshold, 0.85
         )
@@ -4056,7 +4234,7 @@ class TestWatermarkAtomicity(unittest.TestCase):
             gate = asyncio.Event()
 
             async def gated_alias(user_delta):
-                await gate.wait()  # 模拟 db_command_timeout 级的慢 DB I/O
+                await gate.wait()  # emulate slow db_command_timeout I/O
 
             inst._alias_upsert_batch = gated_alias
             retains: list[set] = []
@@ -4068,7 +4246,8 @@ class TestWatermarkAtomicity(unittest.TestCase):
             evt = types.SimpleNamespace(payload={"session": session.sid})
             ta = asyncio.create_task(inst._on_session_memory_updated(evt))
             await asyncio.sleep(0.02)
-            # A 已同步推进水位线（此刻正挂起在别名 upsert 上）
+            # A already advanced the watermark synchronously (suspended
+            # on the alias upsert at this moment)
             self.assertIn("m1", inst._consumed.get(session.sid, set()))
             tb = asyncio.create_task(inst._on_session_memory_updated(evt))
             await asyncio.sleep(0.02)
@@ -4130,12 +4309,15 @@ class TestBuildConfigReflection(unittest.TestCase):
             elif ann is str or ann == "str":
                 value = f"probe-{name}"
             elif get_origin(ann) is Literal:
-                # Literal 白名单字段：取首个非默认合法值验证接线透传——
-                # 探测值若与默认相同（recall_time_label_mode 默认 both
-                # 恰为白名单末位），_build_config 漏接时 pydantic 回落
-                # 同一默认，raw/expected/实际三方相等，断言失效；白名单
-                # 外的串会在装配期被 _cfg_time_label_mode 归一回落，故
-                # 只从白名单内取
+                # Literal whitelist field: take the first non-default
+                # legal value to verify wiring pass-through -- if the
+                # probe value equals the default (recall_time_label_mode
+                # defaults to "both", exactly the whitelist's last item),
+                # a missed _build_config wire falls back to the same
+                # default, making raw/expected/actual all equal and the
+                # assertion vacuous; strings outside the whitelist get
+                # normalized back by _cfg_time_label_mode at assembly,
+                # so the probe must come from inside the whitelist
                 non_default = [a for a in get_args(ann) if a != default]
                 value = (non_default or list(get_args(ann)))[0]
             else:  # list[str]
@@ -4300,7 +4482,8 @@ class TestRelationAuditPoisonBatch(unittest.TestCase):
         for _ in range(2):
             asyncio.run(agent._relation_audit_pass())
         self.assertIsNone(db.kv.get("relation_audit_edge_id"))
-        # 第三次同水位批失败 -> 跳批推水位（其后所有边不再被钉死）
+        # Third same-watermark batch failure -> skip the batch and
+        # advance the watermark (edges after it are no longer pinned)
         asyncio.run(agent._relation_audit_pass())
         self.assertEqual(db.kv.get("relation_audit_edge_id"), "20")
 
@@ -4344,9 +4527,13 @@ class TestRelationAuditPoisonBatch(unittest.TestCase):
         self.assertEqual(db.kv.get("relation_audit_edge_id"), "10")
 
     def test_partial_coverage_never_advances_watermark_then_poison_skips(self):
-        # M2：送审 2 条仅回 1 条判定——水位不得推过未覆盖边（单调水位下
-        # 推进 = 永久漏审）；同水位连续 3 次覆盖不全走毒丸跳批，跳批时
-        # audited 只计已覆盖边，且不得对覆盖不全的批做任何降级
+        # M2: 2 edges submitted but only 1 verdict returned -- the
+        # watermark must not advance past uncovered edges (under a
+        # monotonic watermark, advancing = permanent audit misses); with
+        # 3 consecutive partial-coverage batches at the same watermark,
+        # poison-pill batch skipping kicks in; on skip, audited counts
+        # only covered edges and no demotion is applied to the
+        # partially-covered batch
         db = _AgentDB()
         ts = datetime(2026, 9, 11, tzinfo=timezone.utc)
         edges = [
@@ -4378,7 +4565,8 @@ class TestRelationAuditPoisonBatch(unittest.TestCase):
             "覆盖不全不得推进水位（未覆盖边将永久漏审）",
         )
         self.assertEqual(supersede_calls, [], "覆盖不全的批不得降级任何边")
-        # 第三次同水位覆盖不全 -> 毒丸跳批推水位；audited 只计已覆盖边
+        # Third same-watermark partial coverage -> poison-pill batch
+        # skip advances the watermark; audited counts only covered edges
         audited, superseded = asyncio.run(agent._relation_audit_pass())
         self.assertEqual(db.kv.get("relation_audit_edge_id"), "20")
         self.assertEqual(audited, 1)
@@ -4405,9 +4593,11 @@ class TestEmptyVerdicts(unittest.TestCase):
         self.assertEqual(db.merges, [], "空 verdicts 不得盲目建簇")
 
     def test_partial_coverage_verdicts_defer_without_create(self):
-        # M1：候选 2 条仅覆盖 1 条——未覆盖候选被 _choose_action 视作
-        # unrelated 会走 create 路径重复建簇；部分覆盖必须整条按 unsure
-        # 顺延（绝不盲目创建簇不变量）
+        # M1: 2 candidates but only 1 covered -- an uncovered candidate
+        # is treated as unrelated by _choose_action and would take the
+        # create path, duplicating cluster creation; partial coverage
+        # must defer the whole fact as unsure (the no-blind-cluster-
+        # creation invariant)
         db = _AgentDB()
 
         async def two_candidates(**kwargs):
@@ -4441,8 +4631,13 @@ class TestEmptyVerdicts(unittest.TestCase):
 
 
 class TestCycleStageIsolation(unittest.TestCase):
-    """M4：归一化遍的 DB 读失败必须阶段隔离——喂熔断通道、其余各遍照跑、
-    跳过名单在每条退出路径上持久化（旧行为：整周期经 _run 上抛中止）。"""
+    """Cycle stage isolation for M4.
+
+    A DB read failure in the normalization pass must stay isolated:
+    feed the circuit-breaker channel, keep the remaining passes
+    running, and persist the skip list on every exit path (the old
+    behavior aborted the whole cycle via _run raising).
+    """
 
     def _agent(self, db):
         agent = mod.FactMergeAgent(
@@ -4501,8 +4696,12 @@ class TestCycleStageIsolation(unittest.TestCase):
 
 
 class TestIdValidationBoolGuard(unittest.TestCase):
-    """L1：JSON true 反序列化为 True，True == 1 可穿过 `in valid_ids` ——
-    bool / 非 int 的 id 必须按非法条目计入 dropped。"""
+    """Bool/float id validation guard for L1.
+
+    A JSON true deserializes to True, and True == 1 slips through
+    `in valid_ids` -- bool and non-int ids must be counted in dropped
+    as invalid entries.
+    """
 
     def _llm(self, payload):
         class Llm:
@@ -4531,18 +4730,21 @@ class TestIdValidationBoolGuard(unittest.TestCase):
         self.assertEqual(result["dropped"], 1)
 
     def test_adjudicate_float_cluster_id_normalized(self):
-        # PR review：isinstance(int) 严格校验误杀浮点 id——模型偶发输出
-        # {"cluster_id": 1.0} 会被丢弃致 verdicts 覆盖不全、fact 永久顺延；
-        # 须按基线 int() 归一宽度落回候选 1（bool 拦截语义不变）。
-        # 次轮 review：非整值浮点（1.9）须置空丢弃——int() 会静默截断成 1
-        # 错配到错误簇
+        # PR review: the strict isinstance(int) check wrongly killed
+        # float ids -- an occasional {"cluster_id": 1.0} from the model
+        # would be dropped, leaving verdicts under-covered and the fact
+        # deferred forever; normalize back to candidate 1 by the
+        # baseline int() width (bool interception unchanged).
+        # Follow-up review: non-integral floats (1.9) must be blanked
+        # and dropped -- int() would silently truncate 1.9 into 1 and
+        # mis-match the wrong cluster
         ma = sys.modules["noriflow_memory_pkg.merge_agent"]
         adj = ma.FactAdjudicator(
             llm=self._llm({
                 "verdicts": [
                     {"cluster_id": 1.0, "verdict": "same"},
-                    {"cluster_id": "2", "verdict": "same"},  # 数字串同宽归一
-                    {"cluster_id": 1.9, "verdict": "same"},  # 非整值：置空丢弃
+                    {"cluster_id": "2", "verdict": "same"},  # same-width norm
+                    {"cluster_id": 1.9, "verdict": "same"},  # non-int: dropped
                 ],
                 "unsure": False,
             }),
@@ -4558,8 +4760,10 @@ class TestIdValidationBoolGuard(unittest.TestCase):
         self.assertEqual(result["dropped"], 1)
 
     def test_audit_float_edge_id_normalized(self):
-        # PR review 同款：关系边审计的 isinstance(int) 严格校验须回归到
-        # int() 归一宽度——浮点/数字串 id 落回真实边号（bool 拦截不变）
+        # Same as the PR review above: the relation-edge audit's strict
+        # isinstance(int) check must return to int() width
+        # normalization -- float/numeric-string ids land on the real
+        # edge id (bool interception unchanged)
         ma = sys.modules["noriflow_memory_pkg.merge_agent"]
         auditor = ma.RelationAuditor(
             llm=self._llm({
@@ -4604,8 +4808,13 @@ class TestIdValidationBoolGuard(unittest.TestCase):
 
 
 class TestTimestampKvWriteIsolation(unittest.TestCase):
-    """L2：衰减/归档完成后的时间戳持久化失败不得中断周期（内存护栏已
-    先行，仅重启可能提前重跑一次），也不得同进程二次执行。"""
+    """Timestamp KV write isolation for L2.
+
+    A persist failure of the post-decay/archive timestamp must not
+    abort the cycle (the in-memory guardrail is set first, so only a
+    restart could re-run it early) nor allow a second execution in the
+    same process.
+    """
 
     def test_decay_kv_failure_never_aborts_or_double_decays(self):
         db = _AgentDB()
@@ -4622,7 +4831,8 @@ class TestTimestampKvWriteIsolation(unittest.TestCase):
 
         db.set_kv = set_kv
         db.decay_pass = decay_pass
-        # 预置过期时间戳：跳过首跑初始化分支，直接进入衰减
+        # Pre-seed an expired timestamp: skip the first-run init branch
+        # and go straight into decay
         db.kv["last_decay_at"] = (
             datetime.now(timezone.utc) - timedelta(days=90)
         ).isoformat()
@@ -4634,7 +4844,7 @@ class TestTimestampKvWriteIsolation(unittest.TestCase):
         asyncio.run(agent._maybe_decay())
         self.assertEqual(len(decay_calls), 1)
         self.assertIsNotNone(agent._last_decay_at, "内存护栏须先于 set_kv 设置")
-        # 同进程内不得二次衰减
+        # No second decay within the same process
         asyncio.run(agent._maybe_decay())
         self.assertEqual(len(decay_calls), 1)
 
@@ -4677,8 +4887,9 @@ class TestConfigConstraints(unittest.TestCase):
                 mod.LocalMemoryConfig(**kwargs)
 
     def test_positive_values_accepted(self):
-        # 评分刻度整体缩放时（start_score/promote/demote 同比例）仍应通过：
-        # 迟滞带按配置的证据加分换算，不写死 3 分
+        # With the score scale scaled as a whole (start_score/promote/
+        # demote in proportion) it should still pass: the band scales
+        # with the configured evidence increment, not hard-coded at 3
         cfg = mod.LocalMemoryConfig(
             score_cap=1.5, promote_threshold=1.5, demote_threshold=0.5,
             score_start_high=1, score_start_medium=1,
@@ -4716,18 +4927,21 @@ class TestPersistSemantics(unittest.TestCase):
     def test_mask_sentinel_collision_honored(self):
         cw = importlib.import_module("noriflow_memory_pkg.config_web")
         mask = cw._MASK
-        # 常规：掩码 = 未修改 -> 还原现值
+        # Normal case: mask = unchanged -> restore the current value
         out = cw.unmask_values({"dsn": mask}, {"dsn": "postgres://x"})
         self.assertEqual(out["dsn"], "postgres://x")
-        # 碰撞：真实值恰为掩码串 -> 提交值被尊重（可设置该值）
+        # Collision: the real value happens to be the mask string ->
+        # the submitted value is honored (setting that value is allowed)
         out2 = cw.unmask_values({"dsn": mask}, {"dsn": mask})
         self.assertEqual(out2["dsn"], mask)
 
     def test_numeric_bounds_exposed(self):
         cw = importlib.import_module("noriflow_memory_pkg.config_web")
         schema = cw.config_schema()
-        # score_cap 是 float + gt=0（排他界）：min 必须是 0 之上最近的可表示
-        # 浮点（nextafter），UI 提交该值服务端不会 422（提交 0 会被拒）
+        # score_cap is float + gt=0 (exclusive bound): min must be the
+        # closest representable float above 0 (nextafter), so a UI
+        # submit of that value is not rejected server-side with a 422
+        # (submitting 0 would be)
         self.assertEqual(schema["score_cap"].get("min"), math.nextafter(0, math.inf))
         self.assertGreater(schema["failure_threshold"].get("min", 0), 0)
         self.assertEqual(schema["embedding_dims"].get("min"), 1)
@@ -4796,9 +5010,9 @@ class TestBackfillPendingMarker(unittest.TestCase):
 class TestSupersedeBackfillEdgesOf(unittest.TestCase):
     def test_only_pure_backfill_edges_of_dead_clusters(self):
         conn = _CaptureConn(edges=[
-            {"id": 1, "evidence_keys": ["backfill|5"]},        # 来源死亡 -> 下线
-            {"id": 2, "evidence_keys": ["backfill|5", "s|2026-09-01"]},  # 有线上证据
-            {"id": 3, "evidence_keys": ["backfill|6"]},        # 来源存活
+            {"id": 1, "evidence_keys": ["backfill|5"]},        # dead source
+            {"id": 2, "evidence_keys": ["backfill|5", "s|2026-09-01"]}, # mixed
+            {"id": 3, "evidence_keys": ["backfill|6"]},        # source alive
         ])
         count = asyncio.run(_DB.supersede_backfill_edges_of(conn, [5]))
         self.assertEqual(count, 1)
@@ -4978,7 +5192,8 @@ def _setup() -> None:
         _HTTP_EXCEPTION = Exception
 
 
-# 模块导入即装配（pytest 收集路径）；直跑 main() 重复调用幂等
+# Assembled at import time (pytest collection path); calling main()
+# for a direct run is idempotent
 _setup()
 
 

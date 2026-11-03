@@ -33,7 +33,7 @@ class PromptLoader:
 
     def __init__(self, prompts_dir: str | Path = "prompts") -> None:
         self.prompts_dir = Path(prompts_dir)
-        # name -> (mtime, template)：mtime 变化即失效重读
+        # name -> (mtime, template): invalidate and re-read when mtime changes
         self._cache: dict[str, tuple[float, str]] = {}
 
     def load(self, name: str) -> str:

@@ -1091,9 +1091,11 @@ class SQLiteMemoryDatabase(MemoryBackend):
         connection session — consistent under the single-writer model).
         """
         async with self.pool.acquire() as conn:
-            # 占位符编号固定：session=$1、skip=$2、platform 恒占最高槽
-            # $3（缺席不挤占）——_translate 按 $n 显式下标绑定，若条件
-            # 分支收缩 params 而 LIMIT 槽位写死会越界（IndexError）
+            # Placeholder numbering is fixed: session=$1, skip=$2, and
+            # platform always occupies the highest slot $3 (absent slots are
+            # not squeezed out) — _translate binds by explicit $n index, so a
+            # conditional branch shrinking params while the LIMIT slot is
+            # hard-coded would go out of bounds (IndexError)
             count_sql = (
                 "SELECT count(*) FROM ("
                 f"SELECT kind FROM {CHAT_SUMMARY_TABLE} "  # noqa: S608
@@ -1655,15 +1657,17 @@ class SQLiteMemoryDatabase(MemoryBackend):
                         f"updated_at = $1 WHERE id IN ({phs})",
                         now, *expired_ids,
                     )
-                    # DELETE 无 $1（now）前缀参——占位符自成 $1..$n，不能
-                    # 复用为 UPDATE 准备的 $2..$n+1（错位绑定/越界）
+                    # DELETE has no $1 (now) prefix param — placeholders run
+                    # $1..$n on their own and must not reuse the $2..$n+1
+                    # prepared for the UPDATE (misbound / out-of-bounds)
                     del_phs = ", ".join(f"${i + 1}" for i in range(len(expired_ids)))
                     del_status = await conn.execute(
                         "DELETE FROM memory_user_profile WHERE cluster_id "
                         f"IN ({del_phs})",
                         *expired_ids,
                     )
-                    # 先 await 再切分：await 直链 .rsplit 会作用于协程对象
+                    # Await before splitting: chaining .rsplit directly onto
+                    # the await would act on the coroutine object
                     expired_cleaned = int(del_status.rsplit(" ", 1)[-1])
 
                 # 2) Non-recent score decay (evidence floor inside the SQL
@@ -1708,7 +1712,8 @@ class SQLiteMemoryDatabase(MemoryBackend):
                         f"updated_at = $1 WHERE id IN ({phs})",
                         now, *demoted_ids,
                     )
-                    # 同上：DELETE 占位符自成 $1..$n
+                    # Same as above: the DELETE placeholders run $1..$n on
+                    # their own
                     del_phs = ", ".join(f"${i + 1}" for i in range(len(demoted_ids)))
                     del_status = await conn.execute(
                         "DELETE FROM memory_user_profile WHERE cluster_id "
@@ -1886,9 +1891,11 @@ class SQLiteMemoryDatabase(MemoryBackend):
             )
         out = []
         for r in rows:
-            # 解析失败（旧格式/手工编辑）视作最旧——None 流入别名行会让
-            # alias_upsert 的 _ensure_tz 抛错毒化整批，绑定也随之丢失；
-            # 远古占位时间在 last_seen 单调（MAX）语义下不覆盖真实观测
+            # Unparseable (old format / hand edits) counts as oldest — None
+            # flowing into alias rows would make alias_upsert's _ensure_tz
+            # raise and poison the whole batch, dropping its bindings too;
+            # epoch-old placeholder times never override real observations
+            # under last_seen's monotonic (MAX) semantics
             seen = sqlite_parse_ts(r["last_seen"]) or datetime.min.replace(
                 tzinfo=timezone.utc
             )
@@ -1902,7 +1909,8 @@ class SQLiteMemoryDatabase(MemoryBackend):
         resolution source for the graph read side)."""
         async with self.pool.acquire() as conn:
 
-            # None=全表(原语义);空列表/过滤后空=无待解析 owner 返回 {}
+            # None = whole table (original semantics); empty list / empty
+            # after filtering = no owners to resolve, return {}
             if owners is not None:
                 pairs = [(str(p or ""), str(u or "")) for p, u in owners if u]
                 if not pairs:
@@ -2130,9 +2138,11 @@ class SQLiteMemoryDatabase(MemoryBackend):
     ) -> list[dict]:
         """Injection candidate edges: active with an endpoint hitting the
         node set (bot-endpoint edges included when bot_keys is non-empty)."""
-        # 字符串/字节串会被逐元素迭代成 ['q','q',':',...] 静默空结果——
-        # 静默 miss 正是本函数要根除的形态，故 fail fast 而非归一兼容
-        # （空串 falsy 天然迭代为空，保持旧容忍）
+        # A str/bytes would be iterated element-wise into ['q','q',':',...]
+        # yielding a silently empty result — silent misses are exactly what
+        # this function exists to eradicate, so fail fast instead of
+        # normalizing for compatibility (empty strings are falsy and
+        # naturally iterate to empty; old tolerance kept)
         if (isinstance(node_keys, (str, bytes)) and node_keys) or (
             isinstance(bot_keys, (str, bytes)) and bot_keys
         ):
@@ -2859,9 +2869,11 @@ class SQLiteMemoryDatabase(MemoryBackend):
                     if status not in ("active", "profiled"):
                         return _unchanged()
                     if row["contradicted_at"] is not None:
-                        # 已打过矛盾标记：与 PG 版 RETURNING 未命中分支
-                        # 同款——回读现态报 changed=False（BEGIN IMMEDIATE
-                        # 下本读即最新，重复 dispute 不假报状态变化）
+                        # Contradiction flag already set: same as the PG
+                        # RETURNING-miss branch — read back the current state
+                        # and report changed=False (under BEGIN IMMEDIATE this
+                        # read sees the latest state, so a repeated dispute
+                        # never falsely reports a status change)
                         return _unchanged()
                     await conn.execute(
                         f"UPDATE {FACT_CLUSTER_TABLE} SET contradicted_at = $2 "
@@ -2949,8 +2961,9 @@ class SQLiteMemoryDatabase(MemoryBackend):
                 ids = [int(r["id"]) for r in rows]
                 if ids:
                     # $1=archived_at, $2=written_at cutoff, $3=reinforce
-                    # cutoff, $4..=ids（编号不与 SET 子句撞号——shim 按首
-                    # 次出现顺序绑定参数）
+                    # cutoff, $4..=ids (numbering must not collide with the
+                    # SET clause — the shim binds params by first-appearance
+                    # order)
                     phs = ", ".join(f"${i + 4}" for i in range(len(ids)))
                     # UPDATE-time re-check: the candidate snapshot may be
                     # stale by the time the UPDATE lands (concurrent

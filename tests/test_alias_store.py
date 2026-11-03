@@ -53,7 +53,7 @@ UTC = timezone.utc
 
 
 # ---------------------------------------------------------------------------
-#  变体拆分与清洗
+#  Variant splitting and cleaning
 # ---------------------------------------------------------------------------
 
 
@@ -91,11 +91,11 @@ def test_build_alias_rows_cap_and_dedup() -> None:
     rows = build_alias_rows(raw, source="batch", variant_cap=3)
     by_name = {r["name"]: r for r in rows}
     assert by_name["琳妮特"]["last_seen"] == t2
-    assert len(rows) == 3  # 两个 t2 整串 + 主干（t1 整串被上限截掉）
+    assert len(rows) == 3  # two t2 full strings + trunk (t1 dropped by cap)
     assert "琳妮特（笨蛋猫娘）" not in by_name
     assert all(r["source"] == "batch" for r in rows)
 
-    # 变体风暴收敛
+    # Variant storm convergence
     base = datetime(2026, 9, 1, tzinfo=UTC)
     storm = [
         ("qq", "u2", f"透明人（污染程度达到{p}%）", base + timedelta(hours=p))
@@ -107,7 +107,7 @@ def test_build_alias_rows_cap_and_dedup() -> None:
 
 
 # ---------------------------------------------------------------------------
-#  AliasStore 匹配
+#  AliasStore matching
 # ---------------------------------------------------------------------------
 
 
@@ -161,7 +161,7 @@ def test_alias_store_apply_rows_last_seen_monotonic() -> None:
     }])
     store.apply_rows([{
         "platform": "qq", "user_id": "u1", "name": "阿明",
-        "last_seen": datetime(2026, 8, 1, tzinfo=UTC),  # 更早：不回退
+        "last_seen": datetime(2026, 8, 1, tzinfo=UTC),  # earlier: no rollback
     }])
     assert len(store._names["阿明"]) == 1
 
@@ -178,8 +178,10 @@ def test_is_placeholder_name() -> None:
     assert is_placeholder_name("Undefined")
     assert is_placeholder_name("用户1000002")
     assert is_placeholder_name("1000002")
-    # 真名（含数字混排）不误伤；"未知"系真名昵称不误伤（实测群成员
-    # 昵称（如"未知旅人"式真名）——前缀泛匹配已废除）
+    # Real names (including digit mixes) are not hit; "unknown"-family
+    # real nicknames are not hit either (observed group-member nicknames
+    # like the "unknown traveler"-style real names -- prefix wildcard
+    # matching removed)
     assert not is_placeholder_name("未知昵称")
     assert not is_placeholder_name("未知旅人")
     assert not is_placeholder_name("未知旅人（某频道）（某头衔）")
@@ -201,9 +203,11 @@ def test_alias_store_name_for_reverse_view() -> None:
         {"platform": "qq", "user_id": "3", "name": "1000003",
          "last_seen": datetime(2026, 9, 3, tzinfo=UTC)},
     ])
-    assert store.name_for("qq", "1") == "新名"  # 最新者胜
-    assert store.name_for("qq", "2") == ""      # 占位名不作规范名源
-    assert store.name_for("qq", "3") == ""      # 纯数字不作规范名源
+    # latest wins; placeholder names and pure digits never serve as
+    # canonical-name sources
+    assert store.name_for("qq", "1") == "新名"
+    assert store.name_for("qq", "2") == ""
+    assert store.name_for("qq", "3") == ""
     assert store.name_for("qq", "404") == ""
 
 
@@ -234,7 +238,7 @@ class FakeConnPool:
 
 def _make_db(pool: FakeConnPool) -> MemoryDatabase:
     db = MemoryDatabase(LocalMemoryConfig(dsn="postgresql://x"))
-    db._pool = pool  # noqa: SLF001 -- 注入桩池（对齐现有 db 层桩测姿势）
+    db._pool = pool  # noqa: SLF001 -- stub pool (as in db-layer stub tests)
     return db
 
 
@@ -257,7 +261,7 @@ async def test_alias_upsert_sql_and_params() -> None:
 
 
 # ---------------------------------------------------------------------------
-#  kernel 两层合并
+#  kernel two-layer merge
 # ---------------------------------------------------------------------------
 
 
@@ -297,7 +301,7 @@ async def test_entity_hint_entries_merges_alias_layer() -> None:
     pairs = [(p, u) for _, p, u in entries]
     assert ("qq", "u3003") in pairs
     assert ("qq", "u1001") in pairs
-    assert pairs.count(("qq", "u3003")) == 1  # 窗口与持久不重复注入
+    assert pairs.count(("qq", "u3003")) == 1  # window/persistent dedup
 
 
 async def test_entity_hint_entries_alias_disabled() -> None:
@@ -308,7 +312,7 @@ async def test_entity_hint_entries_alias_disabled() -> None:
 
 
 # ---------------------------------------------------------------------------
-#  main._alias_upsert_batch（批次 sender 名字流）
+#  main._alias_upsert_batch (per-batch sender name stream)
 # ---------------------------------------------------------------------------
 
 
@@ -345,17 +349,18 @@ async def test_alias_upsert_batch_wiring() -> None:
     ts = datetime(2026, 9, 8, 10, 0)
     await plugin._alias_upsert_batch([
         _line("m1", uid="u1", nickname="琳妮特（笨蛋猫娘）", cardname="", timestamp=ts),
-        _line("m2", uid="bot-1", nickname="bot名", timestamp=ts),   # bot 跳过
-        _line("m3", uid="u2", nickname="", cardname="", timestamp=ts),  # 无名跳过
+        _line("m2", uid="bot-1", nickname="bot名", timestamp=ts),  # bot skipped
+        # nameless line is skipped too
+        _line("m3", uid="u2", nickname="", cardname="", timestamp=ts),
     ])
     names = [r["name"] for r in db.upserted]
     assert "琳妮特" in names and "琳妮特（笨蛋猫娘）" in names
     assert all(r["user_id"] == "u1" for r in db.upserted)
-    # 内存视图同步（免整表重载即可命中）
+    # In-memory view sync (hits without a full-table reload)
     hits, _ = kernel.alias_store.match("琳妮特在吗", set())
     assert hits == [("琳妮特", "qq", "u1")]
 
-    # fail-open：alias_upsert 抛异常不上抛
+    # fail-open: alias_upsert raising does not propagate
     class _BadDB(_FakeAliasDB):
         async def alias_upsert(self, rows):
             raise RuntimeError("db down")
@@ -363,23 +368,24 @@ async def test_alias_upsert_batch_wiring() -> None:
     plugin2 = _bare_plugin(kernel=_make_kernel(), db=_BadDB())
     await plugin2._alias_upsert_batch([
         _line("m1", uid="u1", nickname="阿明", timestamp=ts),
-    ])  # 不抛即通过
+    ])  # not raising = pass
 
-    # kernel 未装配 / store 关闭：直接返回
+    # kernel not wired / store closed: return directly
     plugin3 = _bare_plugin(kernel=None, db=db)
     await plugin3._alias_upsert_batch([_line("m1", uid="u1", nickname="阿明")])
     assert not db.upserted or all(r["name"] != "阿明" for r in db.upserted)
 
 
 # ---------------------------------------------------------------------------
-#  归一化匹配（NFKC + casefold）与事实代号别名
+#  Normalized matching (NFKC + casefold) and fact codename aliases
 # ---------------------------------------------------------------------------
 
 
 def test_normalize_alias_text() -> None:
-    # 名片 undefined𝕩𝕩𝕪（𝕩=U+1D569）NFKC 后即 undefinedxxy——含 "xxy"
+    # Card name undefined𝕩𝕩𝕪 (𝕩 = U+1D569) is undefinedxxy after NFKC --
+    # contains "xxy"
     assert normalize_alias_text("undefined𝕩𝕩𝕪") == "undefinedxxy"
-    # 全角字母/数字/括号转半角；大小写收敛
+    # full-width letters/digits/brackets -> half-width; case folded
     assert normalize_alias_text("ＸＹＺ（测试）") == "xyz(测试)"
     assert normalize_alias_text("Shizuku") == "shizuku"
     assert normalize_alias_text("") == ""
@@ -388,13 +394,13 @@ def test_normalize_alias_text() -> None:
 def test_alias_store_match_unicode_variants() -> None:
     """Card-name Unicode variants vs ASCII/half-width text forms: substring hit after normalization."""
     store = _store_with({
-        "𝕩𝕩𝕪": [("qq", "3429924750")],  # 数学字母名片（NFKC 后即 xxy）
-        "Ｓｈｉｚｕｋｕ": [("qq", "u2")],  # 全角名片
-        "Shizuku": [("qq", "u3")],  # 与上行归一化后同名（半角异大小写）
+        "𝕩𝕩𝕪": [("qq", "3429924750")],  # math-alphabet card (NFKC -> xxy)
+        "Ｓｈｉｚｕｋｕ": [("qq", "u2")],  # full-width card
+        "Shizuku": [("qq", "u3")],  # same normalized key as the row above
     })
     hits, _ = store.match("seki还记得xxy吗", set())
     assert ("𝕩𝕩𝕪", "qq", "3429924750") in hits
-    assert all(h[0] != "xxy" for h in hits)  # 展示名保留名片原样
+    assert all(h[0] != "xxy" for h in hits)  # display name keeps card form
     hits, skipped = store.match("shizuku 在吗", set())
     assert hits == []
     assert skipped in (["Ｓｈｉｚｕｋｕ"], ["Shizuku"])
@@ -410,12 +416,14 @@ def test_extract_uid_code_names() -> None:
     assert extract_uid_code_names("用户10001（阿明）和用户10001（阿明）") == [
         ("10001", "阿明")
     ]
-    assert extract_uid_code_names("用户123（小明）") == []  # uid 不足 4 位
-    assert extract_uid_code_names("用户10001 阿明") == []  # 括号缺失
-    # 代号保留原文形态（大小写/全角——DB 与展示用原名，归一化只作匹配键）
+    assert extract_uid_code_names("用户123（小明）") == []  # uid under 4 digits
+    assert extract_uid_code_names("用户10001 阿明") == []  # brackets missing
+    # Codenames keep their original form (case/full-width -- the original
+    # name is used for DB and display; normalization is only the match key)
     assert extract_uid_code_names("用户10001（Kai）是熟人") == [("10001", "Kai")]
     assert extract_uid_code_names("用户10001（Ｋａｉ）是熟人") == [("10001", "Ｋａｉ")]
-    assert extract_uid_code_names("用户１０００１（阿明）") == [("10001", "阿明")]  # uid 全角归一
+    # full-width uid normalizes too
+    assert extract_uid_code_names("用户１０００１（阿明）") == [("10001", "阿明")]
 
 
 def test_build_fact_code_alias_rows() -> None:
@@ -436,7 +444,8 @@ def test_build_fact_code_alias_rows() -> None:
         "last_seen": ts_new,
         "source": "fact",
     }]
-    # 同归一化键多形态：行 name 保留首个观测原文，last_seen 取更晚
+    # Multiple forms under the same normalized key: the row name keeps the
+    # first observed original, last_seen takes the later one
     rows = build_fact_code_alias_rows([
         ("qq", "用户10001（Kai）今天上线", ts_old),
         ("qq", "用户10001（kai）又上线", ts_new),
@@ -448,7 +457,8 @@ def test_build_fact_code_alias_rows() -> None:
         "last_seen": ts_new,
         "source": "fact",
     }]
-    # last_seen=None（SQLite 标量 MAX/时间戳解析失败路径）不崩，视作最旧
+    # last_seen=None (SQLite scalar MAX / timestamp parse failure path)
+    # does not crash and is treated as the oldest
     rows = build_fact_code_alias_rows([
         ("qq", "用户10006（阿明）先出现", None),
         ("qq", "用户10006（阿明）后出现", ts_new),
@@ -536,7 +546,7 @@ async def test_alias_store_refresh_display_by_pair() -> None:
 
 
 # ---------------------------------------------------------------------------
-#  运行器
+#  Runner
 # ---------------------------------------------------------------------------
 
 

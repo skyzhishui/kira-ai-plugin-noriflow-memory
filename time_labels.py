@@ -26,8 +26,9 @@ from core.logging_manager import get_logger
 
 logger = get_logger("noriflow_memory.time_labels", "cyan")
 
-# 未知 mode 按值去重只告警一次：标注按注入记忆/画像条目逐条执行，
-# 逐条告警会日志洪泛
+# Unknown mode values warn only once per value (deduped by value):
+# labeling runs per injected memory/profile entry, so per-entry warnings
+# would flood the log
 _WARNED_MODES: set[str] = set()
 
 
@@ -100,8 +101,9 @@ def relative_time_precise(occurred_at: datetime | None, now: datetime) -> str:
 
 def absolute_time_part(local: datetime, days: int, now_local: datetime) -> str:
     """Absolute time anchor (layered precision): within 7 days include time, older only the date, cross-year includes the year."""
-    # 年份前缀先算：days<7 的近事分支也可能跨年（元旦回溯上月），
-    # 不能让时分短路把年份丢掉
+    # Compute the year prefix first: the days<7 recent branch can still
+    # cross a year boundary (New Year's Day looking back into last
+    # month), so the hour:minute early return must not drop the year
     year_part = f"{local.year}年" if local.year != now_local.year else ""
     if days < 7:
         return f"{year_part}{local.month}月{local.day}日 {local:%H:%M}"
@@ -132,18 +134,23 @@ def memory_time_label(
         return ""
     try:
         if ts.tzinfo is None:
-            # naive 约定为配置时区的本地时间（SQLite 后端/宿主可能传来）：
-            # 直接 astimezone 会按服务器本地时区解释，配置时区不一致时
-            # 日期与"今天/昨天"判定漂移——转换前先钉上 local_tz
+            # naive values are by convention local times in the configured
+            # timezone (the SQLite backend / host may deliver them): a
+            # direct astimezone interprets them in the server's local
+            # timezone, so when the configured timezone differs the date
+            # and the "today/yesterday" verdict drift -- pin local_tz on
+            # before converting
             ts = ts.replace(tzinfo=local_tz)  # type: ignore[arg-type]
         local = ts.astimezone(local_tz)  # type: ignore[arg-type]
         now_local = now.astimezone(local_tz)  # type: ignore[arg-type]
     except (ValueError, OSError, OverflowError):
         return ""
     if local > now_local:
-        # 将来时间戳（时钟偏差/批次预置）：按完整时刻比较，同日内的未来
-        # 时刻一并拦截——相对锚与绝对日期会自相矛盾（今天 · 未来某刻），
-        # 宁可不标注，避免诱导错误时序推理
+        # Future timestamps (clock skew / batch pre-dating): compare by the
+        # full instant and intercept same-day future moments too -- the
+        # relative anchor and the absolute date would contradict each
+        # other ("today · a future moment"); prefer no label over
+        # inducing wrong temporal reasoning
         return ""
     days = (now_local.date() - local.date()).days
     relative = relative_time_part(days)
@@ -153,8 +160,9 @@ def memory_time_label(
     if mode == "both" and absolute:
         return f"{relative} · {absolute}"
     if mode != "relative":
-        # Literal 校验外的兜底：直赋值改 config 不经 pydantic（如热切换），
-        # 未知取值按 relative 处理但落日志，不让手滑静默退化
+        # Fallback outside Literal validation: direct config assignment
+        # bypasses pydantic (e.g. hot swap); unknown values are handled as
+        # relative but logged, so a slip never degrades silently
         if mode not in _WARNED_MODES:
             _WARNED_MODES.add(mode)
             logger.warning("未知 recall_time_label_mode=%r，按 relative 处理", mode)
