@@ -396,6 +396,9 @@ html[data-theme="dark"] .hero-title {
   margin: 2px 0 18px;
 }
 .tab {
+  /* Button reset: neutralize UA styles so <button class="tab"> renders like the old div */
+  appearance: none;
+  -webkit-appearance: none;
   position: relative;
   display: inline-flex; align-items: center; gap: 8px;
   padding: 6px 15px 6px 7px;
@@ -403,7 +406,10 @@ html[data-theme="dark"] .hero-title {
   border: 1px solid var(--line);
   background: var(--nav-fill);
   color: var(--ink-soft);
-  font-weight: 600; font-size: 13px;
+  font-family: inherit;
+  font-size: 13px; font-weight: 600;
+  line-height: inherit;
+  text-align: start;
   cursor: pointer; user-select: none;
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
@@ -451,6 +457,11 @@ html[data-theme="dark"] .hero-title {
   border-color: transparent;
   background: radial-gradient(circle at 32% 28%, var(--sky), var(--sky-deep));
   box-shadow: 0 0 12px var(--glow-soft);
+}
+/* Keyboard focus ring, visible in both themes (--sky-dark is deep on light / light on dark) */
+.tab:focus-visible {
+  outline: 2px solid var(--sky-dark);
+  outline-offset: 2px;
 }
 
 /* ---------------- 子页工具条 ---------------- */
@@ -606,10 +617,13 @@ html[data-theme="dark"] .hero-title {
 
 /* ---------------- 按钮 ---------------- */
 .btn {
+  /* AA-tuned gradient endpoints, local to .btn (global --sky/--violet untouched) */
+  --btn-grad-from: #0d6d9c;
+  --btn-grad-to: #6a4ed6;
   display: inline-flex; align-items: center; gap: 6px;
   border: 1px solid transparent;
   cursor: pointer;
-  background: linear-gradient(135deg, var(--sky), var(--violet));
+  background: linear-gradient(135deg, var(--btn-grad-from), var(--btn-grad-to));
   color: #fff; font-weight: 700;
   padding: 8px 16px;
   border-radius: 999px;
@@ -617,6 +631,12 @@ html[data-theme="dark"] .hero-title {
   font-family: inherit;
   box-shadow: 0 4px 14px var(--glow-soft);
   transition: transform 0.16s ease, box-shadow 0.2s ease, filter 0.2s ease;
+}
+/* Dark theme keeps its luminous gradient and flips to deep ink text (mirrors .tab.active .tab-node) */
+html[data-theme="dark"] .btn {
+  --btn-grad-from: var(--sky);
+  --btn-grad-to: var(--violet);
+  color: #04101d;
 }
 .btn:hover { transform: translateY(-1px); box-shadow: 0 7px 20px var(--glow-soft); filter: brightness(1.06); }
 .btn:active { transform: translateY(0) scale(0.99); box-shadow: none; }
@@ -629,10 +649,11 @@ html[data-theme="dark"] .hero-title {
   box-shadow: none;
 }
 .btn.danger {
-  background: linear-gradient(135deg, #e46a8a, #c2426a);
+  --btn-grad-from: #bd4166;
+  --btn-grad-to: #9c2f55;
   box-shadow: 0 4px 14px var(--bad-bg);
 }
-html[data-theme="dark"] .btn.danger { background: linear-gradient(135deg, #ff6f92, #c94a6e); }
+html[data-theme="dark"] .btn.danger { --btn-grad-from: #ff6f92; --btn-grad-to: #d7587c; }
 .btn.small { padding: 5px 12px; font-size: 12px; }
 .btn.small svg { width: 12px; height: 12px; }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; box-shadow: none; filter: none; }
