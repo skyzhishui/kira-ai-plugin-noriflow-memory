@@ -367,7 +367,10 @@ async def main_async() -> None:
     )
     stored = await _cluster_occurred(summary["cluster_id"])
     stored_dt = (
-        datetime.fromisoformat(stored) if isinstance(stored, str) else stored
+        # Python<3.11 fromisoformat rejects the trailing Z (sqlite_format_ts)
+        datetime.fromisoformat(stored.replace("Z", "+00:00"))
+        if isinstance(stored, str)
+        else stored
     )
     # sqlite may hand back an aware datetime: compare against an aware now
     now_cmp = (
