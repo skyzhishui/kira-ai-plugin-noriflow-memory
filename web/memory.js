@@ -405,7 +405,10 @@ class ForceGraph {
     const svg = this.svg;
     svg.addEventListener("pointerdown", (ev) => {
       svg.setPointerCapture(ev.pointerId);
-      this._down = { x: ev.clientX, y: ev.clientY, moved: false };
+      // setPointerCapture retargets pointerup/pointercancel to the SVG itself,
+      // so remember where the gesture started: `up` resolves the node/edge
+      // from this target instead of ev.target (which is always the svg).
+      this._down = { x: ev.clientX, y: ev.clientY, moved: false, target: ev.target };
       const nodeG = ev.target.closest && ev.target.closest("[data-node]");
       if (nodeG) {
         const n = this.nodes.find((x) => x.id === nodeG.dataset.node);
@@ -430,15 +433,20 @@ class ForceGraph {
       }
     });
     const up = (ev) => {
-      const wasMoved = this._down && this._down.moved;
+      const down = this._down;
+      const wasMoved = down && down.moved;
+      const downTarget = down && down.target;
       const dragNode = this._dragNode;
       if (dragNode) { dragNode.fx = null; dragNode.fy = null; this.reheat(); }
       this._dragNode = null; this._panFrom = null; this._down = null;
       this.svg.classList.remove("dragging");
-      if (wasMoved || !ev.target.closest) return;
-      const nodeG = ev.target.closest("[data-node]");
+      // A cancelled gesture (touch scroll, browser takeover) must not change
+      // the selection; only a real pointerup resolves click targets.
+      if (ev.type === "pointercancel") return;
+      if (wasMoved || !downTarget || !downTarget.closest) return;
+      const nodeG = downTarget.closest("[data-node]");
       if (nodeG) { this.select("node", nodeG.dataset.node); return; }
-      const edgeG = ev.target.closest("[data-edge]");
+      const edgeG = downTarget.closest("[data-edge]");
       if (edgeG) { this.select("edge", edgeG.dataset.edge); return; }
       this.select(null, null);
     };
@@ -854,6 +862,11 @@ const Page = {
     el.appendChild(profileCard);
 
     let page = 1, kw = "";
+    // Profile request bookkeeping: profileReqSeq discards stale responses, and
+    // profileKey records which user the card currently shows so deleting that
+    // user can invalidate the card (and any in-flight request for it).
+    let profileReqSeq = 0;
+    let profileKey = null;
     const loadUsers = async () => {
       pickerCard.innerHTML = '<div class="loading">正在打捞记忆</div>';
       try {
@@ -890,6 +903,17 @@ const Page = {
                     try {
                       const r = await UI.api(`/users/${encodeURIComponent(u.platform)}/${encodeURIComponent(u.user_id)}`, { method: "DELETE" });
                       UI.toast(`已删除：簇 ${r.clusters} · 事实 ${r.facts} · 画像 ${r.profiles} · 别名 ${r.aliases} · 边 ${r.edges}`, "ok");
+                      // Only drop the profile card when it belongs to the deleted
+                      // user; bump the sequence so a response still in flight for
+                      // that user cannot re-render the erased profile.
+                      if (profileKey === `${u.platform}:${u.user_id}`) {
+                        profileReqSeq++;
+                        profileKey = null;
+                        profileCard.innerHTML = "";
+                        profileCard.appendChild(this.el("div", { class: "card" }, [
+                          this.el("div", { class: "empty" }, ["该用户已被删除，画像不再可用"]),
+                        ]));
+                      }
                       loadUsers();
                     } catch (e) { UI.toast("删除失败：" + e.message, "err"); }
                   }, "删除");
@@ -910,9 +934,13 @@ const Page = {
     };
 
     const loadProfile = async (platform, userId, displayName) => {
+      const seq = ++profileReqSeq;
+      profileKey = `${platform}:${userId}`;
       profileCard.innerHTML = '<div class="card"><div class="loading">正在打捞记忆</div></div>';
       try {
         const d = await UI.api(`/profile/${encodeURIComponent(platform)}/${encodeURIComponent(userId)}`);
+        // A newer click (or a deletion) superseded this request: drop the result.
+        if (seq !== profileReqSeq) return;
         profileCard.innerHTML = "";
         const sectionNames = { identity: "基本信息", naming: "称呼偏好", stable: "已知事实", preference: "喜好偏好", commitment: "约定承诺", interaction: "互动偏好", recent: "近期动态" };
         const sectionCards = Object.entries(sectionNames).map(([cat, title]) =>
@@ -939,6 +967,7 @@ const Page = {
         profileCard.scrollIntoView({ behavior: "smooth" });
       } catch (e) {
         // Row clicks are fire-and-forget: surface the failure here with a retry.
+        if (seq !== profileReqSeq) return;
         profileCard.innerHTML = "";
         profileCard.appendChild(UI.errorCard(e, () => loadProfile(platform, userId, displayName)));
       }
@@ -1019,7 +1048,12 @@ const Page = {
         if (s.finished_at && !s.error && s.relations > 0 && s.finished_at !== seenFinished) {
           seenFinished = s.finished_at;
           reload();
+          return;
         }
+        // Idle: keep polling so a backfill started/completed in another tab is
+        // still discovered (this is the "waiting for backfill" contract).
+        // isConnected stops the chain once this tab was switched away.
+        if (bfStatus.isConnected) pollTimer = setTimeout(pollBackfill, 5000);
       }
     };
     el.appendChild(this.el("div", { class: "card" }, [
@@ -1612,7 +1646,18 @@ const Page = {
           // would kill the plugin on restart.
           const raw = ctl.value.trim();
           if (raw === "") continue;
-          const n = t === "int" ? parseInt(raw, 10) : parseFloat(raw);
+          if (t === "int") {
+            // Reject silently truncating input ("1e3" / "1.5" used to become 1
+            // via parseInt and apply live with no warning); collect() throws,
+            // the save handler catches it, toasts and aborts the request.
+            const n = Number(raw);
+            if (!Number.isFinite(n) || !Number.isInteger(n)) {
+              throw new Error(`字段 ${name} 需要整数，当前输入为「${raw}」`);
+            }
+            out[name] = n;
+            continue;
+          }
+          const n = parseFloat(raw);
           if (isNaN(n)) continue;
           out[name] = n;
         }
