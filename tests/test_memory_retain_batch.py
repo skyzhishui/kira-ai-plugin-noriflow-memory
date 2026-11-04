@@ -469,7 +469,7 @@ class TestRetainBatchSQLiteBackend(unittest.TestCase):
     """Real production-path roundtrip (SQLite backend): migration 013 +
     pending-table reads/writes.
 
-    The 10.0.1.91 production machine runs storage_backend=sqlite; this
+    The production deployment runs storage_backend=sqlite; this
     group is a release blocker: migrations apply, and
     UPSERT/SELECT/DELETE roundtrip under the sqlite shim.
     """
