@@ -135,13 +135,17 @@ const UI = {
       this._modalKeyHandler = null;
     }
     const onKey = (e) => { if (e.key === "Escape") close(); };
+    let box = null;
     const close = () => {
-      root.innerHTML = "";
+      // Only the modal that is still mounted may clear the root: a slow save
+      // started in a previous dialog finishing after another modal opened
+      // used to wipe the newer one (its own listener cleanup still runs).
+      if (box !== null && root.firstChild === box) root.innerHTML = "";
       document.removeEventListener("keydown", onKey);
       if (this._modalKeyHandler === onKey) this._modalKeyHandler = null;
     };
     this._modalKeyHandler = onKey;
-    const box = this.el("div", { class: "modal" + (opts.wide ? " wide" : "") }, [
+    box = this.el("div", { class: "modal" + (opts.wide ? " wide" : "") }, [
       this.el("div", { class: "modal-head" }, [
         this.el("h3", {}, [title]),
         this.el("button", { class: "modal-close", type: "button", title: "关闭", onclick: close }, [this.svg("Close")]),
@@ -485,6 +489,12 @@ const Page = {
   async route() {
     const content = document.getElementById("content");
     const tab = (location.hash.replace(/^#\/?/, "") || "overview").split("/")[0];
+    // The rail is rebuilt on every route; if the user activated a tab (keyboard
+    // or click), restore focus to the now-active tab so Tab navigation does not
+    // restart from the top of the document.
+    const keepTabFocus = !!(document.activeElement
+      && document.activeElement.classList
+      && document.activeElement.classList.contains("tab"));
     content.innerHTML = "";
     content.appendChild(this.el("div", { class: "toolbar" }, [
       this.el("div", { class: "tb-cap" }, ["MEMORY ATLAS // RECALL ENGINE"]),
@@ -493,8 +503,12 @@ const Page = {
     // Orbit nav: one star per tab (.tab-node decoration + label), visual only
     const TAB_ICONS = { overview: "✦", clusters: "◈", facts: "✧", profile: "☾", graph: "❋", summaries: "✶", settings: "◉" };
     for (const [key, label] of [["overview", "总览"], ["clusters", "事实簇（确信度）"], ["facts", "原始事实"], ["profile", "用户画像"], ["graph", "关系图谱"], ["summaries", "注入语料"], ["settings", "设置"]]) {
-      tabs.appendChild(this.el("div", {
+      // Real buttons (not divs) so the nav is keyboard reachable: Tab to focus,
+      // Enter/Space activates. UA button chrome is reset in memory.css (.tab).
+      tabs.appendChild(this.el("button", {
+        type: "button",
         class: "tab" + (tab === key ? " active" : ""),
+        "aria-current": tab === key ? "page" : null,
         onclick: () => (location.hash = "#" + key),
       }, [
         this.el("i", { class: "tab-node", "aria-hidden": "true" }, [TAB_ICONS[key] || "✦"]),
@@ -502,6 +516,10 @@ const Page = {
       ]));
     }
     content.appendChild(tabs);
+    if (keepTabFocus) {
+      const activeTab = tabs.querySelector(".tab.active");
+      if (activeTab) activeTab.focus();
+    }
 
     const body = this.el("div");
     content.appendChild(body);
@@ -797,6 +815,9 @@ const Page = {
   // ---------------- Raw facts ----------------
   async renderFacts(el) {
     let query = { page: 1 };
+    // Filter/paging requests may land out of order; only the newest one may
+    // paint (same pattern as profileReqSeq).
+    let reqSeq = 0;
     const listBox = this.el("div");
     el.appendChild(this.filterBar([
       ["user_id", "用户 ID", "裸 uid"],
@@ -809,10 +830,12 @@ const Page = {
     el.appendChild(listBox);
 
     const refresh = async () => {
+      const seq = ++reqSeq;
       listBox.innerHTML = '<div class="loading">正在打捞记忆</div>';
       try {
         const p = new URLSearchParams(Object.assign({ size: 30 }, query));
         const d = await UI.api("/facts?" + p.toString());
+        if (seq !== reqSeq) return; // superseded by a newer filter/page request
         const rows = d.items.map((f) => this.el("tr", {}, [
           this.el("td", { class: "mono" }, [String(f.id)]),
           this.el("td", {}, [
@@ -847,6 +870,7 @@ const Page = {
         ));
       } catch (e) {
         // Paging/filter callers are fire-and-forget: surface the failure here with a retry.
+        if (seq !== reqSeq) return;
         listBox.innerHTML = "";
         listBox.appendChild(UI.errorCard(e, refresh));
       }
@@ -978,6 +1002,10 @@ const Page = {
 
   // ---------------- Relation graph ----------------
   async renderGraph(el) {
+    // Timestamp of the graph snapshot (taken before the fetch): a backfill
+    // that finishes after this moment is NOT reflected in `d`, so its status
+    // must trigger a reload instead of being adopted as the poll baseline.
+    const renderStartAt = Date.now();
     const d = await UI.api("/relations/graph");
 
     // Stats + backfill cards
@@ -1020,14 +1048,32 @@ const Page = {
       catch (e) {
         // Transient failures keep polling (a single 401/500 used to kill the
         // poller forever with a frozen progress bar and disabled buttons);
-        // give up after 5 consecutive failures with the reason surfaced.
-        if (++pollFails >= 5) { bfStatus.textContent = "回填状态获取失败：" + e.message; return; }
+        // give up after 5 consecutive failures with the reason surfaced and
+        // the controls restored, otherwise the buttons stay dead forever.
+        if (++pollFails >= 5) {
+          bfStatus.textContent = "回填状态获取失败：" + e.message;
+          bfBtn.disabled = !d.backfill_available;
+          bfFullBtn.disabled = !d.backfill_available;
+          bfBar.style.display = "none";
+          return;
+        }
         pollTimer = setTimeout(pollBackfill, 3000);
         return;
       }
       pollFails = 0;
       if (!bfStatus.isConnected) return; // tab switched away, stop polling
-      if (seenFinished === null) seenFinished = s.running ? "" : s.finished_at;
+      if (seenFinished === null) {
+        // The status carries an offset-bearing ISO string (server-local), so
+        // Date.parse yields an absolute epoch comparable to renderStartAt.
+        const finishedTs = s.finished_at ? Date.parse(s.finished_at) : NaN;
+        // A completion strictly after our snapshot is a real new completion:
+        // leaving seenFinished unset lets the branch below reload once, and
+        // that finished_at then becomes this view's baseline.
+        const completedAfterSnapshot = !s.running && s.relations > 0
+          && !isNaN(finishedTs) && finishedTs > renderStartAt;
+        if (s.running) seenFinished = "";
+        else if (!completedAfterSnapshot) seenFinished = s.finished_at;
+      }
       if (s.running) {
         bfBtn.disabled = true;
         bfFullBtn.disabled = true;
@@ -1237,8 +1283,13 @@ const Page = {
   // ---------------- Injected corpus (summaries) ----------------
   async renderSummaries(el) {
     let query = { page: 1 };
+    // Filter/paging requests may land out of order; only the newest one may
+    // paint (same pattern as profileReqSeq).
+    let reqSeq = 0;
     const listBox = this.el("div");
-    el.appendChild(this.encodeCard());
+    // The encode card reports the end of a merge cycle so the rows stop
+    // showing「待补编码」without a manual refresh.
+    el.appendChild(this.encodeCard(() => { if (listBox.isConnected) refresh(); }));
     el.appendChild(this.filterBar([
       ["session_id", "会话 ID", ""],
       ["user_id", "触发用户", "裸 uid"],
@@ -1248,10 +1299,12 @@ const Page = {
     el.appendChild(listBox);
 
     const refresh = async () => {
+      const seq = ++reqSeq;
       listBox.innerHTML = '<div class="loading">正在打捞记忆</div>';
       try {
         const p = new URLSearchParams(Object.assign({ size: 20 }, query));
         const d = await UI.api("/summaries?" + p.toString());
+        if (seq !== reqSeq) return; // superseded by a newer filter/page request
         const rows = d.items.map((s) => this.el("tr", {}, [
           this.el("td", { class: "mono" }, [String(s.id)]),
           this.el("td", { class: "mono", style: "font-size:11px" }, [s.session_id]),
@@ -1291,6 +1344,7 @@ const Page = {
         ));
       } catch (e) {
         // Paging/filter callers are fire-and-forget: surface the failure here with a retry.
+        if (seq !== reqSeq) return;
         listBox.innerHTML = "";
         listBox.appendChild(UI.errorCard(e, refresh));
       }
@@ -1322,11 +1376,18 @@ const Page = {
   // The merge loop stays the only runner; the button just resolves its
   // inter-cycle wait early. Polling keeps the backlog count and cycle state
   // fresh; the button enables only after a successful status probe.
-  encodeCard() {
+  encodeCard(onCycleEnd) {
     const encBtn = this.el("button", { class: "btn small", disabled: "" }, ["立即执行补编码"]);
     const encStatus = this.el("span", { class: "muted", style: "font-size:12px" });
     let encTimer = null;
     let encFails = 0;
+    // Set on every status that reports a running cycle; the transition to
+    // idle marks "a cycle finished while this view was open".
+    let cycleRan = false;
+    // finished_at of the last cycle already reflected by the list. A change
+    // detects cycles that started and ended between two idle polls.
+    let seenCycleInit = false;
+    let seenCycle = null;
     const pollEncode = async () => {
       if (encTimer) clearTimeout(encTimer);
       let s;
@@ -1346,6 +1407,7 @@ const Page = {
       const backlog = (s.backlog === null || s.backlog === undefined)
         ? "未知" : (s.backlog_capped ? "1000+" : String(s.backlog));
       if (s.cycle_running) {
+        cycleRan = true;
         encBtn.disabled = true;
         encStatus.textContent = `补编码进行中：待补编码 ${backlog} 条（周期完成自动刷新）`;
         encTimer = setTimeout(pollEncode, 3000);
@@ -1355,6 +1417,21 @@ const Page = {
           ? ` · 上轮周期 ${UI.fmtTime(s.last_cycle.finished_at)} 完成，重编码 ${(s.last_cycle.stats && s.last_cycle.stats.reencoded) || 0} 条`
           : "";
         encStatus.textContent = `待补编码 ${backlog} 条` + last;
+        // A finished cycle means rows still shown as「待补编码」may have been
+        // encoded meanwhile, so refresh the list (the card promised this).
+        // Detected via the observed running→idle transition, or via a new
+        // last_cycle.finished_at for cycles that started and ended between
+        // two idle polls.
+        const curCycle = (s.last_cycle && s.last_cycle.finished_at) || null;
+        let ended = cycleRan;
+        cycleRan = false;
+        if (seenCycleInit && curCycle !== seenCycle) ended = true;
+        seenCycle = curCycle;
+        seenCycleInit = true;
+        if (ended && typeof onCycleEnd === "function") onCycleEnd();
+        // Idle still polls: the merge loop starts cycles on its own, and the
+        // card text promises auto-refresh. Slower cadence than a running cycle.
+        encTimer = setTimeout(pollEncode, 10000);
       }
     };
     encBtn.addEventListener("click", async () => {
@@ -1383,6 +1460,9 @@ const Page = {
     const infoBox = this.el("div", { class: "muted", style: "font-size:12px;line-height:1.9;margin:10px 0" });
     const runBtn = this.el("button", { class: "btn small" }, ["开始迁入"]);
     runBtn.disabled = true;
+    // Bumped on every source-path edit; scan/import responses tagged with an
+    // older value are discarded instead of painting the current path's UI.
+    let pathVer = 0;
 
     const line = (text, strong) =>
       this.el("div", {}, strong ? [this.el("b", {}, [text])] : [text]);
@@ -1414,25 +1494,40 @@ const Page = {
     };
 
     const refresh = async (pathOverride) => {
+      // Path version: editing the input invalidates in-flight scans/imports so
+      // a late response can neither paint a preview for a path the input no
+      // longer shows nor re-enable「开始迁入」.
+      const ver = pathVer;
       runBtn.disabled = true;
       scanBtn.disabled = true;
       infoBox.replaceChildren(line("扫描中…"));
       try {
         const q = pathOverride ? "?source_path=" + encodeURIComponent(pathOverride) : "";
         const d = await UI.api("/kira_memory/import" + q);
+        if (ver !== pathVer) return; // source path changed while scanning
         if (!pathInput.value) pathInput.value = d.source_path || d.default_path || "";
         renderInfo(d);
         runBtn.disabled = !(d.preview && d.preview.exists);
       } catch (e) {
+        if (ver !== pathVer) return; // stale failure: keep the new path's UI
         infoBox.replaceChildren(line(`扫描失败：${e.message}`));
       } finally {
+        // The scan button recovers whether or not the version still matches.
         scanBtn.disabled = false;
       }
     };
 
+    pathInput.addEventListener("input", () => {
+      // New source path: the rendered preview belongs to the old one, and the
+      // import button must wait for a scan of the new path.
+      pathVer++;
+      runBtn.disabled = true;
+      renderIdle();
+    });
     scanBtn.addEventListener("click", () => refresh(pathInput.value.trim()));
     runBtn.addEventListener("click", () => {
       const p = pathInput.value.trim();
+      const ver = pathVer;
       UI.confirm("确认迁入 KiraAI 数据",
         `将从 ${p} 只读迁入记忆数据到本插件。KiraAI 原始数据不会被修改或删除；重复执行按幂等键自动去重。导入的会话批次将由后台管线逐步提炼生效。确认执行？`,
         async () => {
@@ -1446,14 +1541,19 @@ const Page = {
             const s = r.stats || {};
             UI.toast(`迁入完成：摘要 ${s.summary_rows || 0} 条、事实 ${s.fact_rows || 0} 条、别名 ${s.aliases_upserted || 0} 条（跳过重复：摘要 ${s.summary_skipped || 0}、事实 ${s.facts_skipped || 0}）`, "ok");
             // Update in place from this run's stats: no full re-scan after import.
-            infoBox.replaceChildren(
-              line(`本次迁入完成：摘要 ${s.summary_rows || 0} 条、事实 ${s.fact_rows || 0} 条、别名 ${s.aliases_upserted || 0} 条（跳过重复：摘要 ${s.summary_skipped || 0}、事实 ${s.facts_skipped || 0}）。`, true),
-              line("可再次点击「扫描」查看源目录当前可迁入计数。"),
-            );
+            // A path edited mid-import owns the info box now, so leave it alone.
+            if (ver === pathVer) {
+              infoBox.replaceChildren(
+                line(`本次迁入完成：摘要 ${s.summary_rows || 0} 条、事实 ${s.fact_rows || 0} 条、别名 ${s.aliases_upserted || 0} 条（跳过重复：摘要 ${s.summary_skipped || 0}、事实 ${s.facts_skipped || 0}）。`, true),
+                line("可再次点击「扫描」查看源目录当前可迁入计数。"),
+              );
+            }
           } catch (e) {
             UI.toast(`迁入失败：${e.message}`, "err");
           } finally {
-            runBtn.disabled = false;
+            // Only re-enable for the path this run actually imported: a newer
+            // path has not been scanned yet and must stay blocked.
+            if (ver === pathVer) runBtn.disabled = false;
             scanBtn.disabled = false;
           }
         }, "确认迁入");
@@ -1643,9 +1743,17 @@ const Page = {
         else if (t === "int" || t === "float") {
           // Empty/non-numeric input = "leave unchanged" (omit the key), NOT a
           // silent 0 — score_cap=0 would stall promotion, embedding_dims=0
-          // would kill the plugin on restart.
+          // would kill the plugin on restart. Exception: null-default floats
+          // are derived fields and submit null (see below).
           const raw = ctl.value.trim();
-          if (raw === "") continue;
+          if (raw === "") {
+            // A float whose schema default is null is a derived/optional
+            // field (naming_promote_threshold): submitting null tells the
+            // backend to drop the override and restore derivation, while
+            // omitting the key would keep the stored value.
+            if (t === "float" && schema[name].default === null) out[name] = null;
+            continue;
+          }
           if (t === "int") {
             // Reject silently truncating input ("1e3" / "1.5" used to become 1
             // via parseInt and apply live with no warning); collect() throws,
