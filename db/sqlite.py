@@ -525,7 +525,18 @@ class SQLiteMemoryDatabase(MemoryBackend):
         embedding: list[float] | None,
     ) -> None:
         """Insert a raw persona fact (extracted_flag=0, awaiting the merge
-        agent)."""
+        agent).
+
+        Future occurred_at is clamped to now before persistence (byte-for-
+        byte aligned with the PG backend): the recent section orders by
+        occurred_at first, so a future value would pin itself to the top.
+        document_id / evidence_key keep the original input time (idempotency
+        keys must not shift with the clamp).
+        """
+        occurred_at = _ensure_tz(occurred_at)
+        now = datetime.now().astimezone()
+        if occurred_at > now:
+            occurred_at = now
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
@@ -541,7 +552,7 @@ class SQLiteMemoryDatabase(MemoryBackend):
                 document_id, platform, user_id,
                 _json_list(related_user_ids), display_name, category,
                 statement, confidence, session_id, group_id, evidence_key,
-                sqlite_format_ts(_ensure_tz(occurred_at)), _now_ts(),
+                sqlite_format_ts(occurred_at), _now_ts(),
                 _pack_vector(embedding, self._embedding_dims),
             )
 
@@ -2567,8 +2578,14 @@ class SQLiteMemoryDatabase(MemoryBackend):
         self, platforms: list[str], user_ids: list[str], per_section_limit: int
     ) -> dict[str, list[tuple[str, object]]]:
         """Per-section profile rows with multi-account keys merged (key
-        semantics/ordering/dedup identical to the PG version); dedup
-        prefers non-null occurred_at across same-text entries."""
+        semantics/ordering/dedup identical to the PG version).
+
+        Cross-key dedup runs BEFORE the per-section cap: identical statement
+        texts are collapsed within a category (one representative per
+        statement, preferring non-null / latest occurred_at), then
+        row_number truncates -- a statement present on several linked
+        accounts must not consume several slots and push an older distinct
+        event out of the section."""
         pairs = list(zip(platforms, user_ids))
         async with self.pool.acquire() as conn:
             if not pairs:
@@ -2580,18 +2597,31 @@ class SQLiteMemoryDatabase(MemoryBackend):
             rows = await conn.fetch(
                 f"""
                 SELECT category, statement, occurred_at FROM (
-                    SELECT m.category, m.statement,
-                           c.occurred_at AS occurred_at,
+                    SELECT category, statement, occurred_at,
                            row_number() OVER (
-                               PARTITION BY m.category
-                               ORDER BY CASE WHEN m.category = 'recent'
-                                        THEN COALESCE(c.occurred_at, m.updated_at)
+                               PARTITION BY category
+                               ORDER BY CASE WHEN category = 'recent'
+                                        THEN sort_ts
                                    END DESC NULLS LAST,
-                                        m.score DESC, m.updated_at DESC, m.id ASC
+                                        score DESC, updated_at DESC, id ASC
                            ) AS rn
-                    FROM memory_user_profile m
-                    LEFT JOIN memory_fact_cluster c ON c.id = m.cluster_id
-                    WHERE (m.platform, m.user_id) IN ({pair_sql})
+                    FROM (
+                        SELECT m.category, m.statement,
+                               c.occurred_at AS occurred_at,
+                               COALESCE(c.occurred_at, m.updated_at) AS sort_ts,
+                               m.score, m.updated_at, m.id,
+                               row_number() OVER (
+                                   PARTITION BY m.category, m.statement
+                                   ORDER BY (c.occurred_at IS NULL),
+                                            c.occurred_at DESC,
+                                            m.score DESC,
+                                            m.updated_at DESC, m.id ASC
+                               ) AS dup_rn
+                        FROM memory_user_profile m
+                        LEFT JOIN memory_fact_cluster c ON c.id = m.cluster_id
+                        WHERE (m.platform, m.user_id) IN ({pair_sql})
+                    ) d
+                    WHERE dup_rn = 1
                 ) t
                 WHERE rn <= {p.add(per_section_limit)}
                 ORDER BY category, rn

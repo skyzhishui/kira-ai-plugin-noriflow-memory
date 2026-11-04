@@ -389,7 +389,19 @@ class MemoryDatabase(MemoryBackend):
             evidence_key: scoring dedup key "{session_id}|{occurred_at:date}".
             occurred_at: occurrence time (this round's trigger message time).
             embedding: statement vector; None writes NULL (backfilled later).
+
+        Future occurred_at is clamped to now before persistence (same
+        untrusted-time guard as the active tool write path): the recent
+        section orders by occurred_at first, so a future value would pin
+        itself to the top until wall time catches up. document_id /
+        evidence_key keep the original input time (they are idempotency
+        keys; rebasing them on the clamped now would change the key across
+        days and break dedup).
         """
+        occurred_at = _ensure_tz(occurred_at)
+        now = datetime.now().astimezone()
+        if occurred_at > now:
+            occurred_at = now
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
@@ -411,7 +423,7 @@ class MemoryDatabase(MemoryBackend):
                 session_id,
                 group_id,
                 evidence_key,
-                _ensure_tz(occurred_at),
+                occurred_at,
                 vector_literal(embedding),
             )
 
@@ -953,9 +965,9 @@ class MemoryDatabase(MemoryBackend):
 
         The retrieval SELECT no longer ships the vector text with every row
         (with asyncpg's pgvector codec unregistered that is ~18KB of
-        '[...]' text per row; two legs x rerank_candidates is ~0.7MB at the
-        default 20 candidates, ~1.8MB at the old default 50 -- transfer plus
-        JSON parsing). Near-duplicate dedup only consumes the
+        '[...]' text per row; two legs x rerank_candidates is ~1.8MB at the
+        default 50 candidates, ~0.7MB at 20 -- transfer plus JSON parsing).
+        Near-duplicate dedup only consumes the
         vectors of the truncated head rows, so they are fetched precisely
         here by id
         (~1ms localhost RTT). Rows whose embedding is NULL do not appear in
@@ -2862,8 +2874,14 @@ class MemoryDatabase(MemoryBackend):
         related ids do not join injection); ordering and per-section caps
         match the single-key version (global window ordering — recent
         time-first, others score DESC -> updated_at DESC -> id ASC — then
-        per-section caps), and identical statement texts across keys dedup
-        order-preservingly with non-null occurred_at preferred.
+        per-section caps).
+
+        Cross-key dedup happens BEFORE the per-section cap: identical
+        statement texts are collapsed within a category (one representative
+        per statement, preferring non-null / latest occurred_at), then
+        row_number truncates. Deduplicating after the cap let one statement
+        present on several linked accounts consume several slots and push an
+        older distinct event out of the section entirely.
 
         Args:
             platforms: platform tag array (paired 1:1 with user_ids).
@@ -2878,20 +2896,33 @@ class MemoryDatabase(MemoryBackend):
             rows = await conn.fetch(
                 """
                 SELECT category, statement, occurred_at FROM (
-                    SELECT m.category, m.statement,
-                           c.occurred_at AS occurred_at,
+                    SELECT category, statement, occurred_at,
                            row_number() OVER (
-                               PARTITION BY m.category
-                               ORDER BY CASE WHEN m.category = 'recent'
-                                        THEN COALESCE(c.occurred_at, m.updated_at)
+                               PARTITION BY category
+                               ORDER BY CASE WHEN category = 'recent'
+                                        THEN sort_ts
                                    END DESC NULLS LAST,
-                                        m.score DESC, m.updated_at DESC, m.id ASC
+                                        score DESC, updated_at DESC, id ASC
                            ) AS rn
-                    FROM memory_user_profile m
-                    LEFT JOIN memory_fact_cluster c ON c.id = m.cluster_id
-                    JOIN unnest($1::text[], $2::text[]) AS k(platform, user_id)
-                      ON m.platform = k.platform
-                     AND m.user_id = k.user_id
+                    FROM (
+                        SELECT m.category, m.statement,
+                               c.occurred_at AS occurred_at,
+                               COALESCE(c.occurred_at, m.updated_at) AS sort_ts,
+                               m.score, m.updated_at, m.id,
+                               row_number() OVER (
+                                   PARTITION BY m.category, m.statement
+                                   ORDER BY (c.occurred_at IS NULL),
+                                            c.occurred_at DESC,
+                                            m.score DESC,
+                                            m.updated_at DESC, m.id ASC
+                               ) AS dup_rn
+                        FROM memory_user_profile m
+                        LEFT JOIN memory_fact_cluster c ON c.id = m.cluster_id
+                        JOIN unnest($1::text[], $2::text[]) AS k(platform, user_id)
+                          ON m.platform = k.platform
+                         AND m.user_id = k.user_id
+                    ) d
+                    WHERE dup_rn = 1
                 ) t
                 WHERE rn <= $3
                 ORDER BY category, rn

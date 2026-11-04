@@ -349,7 +349,14 @@ def prepare_save(submitted: dict, host_values: dict) -> dict:
     changed = {}
     for k, v in merged.items():
         if k in schema and baseline.get(k) != v:
-            changed[k] = getattr(validated, k)
+            # A submitted null means "clear back to unset". Persist the null
+            # itself instead of the validated value: Optional fields with a
+            # meaningful unset state (naming_promote_threshold) derive their
+            # effective value at model construction, so writing that derived
+            # number here would freeze it -- later score_start_high changes
+            # would no longer re-derive. Keeping null (or the key absent)
+            # preserves the lazy derivation on every config load.
+            changed[k] = None if v is None else getattr(validated, k)
     return {
         "merged": merged,
         "validated": validated,

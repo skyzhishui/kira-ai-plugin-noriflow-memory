@@ -266,6 +266,54 @@ async def test_cross_session_memo_excludes_from_search() -> None:
     print("PASS test_cross_session_memo_excludes_from_search")
 
 
+async def test_cross_session_memo_isolated_per_turn() -> None:
+    """Concurrent rounds of one session must not clear each other's memo.
+
+    Round B's entry clear / registration only touches its own turn key, so
+    round A's already-injected ids stay excluded until A's recall runs.
+    """
+    circuit_breaker_mod = load_modules("circuit_breaker")[0]
+    kernel_mod = load_modules("memory_kernel")[0]
+
+    class _StubBreaker(circuit_breaker_mod.MemoryDBCircuitBreaker):
+        async def is_available(self) -> bool:
+            return True
+
+        async def record_failure(self) -> None:
+            pass
+
+        async def record_success(self) -> None:
+            pass
+
+    class _StubEmbedding:
+        async def embed_one(self, text):
+            return [0.1]
+
+    db = _SearchCaptureDB(rows=[])
+    kernel = kernel_mod.LocalMemoryKernel(
+        db=db,
+        embedding_service=_StubEmbedding(),
+        circuit_breaker=_StubBreaker(),
+        config=LocalMemoryConfig(dsn="postgresql://stub"),
+        bot_id="bot",
+    )
+    # Round A registers its injected ids, then round B starts (entry clear)
+    # and registers its own before A's recall runs.
+    kernel.refresh_cross_session_memo("s1", ["doc-a"], turn_id="turn-a")
+    kernel.refresh_cross_session_memo("s1", [], turn_id="turn-b")
+    kernel.refresh_cross_session_memo("s1", ["doc-b"], turn_id="turn-b")
+
+    await kernel.search(query="猫", session_id="s1", top_k=3, turn_id="turn-a")
+    assert db.search_kwargs["exclude_document_ids"] == ["doc-a"], (
+        "B 轮入口清空/登记不得清掉 A 轮的排除集合"
+    )
+    await kernel.search(query="猫", session_id="s1", top_k=3, turn_id="turn-b")
+    assert db.search_kwargs["exclude_document_ids"] == ["doc-b"], (
+        "B 轮只排除自己注入的行"
+    )
+    print("PASS test_cross_session_memo_isolated_per_turn")
+
+
 # ---------------------------------------------------------------------------
 #  cross-session: block builder budget semantics
 # ---------------------------------------------------------------------------
@@ -561,6 +609,7 @@ async def main() -> None:
     await test_cross_session_pg_sql_shape()
     await test_cross_session_sqlite_fetch()
     await test_cross_session_memo_excludes_from_search()
+    await test_cross_session_memo_isolated_per_turn()
     test_build_cross_session_block_budget()
     await test_naming_create_immediate_promotion_sqlite()
     test_looks_truncated_matrix()

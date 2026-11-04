@@ -200,7 +200,7 @@ flowchart TD
 | max_persona_profiles | integer | 3 | 群聊单轮画像人数上限 |
 | topic_blacklist | list | 空 | 话题黑名单（命中关键词的记忆不注入） |
 | rerank_enabled | bool | true | 启用重排序（需 default_rerank） |
-| rerank_candidates | integer | 20 | 进入重排序的候选数 |
+| rerank_candidates | integer | 50 | 进入重排序的候选数 |
 | failure_threshold | integer | 5 | DB 熔断阈值 |
 | recovery_seconds | float | 60 | 熔断恢复时间 |
 | tool_scope_locked | bool | true | 工具作用域锁定：memory_search/write 忽略 AI 显式传入的 session_id/user_id（write 另含 platform），钉死为触发会话/触发者；memory_remove 无作用域入参，删除限定触发作用域（无法推导时拒绝）；memory_profile/lookup/correct 与指名检索（search 的 name）恒钉死触发者、不受本开关影响；关闭 = 显式参数生效（群聊白名单内可跨用户操作，慎关） |

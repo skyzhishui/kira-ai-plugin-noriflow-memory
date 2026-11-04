@@ -282,7 +282,7 @@
     "type": "float",
     "name": "称呼偏好进画像阈值",
     "default": null,
-    "hint": "naming（称呼偏好）维度进画像阈值。留空/不设（缺省）从 score_start_high 派生（缺省刻度即 3.0）：本人明确称呼要求单次即晋档，且任何评分刻度下按构造成立；显式设置时按本值生效，不得大于 score_cap。留空即派生，无需手填。"
+    "hint": "naming（称呼偏好）维度进画像阈值。留空/不设（缺省）从 score_start_high 派生（缺省刻度即 3.0）：本人明确称呼要求单次即晋档，且任何评分刻度下按构造成立；显式设置时按本值生效，不得小于 demote_threshold（否则晋档后下一轮衰减即被降级）、不得大于 score_cap。留空即派生，无需手填。"
   },
   "naming_prompt_enabled": {
     "type": "switch",
@@ -323,7 +323,7 @@
   "rerank_candidates": {
     "type": "integer",
     "name": "重排序候选数",
-    "default": 20
+    "default": 50
   },
   "failure_threshold": {
     "type": "integer",

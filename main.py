@@ -467,7 +467,7 @@ def _build_config(raw: dict) -> LocalMemoryConfig:
         max_persona_profiles=_cfg_int(raw, "max_persona_profiles", 3),
         topic_blacklist=_cfg_strlist(raw, "topic_blacklist"),
         rerank_enabled=_cfg_bool(raw, "rerank_enabled", True),
-        rerank_candidates=_cfg_int(raw, "rerank_candidates", 20),
+        rerank_candidates=_cfg_int(raw, "rerank_candidates", 50),
         recall_expansion_enabled=_cfg_bool(raw, "recall_expansion_enabled", True),
         recall_expansion_recent_batches=_cfg_int(
             raw, "recall_expansion_recent_batches", 20
@@ -1570,8 +1570,14 @@ class NoriflowMemoryPlugin(BasePlugin):
         # nori's fallback on an identity miss. The memo is registered before
         # recall so same-turn retrieval excludes injected rows (no double
         # exposure through two channels).
+        # Turn id scopes the memo to this pipeline round (host event id is
+        # stable across the turn's tool calls): concurrent rounds of the same
+        # session keep independent exclusions instead of clearing each
+        # other's before recall consumes them. Missing id (older hosts/test
+        # events) falls back to the legacy per-session memo.
+        turn_id = str(getattr(event, "event_id", "") or "")
         if hasattr(kernel, "refresh_cross_session_memo"):
-            kernel.refresh_cross_session_memo(session.session_id, [])
+            kernel.refresh_cross_session_memo(session.session_id, [], turn_id)
         # Whitelist (== "dm") rather than blacklist (!= "gm"): cross-session
         # summaries are a privacy-sensitive injection (the user's own other
         # sessions). The host contract currently has only {dm, gm} (enforced
@@ -1641,7 +1647,7 @@ class NoriflowMemoryPlugin(BasePlugin):
                         # one turn of lag) -- so there is no blind-spot window
                         # unique to this path.
                         kernel.refresh_cross_session_memo(
-                            session.session_id, cs_injected_ids
+                            session.session_id, cs_injected_ids, turn_id
                         )
 
         if self._config.recent_rollout_enabled:
@@ -1718,6 +1724,7 @@ class NoriflowMemoryPlugin(BasePlugin):
                     platform=platform,
                     hints=hints,
                     cross_session=not self._config.summary_recall_session_scoped,
+                    turn_id=turn_id,
                 )
             except Exception:
                 logger.warning("记忆检索失败（不阻断本轮）", exc_info=True)
@@ -3924,6 +3931,10 @@ class NoriflowMemoryPlugin(BasePlugin):
         sid = (session_id or "").strip()
         uid = (user_id or "").strip()
         plat = ""
+        # Same turn id as inject_memory: excludes rows injected into this
+        # turn's prompt from the tool's own search (concurrent rounds of the
+        # same session stay isolated).
+        turn_id = str(getattr(event, "event_id", "") or "")
         if self._tool_scope_lock_enabled():
             # Scope lock: ignore the session_id/user_id explicitly passed by
             # the LLM and pin to the triggering session/trigger user -
@@ -3988,6 +3999,7 @@ class NoriflowMemoryPlugin(BasePlugin):
                     cross_session=not self._config.summary_recall_session_scoped,
                     entity_user_keys=entity_keys or None,
                     entity_user_ids=entity_uids or None,
+                    turn_id=turn_id,
                 )
             elif uid:
                 items = await kernel.search(

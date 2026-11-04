@@ -407,6 +407,33 @@ async def main_async() -> None:
     name = await db.fetch_latest_display_name("qq", "u1")
     check("display_name", name == "小明", str(name))
 
+    # ---- review regression: multi-account profile dedup runs before the
+    # per-section cap (duplicate statements must not eat section slots) ----
+    async with db.pool.acquire() as conn:
+        for cid, uid, stmt, score in (
+            (900001, "up1", "重复称呼", 9.5),
+            (900003, "up1", "补充事实", 8.0),
+            (900002, "up2", "重复称呼", 9.0),
+        ):
+            await conn.execute(
+                "INSERT INTO memory_user_profile (platform, user_id, category,"
+                " cluster_id, statement, score, related_user_ids)"
+                " VALUES ('qq', $1, 'stable', $2, $3, $4, '[]')",
+                uid, cid, stmt, score,
+            )
+    multi = await db.fetch_profile_sections_multi(
+        ["qq", "qq"], ["up1", "up2"], 2
+    )
+    check(
+        "multi_profile_dedup_before_cap",
+        [s for s, _ in multi.get("stable", [])] == ["重复称呼", "补充事实"],
+        str(multi),
+    )
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM memory_user_profile WHERE user_id IN ('up1', 'up2')"
+        )
+
     # Cluster candidate search (vector + scalar fallback)
     cands = await db.search_cluster_candidates(
         platform="qq", user_id="u2", category="stable", related_user_ids=[],
@@ -1035,6 +1062,82 @@ async def main_async() -> None:
     )
     check(
         "regress_rollout_platform_nomatch", rollout == [], str(rollout),
+    )
+
+    # ---- review regression: future occurred_at clamped before persistence
+    # (both backends, byte-aligned behavior) ----
+    future = datetime.now(timezone.utc) + timedelta(days=3)
+    future_doc = "u1@10086|2026-09-12-future"
+    future_key = "10086|2026-09-12"
+    await db.insert_persona_fact_raw(
+        document_id=future_doc,
+        platform="qq", user_id="u1", related_user_ids=[],
+        display_name="小明", category="stable", statement="未来的事实",
+        confidence="high", session_id="10086", group_id="10086",
+        evidence_key=future_key, occurred_at=future, embedding=None,
+    )
+    async with db.pool.acquire() as conn:
+        frow = await conn.fetchrow(
+            "SELECT document_id, evidence_key, occurred_at "
+            "FROM memory_persona_fact_raw WHERE document_id = $1",
+            future_doc,
+        )
+    sqlite_ts = db_pkg.sqlite_parse_ts(frow["occurred_at"])
+    check(
+        "future_fact_clamped_sqlite",
+        sqlite_ts <= datetime.now(timezone.utc) + timedelta(seconds=5)
+        and frow["document_id"] == future_doc
+        and frow["evidence_key"] == future_key,
+        str(dict(frow)),
+    )
+
+    class _CaptureConn:
+        def __init__(self):
+            self.calls = []
+
+        async def execute(self, sql, *args):
+            self.calls.append((sql, args))
+
+    class _CaptureAcquire:
+        def __init__(self, conn):
+            self._conn = conn
+
+        async def __aenter__(self):
+            return self._conn
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _CapturePool:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def acquire(self):
+            return _CaptureAcquire(self._conn)
+
+    cap_conn = _CaptureConn()
+    pg = db_pkg.MemoryDatabase(LocalMemoryConfig(dsn="postgresql://stub"))
+    pg._pool = _CapturePool(cap_conn)
+    await pg.insert_persona_fact_raw(
+        document_id=future_doc,
+        platform="qq", user_id="u1", related_user_ids=[],
+        display_name="小明", category="stable", statement="未来的事实",
+        confidence="high", session_id="10086", group_id="10086",
+        evidence_key=future_key, occurred_at=future, embedding=None,
+    )
+    _, pargs = cap_conn.calls[-1]
+    pg_ts = pargs[11]
+    check(
+        "future_fact_clamped_postgres",
+        pg_ts <= datetime.now(timezone.utc) + timedelta(seconds=5)
+        and pargs[0] == future_doc
+        and pargs[10] == future_key,
+        str(pg_ts),
+    )
+    check(
+        "future_fact_clamp_backends_aligned",
+        abs((pg_ts - sqlite_ts).total_seconds()) < 5,
+        f"pg={pg_ts} sqlite={sqlite_ts}",
     )
 
     await db.close()

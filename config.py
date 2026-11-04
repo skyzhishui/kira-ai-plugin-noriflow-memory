@@ -147,7 +147,8 @@ class LocalMemoryConfig(BaseModel):
         "即 score_start_high）单次即可晋档入画像，该承诺在任何评分刻度下按"
         "构造成立（缺省刻度下即 3.0）；显式设置时按本值生效（高于 "
         "score_start_high 则退化为需二次证据累积，属合法保守配置），且不得"
-        "大于 score_cap（装配期校验）",
+        "小于 demote_threshold（否则晋档后下一轮衰减即被降级）、不得大于 "
+        "score_cap（均装配期校验）",
     )
     naming_prompt_enabled: bool = Field(
         default=True,
@@ -269,7 +270,7 @@ class LocalMemoryConfig(BaseModel):
         "不占 top_k 名额；注入层保留二次防线兜漏网",
     )
     rerank_enabled: bool = Field(default=True, description="是否启用重排序（需 model_config [rerank]）")
-    rerank_candidates: int = Field(default=20, ge=1, description="进入重排序的向量候选数")
+    rerank_candidates: int = Field(default=50, ge=1, description="进入重排序的向量候选数")
 
     # ---- Recall quality tuning (expansion / recent-range exclusion /
     # dedup / time labeling, synced from upstream nori) ----
@@ -555,8 +556,19 @@ class LocalMemoryConfig(BaseModel):
         the profile at cluster creation. Reject and demand an explicit
         naming threshold; the self-reported key fallback (both keys reset:
         3.0 / None -> derived 3.0) always converges.
+
+        Demotion-floor guard (review): the decay pass multiplies the score
+        by decay_factor (<= 1) and then demotes every profiled cluster below
+        demote_threshold. A naming threshold below demote_threshold therefore
+        promotes naming clusters that the very next decay pass demotes again
+        (profile churn, and a naming promise that silently drops out). The
+        guard self-reports the keys it governs: the explicit pair
+        (naming_promote_threshold, demote_threshold) or, when the threshold
+        is derived, (score_start_high, demote_threshold) -- resetting those
+        always converges (default score_start_high 3 > default demote 2).
         """
-        if self.naming_promote_threshold is None:
+        derived = self.naming_promote_threshold is None
+        if derived:
             if self.score_start_high <= 0:
                 raise CrossFieldConfigError(
                     f"score_start_high ({self.score_start_high}) <= 0 时无法派生"
@@ -565,6 +577,19 @@ class LocalMemoryConfig(BaseModel):
                     ("naming_promote_threshold", "score_start_high"),
                 )
             self.naming_promote_threshold = float(self.score_start_high)
+        if self.naming_promote_threshold + 1e-9 < self.demote_threshold:
+            raise CrossFieldConfigError(
+                f"naming_promote_threshold ({self.naming_promote_threshold}) 不得小于 "
+                f"demote_threshold ({self.demote_threshold})：衰减遍先按 "
+                f"decay_factor 衰减再按 demote_threshold 降级，低于降级线的 "
+                "naming 簇晋档后会在下一轮衰减遍被立即降级删除（画像反复抖动，"
+                "称呼承诺静默丢失）",
+                (
+                    ("demote_threshold", "score_start_high")
+                    if derived
+                    else ("naming_promote_threshold", "demote_threshold")
+                ),
+            )
         return self
 
     @model_validator(mode="after")

@@ -476,6 +476,7 @@ class TestConfigBuilder(unittest.TestCase):
         self.assertEqual(cfg.promote_threshold, 6.0)
         self.assertEqual(cfg.demote_threshold, 2.0)
         self.assertEqual(cfg.decay_factor, 0.9)
+        self.assertEqual(cfg.rerank_candidates, 50)
         self.assertGreaterEqual(
             cfg.promote_threshold - cfg.demote_threshold,
             max(cfg.score_start_high, cfg.score_start_medium),
@@ -504,6 +505,33 @@ class TestConfigBuilder(unittest.TestCase):
         })
         self.assertEqual(cfg.dsn, "postgres://u:p@127.0.0.1:5432/db")
         self.assertEqual(cfg.pool_min, 2)
+
+    def test_16_naming_below_demote_fallback_converges(self):
+        # Illegal naming/demote combination falls back per self-reported
+        # key group (not the whole config), and the final model always
+        # satisfies naming >= demote (startup stays possible).
+        cfg = mod._try_build_config({
+            "dsn": "postgres://u:p@127.0.0.1:5432/db",
+            "naming_promote_threshold": 1.0,
+            "demote_threshold": 2.0,
+            "recall_top_k": 9,
+        })
+        self.assertEqual(cfg.recall_top_k, 9)
+        self.assertGreaterEqual(
+            cfg.naming_promote_threshold, cfg.demote_threshold
+        )
+        # Derived case: a low score_start_high must also converge (the
+        # fallback resets the derivation source, not only the threshold key)
+        cfg2 = mod._try_build_config({
+            "dsn": "postgres://u:p@127.0.0.1:5432/db",
+            "score_start_high": 1,
+            "demote_threshold": 2.0,
+            "recall_top_k": 9,
+        })
+        self.assertEqual(cfg2.recall_top_k, 9)
+        self.assertGreaterEqual(
+            cfg2.naming_promote_threshold, cfg2.demote_threshold
+        )
 
 
 class TestHysteresisBandValidation(unittest.TestCase):
@@ -681,6 +709,9 @@ class TestHysteresisBandValidation(unittest.TestCase):
         self.assertEqual(6.1 - 3.1, 2.9999999999999996)
         cfg = self.LocalMemoryConfig(
             promote_threshold=6.1, demote_threshold=3.1,
+            # Keep naming >= demote (the derived default 3.0 would trip the
+            # new demotion-floor guard; equality is allowed)
+            naming_promote_threshold=3.1,
         )
         self.assertEqual(cfg.promote_threshold, 6.1)
 
@@ -730,7 +761,9 @@ class TestHysteresisBandValidation(unittest.TestCase):
         # scale; existing deployments on a scaled ruler stay legal without the
         # new key, so no cross-field rollback drags valid explicit score keys
         # into a reset (the upgrade cascade fix)
-        cfg = self.LocalMemoryConfig(score_start_high=1.0)
+        cfg = self.LocalMemoryConfig(
+            score_start_high=1.0, demote_threshold=0.5
+        )
         self.assertEqual(cfg.naming_promote_threshold, 1.0)
         scaled = self.LocalMemoryConfig(
             score_cap=1.5, promote_threshold=1.5, demote_threshold=0.5,
@@ -755,6 +788,29 @@ class TestHysteresisBandValidation(unittest.TestCase):
             naming_promote_threshold=1.0,
         )
         self.assertEqual(cfg.naming_promote_threshold, 1.0)
+
+    def test_16e_naming_threshold_below_demote_is_rejected(self):
+        # A naming cluster promoted below the demotion line is demoted by
+        # the next decay pass (decay_factor <= 1 then score < demote), i.e.
+        # profile churn and a silently lost naming promise.
+        with self.assertRaises(Exception) as ctx:
+            self.LocalMemoryConfig(
+                promote_threshold=6.0, demote_threshold=3.0,
+                score_start_high=3, naming_promote_threshold=2.0,
+            )
+        self.assertIn("不得小于", str(ctx.exception))
+        # Derived path: naming = score_start_high < demote
+        with self.assertRaises(Exception):
+            self.LocalMemoryConfig(
+                score_start_high=1, demote_threshold=2.0,
+            )
+        # Equality is allowed (decay_factor=1 or sticky evidence can keep
+        # it above the line); only a strictly lower threshold is rejected
+        cfg = self.LocalMemoryConfig(
+            promote_threshold=6.0, demote_threshold=3.0,
+            score_start_high=3, naming_promote_threshold=3.0,
+        )
+        self.assertEqual(cfg.naming_promote_threshold, 3.0)
 
     def test_17_promote_equal_to_cap_is_accepted(self):
         # Equality is allowed: the score can reach the cap via
@@ -1371,15 +1427,32 @@ class TestPersonaService(unittest.TestCase):
                 self.assertNotIn("ANY(related_user_ids)", sql)
                 self.assertNotIn("json_each(related_user_ids)", sql)
             for sql in sqls[:2]:  # the two profile-section queries
-                self.assertIn("CASE WHEN m.category = 'recent'", sql)
+                # Recent time-first lead key (multi-account query uses the
+                # already-projected category/sort_ts aliases)
+                self.assertIn("CASE WHEN", sql)
+                self.assertIn("'recent'", sql)
                 self.assertIn("COALESCE(c.occurred_at, m.updated_at)", sql)
                 # Guard first: a missing lead key fails the assertion here
                 # rather than raising ValueError from index()
                 self.assertIn("END DESC NULLS LAST", sql)
                 tail = sql[sql.index("END DESC NULLS LAST"):]
-                self.assertIn(
-                    "m.score DESC, m.updated_at DESC, m.id ASC", tail
+                self.assertLess(
+                    tail.index("score DESC"), tail.index("updated_at DESC")
                 )
+                self.assertLess(
+                    tail.index("updated_at DESC"), tail.index("id ASC")
+                )
+            # Multi-account query only: dedup must run before the
+            # per-section cap (duplicate statements must not consume slots)
+            multi_sql = sqls[1]
+            self.assertLess(
+                multi_sql.index("PARTITION BY m.category, m.statement"),
+                multi_sql.index("WHERE dup_rn = 1"),
+            )
+            self.assertLess(
+                multi_sql.index("WHERE dup_rn = 1"),
+                multi_sql.index("WHERE rn <= "),
+            )
 
     def test_29c_recent_and_uncertain_time_labels(self):
         # Time-sensitive sections (recent updates / unverified notes)
@@ -2417,6 +2490,88 @@ class TestPluginInjection(unittest.TestCase):
         names = [p.name for p in req.system_prompt]
         self.assertIn(f"{mod.PLUGIN_ID}:recall", names)
         self.assertIn(f"{mod.PLUGIN_ID}:profile", names)
+
+    def test_52g_cross_session_dm_memo_registered_with_injected_ids(self):
+        # DM cross-session injection goes through the real hook: the block
+        # is appended and the memo registration receives exactly the ids
+        # rendered in the block, tagged with this turn's event id (so a
+        # concurrent round of the same session cannot clear it).
+        uid = "u1"
+        inst, _ = _ready_plugin(mod, cfg={
+            "dsn": "postgres://u:p@127.0.0.1:5432/db",
+            "allowed_users": [uid],
+            "cross_session_summary_enabled": True,
+            "recall_hint_enabled": False,
+            "recent_rollout_enabled": False,
+        })
+        now = datetime.now(timezone.utc)
+        rows = [
+            {
+                "document_id": "cs-1", "session_id": "other",
+                "occurred_at": now - timedelta(hours=2),
+                "content": "用户在另一个会话聊了爬山计划",
+            },
+            {
+                "document_id": "cs-2", "session_id": "other2",
+                "occurred_at": now - timedelta(days=1),
+                "content": "用户在另一个会话聊了露营",
+            },
+        ]
+        calls = []
+
+        class MemoKernel:
+            async def fetch_recent_cross_session_summaries(self, **kwargs):
+                self.fetch_kwargs = kwargs
+                return list(rows)
+
+            def refresh_cross_session_memo(
+                self, session_id, document_ids, turn_id=""
+            ):
+                calls.append((session_id, list(document_ids), turn_id))
+
+            async def build_injection_text(self, **kwargs):
+                return ""
+
+            async def build_recent_rollout_text(self, session_id, platform=""):
+                return ""
+
+            def make_recall_hints(self, **kwargs):
+                return None
+
+            def _local_tz(self):
+                return timezone.utc
+
+        class StubPersona:
+            async def build_profile_text(self, **kwargs):
+                return ""
+
+            async def build_multi_profile_text(self, **kwargs):
+                return ""
+
+        kernel = MemoKernel()
+        inst._memory_kernel = kernel
+        inst._persona_service = StubPersona()
+        req = FakeReq()
+        req.tool_set.names = set(mod.ALL_TOOLS)
+        event = types.SimpleNamespace(
+            event_id="ev-dm-1",
+            session=FakeSession(stype="dm"),
+            messages=[make_msg(uid, "记得我喜欢什么吗", mid="m1")],
+        )
+        asyncio.run(inst.inject_memory(event, req, None))
+
+        names = [p.name for p in req.user_prompt]
+        self.assertIn(f"{mod.PLUGIN_ID}:cross_session", names)
+        block = next(
+            p for p in req.user_prompt
+            if p.name.endswith(":cross_session")
+        )
+        self.assertIn("爬山计划", block.content)
+        self.assertIn("露营", block.content)
+        # Entry clear + post-injection registration, both scoped to the turn
+        self.assertEqual(calls[0], ("10086", [], "ev-dm-1"))
+        self.assertEqual(calls[1], ("10086", ["cs-1", "cs-2"], "ev-dm-1"))
+        self.assertEqual(kernel.fetch_kwargs["current_session_type"], "dm")
 
 
 class TestPluginTools(unittest.TestCase):

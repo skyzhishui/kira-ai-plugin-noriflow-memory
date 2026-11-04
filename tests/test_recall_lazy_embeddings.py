@@ -68,12 +68,17 @@ class _LazyCaptureDB:
 
     async def search_chat_summaries(self, **kwargs):
         self.search_kwargs = kwargs
+        # Mirror the real SELECT LIMIT: the candidate pool is truncated
+        # before the dedup loop sees it (assert against the requested limit,
+        # do not silently return every fixture row)
+        limit = kwargs.get("limit")
+        rows = self.rows if limit is None else self.rows[: int(limit)]
         # Mirror the real SELECT shape: with_embedding=False carries no
         # vector column
         if kwargs.get("with_embedding"):
-            return [dict(r) for r in self.rows]
+            return [dict(r) for r in rows]
         stubbed = [
-            {k: v for k, v in r.items() if k != "embedding"} for r in self.rows
+            {k: v for k, v in r.items() if k != "embedding"} for r in rows
         ]
         return [dict(r) for r in stubbed]
 
@@ -108,6 +113,13 @@ class _StubEmbedding:
 
     async def embed_batch(self, texts):
         return [[0.1] for _ in texts]
+
+
+class _StubRerank:
+    """Rerank stub preserving input order (index 0 scores highest)."""
+
+    async def rerank(self, query, documents, top_k=None):
+        return [(idx, 1.0 - idx * 0.001) for idx in range(len(documents))]
 
 
 def _make_kernel(db, **cfg_over) -> LocalMemoryKernel:
@@ -167,10 +179,15 @@ async def test_lazy_path_pages_fetch_on_long_duplicate_run() -> None:
     embed_by_id = {r["id"]: dup_vec for r in rows}
     embed_by_id[rows[18]["id"]] = uniq_vec  # only this one breaks the run
     db = _LazyCaptureDB(rows=rows, embed_by_id=embed_by_id)
-    kernel = _make_kernel(db)
+    # Rerank enabled + explicit candidate count: the pool must be fetched
+    # with the configured 20 candidates (rerank off would cap it at
+    # top_k*4=8 and the fixture rows beyond it would be a stub artifact)
+    kernel = _make_kernel(db, rerank_candidates=20)
+    kernel.rerank_client = _StubRerank()
     items = await kernel.search(query="猫", session_id="s1", top_k=2)
     assert db.search_kwargs is not None
     assert db.search_kwargs["with_embedding"] is False
+    assert db.search_kwargs["limit"] == 20, "候选池上限取 rerank_candidates"
     assert len(db.fetch_calls) == 2, "头部 16 行一块 + 越窗续取一块"
     assert db.fetch_calls[0] == [r["id"] for r in rows[:16]], "首块为头部 16 行"
     assert db.fetch_calls[1] == [r["id"] for r in rows[16:20]], "续取覆盖到池尾"
@@ -208,7 +225,8 @@ async def test_lazy_paging_stops_after_first_failure() -> None:
         return await real_fetch(ids=ids)
 
     db.fetch_embeddings_by_ids = flaky_fetch  # type: ignore[method-assign]
-    kernel = _make_kernel(db)
+    kernel = _make_kernel(db, rerank_candidates=20)
+    kernel.rerank_client = _StubRerank()
     items = await kernel.search(query="猫", session_id="s1", top_k=2)
     # chunk = max(top_k*4, 16) = 16: chunk 1 (rows[:16]) fetched OK; chunk 2
     # (rows[16:20]) failed once and paging stopped for the round -- no third

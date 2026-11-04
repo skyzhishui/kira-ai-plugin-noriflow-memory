@@ -197,6 +197,31 @@ class TestPrepareSave(unittest.TestCase):
         r2 = prepare_save({"naming_promote_threshold": 4.5}, self.HOST)
         self.assertEqual(r2["changed"], {"naming_promote_threshold": 4.5})
 
+    def test_clearing_optional_restores_lazy_derivation(self):
+        # Explicit value -> clear (submitted null) must persist null, not the
+        # derived number: the model resolves None to score_start_high at
+        # construction, so freezing that number would stop later
+        # score_start_high changes from re-deriving.
+        host = {
+            "dsn": "postgres://u:p@h/db",
+            "score_start_high": 3,
+            "naming_promote_threshold": 4.5,
+        }
+        cleared = prepare_save({"naming_promote_threshold": None}, host)
+        self.assertEqual(cleared["changed"], {"naming_promote_threshold": None})
+        # Host state after the save: the key is null (unset), not 3.0
+        host_after = dict(host)
+        host_after.update(cleared["changed"])
+        self.assertIsNone(host_after["naming_promote_threshold"])
+        # A later score_start_high change re-derives the effective value
+        # (4 keeps the hysteresis band 6-2 >= the one-evidence increment)
+        bumped = prepare_save({"score_start_high": 4}, host_after)
+        self.assertEqual(bumped["validated"].naming_promote_threshold, 4.0)
+        self.assertNotIn("naming_promote_threshold", bumped["changed"])
+        # Clearing an already-unset field is a no-op
+        noop = prepare_save({"naming_promote_threshold": None}, host_after)
+        self.assertEqual(noop["changed"], {})
+
 
 class TestPersistHostConfig(unittest.TestCase):
     def test_merge_into_existing_file(self):
