@@ -1,5 +1,40 @@
 # Changelog
 
+## v1.18.6 (2026-11-04)
+
+PR #9 CodeRabbit 评审轮（2 Major + 7 Minor）9 项修复：维护页控件类型、跨会话查询边界与排除范围、截断判定、naming 提示词口径、WebUI 四项。
+
+### fix: 评审确认的缺陷（9 项）
+
+- **维护页 Optional 字段控件误判**（Major）：`_field_type` 现解包 `Optional[X]`/`X | None`
+  （含嵌套与 PEP 604）后按内层类型分类，`naming_promote_threshold`（`Optional[float]`）不再
+  落入 "list" 兜底被渲染成多行文本——宿主无该键时表单回存提交 `[]` 必被 422 拒绝的问题随之
+  消失；`_literal_options` 与 `_numeric_bounds` 的 int 判定同步解包。全 88 字段程序化审计
+  仅此 1 个分类变化，无误伤；
+- **未来时间戳摘要注入**：`fetch_recent_cross_session_summaries`（PG/SQLite 行为对齐）无条件加
+  `occurred_at <= now()` 上界（与 max_age_days 是否启用无关），未来发生的摘要不再按 DESC 排最前
+  占据 top_k 名额；
+- **跨会话排除裸 session_id 误伤**：排除当前会话改用 platform + 会话类型复合条件（类型经
+  group_id 判别：gm→`group_id <> ''`、dm→`group_id = ''`），同适配器下私聊与群聊裸 ID 相同时
+  群聊摘要不再被误排除；调用链 main.py → memory_kernel → 双后端透传
+  current_platform/current_session_type，未传类型的旧调用保留裸 ID 排除回退；
+- **截断判定误杀完整摘要**：`_looks_truncated` 收紧为强信号（逗号族/开括号收尾、空锚点），多行
+  摘要末字为 CJK 汉字不再判截断，语义完整但末行无句末标点的摘要不再被重试后降级原文单通道
+  （`_CJK_IDEOGRAPH_RE` 死代码一并移除）；
+- **naming 提示词规则自相矛盾**：分级 b 与示例第 2/3 条统一——接受迹象只认本人的实际应答，
+  "未纠正/沉默"不再构成接受迹象，杜绝无应答的本人被提取为称呼偏好并晋档入画像；
+- **图谱点击必清空选择**（Major）：setPointerCapture 把 pointerup 事件目标重定向到 SVG 自身，
+  closest 命中判定失效——pointerdown 记录手势起始目标供 pointerup 使用；pointercancel 手势
+  取消不再改动选中状态；
+- **画像卡竞态与删除残留**：画像请求加单调序号丢弃过期响应，删除用户仅清空正展示该用户的卡片，
+  删除后才返回的在途响应不再回填已删用户画像；
+- **回填空闲分支只轮询一次**：空闲时每 5s 续轮询（切页/断连自动停止），其他标签页启动或完成的
+  回填不再被本页漏检（与注释声称的等待行为一致）；
+- **设置页整数项静默截断**：`parseInt` 会把 "1e3"/"1.5" 截成 1 后无提示热生效，现改 `Number` +
+  严格整数校验，非法输入 toast 报错并中止保存（float 分支行为不变）。
+
+全量 14 测试套件通过；web 四项无自动化覆盖（node --check + 手工路径推演验收）。
+
 ## v1.18.5 (2026-11-04)
 
 存量中文注释/docstring 全面英文化（历史清理批）。
