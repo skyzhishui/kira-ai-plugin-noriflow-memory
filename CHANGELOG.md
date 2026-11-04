@@ -1,5 +1,58 @@
 # Changelog
 
+## v1.18.7 (2026-11-05)
+
+PR #9 CodeRabbit 第二轮评审（16 行内 + 2 follow-up + 4 nitpick）修复：后端 7 项、WebUI JS 9 项、
+CSS 可访问性 2 项、测试补强 2 条 nitpick；2 条迁移类 nitpick 评估后不改（014 CONCURRENTLY 需改
+迁移执行器且有 INVALID 索引风险，015 为部署期测量建议非代码缺陷）。
+
+### fix: 后端（评审二轮）
+
+- **清空 naming_promote_threshold 恢复派生**：可选字段空值此前按省略键保存，旧显式值永续；提交
+  null 时派生值被写死、之后刻度变化不再跟随。现 `prepare_save` 对 null 持久化 null 本身，加载时
+  重新从 score_start_high 懒派生（前端配合：default 为 null 的 float 字段空输入提交 null）；
+- **新增装配校验 `naming_promote_threshold >= demote_threshold`**：低于降级线的 naming 簇晋档后
+  会在下一次衰减遍被立即降级删除（画像反复抖动、称呼承诺静默丢失）。显式路径自报
+  (naming_promote_threshold, demote_threshold)、派生路径自报 (score_start_high, demote_threshold)，
+  回退必收敛；注意：现网已存在该组合的显式配置保存将被拒、启动期回退重置相关键；
+- **rerank_candidates 缺省恢复 50**：候选池先 SQL 截断再近重复去重，20 条在近重复密集时去重后
+  不足 top_k；config/main 兜底/schema/README 四处同步（惰性向量取回保证扩池不增传输开销）；
+- **insert_persona_fact_raw 双后端持久化前钳制未来 occurred_at**（与工具写入路径同款不可信时间
+  守卫），document_id/evidence_key 保留原始时间（幂等键不随钳制漂移）；
+- **跨会话注入 memo 按轮次隔离**：键改 (session_id, turn_id)（宿主 event_id），同会话并发轮不再
+  互相清空/覆盖排除集合；新增 TTL 清理 + 64 条硬上限防按轮次键无限增长；空 turn_id 保留旧会话级
+  语义（旧宿主/测试兼容）；
+- **多账号画像先去重后截断**：`fetch_profile_sections_multi`（PG/SQLite 对齐）改为 SQL 内先按
+  (category, statement) 去重（非空/最新 occurred_at 优先）再 row_number 截断，跨账号相同
+  statement 不再挤占 per_section_limit 名额。
+
+### fix: WebUI（评审二轮）
+
+- 弹窗关闭竞态：旧保存请求的 close 回调不再清空已替换的新弹窗（仅本弹窗仍挂载时清空）；
+- **主导航 tab 改为 `<button>`（Major）**：Tab/Enter/Space 键盘可达，active 项 aria-current="page"，
+  切换后焦点保持在当前 tab；CSS 补 UA reset 与 :focus-visible 焦点环，渲染盒模型不变；
+- **按钮对比度达标 WCAG AA**：`.btn` 渐变端点局部加深（亮色 #0d6d9c→#6a4ed6 白字，暗色保留发光
+  渐变翻转为墨色文字，与 active tab 星标同构），danger 变体同步修复，全部主题×端点组合 ≥4.5:1
+  （全局 --sky/--violet 未动）；
+- 原始事实/注入语料列表筛选与翻页请求加序号守卫，先发后至不再覆盖最新结果；
+- 回填轮询连续 5 次失败放弃时恢复按钮可用并隐藏进度条，不再永久卡死；
+- 注入语料页补编码周期结束自动刷新摘要列表（running→idle 跃迁 + finished_at 变化双通道检测），
+  空闲时以 10s 续轮询覆盖后台自发的合并周期（切页/断连自动停止）；
+- Kira 记忆迁入增加源路径版本守卫：改路径即清空旧预览并禁用「开始迁入」，迟到的扫描/迁入响应
+  不得回写新路径的界面状态；
+- 关系图谱首次状态轮询不再吞掉快照之后完成的关系回填（completedAfterSnapshot 判定，自终止无
+  循环重载）；
+- 可选 float 字段清空提交 null 恢复派生（见后端第一条）。
+
+### test: 评审二轮 nitpick 补强
+
+- test_recall_lazy_embeddings：启用 rerank stub 使 use_rerank=True、断言候选池 limit==20、stub
+  按 limit 截断贴近真实后端；
+- 新增 DM 跨会话注入 hook 端到端用例：启用 cross_session_summary_enabled，断言注入块存在且 memo
+  登记与注入一致（此前测试不经过 hook，登记调用被删/调换不会被发现）。
+
+全量 14 测试套件通过；web 改动以 node --check + 手工验收步骤覆盖。
+
 ## v1.18.6 (2026-11-04)
 
 PR #9 CodeRabbit 评审轮（2 Major + 7 Minor）9 项修复：维护页控件类型、跨会话查询边界与排除范围、截断判定、naming 提示词口径、WebUI 四项。
