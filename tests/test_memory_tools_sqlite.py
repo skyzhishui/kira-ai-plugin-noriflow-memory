@@ -368,7 +368,9 @@ async def main_async() -> None:
     stored = await _cluster_occurred(summary["cluster_id"])
     stored_dt = (
         # Python<3.11 fromisoformat rejects the trailing Z (sqlite_format_ts)
-        datetime.fromisoformat(stored.replace("Z", "+00:00"))
+        datetime.fromisoformat(
+            stored[:-1] + "+00:00" if stored.endswith("Z") else stored
+        )
         if isinstance(stored, str)
         else stored
     )

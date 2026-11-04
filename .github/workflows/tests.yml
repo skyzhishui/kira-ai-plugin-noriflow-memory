@@ -56,13 +56,23 @@ jobs:
           rc_all=0
           for f in tests/test_*.py; do
             echo "::group::python $f"
-            timeout 300 python "$f" || {
-              rc=$?
-              echo "::endgroup::"
-              echo "::error::suite $f exited $rc (124 = timed out after 300s)"
-              rc_all=1
-              continue
-            }
+            if command -v timeout >/dev/null 2>&1; then
+              timeout -k 15 300 python "$f" || {
+                rc=$?
+                echo "::endgroup::"
+                echo "::error::suite $f exited $rc (124 = timed out after 300s)"
+                rc_all=1
+                continue
+              }
+            else
+              python "$f" || {
+                rc=$?
+                echo "::endgroup::"
+                echo "::error::suite $f exited $rc"
+                rc_all=1
+                continue
+              }
+            fi
             echo "::endgroup::"
           done
           exit $rc_all
