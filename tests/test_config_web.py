@@ -21,6 +21,7 @@ except ModuleNotFoundError:  # Python 3.10 has no stdlib tomllib; tomli ships vi
     import tomli as tomllib  # noqa: F401
 import unittest
 from pathlib import Path
+from typing import Literal, Optional
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN_DIR))
@@ -38,6 +39,8 @@ from noriflow_memory_pkg.config import LocalMemoryConfig  # noqa: E402
 from noriflow_memory_pkg.config_web import (  # noqa: E402
     SaveBlocked,
     _MASK,
+    _field_type,
+    _literal_options,
     build_payload,
     config_schema,
     mask_values,
@@ -45,6 +48,54 @@ from noriflow_memory_pkg.config_web import (  # noqa: E402
     prepare_save,
     unmask_values,
 )
+
+
+class TestFieldType(unittest.TestCase):
+    """`_field_type` maps pydantic annotations to frontend control types."""
+
+    def test_scalar_annotations(self):
+        self.assertEqual(_field_type(bool), "bool")
+        self.assertEqual(_field_type(int), "int")
+        self.assertEqual(_field_type(float), "float")
+        self.assertEqual(_field_type(str), "str")
+
+    def test_optional_scalars_unwrap_to_inner_type(self):
+        # Regression: Optional[float] used to fall through to the "list"
+        # fallback (multi-line textarea -> empty value submitted as [], 422)
+        self.assertEqual(_field_type(Optional[float]), "float")
+        self.assertEqual(_field_type(Optional[str]), "str")
+        self.assertEqual(_field_type(Optional[int]), "int")
+        self.assertEqual(_field_type(Optional[bool]), "bool")
+
+    def test_pep604_optional_spelling(self):
+        self.assertEqual(_field_type(float | None), "float")
+        self.assertEqual(_field_type(None | str), "str")
+
+    def test_nested_optional(self):
+        self.assertEqual(_field_type(Optional[Optional[float]]), "float")
+        self.assertEqual(_field_type(float | None | None), "float")
+
+    def test_optional_list_stays_list(self):
+        # A list field that may be None is still rendered as a list control
+        self.assertEqual(_field_type(Optional[list[str]]), "list")
+        self.assertEqual(_field_type(list[str] | None), "list")
+        self.assertEqual(_field_type(list[str]), "list")
+
+    def test_literal_is_str_with_options(self):
+        ann = Literal["relative", "absolute", "both"]
+        self.assertEqual(_field_type(ann), "str")
+        self.assertEqual(_literal_options(ann), ["relative", "absolute", "both"])
+        # Optional[Literal[...]] unwraps too; None is not offered as an option
+        opt = Optional[Literal["a", "b"]]
+        self.assertEqual(_field_type(opt), "str")
+        self.assertEqual(_literal_options(opt), ["a", "b"])
+        self.assertIsNone(_literal_options(str))
+        self.assertIsNone(_literal_options(Optional[float]))
+
+    def test_non_optional_union_keeps_fallback(self):
+        # No single control type can serve a multi-type union: keeps the
+        # historical "list" fallback rather than silently picking one member
+        self.assertEqual(_field_type(int | str), "list")
 
 
 class TestSchema(unittest.TestCase):
@@ -66,6 +117,12 @@ class TestSchema(unittest.TestCase):
         self.assertEqual(s["topic_blacklist"]["type"], "list")
         self.assertEqual(s["recall_relevance_threshold"]["type"], "float")
         self.assertEqual(s["recall_time_decay_enabled"]["type"], "bool")
+        # Optional[float] renders as a float control (not the list fallback):
+        # its unset default is None, which an empty list control would submit
+        # as [] and pydantic would 422 on every save
+        self.assertEqual(s["naming_promote_threshold"]["type"], "float")
+        self.assertIsNone(s["naming_promote_threshold"]["default"])
+        self.assertGreater(s["naming_promote_threshold"]["min"], 0.0)  # gt=0 -> exclusive bound nudged inside
         # default_factory field (topic_blacklist): its default is
         # JSON-serializable and is not a sentinel
         json.dumps(s["topic_blacklist"]["default"])
@@ -126,6 +183,19 @@ class TestPrepareSave(unittest.TestCase):
     def test_restart_fields_reported(self):
         r = prepare_save({"pool_max": 16}, self.HOST)
         self.assertEqual(r["restart_required"], ["pool_max"])
+
+    def test_unset_optional_field_does_not_reject_save(self):
+        # Regression: with no naming_promote_threshold key in the host config
+        # (unset Optional[float]), the whole form round-trip must validate --
+        # previously the field was a list control whose empty value was
+        # submitted as [], failing float coercion (422 on every save)
+        payload = build_payload({})
+        r = prepare_save(dict(payload["values"]), {})
+        self.assertEqual(r["changed"], {})
+        self.assertEqual(r["validated"].naming_promote_threshold, 3.0)  # derived from score_start_high
+        # an explicit value is accepted as-is
+        r2 = prepare_save({"naming_promote_threshold": 4.5}, self.HOST)
+        self.assertEqual(r2["changed"], {"naming_promote_threshold": 4.5})
 
 
 class TestPersistHostConfig(unittest.TestCase):

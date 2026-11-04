@@ -24,7 +24,8 @@ from __future__ import annotations
 import json
 import math
 import re
-from typing import TYPE_CHECKING, Any, Literal, get_args, get_origin
+import types
+from typing import TYPE_CHECKING, Any, Literal, Union, get_args, get_origin
 
 from pydantic_core import PydanticUndefined
 
@@ -129,8 +130,39 @@ _CONFIG_GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
 ]
 
 
+# Union origins to strip when resolving an Optional annotation: `Optional[X]`
+# and `X | None` are both valid spellings (typing.Union / PEP 604
+# types.UnionType), and config.py may use either. getattr keeps the import
+# working on a Python without types.UnionType (3.9 and older).
+_UNION_ORIGINS: tuple = (Union, getattr(types, "UnionType", Union))
+
+
+def _unwrap_optional(annotation):
+    """Strip ``Optional[X]`` / ``Union[X, None]`` wrappers down to ``X``.
+
+    Fields whose "unset" state is meaningful (e.g. ``naming_promote_threshold``,
+    derived from score_start_high when None) are declared ``Optional[...]``.
+    Without unwrapping, such an annotation matches no scalar branch of
+    ``_field_type`` and falls through to the "list" fallback: it would be
+    rendered as a multi-line textarea whose empty value is submitted as
+    ``[]`` and 422-rejected by pydantic whenever the host config does not
+    carry the key yet (every save would be refused).
+
+    Nested wrappers (``Optional[Optional[X]]``, ``X | None | None``) are
+    stripped in a loop. A union with more than one non-None member is
+    returned untouched -- it has no single control type to map to.
+    """
+    while get_origin(annotation) in _UNION_ORIGINS:
+        members = [a for a in get_args(annotation) if a is not type(None)]
+        if len(members) != 1:
+            return annotation
+        annotation = members[0]
+    return annotation
+
+
 def _field_type(annotation) -> str:
-    """pydantic annotation -> frontend control type."""
+    """pydantic annotation -> frontend control type (Optional[X] is classified as X)."""
+    annotation = _unwrap_optional(annotation)
     if annotation is bool:
         return "bool"
     if annotation is int:
@@ -148,7 +180,12 @@ def _field_type(annotation) -> str:
 
 
 def _literal_options(annotation) -> list[str] | None:
-    """Optional values of a Literal annotation (None for non-Literal annotations)."""
+    """Optional values of a Literal annotation (None for non-Literal annotations).
+
+    ``Optional[Literal[...]]`` is unwrapped as well (None excluded from the
+    options): an enum field that may be unset still exposes its choices.
+    """
+    annotation = _unwrap_optional(annotation)
     if get_origin(annotation) is Literal:
         return [str(v) for v in get_args(annotation)]
     return None
@@ -165,7 +202,9 @@ def _numeric_bounds(field) -> tuple[Any, Any]:
     """
     lo: Any = None
     hi: Any = None
-    is_int = field.annotation is int
+    # Unwrap Optional so an Optional[int] field still gets the ±1 int nudge
+    # instead of the float ULP nudge
+    is_int = _unwrap_optional(field.annotation) is int
     for meta in field.metadata:
         ge = getattr(meta, "ge", None)
         gt = getattr(meta, "gt", None)
