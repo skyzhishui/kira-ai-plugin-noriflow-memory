@@ -847,18 +847,31 @@ class SQLiteMemoryDatabase(MemoryBackend):
         user_keys: list[str],
         limit: int,
         max_age_days: int = 0,
+        current_platform: str = "",
+        current_session_type: str = "",
     ) -> list[dict]:
         """Recent encoded summaries of the user's other sessions (cross-session
         injection source), newest first (SQLite twin of the PG method;
         participants array-overlap via json_each EXISTS).
 
+        Current-session exclusion is scoped exactly like the PG side: the
+        bare session id is not unique (a DM with a user and a group chat may
+        share it), so the exclusion also pins platform + session type; the
+        type comes from group_id, which the write side sets to session_id
+        for a group chat and '' for a DM. Future-dated rows are always
+        dropped (occurred_at <= now()), as on PG.
+
         Args:
-            current_session_id: session to exclude.
+            current_session_id: bare session id to exclude.
             user_keys: composite identity keys ("platform:uid") of the user.
             limit: max rows (callers bound by cross_session_summary_top_k).
             max_age_days: drop rows older than this (0 = unlimited; the
                 cutoff is bound as a canonical TEXT timestamp, matching the
                 write-side sqlite_format_ts format).
+            current_platform: platform tag of the current session (empty =
+                no platform scoping, legacy callers).
+            current_session_type: "dm" / "gm" of the current session (any
+                other value falls back to the bare-id exclusion).
 
         Returns:
             Dict rows (document_id / session_id / content / occurred_at),
@@ -872,12 +885,30 @@ class SQLiteMemoryDatabase(MemoryBackend):
         if not keys:
             return []
         p = _Params(None)
+        sid_ph = p.add(current_session_id)
+        excluded_sql = f"session_id <> {sid_ph}"
+        if current_session_type in ("dm", "gm"):
+            plat_sql = ""
+            if current_platform:
+                plat_sql = f" AND platform = {p.add(current_platform)}"
+            type_sql = (
+                "group_id <> ''"
+                if current_session_type == "gm"
+                else "group_id = ''"
+            )
+            excluded_sql = (
+                f"NOT (session_id = {sid_ph}{plat_sql} AND {type_sql})"
+            )
+        now_ts = sqlite_format_ts(_ensure_tz(datetime.now(timezone.utc)))
         conds = [
             "summarized",
             "kind = 'chat_summary'",
             "NOT archived",
-            f"session_id <> {p.add(current_session_id)}",
+            excluded_sql,
             _overlap_cond(p, "participants", keys) or "0",
+            # Upper bound mirrors the PG side's occurred_at <= now(); the
+            # canonical UTC TEXT format keeps the comparison lexicographic
+            f"occurred_at <= {p.add(now_ts)}",
         ]
         if int(max_age_days) > 0:
             cutoff = datetime.now(timezone.utc) - timedelta(

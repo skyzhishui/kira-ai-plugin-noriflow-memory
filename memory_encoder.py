@@ -33,7 +33,6 @@ from __future__ import annotations
 
 from core.logging_manager import get_logger
 
-import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -71,21 +70,22 @@ _VALID_CONFIDENCES = frozenset({"high", "medium"})
 # are all lost).
 # The check is a reverse whitelist (killing a complete summary costs a retry
 # plus a possible whole-turn downgrade, which outweighs missing a
-# half-sentence, so it prefers under-detecting):
-# - Last char is a CJK ideograph: a cut Chinese half-sentence almost always
-#   lands on one (all 186 nori production cases ended on an ideograph / comma
-#   family / opening bracket: 发/说/称/的/侃/（/喊/梗...);
+# half-sentence, so it prefers under-detecting). Only strong structural
+# signals count -- the last char's script does not:
 # - Last char is in the comma family (，、：；,;:): a trailing comma is always
 #   a half-sentence, in any script;
 # - Last char is an opening bracket/quote (（「『“‘《【(['): opened but never
 #   closed is always a half-sentence.
-# Conversely, sentence-final punctuation (。！？…”』」～!?.)), ASCII letters or
-# digits ("查ID", "version 2"), half-width ~, emoji and the like are never
-# treated as truncation (the old whitelist wrongly killed 4 complete summaries
+# Conversely, a last char that is a CJK ideograph is NOT a signal: a complete
+# multi-line summary whose closing line simply carries no sentence-final
+# punctuation (a label or a short phrase) ends on an ideograph as well, and
+# flagging it downgraded semantically complete summaries (review Minor #4).
+# Sentence-final punctuation (。！？…”』」～!?.)), ASCII letters or digits
+# ("查ID", "version 2"), half-width ~, emoji and the like are never treated as
+# truncation either (the old whitelist wrongly killed 4 complete summaries
 # among the 190 suspect nori production rows: 3 ending on ~, 1 on ASCII
 # letters).
 # ---------------------------------------------------------------------------
-_CJK_IDEOGRAPH_RE = re.compile(r"[一-鿿]")
 _CLAUSE_MID_PUNCT = frozenset("，、：；,;:")
 _OPENING_BRACKETS = frozenset("（「『“‘《【(['")
 
@@ -96,8 +96,9 @@ def _looks_truncated(summary: str) -> bool:
     Rules (see the module comment above; reverse whitelist):
     - The comma-family / opening-bracket check runs before the line-count
       branch and applies to single-line **and** multi-line summaries alike;
-    - Multi-line summary (first line "【话题】" anchor + sectioned body): a
-      trailing CJK ideograph -> truncated;
+    - Multi-line summary (first line "【话题】" anchor + sectioned body):
+      never truncated on the last char alone -- a CJK ideograph ending is
+      normal for a complete summary;
     - Single-line summary: the pure anchor form "【话题】XXX" the prompt asks
       for is legal; truncation only when the last char is in the comma or
       opening-bracket family, or the anchor is empty (not even the topic was
@@ -122,7 +123,11 @@ def _looks_truncated(summary: str) -> bool:
         # Empty anchor ("【话题】" or the prefix only): the topic itself was
         # never written, so it must be truncated
         return text.rstrip("】").endswith("【话题")
-    return bool(_CJK_IDEOGRAPH_RE.match(last_char))
+    # Multi-line body without a comma-family / opening-bracket tail is taken
+    # as complete: a CJK ideograph last char is not truncation evidence
+    return False
+
+
 # Fact statement length cap (truncate and keep; cf. the relation
 # channel's <=200 magnitude; cluster canonical_statement inherits this
 # value directly -- an uncapped value would bloat the cluster table and

@@ -3,8 +3,9 @@
 (nori #26) and the guidance convergence (nori #29).
 
 Coverage:
-- cross-session: PG query shape (participants && / session exclusion / age
-  window / order), SQLite twin fetch on a real temp DB, kernel memo
+- cross-session: PG query shape (participants && / scoped session exclusion /
+  future-timestamp bound / age window / order), SQLite twin fetch on a real
+  temp DB (same bare id across session types not mis-excluded), kernel memo
   exclusion wiring into the shared retrieval path, block builder budget
   semantics (preamble counted, only rendered rows memo-registered);
 - naming: create-with-immediate-promotion (naming start 3.0 >= threshold
@@ -86,14 +87,37 @@ async def test_cross_session_pg_sql_shape() -> None:
         user_keys=["qq:u1", "qq:u2"],
         limit=2,
         max_age_days=30,
+        current_platform="qq",
+        current_session_type="dm",
     )
     assert len(rows) == 1
     sql, params = conn.queries[0]
-    assert "session_id <> $1" in sql, "排除当前会话"
+    assert (
+        "NOT (session_id = $1 AND platform = $3 AND group_id = '')" in sql
+    ), "排除当前会话须带 platform + 会话类型（裸 session_id 不唯一）"
     assert "participants && $2" in sql, "身份键数组重叠"
-    assert "occurred_at >= now() - make_interval(days => $3)" in sql, "陈旧窗口"
-    assert sql.rstrip().endswith("ORDER BY occurred_at DESC, id DESC LIMIT $4")
-    assert params == ("s1", ["qq:u1", "qq:u2"], 30, 2)
+    assert "occurred_at <= now()" in sql, "排除未来时间戳（否则 DESC 抢占 top_k）"
+    assert "occurred_at >= now() - make_interval(days => $4)" in sql, "陈旧窗口"
+    assert sql.rstrip().endswith("ORDER BY occurred_at DESC, id DESC LIMIT $5")
+    assert params == ("s1", ["qq:u1", "qq:u2"], "qq", 30, 2)
+
+    # Group-chat arm: the type discriminator flips (group_id <> '')
+    conn_gm = _CaptureConn([])
+    db._pool = _CapturePool(conn_gm)
+    await db.fetch_recent_cross_session_summaries(
+        current_session_id="s1",
+        user_keys=["qq:u1"],
+        limit=3,
+        current_platform="qq",
+        current_session_type="gm",
+    )
+    sql_gm, params_gm = conn_gm.queries[0]
+    assert (
+        "NOT (session_id = $1 AND platform = $3 AND group_id <> '')" in sql_gm
+    ), "群聊会话按 group_id <> '' 排除自身"
+    assert "occurred_at <= now()" in sql_gm, "未来时间戳上界与年龄窗口无关"
+    assert params_gm == ("s1", ["qq:u1"], "qq", 3)
+
     # Empty-key filtering (None/blank never enter the array binding)
     conn2 = _CaptureConn([])
     db._pool = _CapturePool(conn2)
@@ -101,6 +125,8 @@ async def test_cross_session_pg_sql_shape() -> None:
         current_session_id="s1",
         user_keys=["", None, "  "],
         limit=2,
+        current_platform="qq",
+        current_session_type="dm",
     )
     assert conn2.queries == [], "全无效键应直接短路不发查询"
     print("PASS test_cross_session_pg_sql_shape")
@@ -125,32 +151,55 @@ async def test_cross_session_sqlite_fetch() -> None:
         db = await _make_sqlite_db(tmp)
         try:
             old = wall_now - timedelta(days=40)
-            for i, (doc, sid, occurred, parts) in enumerate([
-                ("d-other", "s2", wall_now - timedelta(hours=2), ["qq:u1"]),
-                ("d-other-old", "s3", old, ["qq:u1"]),
-                ("d-current", "s1", wall_now - timedelta(hours=1), ["qq:u1"]),
-                ("d-stranger", "s4", wall_now - timedelta(hours=1), ["qq:u9"]),
-            ]):
+            for doc, sid, plat, gid, occurred, parts in [
+                # another DM session, inside the age window
+                ("d-other", "s2", "qq", "", wall_now - timedelta(hours=2),
+                 ["qq:u1"]),
+                # the current DM session itself
+                ("d-current", "s1", "qq", "", wall_now - timedelta(hours=1),
+                 ["qq:u1"]),
+                # same bare id as the current DM but a group chat: a different
+                # session, so a bare-id-only exclusion would wrongly drop it
+                ("d-same-id-group", "s1", "qq", "s1",
+                 wall_now - timedelta(hours=3), ["qq:u1"]),
+                # same bare id + same type, other adapter: another session too
+                ("d-same-id-otherplat", "s1", "napcat", "",
+                 wall_now - timedelta(hours=4), ["napcat:u1"]),
+                # future-dated row (clock skew): must never be injected
+                ("d-future", "s5", "qq", "",
+                 wall_now + timedelta(days=1), ["qq:u1"]),
+                # out of the age window
+                ("d-other-old", "s3", "qq", "", old, ["qq:u1"]),
+                # someone else's session
+                ("d-stranger", "s4", "qq", "", wall_now - timedelta(hours=1),
+                 ["qq:u9"]),
+            ]:
                 await db.insert_chat_summary(
-                    document_id=doc, kind="chat_summary", platform="qq",
-                    session_id=sid, group_id="", user_id="u1",
+                    document_id=doc, kind="chat_summary", platform=plat,
+                    session_id=sid, group_id=gid, user_id="u1",
                     participants=parts, content=f"摘要-{doc}",
                     occurred_at=occurred, summarized=True, embedding=None,
                 )
             rows = await db.fetch_recent_cross_session_summaries(
-                current_session_id="s1", user_keys=["qq:u1"],
+                current_session_id="s1", user_keys=["qq:u1", "napcat:u1"],
                 limit=10, max_age_days=30,
+                current_platform="qq", current_session_type="dm",
             )
-            assert [r["document_id"] for r in rows] == ["d-other"], (
-                "仅命中其他会话、本人参与、窗口内的行（当前会话/陈旧行/陌生人行排除）"
+            assert [r["document_id"] for r in rows] == [
+                "d-other", "d-same-id-group", "d-same-id-otherplat",
+            ], (
+                "仅命中其他会话、本人参与、窗口内的行（当前 DM/同裸 ID 群聊外的"
+                "会话不误排除；陈旧行/未来行/陌生人行排除）"
             )
             rows_all = await db.fetch_recent_cross_session_summaries(
-                current_session_id="s1", user_keys=["qq:u1"],
+                current_session_id="s1", user_keys=["qq:u1", "napcat:u1"],
                 limit=10, max_age_days=0,
+                current_platform="qq", current_session_type="dm",
             )
-            assert [r["document_id"] for r in rows_all] == ["d-other", "d-other-old"], (
-                "max_age_days=0 不限陈旧度，按发生时间新->旧"
-            )
+            assert [r["document_id"] for r in rows_all] == [
+                "d-other", "d-same-id-group", "d-same-id-otherplat",
+                "d-other-old",
+            ], "max_age_days=0 不限陈旧度（未来时间戳仍排除），按发生时间新->旧"
         finally:
             await db.close()
     print("PASS test_cross_session_sqlite_fetch")
@@ -409,8 +458,12 @@ async def test_naming_create_immediate_promotion_sqlite() -> None:
 def test_looks_truncated_matrix() -> None:
     encoder_mod = load_modules("memory_encoder")[0]
     f = encoder_mod._looks_truncated
-    assert f("【话题】爬山\n显示名: 内容发") is True, "多行末字为汉字 -> 截断"
+    assert f("【话题】爬山\n显示名: 内容发") is False, (
+        "多行末字为汉字不再判截断（语义完整的短句同样以汉字收尾）"
+    )
     assert f("【话题】爬山\n显示名: 内容。") is False, "句号收尾完整"
+    assert f("【话题】爬山\n显示名: 内容，") is True, "多行逗号族收尾必是半句"
+    assert f("【话题】爬山\n显示名: 内容（") is True, "多行开括号收尾必是半句"
     assert f("【话题】查ID") is False, "单行纯锚点 + ASCII 收尾合法"
     assert f("【话题】版本 2") is False
     assert f("【话题】摸鱼~") is False, "半角 ~ 收尾不误杀"
@@ -435,7 +488,7 @@ async def test_encode_truncated_retries_then_degrades() -> None:
             return json.dumps(self._payloads.pop(0), ensure_ascii=False)
 
     good = {"summary": "【话题】爬山计划\n显示名: 约定了周末爬山。", "facts": []}
-    half = {"summary": "【话题】爬山\n显示名: 约定了周末", "facts": []}
+    half = {"summary": "【话题】爬山\n显示名: 约定了周末，", "facts": []}
 
     llm = Scripted([half, good])
     enc = encoder_mod.MemoryEncoder(llm=llm, prompt_dir=PLUGIN_DIR / "prompts")

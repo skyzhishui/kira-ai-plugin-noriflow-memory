@@ -867,6 +867,8 @@ class MemoryDatabase(MemoryBackend):
         user_keys: list[str],
         limit: int,
         max_age_days: int = 0,
+        current_platform: str = "",
+        current_session_type: str = "",
     ) -> list[dict]:
         """Recent encoded summaries of the user's other sessions (cross-session
         injection source), newest first.
@@ -878,11 +880,27 @@ class MemoryDatabase(MemoryBackend):
         excluded. None/blank keys are dropped before the array bind
         (str(None) == 'None' is truthy and would pollute the match).
 
+        Current-session exclusion is scoped, not bare: the host stores the
+        bare user/group id in session_id (Session.sid = adapter:type:id is
+        the unique key), so a DM with a user and a group chat on one adapter
+        can share the same bare id -- excluding on session_id alone would
+        drop the user's own group-chat summaries from a DM injection.
+        chat_summary has no session_type column, but the write side encodes
+        it: group_id = session_id for a group chat, '' for a DM.
+
+        Future-dated rows (clock skew / a bad upstream timestamp) are always
+        dropped: occurred_at DESC would otherwise put them first, let them
+        eat top_k slots and inject "a summary from the future".
+
         Args:
-            current_session_id: session to exclude.
+            current_session_id: bare session id to exclude.
             user_keys: composite identity keys of the current user.
             limit: max rows (callers bound by cross_session_summary_top_k).
             max_age_days: drop rows older than this (0 = unlimited).
+            current_platform: platform tag of the current session (empty =
+                no platform scoping, legacy callers).
+            current_session_type: "dm" / "gm" of the current session (any
+                other value falls back to the bare-id exclusion).
 
         Returns:
             Dict rows (document_id / session_id / content / occurred_at),
@@ -896,17 +914,33 @@ class MemoryDatabase(MemoryBackend):
         if not keys:
             return []
         params: list[object] = [current_session_id, keys]
+        excluded_sql = "session_id <> $1"
+        if current_session_type in ("dm", "gm"):
+            plat_sql = ""
+            if current_platform:
+                params.append(current_platform)
+                plat_sql = f" AND platform = ${len(params)}"
+            type_sql = (
+                "group_id <> ''"
+                if current_session_type == "gm"
+                else "group_id = ''"
+            )
+            excluded_sql = f"NOT (session_id = $1{plat_sql} AND {type_sql})"
         age_sql = ""
         if int(max_age_days) > 0:
             params.append(int(max_age_days))
-            age_sql = " AND occurred_at >= now() - make_interval(days => $3)"
+            age_sql = (
+                " AND occurred_at >= now() - "
+                f"make_interval(days => ${len(params)})"
+            )
         params.append(int(limit))
         limit_ph = f"${len(params)}"
         sql = (
             f"SELECT document_id, session_id, content, occurred_at "
             f"FROM {CHAT_SUMMARY_TABLE} "  # noqa: S608 -- whitelist constant table names
             "WHERE summarized AND kind = 'chat_summary' AND NOT archived "
-            "AND session_id <> $1 AND participants && $2"
+            f"AND {excluded_sql} AND participants && $2 "
+            "AND occurred_at <= now()"
             f"{age_sql} ORDER BY occurred_at DESC, id DESC LIMIT {limit_ph}"
         )
         async with self.pool.acquire() as conn:

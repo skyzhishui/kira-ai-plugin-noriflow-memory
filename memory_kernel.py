@@ -2320,15 +2320,22 @@ class LocalMemoryKernel:
         user_keys: list[str],
         limit: int,
         max_age_days: int = 0,
+        current_platform: str = "",
+        current_session_type: str = "",
     ) -> list[dict]:
         """Fetch recent cross-session summaries through the shared guarded
         call (fail-open: a DB failure logs and returns []).
 
         Args:
-            current_session_id: session to exclude.
+            current_session_id: bare session id to exclude.
             user_keys: composite identity keys ("platform:uid") of the user.
             limit: max rows.
             max_age_days: drop rows older than this (0 = unlimited).
+            current_platform: platform tag of the current session (scopes the
+                current-session exclusion).
+            current_session_type: "dm" / "gm" of the current session (scopes
+                the current-session exclusion: the bare id alone collides
+                between a DM with a user and a group chat).
 
         Returns:
             Dict rows (document_id / session_id / content / occurred_at).
@@ -2339,6 +2346,8 @@ class LocalMemoryKernel:
                 user_keys=user_keys,
                 limit=limit,
                 max_age_days=max_age_days,
+                current_platform=current_platform,
+                current_session_type=current_session_type,
             ),
             description="跨会话摘要查询",
         )

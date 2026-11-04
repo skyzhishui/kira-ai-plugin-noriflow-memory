@@ -1594,6 +1594,11 @@ class NoriflowMemoryPlugin(BasePlugin):
                         user_keys=[f"{platform}:{cs_user_id}"],
                         limit=self._config.cross_session_summary_top_k,
                         max_age_days=self._config.cross_session_summary_max_age_days,
+                        # Scoped exclusion: the bare session_id is not unique
+                        # (a DM with a user and a group chat can share it), so
+                        # the query also pins platform + session type
+                        current_platform=platform,
+                        current_session_type=getattr(session, "session_type", ""),
                     )
                 except Exception:
                     logger.warning("跨会话摘要获取失败（不阻断本轮）", exc_info=True)

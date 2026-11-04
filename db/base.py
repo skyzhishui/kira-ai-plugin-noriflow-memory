@@ -486,7 +486,13 @@ class MemoryBackend(ABC):
 
     @abstractmethod
     async def fetch_recent_cross_session_summaries(self, **kwargs) -> list[dict]:
-        """Recent encoded summaries of the user's other sessions (cross-session injection source)."""
+        """Recent encoded summaries of the user's other sessions (cross-session
+        injection source). Keyword contract: current_session_id /
+        user_keys / limit / max_age_days / current_platform /
+        current_session_type (the last two scope the current-session
+        exclusion: the bare session id is not unique across a DM and a group
+        chat); both backends also drop future-dated rows
+        (occurred_at <= now())."""
 
     @abstractmethod
     async def fetch_embeddings_by_ids(self, **kwargs) -> dict[int, object]:
