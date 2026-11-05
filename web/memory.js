@@ -1008,38 +1008,43 @@ const Page = {
       status.appendChild(this.el("option", Object.assign({ value: s }, s === c.status ? { selected: "" } : {}), [s]));
     }
     if (c.status === "replaced") status.disabled = true;
+    // In-flight guard: the save button disables for the whole request and is
+    // restored in `finally`, so a double click cannot submit twice and a
+    // failed request leaves the dialog reusable.
+    const saveBtn = this.el("button", { class: "btn" }, [UI.svg("DocumentChecked"), "保存修正"]);
+    saveBtn.addEventListener("click", async () => {
+      if (saveBtn.disabled) return;
+      saveBtn.disabled = true;
+      try {
+        // Empty or non-numeric score means "leave unchanged": an empty
+        // string must not become Number("") === 0, which would silently
+        // reset the score and demote the cluster out of the profile.
+        const body = { canonical_statement: stmt.value };
+        // Submit a status only when the user actually changed it. Echoing
+        // the status captured when the dialog opened would, if the merge
+        // pipeline promoted the cluster meanwhile, write that stale value
+        // back as a real transition and drop the profile projection.
+        if (status.value !== c.status) body.status = status.value;
+        const rawScore = score.value.trim();
+        const parsedScore = Number(rawScore);
+        if (rawScore !== "" && !Number.isNaN(parsedScore)) body.score = parsedScore;
+        await UI.api(`/clusters/${c.id}`, {
+          method: "PUT",
+          body: JSON.stringify(body),
+        });
+        UI.toast("簇已修正", "ok");
+        closeM();
+        refresh();
+      } catch (e) { UI.toast("修正失败：" + e.message, "err"); }
+      finally { saveBtn.disabled = false; }
+    });
     const closeM = UI.modal(`修正簇 #${c.id}（用户 ${c.user_id}）`, [
       this.el("div", { class: "cfg-field" }, [this.el("label", {}, ["规范陈述（改陈述会重置向量待重算）"]), stmt]),
       this.el("div", { class: "cfg-field" }, [this.el("label", {}, [scoreHint]), score]),
       this.el("div", { class: "cfg-field" }, [this.el("label", {}, ["状态（切出 profiled 会同步移除画像投影）"]), status]),
       this.el("p", { class: "muted" }, [`证据键：${(c.evidence_keys || []).join("、") || "无"}`]),
     ], [
-      this.el("button", {
-        class: "btn",
-        onclick: async () => {
-          try {
-            // Empty or non-numeric score means "leave unchanged": an empty
-            // string must not become Number("") === 0, which would silently
-            // reset the score and demote the cluster out of the profile.
-            const body = { canonical_statement: stmt.value };
-            // Submit a status only when the user actually changed it. Echoing
-            // the status captured when the dialog opened would, if the merge
-            // pipeline promoted the cluster meanwhile, write that stale value
-            // back as a real transition and drop the profile projection.
-            if (status.value !== c.status) body.status = status.value;
-            const rawScore = score.value.trim();
-            const parsedScore = Number(rawScore);
-            if (rawScore !== "" && !Number.isNaN(parsedScore)) body.score = parsedScore;
-            await UI.api(`/clusters/${c.id}`, {
-              method: "PUT",
-              body: JSON.stringify(body),
-            });
-            UI.toast("簇已修正", "ok");
-            closeM();
-            refresh();
-          } catch (e) { UI.toast("修正失败：" + e.message, "err"); }
-        },
-      }, [UI.svg("DocumentChecked"), "保存修正"]),
+      saveBtn,
     ]);
   },
 
@@ -1268,6 +1273,10 @@ const Page = {
       this.el("div", { class: "num" }, [String(num)]),
     ]);
     const bfStatus = this.el("div", { class: "muted", style: "font-size:12px" });
+    // Shown only after the status probe gives up: an explicit re-probe instead
+    // of re-enabling start buttons whose last known state may still be
+    // "running" (a second start then only produces a misleading failure).
+    const bfRetry = this.el("button", { class: "btn small ghost", style: "display:none" }, ["重试状态"]);
     const bfBar = this.el("div", { class: "bf-progress", style: "display:none" }, [
       this.el("i", { style: "width:0%" }),
     ]);
@@ -1285,6 +1294,13 @@ const Page = {
     };
     bfBtn.addEventListener("click", () => startBackfill(false));
     bfFullBtn.addEventListener("click", () => startBackfill(true));
+    bfRetry.addEventListener("click", () => {
+      // Re-probe only: the start buttons stay disabled until the status
+      // response confirms the worker is idle.
+      bfRetry.style.display = "none";
+      pollFails = 0;
+      pollBackfill();
+    });
     const reload = async () => {
       el.innerHTML = "";
       try {
@@ -1311,19 +1327,24 @@ const Page = {
       catch (e) {
         // Transient failures keep polling (a single 401/500 used to kill the
         // poller forever with a frozen progress bar and disabled buttons);
-        // give up after 5 consecutive failures with the reason surfaced and
-        // the controls restored, otherwise the buttons stay dead forever.
+        // give up after 5 consecutive failures. The last known state may
+        // still be "running", so the start buttons stay disabled -- enabling
+        // them here would invite a second start that the server can only
+        // reject ("回填启动失败"), which misreads as a real failure. An
+        // explicit re-probe restores the controls once the state is known.
         if (++pollFails >= 5) {
-          bfStatus.textContent = "回填状态获取失败：" + e.message;
-          bfBtn.disabled = !d.backfill_available;
-          bfFullBtn.disabled = !d.backfill_available;
+          bfStatus.textContent = "回填状态获取失败：" + e.message + "（已暂停状态轮询）";
+          bfBtn.disabled = true;
+          bfFullBtn.disabled = true;
           bfBar.style.display = "none";
+          bfRetry.style.display = "";
           return;
         }
         pollTimer = setTimeout(pollBackfill, 3000);
         return;
       }
       pollFails = 0;
+      bfRetry.style.display = "none";
       if (!bfStatus.isConnected) return; // tab switched away, stop polling
       if (seenFinished === null) {
         // Both sides of this comparison are server timestamps: finished_at
@@ -1378,7 +1399,7 @@ const Page = {
         stat(d.stats.edges_superseded, "superseded（墓碑，不注入）"),
       ]),
       this.el("div", { style: "height:10px" }),
-      this.el("div", { class: "graph-bf-row" }, [bfBtn, bfFullBtn, bfStatus]),
+      this.el("div", { class: "graph-bf-row" }, [bfBtn, bfFullBtn, bfStatus, bfRetry]),
       bfBar,
     ]));
     if (!d.stats.edges) {
@@ -1640,21 +1661,25 @@ const Page = {
 
   editSummary(s, refresh) {
     const ta = this.el("textarea", { class: "code", style: "min-height:180px" }, [s.content]);
+    // In-flight guard (same pattern as editCluster): no duplicate PUT on a
+    // double click, and a failed request restores the button.
+    const saveBtn = this.el("button", { class: "btn" }, [UI.svg("DocumentChecked"), "保存修正"]);
+    saveBtn.addEventListener("click", async () => {
+      if (saveBtn.disabled) return;
+      saveBtn.disabled = true;
+      try {
+        await UI.api(`/summaries/${s.id}`, { method: "PUT", body: JSON.stringify({ content: ta.value }) });
+        UI.toast("摘要已修正，向量待重算", "ok");
+        closeM();
+        refresh();
+      } catch (e) { UI.toast("修正失败：" + e.message, "err"); }
+      finally { saveBtn.disabled = false; }
+    });
     const closeM = UI.modal(`修正摘要 #${s.id}`, [
       this.el("p", { class: "muted" }, ["修改内容会把向量置空，由补算任务自动重算（约 5 分钟内生效）。"]),
       ta,
     ], [
-      this.el("button", {
-        class: "btn",
-        onclick: async () => {
-          try {
-            await UI.api(`/summaries/${s.id}`, { method: "PUT", body: JSON.stringify({ content: ta.value }) });
-            UI.toast("摘要已修正，向量待重算", "ok");
-            closeM();
-            refresh();
-          } catch (e) { UI.toast("修正失败：" + e.message, "err"); }
-        },
-      }, [UI.svg("DocumentChecked"), "保存修正"]),
+      saveBtn,
     ]);
   },
 
@@ -2096,8 +2121,17 @@ const Page = {
         saveBtn.disabled = true;
         try {
           const r = await UI.api("/config", { method: "PUT", body: JSON.stringify({ values: collect() }) });
-          if (!r.saved) { UI.toast("配置没有变化", ""); return; }
+          // A pre-existing (pre-validator) illegal cross-field combination is
+          // skipped for validation only; the stored values stay untouched.
+          // Explain it instead of letting the save look silently partial.
+          const legacyNote = () => {
+            if (r.legacy_fallback && r.legacy_fallback.length) {
+              UI.toast(`以下历史配置与当前跨字段校验冲突，本次保存已跳过（保持原值，运行时按启动回退默认值）：${r.legacy_fallback.join("、")}`, "err");
+            }
+          };
+          if (!r.saved) { UI.toast("配置没有变化", ""); legacyNote(); return; }
           UI.toast(`已保存 ${r.changes} 项配置`, "ok");
+          legacyNote();
           if (r.persistence_error) {
             // Applied live but failed to persist: reverts on restart, surface it
             UI.toast(`已热生效但落盘失败，重启后将回退：${r.persistence_error}`, "err");

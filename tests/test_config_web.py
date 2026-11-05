@@ -197,6 +197,65 @@ class TestPrepareSave(unittest.TestCase):
         r2 = prepare_save({"naming_promote_threshold": 4.5}, self.HOST)
         self.assertEqual(r2["changed"], {"naming_promote_threshold": 4.5})
 
+    def test_legacy_cross_field_conflict_does_not_block_unrelated_save(self):
+        # A stored combination that was legal before the naming x decay guard
+        # (3 * 0.9 = 2.7 < 3) must not block saving an unrelated field. The
+        # failing group is untouched by this save, so validation reuses the
+        # startup fallback defaults and nothing in that group is persisted.
+        host = {
+            "dsn": "postgres://u:p@h/db",
+            "naming_promote_threshold": 3.0,
+            "demote_threshold": 3.0,
+            "decay_factor": 0.9,
+        }
+        submitted = dict(host)
+        submitted["recall_top_k"] = 7
+        r = prepare_save(submitted, host)
+        self.assertEqual(r["changed"], {"recall_top_k": 7})
+        self.assertEqual(
+            r["legacy_fallback"],
+            ["decay_factor", "demote_threshold", "naming_promote_threshold"],
+        )
+        # Validation used startup-equivalent defaults; the host keeps its raw
+        # values because none of the group keys entered `changed`.
+        self.assertEqual(r["validated"].decay_factor, 0.9)
+        self.assertEqual(r["validated"].demote_threshold, 2.0)
+        self.assertEqual(r["validated"].naming_promote_threshold, 3.0)
+
+    def test_editing_the_conflicting_group_still_rejects(self):
+        # Same legacy host, but this save edits a group member and the
+        # resulting combination is still illegal: the constraint stays
+        # enforced (no blind relaxation) with the validator's explanation.
+        host = {
+            "dsn": "postgres://u:p@h/db",
+            "naming_promote_threshold": 3.0,
+            "demote_threshold": 3.0,
+            "decay_factor": 0.9,
+        }
+        with self.assertRaises(ValueError) as cm:
+            prepare_save({"decay_factor": 0.95, "recall_top_k": 7}, host)
+        self.assertIn("配置校验失败", str(cm.exception))
+
+    def test_legacy_derived_naming_conflict_does_not_block_unrelated_save(self):
+        # Derived naming threshold (None) with a legacy decay: 3 * 0.5 = 1.5
+        # < 2. The fallback group self-reported by the validator is
+        # (demote_threshold, score_start_high, decay_factor).
+        host = {
+            "dsn": "postgres://u:p@h/db",
+            "score_start_high": 3,
+            "demote_threshold": 2.0,
+            "decay_factor": 0.5,
+        }
+        submitted = dict(host)
+        submitted["recall_top_k"] = 7
+        r = prepare_save(submitted, host)
+        self.assertEqual(r["changed"], {"recall_top_k": 7})
+        self.assertEqual(
+            r["legacy_fallback"],
+            ["decay_factor", "demote_threshold", "score_start_high"],
+        )
+        self.assertEqual(r["validated"].decay_factor, 0.9)
+
     def test_clearing_optional_restores_lazy_derivation(self):
         # Explicit value -> clear (submitted null) must persist null, not the
         # derived number: the model resolves None to score_start_high at

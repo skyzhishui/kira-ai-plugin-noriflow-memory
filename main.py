@@ -5366,7 +5366,12 @@ class NoriflowMemoryPlugin(BasePlugin):
 
         changed = result["changed"]
         if not changed:
-            return {"saved": False, "changes": 0, "restart_required": []}
+            return {
+                "saved": False,
+                "changes": 0,
+                "restart_required": [],
+                "legacy_fallback": result.get("legacy_fallback", []),
+            }
 
         # 1) Hot-update the runtime instance in place (kernel/merge_agent/
         #    encoder/circuit breaker share the reference, so it takes effect
@@ -5421,6 +5426,12 @@ class NoriflowMemoryPlugin(BasePlugin):
             "changes": len(changed),
             "restart_required": result["restart_required"],
         }
+        if result.get("legacy_fallback"):
+            # Pre-existing (pre-validator) illegal combination: validation
+            # used startup-equivalent defaults and none of these keys were
+            # persisted. Reported so the WebUI can explain the save instead
+            # of silently hiding the stale stored values.
+            resp["legacy_fallback"] = result["legacy_fallback"]
         if persistence_error:
             resp["persistence_error"] = persistence_error
         return resp

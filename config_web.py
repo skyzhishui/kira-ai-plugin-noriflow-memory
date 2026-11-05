@@ -27,9 +27,10 @@ import re
 import types
 from typing import TYPE_CHECKING, Any, Literal, Union, get_args, get_origin
 
+from pydantic import ValidationError
 from pydantic_core import PydanticUndefined
 
-from .config import LocalMemoryConfig
+from .config import CROSS_FIELD_VALIDATED_KEYS, LocalMemoryConfig
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -298,11 +299,47 @@ def build_payload(host_values: dict) -> dict:
     }
 
 
+def _same_value(a: Any, b: Any) -> bool:
+    """Compare config values, treating int/float as equal by numeric value.
+
+    Used only to decide whether a field was touched by this save. A type
+    difference (e.g. a direct API caller submitting "3" for a numeric field)
+    is deliberately treated as "touched": the constraint stays enforced
+    instead of being relaxed on a guess.
+    """
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a is b or a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return float(a) == float(b)
+    return a == b
+
+
+def _cross_field_groups(exc: ValidationError) -> tuple[set[str], list[tuple[str, ...]]]:
+    """Split a ValidationError into field-level keys and cross-field groups.
+
+    Mirrors main._cross_field_fallback_keys: a CrossFieldConfigError raised by
+    a model validator self-reports the keys it governs (pydantic places the
+    exception instance in ctx["error"]). An error without declared keys falls
+    back to the defensive CROSS_FIELD_VALIDATED_KEYS table, exactly like the
+    startup fallback path.
+    """
+    field_bad: set[str] = set()
+    groups: list[tuple[str, ...]] = []
+    for err in exc.errors():
+        loc = err.get("loc") or ()
+        if loc:
+            field_bad.add(str(loc[0]))
+            continue
+        declared = getattr((err.get("ctx") or {}).get("error"), "keys", None)
+        groups.append(tuple(declared) if declared else ())
+    return field_bad, groups
+
+
 def prepare_save(submitted: dict, host_values: dict) -> dict:
     """Validate and diff submitted values.
 
     Returns:
-        {"merged", "validated", "changed", "restart_required"}.
+        {"merged", "validated", "changed", "restart_required", "legacy_fallback"}.
 
     Raises:
         ValueError: validation failed (message includes pydantic details).
@@ -337,10 +374,53 @@ def prepare_save(submitted: dict, host_values: dict) -> dict:
     # must not override host and runtime state)
     baseline = {k: f["default"] for k, f in schema.items()}
     baseline.update({k: v for k, v in host_values.items() if k in schema})
-    try:
-        validated = LocalMemoryConfig(**{**baseline, **merged})
-    except Exception as exc:
-        raise ValueError(f"配置校验失败：{exc}") from exc
+    input_values = {**baseline, **merged}
+    legacy_fallback: set[str] = set()
+    validated = None
+    # Round cap mirrors main._try_build_config: each round drops at least one
+    # group, so the input shrinks monotonically and the loop terminates.
+    for _ in range(6):
+        try:
+            validated = LocalMemoryConfig(**input_values)
+            break
+        except ValidationError as exc:
+            field_bad, groups = _cross_field_groups(exc)
+            if field_bad:
+                # Field-level violations are still pinpointed per field and
+                # rejected; only pre-existing cross-field conflicts may be
+                # tolerated (see below).
+                raise ValueError(f"配置校验失败：{exc}") from exc
+            group = next(
+                (set(g) for g in groups if g),
+                set(CROSS_FIELD_VALIDATED_KEYS) & set(input_values),
+            )
+            # Only a PRE-EXISTING conflict may be skipped: every key in the
+            # failing group must still carry its stored/default value. If the
+            # current save edits any key of the group, the full constraint is
+            # enforced (the validator message explains the illegal
+            # combination) -- constraints are never blindly relaxed.
+            touched = {
+                k for k in group
+                if not _same_value(merged.get(k, baseline.get(k)), baseline.get(k))
+            }
+            if touched or not group:
+                raise ValueError(f"配置校验失败：{exc}") from exc
+            # Reuse the startup fallback style (main._try_build_config): drop
+            # only the invalid legacy group so saving unrelated fields is not
+            # blocked by a combination that was legal before this validator
+            # existed. The keys are untouched by this save, so they stay out
+            # of ``changed`` and the host keeps its raw values; validation
+            # uses the same defaults the startup path would have applied.
+            for k in group:
+                input_values.pop(k, None)
+            # Report only keys the host actually stores: a default-valued
+            # member of the group was not a stored legacy value.
+            legacy_fallback |= {k for k in group if k in host_values}
+            continue
+        except Exception as exc:
+            raise ValueError(f"配置校验失败：{exc}") from exc
+    if validated is None:  # pragma: no cover - only reachable on loop exhaustion
+        raise ValueError("配置校验失败：跨字段校验未收敛")
 
     # Persist the VALIDATED value, not the raw submitted one: direct API
     # callers may submit strings for numeric fields; storing those would
@@ -362,6 +442,10 @@ def prepare_save(submitted: dict, host_values: dict) -> dict:
         "validated": validated,
         "changed": changed,
         "restart_required": sorted(k for k in changed if k in _RESTART_FIELDS),
+        # Legacy cross-field keys ignored for validation only (not persisted):
+        # the WebUI can explain why a save of unrelated fields succeeded while
+        # these stored values remain untouched.
+        "legacy_fallback": sorted(legacy_fallback),
     }
 
 

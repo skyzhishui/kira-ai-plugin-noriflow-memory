@@ -491,8 +491,8 @@ class MemoryBackend(ABC):
         user_keys / limit / max_age_days / current_platform /
         current_session_type (the last two scope the current-session
         exclusion: the bare session id is not unique across a DM and a group
-        chat); both backends also drop future-dated rows
-        (occurred_at <= now())."""
+        chat); both backends also drop future-dated rows using the same
+        application clock (bound upper bound, not the DB's now())."""
 
     @abstractmethod
     async def fetch_embeddings_by_ids(self, **kwargs) -> dict[int, object]:

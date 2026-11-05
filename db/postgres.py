@@ -25,7 +25,7 @@ semantics; this layer lets exceptions propagate unchanged.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import asyncpg
@@ -328,7 +328,19 @@ class MemoryDatabase(MemoryBackend):
                 degraded encode, excluded from recall until the merge
                 agent's catch-up pass re-encodes it back to true; bot_self
                 raw text is by-design and always passes true).
+
+        Future occurred_at is clamped to now before persistence (same
+        untrusted-time guard as insert_persona_fact_raw): the cross-session
+        and recent sections order by occurred_at first, so a future value
+        would pin itself to the top until wall time catches up. document_id
+        keeps the original input time (it is the idempotency key; rebasing
+        it on the clamped now would change the key across days and break
+        dedup).
         """
+        occurred_at = _ensure_tz(occurred_at)
+        now = datetime.now().astimezone()
+        if occurred_at > now:
+            occurred_at = now
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
@@ -347,7 +359,7 @@ class MemoryDatabase(MemoryBackend):
                 user_id,
                 participants,
                 content,
-                _ensure_tz(occurred_at),
+                occurred_at,
                 vector_literal(embedding),
                 summarized,
                 build_search_text(content),
@@ -902,13 +914,17 @@ class MemoryDatabase(MemoryBackend):
 
         Future-dated rows (clock skew / a bad upstream timestamp) are always
         dropped: occurred_at DESC would otherwise put them first, let them
-        eat top_k slots and inject "a summary from the future".
+        eat top_k slots and inject "a summary from the future". The upper
+        bound is the application clock (a bound parameter), not the DB's
+        now(), so the future guard and the age window share one clock domain
+        with the SQLite backend.
 
         Args:
             current_session_id: bare session id to exclude.
             user_keys: composite identity keys of the current user.
             limit: max rows (callers bound by cross_session_summary_top_k).
-            max_age_days: drop rows older than this (0 = unlimited).
+            max_age_days: drop rows older than this (0 = unlimited; the
+                cutoff is derived from the same application now).
             current_platform: platform tag of the current session (empty =
                 no platform scoping, legacy callers).
             current_session_type: "dm" / "gm" of the current session (any
@@ -925,6 +941,7 @@ class MemoryDatabase(MemoryBackend):
         ]
         if not keys:
             return []
+        now = _ensure_tz(datetime.now().astimezone())
         params: list[object] = [current_session_id, keys]
         excluded_sql = "session_id <> $1"
         if current_session_type in ("dm", "gm"):
@@ -940,20 +957,19 @@ class MemoryDatabase(MemoryBackend):
             excluded_sql = f"NOT (session_id = $1{plat_sql} AND {type_sql})"
         age_sql = ""
         if int(max_age_days) > 0:
-            params.append(int(max_age_days))
-            age_sql = (
-                " AND occurred_at >= now() - "
-                f"make_interval(days => ${len(params)})"
-            )
+            params.append(now - timedelta(days=int(max_age_days)))
+            age_sql = f" AND occurred_at >= ${len(params)}"
+        params.append(now)
+        now_ph = f"${len(params)}"
         params.append(int(limit))
         limit_ph = f"${len(params)}"
         sql = (
             f"SELECT document_id, session_id, content, occurred_at "
             f"FROM {CHAT_SUMMARY_TABLE} "  # noqa: S608 -- whitelist constant table names
             "WHERE summarized AND kind = 'chat_summary' AND NOT archived "
-            f"AND {excluded_sql} AND participants && $2 "
-            "AND occurred_at <= now()"
-            f"{age_sql} ORDER BY occurred_at DESC, id DESC LIMIT {limit_ph}"
+            f"AND {excluded_sql} AND participants && $2"
+            f"{age_sql} AND occurred_at <= {now_ph}"
+            f" ORDER BY occurred_at DESC, id DESC LIMIT {limit_ph}"
         )
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)

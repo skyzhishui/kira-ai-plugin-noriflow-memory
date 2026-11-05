@@ -1285,6 +1285,72 @@ async def main_async() -> None:
         f"pg={pg_ts} sqlite={sqlite_ts}",
     )
 
+    # ---- review regression: chat summary occurred_at clamped the same way
+    # (future rows would otherwise pin the cross-session/recent sections) ----
+    future_summary_doc = "10086-futuresummary"
+    await db.insert_chat_summary(
+        document_id=future_summary_doc, kind="chat_summary", platform="qq",
+        session_id="10086", group_id="", user_id="u1",
+        participants=["qq:u1"], content="未来的摘要",
+        occurred_at=future, summarized=True, embedding=None,
+    )
+    async with db.pool.acquire() as conn:
+        srow = await conn.fetchrow(
+            "SELECT document_id, occurred_at FROM memory_chat_summary "
+            "WHERE document_id = $1",
+            future_summary_doc,
+        )
+    sqlite_summary_ts = db_pkg.sqlite_parse_ts(srow["occurred_at"])
+    check(
+        "future_summary_clamped_sqlite",
+        sqlite_summary_ts <= datetime.now(timezone.utc) + timedelta(seconds=5)
+        and srow["document_id"] == future_summary_doc,
+        str(dict(srow)),
+    )
+
+    # document_id stays the idempotency key (the clamp must not rebase it):
+    # a repeat insert with the same key is still a no-op.
+    await db.insert_chat_summary(
+        document_id=future_summary_doc, kind="chat_summary", platform="qq",
+        session_id="10086", group_id="", user_id="u1",
+        participants=["qq:u1"], content="未来的摘要（重复写入）",
+        occurred_at=future + timedelta(days=1), summarized=True, embedding=None,
+    )
+    async with db.pool.acquire() as conn:
+        dup = await conn.fetchrow(
+            "SELECT count(*) AS n FROM memory_chat_summary "
+            "WHERE document_id = $1",
+            future_summary_doc,
+        )
+    check(
+        "future_summary_idempotent_sqlite",
+        int(dup["n"]) == 1,
+        str(dict(dup)),
+    )
+
+    cap_conn2 = _CaptureConn()
+    pg2 = db_pkg.MemoryDatabase(LocalMemoryConfig(dsn="postgresql://stub"))
+    pg2._pool = _CapturePool(cap_conn2)
+    await pg2.insert_chat_summary(
+        document_id=future_summary_doc, kind="chat_summary", platform="qq",
+        session_id="10086", group_id="", user_id="u1",
+        participants=["qq:u1"], content="未来的摘要",
+        occurred_at=future, summarized=True, embedding=None,
+    )
+    _, sargs = cap_conn2.calls[-1]
+    pg_summary_ts = sargs[8]
+    check(
+        "future_summary_clamped_postgres",
+        pg_summary_ts <= datetime.now(timezone.utc) + timedelta(seconds=5)
+        and sargs[0] == future_summary_doc,
+        str(pg_summary_ts),
+    )
+    check(
+        "future_summary_clamp_backends_aligned",
+        abs((pg_summary_ts - sqlite_summary_ts).total_seconds()) < 5,
+        f"pg={pg_summary_ts} sqlite={sqlite_summary_ts}",
+    )
+
     await db.close()
 
     # ---- persistence: data survives close + reopen ----

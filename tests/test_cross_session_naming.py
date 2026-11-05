@@ -96,10 +96,18 @@ async def test_cross_session_pg_sql_shape() -> None:
         "NOT (session_id = $1 AND platform = $3 AND group_id = '')" in sql
     ), "排除当前会话须带 platform + 会话类型（裸 session_id 不唯一）"
     assert "participants && $2" in sql, "身份键数组重叠"
-    assert "occurred_at <= now()" in sql, "排除未来时间戳（否则 DESC 抢占 top_k）"
-    assert "occurred_at >= now() - make_interval(days => $4)" in sql, "陈旧窗口"
-    assert sql.rstrip().endswith("ORDER BY occurred_at DESC, id DESC LIMIT $5")
-    assert params == ("s1", ["qq:u1", "qq:u2"], "qq", 30, 2)
+    assert "occurred_at >= $4" in sql, "陈旧窗口（应用时钟绑定）"
+    assert "occurred_at <= $5" in sql, (
+        "排除未来时间戳（否则 DESC 抢占 top_k；上界须为应用时钟绑定，"
+        "与 SQLite 同钟域）"
+    )
+    assert "now()" not in sql, "PG 不得用 DB now()（跨后端时钟域分叉）"
+    assert sql.rstrip().endswith("ORDER BY occurred_at DESC, id DESC LIMIT $6")
+    sid, keys, plat, cutoff, now_bound, limit = params
+    assert (sid, keys, plat, limit) == ("s1", ["qq:u1", "qq:u2"], "qq", 2)
+    assert now_bound.tzinfo is not None, "上界须为 aware datetime"
+    assert abs((now_bound - datetime.now(timezone.utc)).total_seconds()) < 60
+    assert abs((now_bound - cutoff) - timedelta(days=30)) < timedelta(seconds=1)
 
     # Group-chat arm: the type discriminator flips (group_id <> '')
     conn_gm = _CaptureConn([])
@@ -115,8 +123,10 @@ async def test_cross_session_pg_sql_shape() -> None:
     assert (
         "NOT (session_id = $1 AND platform = $3 AND group_id <> '')" in sql_gm
     ), "群聊会话按 group_id <> '' 排除自身"
-    assert "occurred_at <= now()" in sql_gm, "未来时间戳上界与年龄窗口无关"
-    assert params_gm == ("s1", ["qq:u1"], "qq", 3)
+    assert "occurred_at <= $4" in sql_gm, "未来时间戳上界与年龄窗口无关"
+    assert "now()" not in sql_gm
+    assert params_gm[:3] == ("s1", ["qq:u1"], "qq")
+    assert params_gm[4] == 3
 
     # Empty-key filtering (None/blank never enter the array binding)
     conn2 = _CaptureConn([])
@@ -179,6 +189,16 @@ async def test_cross_session_sqlite_fetch() -> None:
                     session_id=sid, group_id=gid, user_id="u1",
                     participants=parts, content=f"摘要-{doc}",
                     occurred_at=occurred, summarized=True, embedding=None,
+                )
+            # The write path clamps future occurred_at (review fix), so force
+            # the stored value into the future after the fact to still
+            # exercise the query-side future guard.
+            async with db.pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE memory_chat_summary SET occurred_at = $2 "
+                    "WHERE document_id = $1",
+                    "d-future",
+                    _db_pkg.sqlite_format_ts(wall_now + timedelta(days=1)),
                 )
             rows = await db.fetch_recent_cross_session_summaries(
                 current_session_id="s1", user_keys=["qq:u1", "napcat:u1"],

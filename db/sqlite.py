@@ -478,8 +478,16 @@ class SQLiteMemoryDatabase(MemoryBackend):
 
         Syncs the FTS5 shadow table in the same transaction (BM25 leg);
         parameter semantics in the postgres namesake.
+
+        Future occurred_at is clamped to now before persistence (byte-for-
+        byte aligned with the PG backend); document_id keeps the original
+        input time (idempotency keys must not shift with the clamp).
         """
-        occurred = sqlite_format_ts(_ensure_tz(occurred_at))
+        occurred_at = _ensure_tz(occurred_at)
+        now = datetime.now().astimezone()
+        if occurred_at > now:
+            occurred_at = now
+        occurred = sqlite_format_ts(occurred_at)
         written = _now_ts()
         search_text = build_search_text(content)
         blob = _pack_vector(embedding, self._embedding_dims)
@@ -870,7 +878,7 @@ class SQLiteMemoryDatabase(MemoryBackend):
         share it), so the exclusion also pins platform + session type; the
         type comes from group_id, which the write side sets to session_id
         for a group chat and '' for a DM. Future-dated rows are always
-        dropped (occurred_at <= now()), as on PG.
+        dropped (occurred_at <= the application now), as on PG.
 
         Args:
             current_session_id: bare session id to exclude.
@@ -910,21 +918,21 @@ class SQLiteMemoryDatabase(MemoryBackend):
             excluded_sql = (
                 f"NOT (session_id = {sid_ph}{plat_sql} AND {type_sql})"
             )
-        now_ts = sqlite_format_ts(_ensure_tz(datetime.now(timezone.utc)))
+        now_dt = _ensure_tz(datetime.now(timezone.utc))
+        now_ts = sqlite_format_ts(now_dt)
         conds = [
             "summarized",
             "kind = 'chat_summary'",
             "NOT archived",
             excluded_sql,
             _overlap_cond(p, "participants", keys) or "0",
-            # Upper bound mirrors the PG side's occurred_at <= now(); the
-            # canonical UTC TEXT format keeps the comparison lexicographic
+            # Upper bound mirrors the PG side's occurred_at <= $now; the
+            # canonical UTC TEXT format keeps the comparison lexicographic.
+            # Both backends bind the application clock (no DB now()).
             f"occurred_at <= {p.add(now_ts)}",
         ]
         if int(max_age_days) > 0:
-            cutoff = datetime.now(timezone.utc) - timedelta(
-                days=int(max_age_days)
-            )
+            cutoff = now_dt - timedelta(days=int(max_age_days))
             conds.append(
                 f"occurred_at >= {p.add(sqlite_format_ts(_ensure_tz(cutoff)))}"
             )
