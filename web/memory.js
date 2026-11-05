@@ -1162,7 +1162,7 @@ const Page = {
               : [UI.badge(`画像 ${u.profiled}`, u.profiled ? "ok" : "gray"), " ",
                 UI.badge(`活跃 ${u.active}`, "sky"), " ",
                 u.pending ? UI.badge(`待定 ${u.pending}`, "warn") : null]),
-            this.el("td", {}, [UI.scoreBar(u.max_score)]),
+            this.el("td", {}, [u.max_score == null ? "—" : UI.scoreBar(u.max_score)]),
             this.el("td", {}, [UI.fmtTime(u.updated_at)]),
             this.el("td", {}, [
               this.el("button", {
