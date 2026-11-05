@@ -146,8 +146,9 @@ class LocalMemoryConfig(BaseModel):
         " score_start_high 派生——本人明确称呼要求（confidence=high，起步分"
         "即 score_start_high）单次即可晋档入画像，该承诺在任何评分刻度下按"
         "构造成立（缺省刻度下即 3.0）；显式设置时按本值生效（高于 "
-        "score_start_high 则退化为需二次证据累积，属合法保守配置），且不得"
-        "小于 demote_threshold（否则晋档后下一轮衰减即被降级）、不得大于 "
+        "score_start_high 则退化为需二次证据累积，属合法保守配置），且衰减后"
+        "（naming_promote_threshold × decay_factor）不得低于 demote_threshold"
+        "（否则晋档后下一轮衰减即被降级）、不得大于 "
         "score_cap（均装配期校验）",
     )
     naming_prompt_enabled: bool = Field(
@@ -557,15 +558,24 @@ class LocalMemoryConfig(BaseModel):
         naming threshold; the self-reported key fallback (both keys reset:
         3.0 / None -> derived 3.0) always converges.
 
-        Demotion-floor guard (review): the decay pass multiplies the score
-        by decay_factor (<= 1) and then demotes every profiled cluster below
-        demote_threshold. A naming threshold below demote_threshold therefore
-        promotes naming clusters that the very next decay pass demotes again
-        (profile churn, and a naming promise that silently drops out). The
-        guard self-reports the keys it governs: the explicit pair
-        (naming_promote_threshold, demote_threshold) or, when the threshold
-        is derived, (score_start_high, demote_threshold) -- resetting those
-        always converges (default score_start_high 3 > default demote 2).
+        Decay-scaled demotion-floor guard (review): the decay pass first
+        multiplies every non-recent score by decay_factor (<= 1) and only
+        then demotes profiled clusters below demote_threshold. The score a
+        naming cluster is promoted with is exactly its threshold (a cluster
+        created or promoted at the threshold can sit right on it), so the
+        value the next decay pass compares is ``threshold * decay_factor``,
+        not the threshold itself. Requiring ``threshold >= demote`` is
+        therefore not enough: equality still decays below the demotion line
+        whenever decay_factor < 1 (the default 0.9 included), and anchors
+        (anchor_profile_size) only protect the top N rows of the dimension.
+        The guard validates the post-decay floor instead:
+        ``threshold * decay_factor >= demote_threshold``.
+
+        The guard self-reports the keys it governs: the explicit group
+        (naming_promote_threshold, demote_threshold, decay_factor) or, when
+        the threshold is derived, (score_start_high, demote_threshold,
+        decay_factor) -- resetting those always converges (default
+        3 * 0.9 = 2.7 >= default demote 2).
         """
         derived = self.naming_promote_threshold is None
         if derived:
@@ -577,17 +587,23 @@ class LocalMemoryConfig(BaseModel):
                     ("naming_promote_threshold", "score_start_high"),
                 )
             self.naming_promote_threshold = float(self.score_start_high)
-        if self.naming_promote_threshold + 1e-9 < self.demote_threshold:
+        decayed_floor = self.naming_promote_threshold * self.decay_factor
+        if decayed_floor + 1e-9 < self.demote_threshold:
             raise CrossFieldConfigError(
-                f"naming_promote_threshold ({self.naming_promote_threshold}) 不得小于 "
+                f"naming_promote_threshold ({self.naming_promote_threshold}) × "
+                f"decay_factor ({self.decay_factor}) = {decayed_floor} 不得小于 "
                 f"demote_threshold ({self.demote_threshold})：衰减遍先按 "
-                f"decay_factor 衰减再按 demote_threshold 降级，低于降级线的 "
-                "naming 簇晋档后会在下一轮衰减遍被立即降级删除（画像反复抖动，"
+                f"decay_factor 衰减再按 demote_threshold 降级，衰减后低于降级线"
+                "的 naming 簇晋档后会在下一轮衰减遍被立即降级删除（画像反复抖动，"
                 "称呼承诺静默丢失）",
                 (
-                    ("demote_threshold", "score_start_high")
+                    ("demote_threshold", "score_start_high", "decay_factor")
                     if derived
-                    else ("naming_promote_threshold", "demote_threshold")
+                    else (
+                        "naming_promote_threshold",
+                        "demote_threshold",
+                        "decay_factor",
+                    )
                 ),
             )
         return self

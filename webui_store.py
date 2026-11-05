@@ -779,6 +779,9 @@ async def fetch_relation_graph(backend, bot_user_id: str = "") -> dict:
                 "last_seen": _dt(e["last_seen"]),
                 "occurred_at": _dt(e["occurred_at"]),
                 "supersede_reason": e.get("supersede_reason") or "",
+                # Timestamp of the tombstone (empty when the edge never was
+                # superseded); the graph detail pane appends it to the reason.
+                "superseded_at": _dt(e.get("superseded_at")),
             }
             for e in edges
         ],

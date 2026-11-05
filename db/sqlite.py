@@ -2585,7 +2585,9 @@ class SQLiteMemoryDatabase(MemoryBackend):
         statement, preferring non-null / latest occurred_at), then
         row_number truncates -- a statement present on several linked
         accounts must not consume several slots and push an older distinct
-        event out of the section."""
+        event out of the section. Ranking uses the MAX score of the
+        statement's duplicate group (the representative is the latest copy,
+        which may be the lower-scored one), matching the PG version."""
         pairs = list(zip(platforms, user_ids))
         async with self.pool.acquire() as conn:
             if not pairs:
@@ -2603,13 +2605,16 @@ class SQLiteMemoryDatabase(MemoryBackend):
                                ORDER BY CASE WHEN category = 'recent'
                                         THEN sort_ts
                                    END DESC NULLS LAST,
-                                        score DESC, updated_at DESC, id ASC
+                                        best_score DESC, updated_at DESC, id ASC
                            ) AS rn
                     FROM (
                         SELECT m.category, m.statement,
                                c.occurred_at AS occurred_at,
                                COALESCE(c.occurred_at, m.updated_at) AS sort_ts,
                                m.score, m.updated_at, m.id,
+                               max(m.score) OVER (
+                                   PARTITION BY m.category, m.statement
+                               ) AS best_score,
                                row_number() OVER (
                                    PARTITION BY m.category, m.statement
                                    ORDER BY (c.occurred_at IS NULL),

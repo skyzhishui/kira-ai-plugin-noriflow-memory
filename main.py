@@ -1575,9 +1575,16 @@ class NoriflowMemoryPlugin(BasePlugin):
         # session keep independent exclusions instead of clearing each
         # other's before recall consumes them. Missing id (older hosts/test
         # events) falls back to the legacy per-session memo.
+        # platform + session_type join the memo key: a bare session_id is not
+        # unique across adapters or between a DM and a group chat, so
+        # contexts sharing it must keep independent exclusions.
         turn_id = str(getattr(event, "event_id", "") or "")
+        session_type = str(getattr(session, "session_type", "") or "")
         if hasattr(kernel, "refresh_cross_session_memo"):
-            kernel.refresh_cross_session_memo(session.session_id, [], turn_id)
+            kernel.refresh_cross_session_memo(
+                session.session_id, [], turn_id,
+                platform=platform, session_type=session_type,
+            )
         # Whitelist (== "dm") rather than blacklist (!= "gm"): cross-session
         # summaries are a privacy-sensitive injection (the user's own other
         # sessions). The host contract currently has only {dm, gm} (enforced
@@ -1647,7 +1654,8 @@ class NoriflowMemoryPlugin(BasePlugin):
                         # one turn of lag) -- so there is no blind-spot window
                         # unique to this path.
                         kernel.refresh_cross_session_memo(
-                            session.session_id, cs_injected_ids, turn_id
+                            session.session_id, cs_injected_ids, turn_id,
+                            platform=platform, session_type=session_type,
                         )
 
         if self._config.recent_rollout_enabled:
@@ -1725,6 +1733,7 @@ class NoriflowMemoryPlugin(BasePlugin):
                     hints=hints,
                     cross_session=not self._config.summary_recall_session_scoped,
                     turn_id=turn_id,
+                    session_type=session_type,
                 )
             except Exception:
                 logger.warning("记忆检索失败（不阻断本轮）", exc_info=True)
@@ -3935,6 +3944,15 @@ class NoriflowMemoryPlugin(BasePlugin):
         # turn's prompt from the tool's own search (concurrent rounds of the
         # same session stay isolated).
         turn_id = str(getattr(event, "event_id", "") or "")
+        # Triggering event context for the exclusion memo: platform +
+        # session_type are part of the cross-session memo key (a bare
+        # session_id is not unique across adapters / DM-vs-group), so the
+        # tool must look the memo up under the same context that
+        # inject_memory registered it with.
+        event_sid, _, event_plat = self._event_scope(event)
+        event_session_type = str(
+            getattr(getattr(event, "session", None), "session_type", "") or ""
+        )
         if self._tool_scope_lock_enabled():
             # Scope lock: ignore the session_id/user_id explicitly passed by
             # the LLM and pin to the triggering session/trigger user -
@@ -4000,10 +4018,22 @@ class NoriflowMemoryPlugin(BasePlugin):
                     entity_user_keys=entity_keys or None,
                     entity_user_ids=entity_uids or None,
                     turn_id=turn_id,
+                    session_type=event_session_type,
+                    memo_platform=event_plat,
                 )
             elif uid:
+                # User-scope recall keeps its owner-only filter (no platform
+                # parameter: that would widen the participant key group), but
+                # still passes the triggering session + turn + context so
+                # this turn's already-injected summaries are excluded from
+                # the tool results. session_id is ignored by scope=user
+                # filtering, so this only feeds the exclusion memo.
                 items = await kernel.search(
                     query=query, top_k=top_k, user_id=uid, scope="user",
+                    session_id=event_sid or sid,
+                    turn_id=turn_id,
+                    session_type=event_session_type,
+                    memo_platform=event_plat,
                 )
             else:
                 return "需要提供 session_id 或 user_id 之一（当前会话 ID 见上下文）"

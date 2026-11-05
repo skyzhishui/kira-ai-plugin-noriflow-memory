@@ -251,7 +251,7 @@ body > header, body > main, body > footer { position: relative; z-index: 1; }
   background:
     repeating-linear-gradient(0deg, var(--scan) 0 1px, transparent 1px 4px) padding-box,
     linear-gradient(180deg, var(--card-sheen), transparent 46%) padding-box,
-    var(--card-fill) padding-box,
+    linear-gradient(var(--card-fill), var(--card-fill)) padding-box,
     var(--card-border) border-box;
   box-shadow: 0 18px 46px var(--shadow-deep), inset 0 1px 0 var(--card-sheen);
   backdrop-filter: blur(14px) saturate(1.2);
@@ -487,7 +487,7 @@ html[data-theme="dark"] .hero-title {
   background:
     repeating-linear-gradient(0deg, var(--scan) 0 1px, transparent 1px 4px) padding-box,
     linear-gradient(180deg, var(--card-sheen), transparent 42%) padding-box,
-    var(--card-fill) padding-box,
+    linear-gradient(var(--card-fill), var(--card-fill)) padding-box,
     var(--card-border) border-box;
   box-shadow: 0 16px 40px var(--shadow-deep), inset 0 1px 0 var(--card-sheen);
   backdrop-filter: blur(13px) saturate(1.18);
@@ -945,7 +945,7 @@ html[data-theme="dark"] #modal-root { background: rgba(3, 6, 16, 0.6); }
   border-radius: 18px;
   background:
     linear-gradient(180deg, var(--card-sheen), transparent 40%) padding-box,
-    var(--card-fill) padding-box,
+    linear-gradient(var(--card-fill), var(--card-fill)) padding-box,
     var(--card-border) border-box;
   box-shadow: 0 30px 70px var(--shadow-deep), 0 0 40px var(--card-glow), inset 0 1px 0 var(--card-sheen);
   backdrop-filter: blur(16px) saturate(1.2);
@@ -1069,7 +1069,7 @@ html[data-theme="light"] .modal {
 }
 .fg-dim { opacity: 0.12; }
 .fg-node.sel circle { stroke: var(--sky-dark); stroke-width: 4; }
-.fg-edge.sel line { stroke: var(--sky-dark); stroke-opacity: 1; stroke-width: 2.6; }
+.fg-edge.sel line:not(.hit) { stroke: var(--sky-dark); stroke-opacity: 1; stroke-width: 2.6; }
 .fg-edge.sel text { fill: var(--ink); font-weight: 700; }
 
 .graph-legend {

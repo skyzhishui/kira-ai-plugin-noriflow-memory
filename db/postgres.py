@@ -2883,6 +2883,14 @@ class MemoryDatabase(MemoryBackend):
         present on several linked accounts consume several slots and push an
         older distinct event out of the section entirely.
 
+        Ranking of the deduped row uses the MAX score of the statement's
+        duplicate group, not the representative row's score: the
+        representative is chosen by newest occurred_at, so a newer but
+        lower-scored copy would otherwise demote the whole statement below
+        less relevant distinct rows and push it out of the per-section cap.
+        The representative row (and its occurred_at, the displayed time)
+        still comes from the latest copy.
+
         Args:
             platforms: platform tag array (paired 1:1 with user_ids).
             user_ids: user id array.
@@ -2902,13 +2910,16 @@ class MemoryDatabase(MemoryBackend):
                                ORDER BY CASE WHEN category = 'recent'
                                         THEN sort_ts
                                    END DESC NULLS LAST,
-                                        score DESC, updated_at DESC, id ASC
+                                        best_score DESC, updated_at DESC, id ASC
                            ) AS rn
                     FROM (
                         SELECT m.category, m.statement,
                                c.occurred_at AS occurred_at,
                                COALESCE(c.occurred_at, m.updated_at) AS sort_ts,
                                m.score, m.updated_at, m.id,
+                               max(m.score) OVER (
+                                   PARTITION BY m.category, m.statement
+                               ) AS best_score,
                                row_number() OVER (
                                    PARTITION BY m.category, m.statement
                                    ORDER BY (c.occurred_at IS NULL),

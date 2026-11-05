@@ -561,7 +561,12 @@ class TestHysteresisBandValidation(unittest.TestCase):
     def test_02_band_equal_to_one_evidence_is_accepted(self):
         # band == increment (6/3): a demoted cluster caps at
         # 2.999+3=5.999 < 6, so one piece of evidence cannot promote back
-        cfg = self.LocalMemoryConfig(promote_threshold=6.0, demote_threshold=3.0)
+        # decay_factor=1.0 keeps the default-derived naming threshold (3.0)
+        # above the decay-scaled demote floor (3.0 * 1.0 >= 3.0); the naming
+        # guard is orthogonal to the hysteresis band under test here.
+        cfg = self.LocalMemoryConfig(
+            promote_threshold=6.0, demote_threshold=3.0, decay_factor=1.0
+        )
         self.assertEqual(cfg.promote_threshold - cfg.demote_threshold, 3.0)
 
     def test_03_band_below_one_evidence_is_rejected(self):
@@ -621,11 +626,12 @@ class TestHysteresisBandValidation(unittest.TestCase):
     def test_10_pool_invalid_keeps_valid_explicit_scoring(self):
         # Review scenario: invalid pool bounds must not drag down legal,
         # deliberately-tuned explicit scoring config
-        # (promote=8/demote=3 band=5 >= 3 is legal) -- fall back exactly
-        # the group the validator self-reports
+        # (promote=8/demote=3 band=5 >= 3 is legal; decay_factor=1.0 keeps
+        # the derived naming threshold 3.0 on the decay-scaled demote floor)
         cfg = mod._try_build_config({
             "pool_min": 9, "pool_max": 6,
             "promote_threshold": 8.0, "demote_threshold": 3.0,
+            "decay_factor": 1.0,
             "recall_top_k": 7,
         })
         self.assertEqual(cfg.pool_min, 2)
@@ -709,9 +715,9 @@ class TestHysteresisBandValidation(unittest.TestCase):
         self.assertEqual(6.1 - 3.1, 2.9999999999999996)
         cfg = self.LocalMemoryConfig(
             promote_threshold=6.1, demote_threshold=3.1,
-            # Keep naming >= demote (the derived default 3.0 would trip the
-            # new demotion-floor guard; equality is allowed)
-            naming_promote_threshold=3.1,
+            # Keep naming above the decay-scaled demote floor: 3.5 * 0.9 =
+            # 3.15 >= 3.1 (the band assertion below is what is under test)
+            naming_promote_threshold=3.5,
         )
         self.assertEqual(cfg.promote_threshold, 6.1)
 
@@ -804,13 +810,29 @@ class TestHysteresisBandValidation(unittest.TestCase):
             self.LocalMemoryConfig(
                 score_start_high=1, demote_threshold=2.0,
             )
-        # Equality is allowed (decay_factor=1 or sticky evidence can keep
-        # it above the line); only a strictly lower threshold is rejected
+        # Equality no longer suffices while decay_factor < 1: the promoted
+        # cluster sits exactly on the threshold, the next decay pass scales
+        # it to 3.0 * 0.9 = 2.7 < demote 3.0 and demotes it.
+        with self.assertRaises(Exception) as ctx_eq:
+            self.LocalMemoryConfig(
+                promote_threshold=6.0, demote_threshold=3.0,
+                score_start_high=3, naming_promote_threshold=3.0,
+            )
+        self.assertIn("decay_factor", str(ctx_eq.exception))
+        # Equality is legal only when the post-decay floor is met: no decay
+        # (decay_factor=1) keeps threshold == demote above the line ...
         cfg = self.LocalMemoryConfig(
-            promote_threshold=6.0, demote_threshold=3.0,
+            promote_threshold=6.0, demote_threshold=3.0, decay_factor=1.0,
             score_start_high=3, naming_promote_threshold=3.0,
         )
         self.assertEqual(cfg.naming_promote_threshold, 3.0)
+        # ... and under the default 0.9 decay the threshold must clear
+        # demote / decay (3.4 * 0.9 = 3.06 >= 3.0)
+        cfg2 = self.LocalMemoryConfig(
+            promote_threshold=6.0, demote_threshold=3.0,
+            score_start_high=3, naming_promote_threshold=3.4,
+        )
+        self.assertEqual(cfg2.naming_promote_threshold, 3.4)
 
     def test_17_promote_equal_to_cap_is_accepted(self):
         # Equality is allowed: the score can reach the cap via
@@ -1453,6 +1475,11 @@ class TestPersonaService(unittest.TestCase):
                 multi_sql.index("WHERE dup_rn = 1"),
                 multi_sql.index("WHERE rn <= "),
             )
+            # Ranking uses the statement group's max score (the deduped
+            # representative is chosen by latest occurred_at and may carry a
+            # lower score), not the representative row's own score
+            self.assertIn("max(m.score) OVER (", multi_sql)
+            self.assertIn("best_score DESC", multi_sql)
 
     def test_29c_recent_and_uncertain_time_labels(self):
         # Time-sensitive sections (recent updates / unverified notes)
@@ -2525,9 +2552,13 @@ class TestPluginInjection(unittest.TestCase):
                 return list(rows)
 
             def refresh_cross_session_memo(
-                self, session_id, document_ids, turn_id=""
+                self, session_id, document_ids, turn_id="",
+                platform="", session_type="",
             ):
-                calls.append((session_id, list(document_ids), turn_id))
+                calls.append((
+                    session_id, list(document_ids), turn_id,
+                    platform, session_type,
+                ))
 
             async def build_injection_text(self, **kwargs):
                 return ""
@@ -2569,8 +2600,11 @@ class TestPluginInjection(unittest.TestCase):
         self.assertIn("爬山计划", block.content)
         self.assertIn("露营", block.content)
         # Entry clear + post-injection registration, both scoped to the turn
-        self.assertEqual(calls[0], ("10086", [], "ev-dm-1"))
-        self.assertEqual(calls[1], ("10086", ["cs-1", "cs-2"], "ev-dm-1"))
+        # and to the (platform, session_type) context of the triggering event
+        self.assertEqual(calls[0], ("10086", [], "ev-dm-1", "napcat", "dm"))
+        self.assertEqual(
+            calls[1], ("10086", ["cs-1", "cs-2"], "ev-dm-1", "napcat", "dm")
+        )
         self.assertEqual(kernel.fetch_kwargs["current_session_type"], "dm")
 
 
@@ -2642,9 +2676,21 @@ class TestPluginTools(unittest.TestCase):
         inst = self._inst(extra_cfg={"tool_scope_locked": False})
         captured = {}
         inst._memory_kernel = self._scope_kernel(captured)
-        asyncio.run(inst.memory_search(self._tool_event(), query="猫", user_id="u9"))
+        event = self._tool_event()
+        event.event_id = "ev-user-scope"
+        asyncio.run(inst.memory_search(event, query="猫", user_id="u9"))
         self.assertEqual(captured.get("scope"), "user")
         self.assertEqual(captured.get("user_id"), "u9")
+        # The user-scope branch must still carry this turn's exclusion
+        # context: without session_id + turn_id the already-injected
+        # cross-session summaries would reappear in the tool result.
+        self.assertEqual(captured.get("session_id"), "napcat:dm:9900000002")
+        self.assertEqual(captured.get("turn_id"), "ev-user-scope")
+        self.assertEqual(captured.get("session_type"), "dm")
+        self.assertEqual(captured.get("memo_platform"), "napcat")
+        # The user filter itself stays owner-only: no platform argument is
+        # passed into the search filter (only into the memo context)
+        self.assertNotIn("platform", captured)
 
     def test_53d2_explicit_scope_overridden_when_locked(self):
         # Lock on (default): explicit session_id/user_id are ignored and

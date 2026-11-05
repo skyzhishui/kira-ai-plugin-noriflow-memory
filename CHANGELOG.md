@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.18.8 (2026-11-05)
+
+PR #9 CodeRabbit 第三轮评审修复：20 条行内反馈、1 条 body-only 反馈，以及上一轮确认遗漏的 3 项。
+
+### fix: 后端与数据一致性
+
+- naming 阈值校验改为 `naming_promote_threshold * decay_factor >= demote_threshold`，与实际衰减顺序一致；同步更新 schema 提示；
+- 多账号画像去重排序纳入分组最高分，PG/SQLite 保持一致；
+- 用户 scope 查询补齐 `session_id + turn_id`；跨会话 memo 键加入 platform、session type，并保护执行中的轮次不被容量清理；
+- 用户列表纳入只有原始事实、尚未成簇的用户；关系图数据补齐 `superseded_at`；
+- 补充配置、memo、画像排序、raw-only 用户和关系图字段回归测试。
+
+### fix: WebUI 与可访问性
+
+- 大图斥力改为空间网格近似，避免 stride 采样遗漏节点；SVG 卸载后停止残留 rAF；簇列表增加请求序号守卫；
+- 弹窗增加焦点陷阱、背景 inert、关闭后焦点恢复；画像行、关系行、图节点和边支持键盘操作；图谱平移改用 `getScreenCTM().inverse()`；
+- 修复簇修正保存时 status 被旧值回写、分类筛选缺少 preference/commitment、评分提示阈值写死、图标按钮缺少 aria-label 等问题；
+- 图谱加载失败显示重试入口，补编码轮询首次基线与连续失败恢复，使用服务端 `Date` 消除 finished_at 时钟偏差，并显示边降级时间；
+- 支持运行中动态切换 reduced-motion；修复卡片/横幅/弹窗多层背景语法和关系图命中线样式；
+- raw-only 用户显示“未成簇”，用户列表标题改为“有记忆用户”。
+
+Docstring Coverage 门禁在本地无对应配置/工具，无法复现；本轮新增公共接口未引入无意义文档占位，保留现状并记录待 CI 反馈。
+
 ## v1.18.7 (2026-11-05)
 
 PR #9 CodeRabbit 第二轮评审（16 行内 + 2 follow-up + 4 nitpick）修复：后端 7 项、WebUI JS 9 项、

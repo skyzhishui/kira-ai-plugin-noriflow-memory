@@ -345,12 +345,18 @@ class LocalMemoryKernel:
         # it; the TTL covers one pipeline round
         self._rollout_memo: dict[str, tuple[list[str], float]] = {}
         # Cross-session injection dedup memo:
-        # {(session_id, turn_id): (injected document_ids, monotonic time)}
-        # Shares the retrieval exclusion channel with rolling fill-back. The
-        # turn_id half (host event id) isolates concurrent rounds of one
+        # {(platform, session_type, session_id, turn_id):
+        #      (injected document_ids, monotonic time)}
+        # Shares the retrieval exclusion channel with rolling fill-back.
+        # The turn_id half (host event id) isolates concurrent rounds of one
         # session: each round clears/registers only its own key, so round B
         # cannot wipe round A's exclusions before A's recall consumes them.
-        # Empty turn_id keeps the legacy per-session key.
+        # platform + session_type separate contexts that share a bare
+        # session_id (the host does not guarantee its uniqueness across
+        # platforms or between a DM and a group chat), so one context's
+        # entry clear/registration never leaks into another's recall.
+        # Empty context fields keep the legacy shared key for callers/tests
+        # that pass neither.
         self._cross_session_memo: dict[tuple, tuple[list[str], float]] = {}
         # Two-phase commit staging area (written by
         # build_recent_rollout_text, committed by commit_rollout_memo):
@@ -1117,6 +1123,8 @@ class LocalMemoryKernel:
         entity_user_keys: Optional[list[str]] = None,
         entity_user_ids: Optional[list[str]] = None,
         turn_id: str = "",
+        session_type: str = "",
+        memo_platform: str = "",
     ) -> list[MemoryItem]:
         """Search memory (vector + rerank pipeline).
 
@@ -1239,6 +1247,13 @@ class LocalMemoryKernel:
             entity_user_ids: Corresponding list of bare uids.
             turn_id: Turn identifier (host event id) scoping the injected-id
                 exclusion memo. Empty keeps the legacy per-session memo.
+            session_type: Session type (host session_type, e.g. dm/gm)
+                scoping the cross-session exclusion memo together with
+                platform (see _cross_session_memo_key).
+            memo_platform: Platform used only for the exclusion-memo key when
+                the caller cannot pass the filtering platform (scope=user
+                tool search keeps its legacy owner-only user filter); empty
+                falls back to platform.
 
         Returns:
             List of memory items (at most top_k rows; per_user mode at most
@@ -1334,7 +1349,10 @@ class LocalMemoryKernel:
                 hybrid=self.config.hybrid_search_enabled,
                 rrf_k=self.config.hybrid_rrf_k,
                 exclude_document_ids=self._injected_excluded_ids(
-                    session_id, turn_id
+                    session_id,
+                    turn_id,
+                    memo_platform or platform,
+                    session_type,
                 ),
                 with_embedding=(
                     self.config.dedup_similarity_threshold > 0
@@ -1681,6 +1699,7 @@ class LocalMemoryKernel:
         per_user: bool = False,
         hints: Optional[RecallHints] = None,
         turn_id: str = "",
+        session_type: str = "",
     ) -> str:
         started = time.perf_counter()
         try:
@@ -1698,6 +1717,7 @@ class LocalMemoryKernel:
                 per_user=per_user,
                 hints=hints,
                 turn_id=turn_id,
+                session_type=session_type,
             )
         finally:
             elapsed_ms = (time.perf_counter() - started) * 1000
@@ -1729,6 +1749,7 @@ class LocalMemoryKernel:
         per_user: bool = False,
         hints: Optional[RecallHints] = None,
         turn_id: str = "",
+        session_type: str = "",
     ) -> str:
         """Build the memory text to inject into the LLM.
 
@@ -1792,6 +1813,9 @@ class LocalMemoryKernel:
                 ask-about-others recall key group).
             turn_id: Turn identifier (host event id) scoping the injected-id
                 exclusion memo (see search).
+            session_type: Session type scoping the cross-session exclusion
+                memo (see search); pass the host session's session_type so
+                this recall matches the injection-registered entry.
         """
         # Asking-about-others recall keys: explicit hints win (adapter matched
         # the batch text); otherwise self-match once on the query (in-memory
@@ -1829,6 +1853,7 @@ class LocalMemoryKernel:
             entity_user_keys=entity_keys or None,
             entity_user_ids=entity_uids or None,
             turn_id=turn_id,
+            session_type=session_type,
         )
 
         # P3 edge injection (scenarios A/C): the relation statement-line
@@ -2247,6 +2272,11 @@ class LocalMemoryKernel:
     # memo capacity cap (expired entries are pruned beyond it; guards slow
     # accumulation over long runs)
     _ROLLOUT_MEMO_MAX_SESSIONS = 64
+    # Cross-session memo in-flight protection window: capacity pruning never
+    # evicts a round younger than this (its recall may still be pending);
+    # only rounds older than the window are capacity-eviction candidates.
+    # TTL (above) remains the hard lifetime bound.
+    _CROSS_SESSION_MEMO_INFLIGHT_SECONDS = 300.0
 
     def _rollout_excluded_ids(self, session_id: str) -> list[str] | None:
         """Get this session's already-injected rolling-fill-back block
@@ -2271,23 +2301,42 @@ class LocalMemoryKernel:
         return ids or None
 
     @staticmethod
-    def _cross_session_memo_key(session_id: str, turn_id: str = "") -> tuple:
-        """Memo key: (session_id, turn_id).
+    def _cross_session_memo_key(
+        session_id: str,
+        turn_id: str = "",
+        platform: str = "",
+        session_type: str = "",
+    ) -> tuple:
+        """Memo key: (platform, session_type, session_id, turn_id).
 
         A non-empty turn_id (the host event id) isolates one pipeline round;
         concurrent rounds of the same session therefore never clear or
-        replace each other's exclusions. Empty turn_id keeps the legacy
-        per-session key for callers/tests that do not pass one.
+        replace each other's exclusions. platform + session_type separate
+        contexts that share a bare session_id: the host does not guarantee
+        session_id uniqueness across adapters, and a DM with a user and a
+        group chat can carry the same id, so without them one context's
+        entry clear / registration would wipe another's exclusions and leak
+        rows into recall. Empty fields keep the legacy shared key for
+        callers/tests that pass none.
         """
-        return (session_id, turn_id or "")
+        return (platform or "", session_type or "", session_id, turn_id or "")
 
     def _prune_cross_session_memo(self) -> None:
-        """Drop expired entries, then hard-cap the newest entries.
+        """Drop expired entries, then cap only rounds that are no longer in
+        flight.
 
         Per-turn keys multiply across turns, so the TTL alone is not a hard
-        bound under sustained traffic: after the expiry sweep, keep only the
-        newest _ROLLOUT_MEMO_MAX_SESSIONS entries. Old rounds are long done
-        by then, so dropping their exclusions is safe.
+        bound under sustained traffic. A plain newest-N cap is not safe
+        either: a burst of N later rounds registering their ids before an
+        older round runs its recall would evict that older round's
+        exclusions, and its recall could re-return summaries already
+        injected into the prompt. Capacity pruning therefore only evicts
+        entries older than _CROSS_SESSION_MEMO_INFLIGHT_SECONDS (rounds
+        younger than that may still be executing); the TTL sweep still
+        removes everything eventually. Under an extreme burst the memo may
+        transiently exceed the cap by the number of rounds started within
+        the in-flight window -- bounded by traffic, and later pruned once
+        those rounds age out -- rather than dropping live exclusions.
         """
         now_m = time.monotonic()
         live = {
@@ -2296,11 +2345,24 @@ class LocalMemoryKernel:
             if now_m - value[1] <= self._ROLLOUT_MEMO_TTL_SECONDS
         }
         if len(live) > self._ROLLOUT_MEMO_MAX_SESSIONS:
-            live = dict(
-                sorted(
-                    live.items(), key=lambda kv: kv[1][1], reverse=True
-                )[: self._ROLLOUT_MEMO_MAX_SESSIONS]
+            protected = {
+                key: value
+                for key, value in live.items()
+                if now_m - value[1] <= self._CROSS_SESSION_MEMO_INFLIGHT_SECONDS
+            }
+            candidates = sorted(
+                (
+                    (key, value)
+                    for key, value in live.items()
+                    if now_m - value[1] > self._CROSS_SESSION_MEMO_INFLIGHT_SECONDS
+                ),
+                key=lambda kv: kv[1][1],
+                reverse=True,
             )
+            room = max(self._ROLLOUT_MEMO_MAX_SESSIONS - len(protected), 0)
+            kept = dict(candidates[:room])
+            kept.update(protected)
+            live = kept
         self._cross_session_memo = live
 
     def refresh_cross_session_memo(
@@ -2308,6 +2370,8 @@ class LocalMemoryKernel:
         session_id: str,
         document_ids: list[str],
         turn_id: str = "",
+        platform: str = "",
+        session_type: str = "",
     ) -> None:
         """Replace this round's cross-session injected ids; empty clears.
 
@@ -2321,12 +2385,16 @@ class LocalMemoryKernel:
         turn_id scopes the entry to one pipeline round: concurrent rounds of
         the same session hold independent memos, so round B's entry clear /
         registration can no longer wipe the exclusions round A still needs
-        for its planner recall / tool search. Mirrors the rollout memo
-        TTL/capacity semantics.
+        for its planner recall / tool search. platform + session_type
+        separate contexts sharing a bare session_id (see
+        _cross_session_memo_key); callers must pass the same context on
+        lookup. Mirrors the rollout memo TTL/capacity semantics.
         """
         if not session_id:
             return
-        key = self._cross_session_memo_key(session_id, turn_id)
+        key = self._cross_session_memo_key(
+            session_id, turn_id, platform, session_type
+        )
         if not document_ids:
             self._cross_session_memo.pop(key, None)
             return
@@ -2339,12 +2407,18 @@ class LocalMemoryKernel:
             self._prune_cross_session_memo()
 
     def _cross_session_excluded_ids(
-        self, session_id: str, turn_id: str = ""
+        self,
+        session_id: str,
+        turn_id: str = "",
+        platform: str = "",
+        session_type: str = "",
     ) -> list[str] | None:
         """Cross-session memo ids within TTL (None when absent/expired)."""
         if not session_id:
             return None
-        key = self._cross_session_memo_key(session_id, turn_id)
+        key = self._cross_session_memo_key(
+            session_id, turn_id, platform, session_type
+        )
         entry = self._cross_session_memo.get(key)
         if not entry:
             return None
@@ -2355,7 +2429,11 @@ class LocalMemoryKernel:
         return ids or None
 
     def _injected_excluded_ids(
-        self, session_id: str, turn_id: str = ""
+        self,
+        session_id: str,
+        turn_id: str = "",
+        platform: str = "",
+        session_type: str = "",
     ) -> list[str] | None:
         """Union of every already-injected memo (rollout fill-back +
         cross-session summaries) for this session, deduped.
@@ -2364,12 +2442,18 @@ class LocalMemoryKernel:
         this: rows already presented to the model this round are excluded so
         the same summary cannot be both injected and recalled (double
         exposure), while budget-dropped rows stay searchable. turn_id scopes
-        the cross-session half to the current pipeline round (see
+        the cross-session half to the current pipeline round and platform +
+        session_type to the current context (see
         refresh_cross_session_memo).
         """
         ids = [
             *(self._rollout_excluded_ids(session_id) or []),
-            *(self._cross_session_excluded_ids(session_id, turn_id) or []),
+            *(
+                self._cross_session_excluded_ids(
+                    session_id, turn_id, platform, session_type
+                )
+                or []
+            ),
         ]
         return list(dict.fromkeys(ids)) or None
 

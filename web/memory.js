@@ -72,6 +72,13 @@ const UI = {
       throw new Error(detail);
     }
     if (body === null) throw new Error("响应不是合法 JSON（HTTP " + resp.status + "）");
+    if (opts.meta) {
+      // The HTTP Date header is the server clock for this response. Server
+      // timestamps (e.g. a backfill finished_at) must be compared against it
+      // instead of the browser clock, which may be skewed.
+      const hdr = resp.headers.get("date");
+      return { data: body, serverNow: hdr ? Date.parse(hdr) : NaN };
+    }
     return body;
   },
 
@@ -127,28 +134,85 @@ const UI = {
     setTimeout(() => t.remove(), 3600);
   },
 
+  // Keyboard entry for elements whose only action is a pointer click: make
+  // them focusable and run the same handler on Enter/Space. No synthetic
+  // click is dispatched, so drag gestures and double-click handlers are not
+  // affected. Row wrappers with inner controls (e.g. a delete button) keep
+  // their own keys: only the wrapper itself activates the row action.
+  kbClick(node, handler) {
+    node.setAttribute("tabindex", "0");
+    node.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      if (e.target !== node) return;
+      e.preventDefault();
+      handler(e);
+    });
+    return node;
+  },
+
+  // Focusable children of a container, in DOM order (disabled and hidden
+  // nodes excluded). Queried live so dynamically rebuilt modal bodies are
+  // included.
+  _focusables(box) {
+    return Array.from(box.querySelectorAll(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+    )).filter((n) => !n.disabled && n.getClientRects().length > 0);
+  },
+
+  // The page behind the dialog is inert while a modal is open: pointer and
+  // keyboard navigation cannot reach it, matching the visual overlay. The
+  // dialog layer and transient toasts stay active.
+  _setBackgroundInert(on) {
+    for (const child of document.body.children) {
+      if (child.id === "modal-root" || child.id === "toast-root") continue;
+      if (on) child.setAttribute("inert", "");
+      else child.removeAttribute("inert");
+    }
+  },
+
   modal(title, bodyNodes, actions = [], opts = {}) {
     const root = document.getElementById("modal-root");
+    // Capture the opener before the previous dialog layer is cleared so
+    // closing returns the keyboard user to the control that opened this one.
+    const opener = document.activeElement && typeof document.activeElement.focus === "function"
+      ? document.activeElement : null;
     root.innerHTML = "";
     if (this._modalKeyHandler) {
       document.removeEventListener("keydown", this._modalKeyHandler);
       this._modalKeyHandler = null;
     }
-    const onKey = (e) => { if (e.key === "Escape") close(); };
     let box = null;
     const close = () => {
-      // Only the modal that is still mounted may clear the root: a slow save
-      // started in a previous dialog finishing after another modal opened
-      // used to wipe the newer one (its own listener cleanup still runs).
-      if (box !== null && root.firstChild === box) root.innerHTML = "";
+      // Only the modal that is still mounted may clear the root/inert state:
+      // a slow save started in a previous dialog finishing after another
+      // modal opened used to wipe the newer one (its own listener cleanup
+      // still runs).
+      const mounted = box !== null && root.firstChild === box;
+      if (mounted) root.innerHTML = "";
       document.removeEventListener("keydown", onKey);
       if (this._modalKeyHandler === onKey) this._modalKeyHandler = null;
+      if (!mounted) return; // superseded by a newer dialog: leave its state alone
+      this._setBackgroundInert(false);
+      if (opener && opener.isConnected) opener.focus();
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") { close(); return; }
+      if (e.key !== "Tab" || box === null) return;
+      // Wrap Tab/Shift+Tab inside the dialog. The background is inert, so
+      // without an explicit wrap focus would jump to browser chrome.
+      const items = this._focusables(box);
+      if (!items.length) { e.preventDefault(); box.focus(); return; }
+      const first = items[0], last = items[items.length - 1];
+      const active = document.activeElement;
+      if (!box.contains(active)) { e.preventDefault(); first.focus(); return; }
+      if (e.shiftKey && active === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && active === last) { e.preventDefault(); first.focus(); }
     };
     this._modalKeyHandler = onKey;
-    box = this.el("div", { class: "modal" + (opts.wide ? " wide" : "") }, [
+    box = this.el("div", { class: "modal" + (opts.wide ? " wide" : ""), tabindex: "-1" }, [
       this.el("div", { class: "modal-head" }, [
         this.el("h3", {}, [title]),
-        this.el("button", { class: "modal-close", type: "button", title: "关闭", onclick: close }, [this.svg("Close")]),
+        this.el("button", { class: "modal-close", type: "button", title: "关闭", "aria-label": "关闭", onclick: close }, [this.svg("Close")]),
       ]),
       this.el("div", { class: "modal-body" }, bodyNodes),
       this.el("div", { class: "modal-actions" }, actions.concat([
@@ -158,6 +222,11 @@ const UI = {
     root.appendChild(box);
     root.onclick = (e) => { if (e.target === root) close(); };
     document.addEventListener("keydown", onKey);
+    this._setBackgroundInert(true);
+    // Initial focus goes to the first focusable element (the close button),
+    // which also puts screen readers inside the dialog.
+    const firstFocusable = this._focusables(box)[0];
+    (firstFocusable || box).focus();
     return close;
   },
 
@@ -268,6 +337,18 @@ class ForceGraph {
       const g = this._svg("g");
       g.setAttribute("class", "fg-edge" + (e.status !== "active" ? " " + e.status : ""));
       g.dataset.edge = String(e.id);
+      // Keyboard parity with pointer selection: the group itself is
+      // focusable and Enter/Space select it. No synthetic click is
+      // dispatched, so drag/zoom gestures are untouched.
+      g.setAttribute("tabindex", "0");
+      g.setAttribute("focusable", "true");
+      g.setAttribute("role", "button");
+      g.setAttribute("aria-label", `${e.subject_name || "?"} → ${e.object_name || "?"} ${e.label}`);
+      g.addEventListener("keydown", (ev) => {
+        if (ev.key !== "Enter" && ev.key !== " ") return;
+        ev.preventDefault();
+        this.select("edge", String(e.id));
+      });
       const line = this._svg("line");
       const hit = this._svg("line");
       hit.setAttribute("class", "hit");
@@ -281,6 +362,15 @@ class ForceGraph {
       const g = this._svg("g");
       g.setAttribute("class", "fg-node" + (n.is_bot ? " bot" : ""));
       g.dataset.node = n.id;
+      g.setAttribute("tabindex", "0");
+      g.setAttribute("focusable", "true");
+      g.setAttribute("role", "button");
+      g.setAttribute("aria-label", `${n.name}${n.is_bot ? "（bot）" : ""}，${n.degree} 条关系边`);
+      g.addEventListener("keydown", (ev) => {
+        if (ev.key !== "Enter" && ev.key !== " ") return;
+        ev.preventDefault();
+        this.select("node", n.id);
+      });
       const circle = this._svg("circle");
       circle.setAttribute("r", String(9 + Math.min(n.degree, 10)));
       const label = this._svg("text");
@@ -328,20 +418,12 @@ class ForceGraph {
     const ns = this.nodes, es = this.edges;
     const a = this._alpha;
     const REP = 5200, SPR = 0.03, L = 132, FRICTION = 0.86, GRAV = 0.05;
-    // Repulsion is O(n²); with big graphs (e.g. hundreds of disjoint edges)
-    // the pair loop alone can freeze the tab. Above the node threshold the
-    // loop strides so ~the same pair budget is spent per tick (skipped nodes
-    // still get spring + centering forces, layout stays readable).
-    const stride = ns.length > 160 ? Math.ceil(ns.length / 160) : 1;
-    for (let i = 0; i < ns.length; i += stride) {
-      for (let j = i + stride; j < ns.length; j += stride) {
-        let dx = ns[j].x - ns[i].x, dy = ns[j].y - ns[i].y;
-        let d2 = dx * dx + dy * dy;
-        if (d2 < 1) { dx = Math.random() + 0.1; dy = Math.random() + 0.1; d2 = dx * dx + dy * dy; }
-        const d = Math.sqrt(d2), f = (REP / d2) * a, fx = (dx / d) * f, fy = (dy / d) * f;
-        ns[i].vx -= fx; ns[i].vy -= fy; ns[j].vx += fx; ns[j].vy += fy;
-      }
-    }
+    // Repulsion is O(n²) for small graphs and dominates the frame budget on
+    // big ones (e.g. hundreds of disjoint edges). Up to 160 nodes keep the
+    // exact pair loop; above that a uniform spatial grid approximates it so
+    // every node still receives repulsion without an O(n²) pass.
+    if (ns.length > 160) this._repelGrid(ns, a, REP);
+    else this._repelExact(ns, a, REP);
     for (const e of es) {
       const dx = e.o.x - e.s.x, dy = e.o.y - e.s.y;
       const d = Math.sqrt(dx * dx + dy * dy) || 1;
@@ -361,6 +443,92 @@ class ForceGraph {
     // ignore alpha decay while gravity decayed -> net drift; friction then
     // drains the residual speed)
     this._alpha = Math.max(0, a - 0.006);
+  }
+
+  // Exact O(n²) repulsion: unchanged behaviour for graphs that can afford it.
+  _repelExact(ns, a, REP) {
+    for (let i = 0; i < ns.length; i++) {
+      for (let j = i + 1; j < ns.length; j++) {
+        let dx = ns[j].x - ns[i].x, dy = ns[j].y - ns[i].y;
+        let d2 = dx * dx + dy * dy;
+        if (d2 < 1) { dx = Math.random() + 0.1; dy = Math.random() + 0.1; d2 = dx * dx + dy * dy; }
+        const d = Math.sqrt(d2), f = (REP / d2) * a, fx = (dx / d) * f, fy = (dy / d) * f;
+        ns[i].vx -= fx; ns[i].vy -= fy; ns[j].vx += fx; ns[j].vy += fy;
+      }
+    }
+  }
+
+  // Approximate repulsion for graphs above the exact threshold.
+  //
+  // A node is pushed by the nodes in its own 3x3 cell neighbourhood, which
+  // covers every pair within one cell edge. The cell edge is derived from the
+  // current layout extent (with the viewBox as a floor, so a shrinking layout
+  // never collapses the grid) and from the node count, aiming at a handful of
+  // nodes per cell. Cells holding more than CELL_MAX nodes are collapsed into
+  // a single point mass (count + centroid), so a dense pile-up cannot turn
+  // this pass into O(n²): each node does at most 9 * CELL_MAX force
+  // evaluations. Every node runs the pass, so all nodes participate (the old
+  // global `stride` loop left whole index congruence classes untouched).
+  _repelGrid(ns, a, REP) {
+    const CELL_MAX = 8;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const n of ns) {
+      if (n.x < minX) minX = n.x;
+      if (n.x > maxX) maxX = n.x;
+      if (n.y < minY) minY = n.y;
+      if (n.y > maxY) maxY = n.y;
+    }
+    // Degenerate layouts (single point, flat line, initial ring) get a floor
+    // proportional to the viewBox so the cell size stays sane. Targeting
+    // ~CELL_MAX/2 nodes per cell keeps most cells exact, while the clamp
+    // bounds the neighbourhood radius.
+    const w = Math.max(maxX - minX, this.W * 0.3);
+    const h = Math.max(maxY - minY, this.H * 0.3);
+    const cell = Math.max(48, Math.min(240, Math.sqrt((CELL_MAX * w * h) / (2 * ns.length))));
+
+    const cells = new Map();
+    for (let i = 0; i < ns.length; i++) {
+      const n = ns[i];
+      const key = Math.floor((n.x - minX) / cell) + "," + Math.floor((n.y - minY) / cell);
+      let c = cells.get(key);
+      if (!c) { c = { nodes: [], sx: 0, sy: 0 }; cells.set(key, c); }
+      c.nodes.push(i); c.sx += n.x; c.sy += n.y;
+    }
+
+    for (let i = 0; i < ns.length; i++) {
+      const ni = ns[i];
+      const cx = Math.floor((ni.x - minX) / cell);
+      const cy = Math.floor((ni.y - minY) / cell);
+      for (let ox = -1; ox <= 1; ox++) {
+        for (let oy = -1; oy <= 1; oy++) {
+          // Missing cells at the grid border are simply skipped.
+          const c = cells.get((cx + ox) + "," + (cy + oy));
+          if (!c) continue;
+          if (c.nodes.length > CELL_MAX) {
+            // Point-mass approximation; exclude `ni` from its own cell.
+            const own = ox === 0 && oy === 0;
+            const mass = c.nodes.length - (own ? 1 : 0);
+            if (mass <= 0) continue;
+            const mx = (c.sx - (own ? ni.x : 0)) / mass;
+            const my = (c.sy - (own ? ni.y : 0)) / mass;
+            let dx = mx - ni.x, dy = my - ni.y;
+            let d2 = dx * dx + dy * dy;
+            if (d2 < 1) { dx = Math.random() + 0.1; dy = Math.random() + 0.1; d2 = dx * dx + dy * dy; }
+            const d = Math.sqrt(d2), f = (REP * mass / d2) * a;
+            ni.vx -= (dx / d) * f; ni.vy -= (dy / d) * f;
+          } else {
+            for (const j of c.nodes) {
+              if (j === i) continue;
+              let dx = ns[j].x - ni.x, dy = ns[j].y - ni.y;
+              let d2 = dx * dx + dy * dy;
+              if (d2 < 1) { dx = Math.random() + 0.1; dy = Math.random() + 0.1; d2 = dx * dx + dy * dy; }
+              const d = Math.sqrt(d2), f = (REP / d2) * a;
+              ni.vx -= (dx / d) * f; ni.vy -= (dy / d) * f;
+            }
+          }
+        }
+      }
+    }
   }
 
   _draw() {
@@ -383,6 +551,16 @@ class ForceGraph {
   _loop() {
     if (this._raf) return;
     const step = () => {
+      // A route change can detach the SVG while a drag is in flight: pointerup
+      // then never reaches us, `_dragNode` stays set and the loop would keep
+      // scheduling frames forever. Stop and drop the drag/pan state instead.
+      if (!this.svg.isConnected) {
+        this._raf = null;
+        if (this._dragNode) { this._dragNode.fx = null; this._dragNode.fy = null; }
+        this._dragNode = null; this._panFrom = null; this._down = null;
+        this.svg.classList.remove("dragging");
+        return;
+      }
       this._tick(); this._tick();
       this._draw();
       const energy = this.nodes.reduce((s, n) => s + Math.abs(n.vx) + Math.abs(n.vy), 0);
@@ -430,10 +608,22 @@ class ForceGraph {
         this._dragNode.fx = w.x; this._dragNode.fy = w.y;
         this.reheat();
       } else if (this._panFrom) {
-        const k = this.W / this.svg.getBoundingClientRect().width || 1;
-        this.tx = this._panFrom.tx + (ev.clientX - this._panFrom.x) * k;
-        this.ty = this._panFrom.ty + (ev.clientY - this._panFrom.y) * k;
-        this._applyTransform();
+        // Convert the pointer delta from client pixels into viewBox user
+        // units through the live screen CTM: the viewBox is letterboxed by
+        // preserveAspectRatio, so a single width ratio drifts. The translation
+        // component cancels out by transforming both endpoints.
+        const ctm = this.svg.getScreenCTM();
+        if (ctm) {
+          const inv = ctm.inverse();
+          const p0 = this.svg.createSVGPoint();
+          p0.x = this._panFrom.x; p0.y = this._panFrom.y;
+          const p1 = this.svg.createSVGPoint();
+          p1.x = ev.clientX; p1.y = ev.clientY;
+          const a = p0.matrixTransform(inv), b = p1.matrixTransform(inv);
+          this.tx = this._panFrom.tx + (b.x - a.x);
+          this.ty = this._panFrom.ty + (b.y - a.y);
+          this._applyTransform();
+        }
       }
     });
     const up = (ev) => {
@@ -480,6 +670,16 @@ class ForceGraph {
    页面主体：六个 tab（总览/事实簇/原始事实/用户画像/关系图谱/注入语料）
    hash 路由（#overview 等），刷新保位
    ============================================================ */
+// Shared category options for the cluster/fact filters: every active
+// dimension must be selectable in both tabs, so the list lives in one place
+// (preference/commitment included).
+const _CATEGORIES = [
+  ["", "全部"], ["identity", "identity"], ["stable", "stable"],
+  ["preference", "preference"], ["commitment", "commitment"],
+  ["interaction", "interaction"], ["naming", "naming"],
+  ["recent", "recent"], ["uncertain", "uncertain"],
+];
+
 const Page = {
   async boot() {
     addEventListener("hashchange", () => this.route());
@@ -720,21 +920,37 @@ const Page = {
   // ---------------- Fact clusters ----------------
   async renderClusters(el) {
     let query = { page: 1 };
+    // Filter/paging requests may land out of order; only the newest one may
+    // paint (same pattern as renderFacts/renderSummaries).
+    let reqSeq = 0;
     const listBox = this.el("div");
     el.appendChild(this.filterBar([
       ["user_id", "用户 ID", "裸 uid"],
       ["session_id", "会话 ID", "按证据键前缀"],
-      ["category", "分类", "", [["", "全部"], ["identity", "identity"], ["stable", "stable"], ["preference", "preference"], ["commitment", "commitment"], ["interaction", "interaction"], ["naming", "naming"], ["recent", "recent"], ["uncertain", "uncertain"]]],
+      ["category", "分类", "", _CATEGORIES],
       ["status", "状态", "", [["", "全部"], ["active", "active"], ["profiled", "profiled"], ["pending_uncertain", "pending_uncertain"], ["replaced", "replaced"], ["dead", "dead"]]],
       ["q", "内容包含", "陈述关键词"],
     ], (vals) => { query = Object.assign({}, vals, { page: 1 }); refresh(); }));
     el.appendChild(listBox);
 
+    // Scoring thresholds for the edit hint come from the live config so the
+    // text matches the thresholds actually used for promotion/demotion
+    // (0~score_cap, >= promote_threshold / < demote_threshold). Cached for the
+    // tab lifetime; an unavailable config falls back to generic wording.
+    let cfgValues = null;
+    const loadCfgValues = async () => {
+      if (cfgValues) return cfgValues;
+      try { cfgValues = (await UI.api("/config")).values || {}; } catch (e) { cfgValues = {}; }
+      return cfgValues;
+    };
+
     const refresh = async () => {
+      const seq = ++reqSeq;
       listBox.innerHTML = '<div class="loading">正在打捞记忆</div>';
       try {
         const p = new URLSearchParams(Object.assign({ size: 30 }, query));
         const d = await UI.api("/clusters?" + p.toString());
+        if (seq !== reqSeq) return; // superseded by a newer filter/page request
         const statusColor = { active: "sky", profiled: "ok", pending_uncertain: "warn", replaced: "gray", dead: "bad" };
         const rows = d.items.map((c) => this.el("tr", {}, [
           this.el("td", { class: "mono" }, [String(c.id)]),
@@ -748,7 +964,7 @@ const Page = {
           this.el("td", {}, [`${c.evidence_count} 证据`]),
           this.el("td", {}, [UI.fmtTime(c.updated_at)]),
           this.el("td", {}, [
-            this.el("button", { class: "btn small ghost", onclick: () => this.editCluster(c, refresh) }, [UI.svg("EditPen"), "修正"]),
+            this.el("button", { class: "btn small ghost", onclick: async () => this.editCluster(c, refresh, await loadCfgValues()) }, [UI.svg("EditPen"), "修正"]),
           ]),
         ]));
         listBox.innerHTML = "";
@@ -761,6 +977,7 @@ const Page = {
       } catch (e) {
         // Paging/filter callers are fire-and-forget: surface the failure here
         // with a retry instead of leaving the list stuck on "loading".
+        if (seq !== reqSeq) return;
         listBox.innerHTML = "";
         listBox.appendChild(UI.errorCard(e, refresh));
       }
@@ -768,9 +985,18 @@ const Page = {
     await refresh();
   },
 
-  editCluster(c, refresh) {
+  editCluster(c, refresh, cfg = {}) {
+    const num = (v, fb) => (typeof v === "number" && Number.isFinite(v) ? v : fb);
+    const cap = num(cfg.score_cap, 10);
+    const promote = num(cfg.promote_threshold, null);
+    const demote = num(cfg.demote_threshold, null);
+    // Use the deployment's real thresholds when available: a hardcoded
+    // ">=10 / <4" hint lies as soon as score_cap/promote/demote are tuned.
+    const scoreHint = promote !== null && demote !== null
+      ? `确信度分数（0~${cap}，≥${promote} 进画像 / <${demote} 降级待定）`
+      : `确信度分数（0~${cap}；达到晋升阈值进画像，低于降级阈值移出画像）`;
     const stmt = this.el("textarea", {}, [c.statement]);
-    const score = this.el("input", { type: "number", step: "0.5", min: "0", max: "10", value: String(c.score) });
+    const score = this.el("input", { type: "number", step: "0.5", min: "0", max: String(cap), value: String(c.score) });
     const status = this.el("select");
     // replaced is a merge-pipeline-only tombstone: the Kira side forbids
     // manual move-out, so it is not selectable; when already replaced the
@@ -784,7 +1010,7 @@ const Page = {
     if (c.status === "replaced") status.disabled = true;
     const closeM = UI.modal(`修正簇 #${c.id}（用户 ${c.user_id}）`, [
       this.el("div", { class: "cfg-field" }, [this.el("label", {}, ["规范陈述（改陈述会重置向量待重算）"]), stmt]),
-      this.el("div", { class: "cfg-field" }, [this.el("label", {}, ["确信度分数（0~10，≥10 进画像 / <4 降级待定）"]), score]),
+      this.el("div", { class: "cfg-field" }, [this.el("label", {}, [scoreHint]), score]),
       this.el("div", { class: "cfg-field" }, [this.el("label", {}, ["状态（切出 profiled 会同步移除画像投影）"]), status]),
       this.el("p", { class: "muted" }, [`证据键：${(c.evidence_keys || []).join("、") || "无"}`]),
     ], [
@@ -795,7 +1021,12 @@ const Page = {
             // Empty or non-numeric score means "leave unchanged": an empty
             // string must not become Number("") === 0, which would silently
             // reset the score and demote the cluster out of the profile.
-            const body = { canonical_statement: stmt.value, status: status.value };
+            const body = { canonical_statement: stmt.value };
+            // Submit a status only when the user actually changed it. Echoing
+            // the status captured when the dialog opened would, if the merge
+            // pipeline promoted the cluster meanwhile, write that stale value
+            // back as a real transition and drop the profile projection.
+            if (status.value !== c.status) body.status = status.value;
             const rawScore = score.value.trim();
             const parsedScore = Number(rawScore);
             if (rawScore !== "" && !Number.isNaN(parsedScore)) body.score = parsedScore;
@@ -822,7 +1053,7 @@ const Page = {
     el.appendChild(this.filterBar([
       ["user_id", "用户 ID", "裸 uid"],
       ["session_id", "会话 ID", ""],
-      ["category", "分类", "", [["", "全部"], ["identity", "identity"], ["stable", "stable"], ["preference", "preference"], ["commitment", "commitment"], ["interaction", "interaction"], ["naming", "naming"], ["recent", "recent"], ["uncertain", "uncertain"]]],
+      ["category", "分类", "", _CATEGORIES],
       ["confidence", "确信度", "", [["", "全部"], ["high", "high"], ["medium", "medium"]]],
       ["extracted", "处理状态", "", [["", "全部"], ["0", "待处理"], ["1", "已入簇"]]],
       ["q", "内容包含", "事实关键词"],
@@ -851,6 +1082,8 @@ const Page = {
           this.el("td", {}, [
             this.el("button", {
               class: "btn small danger",
+              "aria-label": `删除事实 #${f.id}`,
+              title: `删除事实 #${f.id}`,
               onclick: () => UI.confirm("删除原始事实", `确定删除事实 #${f.id} 吗？${f.extracted ? "该事实已入簇，删除不影响簇本身。" : "该事实还未入簇，删除后不会再参与合并。"}`, async () => {
                 try {
                   await UI.api(`/facts/${f.id}`, { method: "DELETE" });
@@ -891,60 +1124,77 @@ const Page = {
     // user can invalidate the card (and any in-flight request for it).
     let profileReqSeq = 0;
     let profileKey = null;
+    // User-list requests race the same way (search by keyword + paging):
+    // only the newest response may paint, success or failure.
+    let usersReqSeq = 0;
     const loadUsers = async () => {
+      const seq = ++usersReqSeq;
       pickerCard.innerHTML = '<div class="loading">正在打捞记忆</div>';
       try {
         const d = await UI.api(`/users?page=${page}&size=30&q=${encodeURIComponent(kw)}`);
+        if (seq !== usersReqSeq) return; // superseded by a newer search/page
         pickerCard.innerHTML = "";
         const search = this.el("div", { class: "filter-row" }, [
           this.el("div", { class: "f" }, [this.el("label", {}, ["搜索用户 ID"])]),
         ]);
         const inp = this.el("input", { type: "text", placeholder: "user_id", value: kw });
         search.querySelector(".f").appendChild(inp);
-        search.appendChild(this.el("button", { class: "btn small", onclick: () => { kw = inp.value.trim(); page = 1; loadUsers(); } }, [UI.svg("Search")]));
-        pickerCard.appendChild(this.el("h3", {}, [UI.paw(), `选择用户查看画像（共 ${d.total} 个有簇用户）`]));
+        search.appendChild(this.el("button", {
+          class: "btn small",
+          "aria-label": "搜索用户",
+          title: "搜索用户",
+          onclick: () => { kw = inp.value.trim(); page = 1; loadUsers(); },
+        }, [UI.svg("Search")]));
+        pickerCard.appendChild(this.el("h3", {}, [UI.paw(), `选择用户查看画像（共 ${d.total} 个有记忆用户）`]));
         pickerCard.appendChild(search);
-        const rows = d.items.map((u) => this.el("tr", { style: "cursor:pointer", onclick: () => loadProfile(u.platform, u.user_id, u.display_name) }, [
-          this.el("td", {}, [
-            this.el("div", { style: "font-weight:700" }, [u.display_name || "（无名）"]),
-            this.el("div", { class: "muted mono", style: "font-size:11px" }, [u.user_id]),
-          ]),
-          this.el("td", {}, [u.platform]),
-          this.el("td", {}, [UI.badge(`画像 ${u.profiled}`, u.profiled ? "ok" : "gray"), " ",
-            UI.badge(`活跃 ${u.active}`, "sky"), " ",
-            u.pending ? UI.badge(`待定 ${u.pending}`, "warn") : null]),
-          this.el("td", {}, [UI.scoreBar(u.max_score)]),
-          this.el("td", {}, [UI.fmtTime(u.updated_at)]),
-          this.el("td", {}, [
-            this.el("button", {
-              class: "btn small danger",
-              onclick: (ev) => {
-                // Row click opens the profile; the button click erases memory.
-                ev.stopPropagation();
-                UI.confirm("清除该用户的全部记忆",
-                  `确定删除 ${u.platform}:${u.user_id} 的画像/事实簇/原始事实/别名与关系边吗？此操作不可恢复（对话摘要为会话维度、可能涉及他人，不随此级联删除）。`,
-                  async () => {
-                    try {
-                      const r = await UI.api(`/users/${encodeURIComponent(u.platform)}/${encodeURIComponent(u.user_id)}`, { method: "DELETE" });
-                      UI.toast(`已删除：簇 ${r.clusters} · 事实 ${r.facts} · 画像 ${r.profiles} · 别名 ${r.aliases} · 边 ${r.edges}`, "ok");
-                      // Only drop the profile card when it belongs to the deleted
-                      // user; bump the sequence so a response still in flight for
-                      // that user cannot re-render the erased profile.
-                      if (profileKey === `${u.platform}:${u.user_id}`) {
-                        profileReqSeq++;
-                        profileKey = null;
-                        profileCard.innerHTML = "";
-                        profileCard.appendChild(this.el("div", { class: "card" }, [
-                          this.el("div", { class: "empty" }, ["该用户已被删除，画像不再可用"]),
-                        ]));
-                      }
-                      loadUsers();
-                    } catch (e) { UI.toast("删除失败：" + e.message, "err"); }
-                  }, "删除");
-              },
-            }, ["清除记忆"]),
-          ]),
-        ]));
+        const rows = d.items.map((u) => {
+          const openProfile = () => loadProfile(u.platform, u.user_id, u.display_name);
+          // Keyboard entry mirrors the row click; the delete button inside
+          // keeps its own keys (kbClick ignores bubbling inner events).
+          return UI.kbClick(this.el("tr", { style: "cursor:pointer", onclick: openProfile }, [
+            this.el("td", {}, [
+              this.el("div", { style: "font-weight:700" }, [u.display_name || "（无名）"]),
+              this.el("div", { class: "muted mono", style: "font-size:11px" }, [u.user_id]),
+            ]),
+            this.el("td", {}, [u.platform]),
+            this.el("td", {}, u.active + u.profiled + u.pending === 0
+              ? [UI.badge("未成簇", "gray")]
+              : [UI.badge(`画像 ${u.profiled}`, u.profiled ? "ok" : "gray"), " ",
+                UI.badge(`活跃 ${u.active}`, "sky"), " ",
+                u.pending ? UI.badge(`待定 ${u.pending}`, "warn") : null]),
+            this.el("td", {}, [UI.scoreBar(u.max_score)]),
+            this.el("td", {}, [UI.fmtTime(u.updated_at)]),
+            this.el("td", {}, [
+              this.el("button", {
+                class: "btn small danger",
+                onclick: (ev) => {
+                  // Row click opens the profile; the button click erases memory.
+                  ev.stopPropagation();
+                  UI.confirm("清除该用户的全部记忆",
+                    `确定删除 ${u.platform}:${u.user_id} 的画像/事实簇/原始事实/别名与关系边吗？此操作不可恢复（对话摘要为会话维度、可能涉及他人，不随此级联删除）。`,
+                    async () => {
+                      try {
+                        const r = await UI.api(`/users/${encodeURIComponent(u.platform)}/${encodeURIComponent(u.user_id)}`, { method: "DELETE" });
+                        UI.toast(`已删除：簇 ${r.clusters} · 事实 ${r.facts} · 画像 ${r.profiles} · 别名 ${r.aliases} · 边 ${r.edges}`, "ok");
+                        // Only drop the profile card when it belongs to the deleted
+                        // user; bump the sequence so a response still in flight for
+                        // that user cannot re-render the erased profile.
+                        if (profileKey === `${u.platform}:${u.user_id}`) {
+                          profileReqSeq++;
+                          profileKey = null;
+                          profileCard.innerHTML = "";
+                          profileCard.appendChild(this.el("div", { class: "card" }, [
+                            this.el("div", { class: "empty" }, ["该用户已被删除，画像不再可用"]),
+                          ]));
+                        }
+                        loadUsers();
+                      } catch (e) { UI.toast("删除失败：" + e.message, "err"); }
+                    }, "删除");
+                },
+              }, ["清除记忆"]),
+            ]),
+          ]), openProfile);
+        });
         pickerCard.appendChild(this.el("table", { class: "tbl" }, [
           this.el("thead", {}, [this.el("tr", {}, ["用户", "平台", "簇构成", "最高确信度", "最近更新", "操作"].map((t) => this.el("th", {}, [t])))]),
           this.el("tbody", {}, rows),
@@ -952,6 +1202,8 @@ const Page = {
         pickerCard.appendChild(UI.pager(d.total, d.page, d.size, (p) => { page = p; loadUsers(); }));
       } catch (e) {
         // Search/paging callers are fire-and-forget: surface the failure here with a retry.
+        // A stale failure must not replace a newer list either.
+        if (seq !== usersReqSeq) return;
         pickerCard.innerHTML = "";
         pickerCard.appendChild(UI.errorCard(e, loadUsers));
       }
@@ -1002,11 +1254,13 @@ const Page = {
 
   // ---------------- Relation graph ----------------
   async renderGraph(el) {
-    // Timestamp of the graph snapshot (taken before the fetch): a backfill
-    // that finishes after this moment is NOT reflected in `d`, so its status
-    // must trigger a reload instead of being adopted as the poll baseline.
-    const renderStartAt = Date.now();
-    const d = await UI.api("/relations/graph");
+    // Snapshot time taken from the server (HTTP Date header on the graph
+    // response): a backfill that finishes after this moment is NOT reflected
+    // in `d`, so its status must trigger a reload instead of being adopted as
+    // the poll baseline. Comparing against the server clock avoids skew with
+    // the browser clock.
+    const { data: d, serverNow } = await UI.api("/relations/graph", { meta: true });
+    const snapshotTs = Number.isFinite(serverNow) ? serverNow : null;
 
     // Stats + backfill cards
     const stat = (num, lbl) => this.el("div", { class: "dash-pod" }, [
@@ -1033,7 +1287,16 @@ const Page = {
     bfFullBtn.addEventListener("click", () => startBackfill(true));
     const reload = async () => {
       el.innerHTML = "";
-      try { await this.renderGraph(el); } catch (e) { /* tab race */ }
+      try {
+        await this.renderGraph(el);
+      } catch (e) {
+        // A failed refresh used to leave the tab blank; surface it with a
+        // retry instead. A route change tears `el` down, so only paint while
+        // the container is still mounted.
+        if (!el.isConnected) return;
+        el.innerHTML = "";
+        el.appendChild(UI.errorCard(e, reload));
+      }
     };
     let pollTimer = null;
     // Full-page refresh only on new completions seen during this stay: the
@@ -1063,14 +1326,17 @@ const Page = {
       pollFails = 0;
       if (!bfStatus.isConnected) return; // tab switched away, stop polling
       if (seenFinished === null) {
-        // The status carries an offset-bearing ISO string (server-local), so
-        // Date.parse yields an absolute epoch comparable to renderStartAt.
+        // Both sides of this comparison are server timestamps: finished_at
+        // and the graph response's Date header. A skewed browser clock can
+        // therefore not fake (or hide) a new completion. When the header is
+        // unavailable, adopt the status as the baseline; a completion missed
+        // here still refreshes the view on the next real cycle.
         const finishedTs = s.finished_at ? Date.parse(s.finished_at) : NaN;
         // A completion strictly after our snapshot is a real new completion:
         // leaving seenFinished unset lets the branch below reload once, and
         // that finished_at then becomes this view's baseline.
-        const completedAfterSnapshot = !s.running && s.relations > 0
-          && !isNaN(finishedTs) && finishedTs > renderStartAt;
+        const completedAfterSnapshot = snapshotTs !== null && !s.running && s.relations > 0
+          && !isNaN(finishedTs) && finishedTs > snapshotTs;
         if (s.running) seenFinished = "";
         else if (!completedAfterSnapshot) seenFinished = s.finished_at;
       }
@@ -1164,9 +1430,9 @@ const Page = {
             ? this.el("ul", { style: "margin:8px 0 0;padding-left:16px" }, conn.map((e) => {
                 const other = e.subject === n.id ? e.object_name : e.subject_name;
                 const arrow = e.subject === n.id ? "→" : "←";
-                return this.el("li", { style: "cursor:pointer;font-size:13px", onclick: () => fg.select("edge", String(e.id)) }, [
+                return UI.kbClick(this.el("li", { style: "cursor:pointer;font-size:13px", onclick: () => fg.select("edge", String(e.id)) }, [
                   `${arrow} ${other}（${e.label}${e.status !== "active" ? " · " + e.status : ""}）`,
-                ]);
+                ]), () => fg.select("edge", String(e.id)));
               }))
             : null,
         ]));
@@ -1253,20 +1519,30 @@ const Page = {
       const rows = d.edges
         .filter((e) => !kw || [e.label, e.statement, e.subject_name, e.object_name, e.subject, e.object]
           .some((v) => String(v || "").toLowerCase().includes(kw)))
-        .map((e) => this.el("tr", { style: "cursor:pointer", onclick: () => { fg.select("edge", String(e.id)); graphHost.scrollIntoView({ behavior: "smooth", block: "center" }); } }, [
-          this.el("td", {}, [UI.badge(e.label, "pink")]),
-          this.el("td", {}, [`${e.subject_name || "?"} → ${e.object_name || "?"}`]),
-          this.el("td", {}, [UI.badge(e.status, edgeStatusColor[e.status] || "gray")]),
-          this.el("td", {}, [`${e.evidence_count} 证据`]),
-          this.el("td", { class: "wrap" }, [e.statement]),
-          this.el("td", {}, [UI.fmtTime(e.last_seen)]),
-        ]));
+        .map((e) => {
+          const openEdge = () => {
+            fg.select("edge", String(e.id));
+            graphHost.scrollIntoView({ behavior: "smooth", block: "center" });
+          };
+          // Row click and keyboard activation share one action.
+          return UI.kbClick(this.el("tr", { style: "cursor:pointer", onclick: openEdge }, [
+            this.el("td", {}, [UI.badge(e.label, "pink")]),
+            this.el("td", {}, [`${e.subject_name || "?"} → ${e.object_name || "?"}`]),
+            this.el("td", {}, [UI.badge(e.status, edgeStatusColor[e.status] || "gray")]),
+            this.el("td", {}, [`${e.evidence_count} 证据`]),
+            this.el("td", { class: "wrap" }, [e.statement]),
+            this.el("td", {}, [UI.fmtTime(e.last_seen)]),
+            // Superseded edges carry the downgrade timestamp (same source
+            // field the detail panel uses; blank for live edges).
+            this.el("td", {}, [UI.fmtTime(e.superseded_at)]),
+          ]), openEdge);
+        });
       listBox.innerHTML = "";
       listBox.appendChild(this.tableCard(
         d.stats.edges_shown < d.stats.edges
           ? `关系边（共 ${d.stats.edges} 条，按证据数排序，仅展示前 ${d.stats.edges_shown} 条）`
           : `关系边（共 ${d.stats.edges} 条，按证据数排序）`,
-        ["label", "端点", "状态", "证据", "陈述", "最近证据"],
+        ["label", "端点", "状态", "证据", "陈述", "最近证据", "降级时间"],
         rows
       ));
     };
@@ -1288,8 +1564,9 @@ const Page = {
     let reqSeq = 0;
     const listBox = this.el("div");
     // The encode card reports the end of a merge cycle so the rows stop
-    // showing「待补编码」without a manual refresh.
-    el.appendChild(this.encodeCard(() => { if (listBox.isConnected) refresh(); }));
+    // showing「待补编码」without a manual refresh. The callback is quiet: an
+    // automatic background sync must not flash the loading placeholder.
+    el.appendChild(this.encodeCard(() => { if (listBox.isConnected) refresh(true); }));
     el.appendChild(this.filterBar([
       ["session_id", "会话 ID", ""],
       ["user_id", "触发用户", "裸 uid"],
@@ -1298,9 +1575,11 @@ const Page = {
     ], (vals) => { query = Object.assign({}, vals, { page: 1 }); refresh(); }));
     el.appendChild(listBox);
 
-    const refresh = async () => {
+    const refresh = async (quiet = false) => {
       const seq = ++reqSeq;
-      listBox.innerHTML = '<div class="loading">正在打捞记忆</div>';
+      // A quiet refresh (automatic post-cycle sync) keeps the rows already on
+      // screen instead of flashing the loading placeholder.
+      if (!quiet || !listBox.firstChild) listBox.innerHTML = '<div class="loading">正在打捞记忆</div>';
       try {
         const p = new URLSearchParams(Object.assign({ size: 20 }, query));
         const d = await UI.api("/summaries?" + p.toString());
@@ -1321,10 +1600,17 @@ const Page = {
               : (s.has_embedding ? UI.badge("已向量化", "ok") : UI.badge("待补算", "warn")),
           ]),
           this.el("td", { style: "white-space:nowrap" }, [
-            this.el("button", { class: "btn small ghost", onclick: () => this.editSummary(s, refresh) }, [UI.svg("EditPen")]),
+            this.el("button", {
+              class: "btn small ghost",
+              "aria-label": `编辑摘要 #${s.id}`,
+              title: `编辑摘要 #${s.id}`,
+              onclick: () => this.editSummary(s, refresh),
+            }, [UI.svg("EditPen")]),
             " ",
             this.el("button", {
               class: "btn small danger",
+              "aria-label": `删除摘要 #${s.id}`,
+              title: `删除摘要 #${s.id}`,
               onclick: () => UI.confirm("删除摘要", "删除后该轮内容不再参与 recall，确定吗？", async () => {
                 try {
                   await UI.api(`/summaries/${s.id}`, { method: "DELETE" });
@@ -1346,7 +1632,7 @@ const Page = {
         // Paging/filter callers are fire-and-forget: surface the failure here with a retry.
         if (seq !== reqSeq) return;
         listBox.innerHTML = "";
-        listBox.appendChild(UI.errorCard(e, refresh));
+        listBox.appendChild(UI.errorCard(e, () => refresh()));
       }
     };
     await refresh();
@@ -1379,6 +1665,9 @@ const Page = {
   encodeCard(onCycleEnd) {
     const encBtn = this.el("button", { class: "btn small", disabled: "" }, ["立即执行补编码"]);
     const encStatus = this.el("span", { class: "muted", style: "font-size:12px" });
+    // Shown only after the status probe gives up: explicit retry instead of a
+    // dead card.
+    const encRetry = this.el("button", { class: "btn small ghost", style: "display:none" }, ["重试状态"]);
     let encTimer = null;
     let encFails = 0;
     // Set on every status that reports a running cycle; the transition to
@@ -1393,11 +1682,19 @@ const Page = {
       let s;
       try { s = await UI.api("/encode/backfill/status"); }
       catch (e) {
-        if (++encFails >= 5) { encStatus.textContent = "补编码状态获取失败：" + e.message; return; }
+        if (++encFails >= 5) {
+          // Give up polling but keep the card usable: restore the kick button
+          // and expose an explicit retry instead of freezing the status line.
+          encStatus.textContent = "补编码状态获取失败：" + e.message;
+          encBtn.disabled = false;
+          encRetry.style.display = "";
+          return;
+        }
         encTimer = setTimeout(pollEncode, 5000);
         return;
       }
       encFails = 0;
+      encRetry.style.display = "none";
       if (!encStatus.isConnected) return; // tab switched away, stop polling
       if (!s.available) {
         encBtn.disabled = true;
@@ -1425,7 +1722,13 @@ const Page = {
         const curCycle = (s.last_cycle && s.last_cycle.finished_at) || null;
         let ended = cycleRan;
         cycleRan = false;
-        if (seenCycleInit && curCycle !== seenCycle) ended = true;
+        // The first idle observation establishes the baseline but still
+        // refreshes once: the list was painted independently of this status,
+        // so a cycle that ended just before mount would otherwise stay stale
+        // until the next change. The list's request sequence guard collapses
+        // this into a single paint (no double flicker).
+        if (!seenCycleInit) ended = true;
+        else if (curCycle !== seenCycle) ended = true;
         seenCycle = curCycle;
         seenCycleInit = true;
         if (ended && typeof onCycleEnd === "function") onCycleEnd();
@@ -1436,10 +1739,17 @@ const Page = {
     };
     encBtn.addEventListener("click", async () => {
       encBtn.disabled = true;
+      // A fresh kick also resets the probe failure budget (see retry above).
+      encFails = 0;
       try {
         await UI.api("/encode/backfill", { method: "POST" });
         UI.toast("已触发补编码：合并周期立即开始", "ok");
       } catch (e) { UI.toast("触发失败：" + e.message, "err"); }
+      pollEncode();
+    });
+    encRetry.addEventListener("click", () => {
+      encRetry.style.display = "none";
+      encFails = 0;
       pollEncode();
     });
     const card = this.el("div", { class: "card" }, [
@@ -1447,7 +1757,7 @@ const Page = {
       this.el("p", { class: "muted", style: "font-size:12px" }, [
         "唤醒合并周期立即执行一次补编码（周期仍是唯一执行者，不会并发）；积压数量与周期状态自动刷新。",
       ]),
-      this.el("div", { style: "display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px" }, [encBtn, encStatus]),
+      this.el("div", { style: "display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:8px" }, [encBtn, encStatus, encRetry]),
     ]);
     pollEncode();
     return card;

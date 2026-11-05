@@ -434,6 +434,56 @@ async def main_async() -> None:
             "DELETE FROM memory_user_profile WHERE user_id IN ('up1', 'up2')"
         )
 
+    # ---- review regression: dedup ranking uses the statement group's MAX
+    # score, not the representative row's score ----
+    # The representative is the latest copy (newest occurred_at), which may
+    # be the lower-scored one; ordering by that row's score would rank the
+    # whole statement below a less relevant distinct fact and push it out of
+    # the per-section cap.
+    async with db.pool.acquire() as conn:
+        for cid, stmt, score, occurred in (
+            (910001, "重复评分陈述", 2.0, "2026-09-20T00:00:00Z"),
+            (910002, "另一条陈述", 5.0, "2026-09-15T00:00:00Z"),
+            (910003, "重复评分陈述", 9.0, "2026-09-10T00:00:00Z"),
+        ):
+            await conn.execute(
+                "INSERT INTO memory_fact_cluster (id, platform, user_id,"
+                " category, canonical_statement, score, occurred_at)"
+                " VALUES ($1, 'qq', 'up3', 'stable', $2, $3, $4)",
+                cid, stmt, score, occurred,
+            )
+            await conn.execute(
+                "INSERT INTO memory_user_profile (platform, user_id, category,"
+                " cluster_id, statement, score, related_user_ids)"
+                " VALUES ('qq', 'up3', 'stable', $1, $2, $3, '[]')",
+                cid, stmt, score,
+            )
+    capped = await db.fetch_profile_sections_multi(["qq"], ["up3"], 1)
+    check(
+        "multi_profile_dedup_ranks_by_group_max_score",
+        [s for s, _ in capped.get("stable", [])] == ["重复评分陈述"],
+        str(capped),
+    )
+    both = await db.fetch_profile_sections_multi(["qq"], ["up3"], 2)
+    check(
+        "multi_profile_dedup_group_max_score_order",
+        [s for s, _ in both.get("stable", [])] == ["重复评分陈述", "另一条陈述"],
+        str(both),
+    )
+    # The representative row (and its displayed time) is still the latest copy
+    check(
+        "multi_profile_dedup_representative_is_latest",
+        both["stable"][0][1].isoformat() == "2026-09-20T00:00:00+00:00",
+        str(both["stable"][0]),
+    )
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM memory_user_profile WHERE user_id = 'up3'"
+        )
+        await conn.execute(
+            "DELETE FROM memory_fact_cluster WHERE user_id = 'up3'"
+        )
+
     # Cluster candidate search (vector + scalar fallback)
     cands = await db.search_cluster_candidates(
         platform="qq", user_id="u2", category="stable", related_user_ids=[],
@@ -746,11 +796,25 @@ async def main_async() -> None:
     check("webui_delete_summary_fts_cleanup", int(left) == 0, str(left))
 
     graph = await webui.fetch_relation_graph(db, bot_user_id="bot")
+    superseded_edges = [e for e in graph["edges"] if e["status"] == "superseded"]
     check(
         "webui_relation_graph",
         graph["stats"]["edges"] == 2
         and graph["stats"]["edges_superseded"] == 1
         and any(n["is_bot"] for n in graph["nodes"]), str(graph["stats"]),
+    )
+    # The detail pane renders "reason · superseded_at": the tombstone timestamp
+    # must reach the payload as a formatted string, empty for live edges.
+    check(
+        "webui_relation_graph_superseded_at",
+        len(superseded_edges) == 1
+        and isinstance(superseded_edges[0]["superseded_at"], str)
+        and bool(superseded_edges[0]["superseded_at"])
+        and all(
+            e["superseded_at"] == ""
+            for e in graph["edges"] if e["status"] != "superseded"
+        ),
+        str([(e["status"], e["superseded_at"]) for e in graph["edges"]]),
     )
 
     out = await webui.update_relation_edge(
@@ -982,6 +1046,87 @@ async def main_async() -> None:
         "regress_like_clusters_underscore",
         (await webui.fetch_clusters(db, 1, 10, q="qq_123"))["total"] == 1,
     )
+
+    # ---- review regression: raw-only users reach the user picker ----
+    # fetch_users used to source its user set from memory_fact_cluster alone,
+    # so a user whose facts never converged into a cluster stayed invisible on
+    # the maintenance page and their memory could not be erased from the UI.
+    # The user set must be the union of cluster owners and raw-fact owners,
+    # with zero cluster counts for the latter.
+    await db.insert_persona_fact_raw(
+        document_id="u_rawonly@10086|2026-09-12-r1",
+        platform="qq", user_id="u_rawonly", related_user_ids=[],
+        display_name="无簇用户", category="stable", statement="只有原始事实",
+        confidence="high", session_id="10086", group_id="10086",
+        evidence_key="10086|2026-09-19", occurred_at=now, embedding=None,
+    )
+    raw_only = await webui.fetch_users(db, keyword="u_rawonly", page=1, size=10)
+    check(
+        "regress_users_raw_only_listed",
+        raw_only["total"] == 1
+        and raw_only["items"][0]["user_id"] == "u_rawonly"
+        and raw_only["items"][0]["display_name"] == "无簇用户",
+        str(raw_only),
+    )
+    check(
+        "regress_users_raw_only_zero_clusters",
+        raw_only["items"][0]["active"] == 0
+        and raw_only["items"][0]["profiled"] == 0
+        and raw_only["items"][0]["pending"] == 0
+        and raw_only["items"][0]["max_score"] is None,
+        str(raw_only["items"][0]),
+    )
+    listed = await webui.fetch_users(db, keyword="", page=1, size=100)
+    check(
+        "regress_users_raw_only_in_unfiltered_page",
+        any(i["user_id"] == "u_rawonly" for i in listed["items"]),
+        str([i["user_id"] for i in listed["items"]]),
+    )
+    # Pagination and keyword filtering must both run over the union source
+    # (a raw-only user must be pageable and filterable, not only visible on
+    # an unfiltered first page).
+    raw_page1 = await webui.fetch_users(db, keyword="u_rawonly", page=1, size=1)
+    raw_page2 = await webui.fetch_users(db, keyword="u_rawonly", page=2, size=1)
+    check(
+        "regress_users_raw_only_pagination",
+        raw_page1["total"] == 1
+        and raw_page2["total"] == 1
+        and len(raw_page1["items"]) == 1
+        and raw_page2["items"] == [],
+        f"p1={raw_page1} p2={raw_page2}",
+    )
+    union_page1 = await webui.fetch_users(db, keyword="u", page=1, size=1)
+    union_page2 = await webui.fetch_users(db, keyword="u", page=2, size=1)
+    check(
+        "regress_users_union_pagination",
+        union_page1["total"] == union_page2["total"]
+        and union_page1["total"] >= 2
+        and len(union_page1["items"]) == 1
+        and len(union_page2["items"]) == 1
+        and union_page1["items"][0]["user_id"]
+        != union_page2["items"][0]["user_id"],
+        f"p1={union_page1} p2={union_page2}",
+    )
+    miss = await webui.fetch_users(db, keyword="no-such-user", page=1, size=10)
+    check(
+        "regress_users_keyword_miss",
+        miss["total"] == 0 and miss["items"] == [],
+        str(miss),
+    )
+    # PG/SQLite alignment (static): both dialect bodies must source users
+    # from the cluster ∪ raw-fact union and take the newest write time from
+    # both tables (PG has no live-db harness here; live_check covers it).
+    for impl_name in ("webui_store_pg.py", "webui_store_sqlite.py"):
+        src = (PLUGIN_DIR / impl_name).read_text(encoding="utf-8")
+        check(
+            f"regress_users_union_source_{impl_name}",
+            "SELECT platform, user_id FROM memory_fact_cluster" in src
+            and "SELECT platform, user_id FROM memory_persona_fact_raw" in src
+            and "UNION" in src
+            and "max(updated_at) AS updated_at" in src
+            and "written_at AS updated_at" in src,
+            "user source must union cluster owners and raw-fact owners",
+        )
 
     # ---- review regression: row-count parsing of decay profile cascade ----
     # A direct `await conn.execute(...).rsplit(...)` chain calls .rsplit on

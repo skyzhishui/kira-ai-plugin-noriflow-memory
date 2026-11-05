@@ -314,6 +314,160 @@ async def test_cross_session_memo_isolated_per_turn() -> None:
     print("PASS test_cross_session_memo_isolated_per_turn")
 
 
+async def test_cross_session_memo_isolated_per_context() -> None:
+    """Same bare session_id in different platform/session-type contexts must
+    keep independent memos.
+
+    The host does not guarantee a session_id is unique across adapters, and a
+    DM with a user can share its id with a group chat; without platform +
+    session_type in the key, one context's clear/registration would wipe the
+    other's exclusions and leak already-injected summaries back into recall.
+    """
+    circuit_breaker_mod = load_modules("circuit_breaker")[0]
+    kernel_mod = load_modules("memory_kernel")[0]
+
+    class _StubBreaker(circuit_breaker_mod.MemoryDBCircuitBreaker):
+        async def is_available(self) -> bool:
+            return True
+
+        async def record_failure(self) -> None:
+            pass
+
+        async def record_success(self) -> None:
+            pass
+
+    class _StubEmbedding:
+        async def embed_one(self, text):
+            return [0.1]
+
+    db = _SearchCaptureDB(rows=[])
+    kernel = kernel_mod.LocalMemoryKernel(
+        db=db,
+        embedding_service=_StubEmbedding(),
+        circuit_breaker=_StubBreaker(),
+        config=LocalMemoryConfig(dsn="postgresql://stub"),
+        bot_id="bot",
+    )
+    for platform, stype, doc in (
+        ("qq", "dm", "doc-qq-dm"),
+        ("web", "dm", "doc-web-dm"),
+        ("qq", "gm", "doc-qq-gm"),
+    ):
+        kernel.refresh_cross_session_memo(
+            "s1", [doc], turn_id="t", platform=platform, session_type=stype,
+        )
+
+    for platform, stype, expected in (
+        ("qq", "dm", "doc-qq-dm"),
+        ("web", "dm", "doc-web-dm"),
+        ("qq", "gm", "doc-qq-gm"),
+    ):
+        await kernel.search(
+            query="猫", session_id="s1", top_k=3, turn_id="t",
+            platform=platform, session_type=stype,
+        )
+        assert db.search_kwargs["exclude_document_ids"] == [expected], (
+            f"{platform}/{stype} 只应排除自己上下文的注入行"
+        )
+
+    # Clearing one context must not clear the other contexts sharing the id
+    kernel.refresh_cross_session_memo(
+        "s1", [], turn_id="t", platform="web", session_type="dm",
+    )
+    await kernel.search(
+        query="猫", session_id="s1", top_k=3, turn_id="t",
+        platform="web", session_type="dm",
+    )
+    assert db.search_kwargs["exclude_document_ids"] is None
+    await kernel.search(
+        query="猫", session_id="s1", top_k=3, turn_id="t",
+        platform="qq", session_type="dm",
+    )
+    assert db.search_kwargs["exclude_document_ids"] == ["doc-qq-dm"]
+    print("PASS test_cross_session_memo_isolated_per_context")
+
+
+async def test_cross_session_memo_prune_keeps_inflight() -> None:
+    """Capacity pruning must never evict a round that may still be executing.
+
+    A plain newest-N cap drops the oldest entries even when their recall has
+    not run yet (64 later rounds registering first would silently un-exclude
+    the older round's injected summaries). Only entries past the in-flight
+    window are capacity candidates; the TTL still bounds the memo lifetime.
+    """
+    circuit_breaker_mod = load_modules("circuit_breaker")[0]
+    kernel_mod = load_modules("memory_kernel")[0]
+
+    class _StubBreaker(circuit_breaker_mod.MemoryDBCircuitBreaker):
+        async def is_available(self) -> bool:
+            return True
+
+        async def record_failure(self) -> None:
+            pass
+
+        async def record_success(self) -> None:
+            pass
+
+    class _StubEmbedding:
+        async def embed_one(self, text):
+            return [0.1]
+
+    def _kernel():
+        return kernel_mod.LocalMemoryKernel(
+            db=_SearchCaptureDB(rows=[]),
+            embedding_service=_StubEmbedding(),
+            circuit_breaker=_StubBreaker(),
+            config=LocalMemoryConfig(dsn="postgresql://stub"),
+            bot_id="bot",
+        )
+
+    now = kernel_mod.time.monotonic()
+    inflight = kernel_mod.LocalMemoryKernel._CROSS_SESSION_MEMO_INFLIGHT_SECONDS
+    max_entries = kernel_mod.LocalMemoryKernel._ROLLOUT_MEMO_MAX_SESSIONS
+
+    # All fresh: over the cap but all in flight -> nothing is evicted
+    fresh_only = _kernel()
+    fresh_only._cross_session_memo = {
+        ("qq", "dm", "s", f"fresh{i}"): ([f"f{i}"], now)
+        for i in range(max_entries + 6)
+    }
+    fresh_only._prune_cross_session_memo()
+    assert len(fresh_only._cross_session_memo) == max_entries + 6, (
+        "仍在执行的轮次不得被数量上限淘汰"
+    )
+
+    # Old (past the in-flight window, within TTL) + fresh: only the oldest
+    # old entries beyond the cap are dropped; every fresh entry survives
+    kernel = _kernel()
+    kernel._cross_session_memo = {
+        ("qq", "dm", "s", f"old{i}"): ([f"d{i}"], now - inflight - 100.0)
+        for i in range(10)
+    }
+    for i in range(60):
+        kernel._cross_session_memo[("qq", "dm", "s", f"fresh{i}")] = (
+            [f"f{i}"], now,
+        )
+    kernel._prune_cross_session_memo()
+    assert len(kernel._cross_session_memo) == max_entries, str(
+        len(kernel._cross_session_memo)
+    )
+    assert all(
+        ("qq", "dm", "s", f"fresh{i}") in kernel._cross_session_memo
+        for i in range(60)
+    ), "fresh（in-flight）轮次必须全部保留"
+    assert sum(
+        1 for key in kernel._cross_session_memo if key[3].startswith("old")
+    ) == 4, "只淘汰超出上限的已完成轮次"
+
+    # TTL sweep still removes expired entries regardless of the cap
+    kernel._cross_session_memo[("qq", "dm", "s", "expired")] = (
+        ["x"], now - kernel_mod.LocalMemoryKernel._ROLLOUT_MEMO_TTL_SECONDS - 1,
+    )
+    kernel._prune_cross_session_memo()
+    assert ("qq", "dm", "s", "expired") not in kernel._cross_session_memo
+    print("PASS test_cross_session_memo_prune_keeps_inflight")
+
+
 # ---------------------------------------------------------------------------
 #  cross-session: block builder budget semantics
 # ---------------------------------------------------------------------------
@@ -610,6 +764,8 @@ async def main() -> None:
     await test_cross_session_sqlite_fetch()
     await test_cross_session_memo_excludes_from_search()
     await test_cross_session_memo_isolated_per_turn()
+    await test_cross_session_memo_isolated_per_context()
+    await test_cross_session_memo_prune_keeps_inflight()
     test_build_cross_session_block_budget()
     await test_naming_create_immediate_promotion_sqlite()
     test_looks_truncated_matrix()

@@ -55,33 +55,54 @@ async def fetch_overview(backend) -> tuple[dict, list]:
 
 
 async def fetch_users_data(backend, keyword: str, page: int, size: int) -> dict:
-    """Users with facts/clusters: raw query (DISTINCT ON rewritten as a window function)."""
+    """Users with facts/clusters: raw query (DISTINCT ON rewritten as a window function).
+
+    The user set is the union of cluster owners and raw-fact owners: a user
+    whose facts have not converged into a cluster yet still owns memory and
+    must stay reachable (and erasable) from the persona page. Cluster counts
+    for such raw-only users fall out as 0 from the LEFT JOIN; their
+    updated_at comes from the newest raw-fact write instead.
+    """
     params: list = []
     where = ""
     if keyword:
         params.append(_like_contains_pattern(keyword))
-        where = "WHERE c.user_id LIKE $1 ESCAPE '\\'"
+        where = "WHERE l.user_id LIKE $1 ESCAPE '\\'"
     async with _pool(backend).acquire() as conn:
         total = await conn.fetchval(
             f"""
             SELECT count(*) FROM (
-              SELECT 1 FROM memory_fact_cluster c {where}
-              GROUP BY c.platform, c.user_id
-            ) t
+              SELECT platform, user_id FROM memory_fact_cluster
+              UNION
+              SELECT platform, user_id FROM memory_persona_fact_raw
+            ) l {where}
             """,
             *params,
         )
         rows = await conn.fetch(
             f"""
-            SELECT c.platform, c.user_id,
-                   count(*) FILTER (WHERE c.status = 'active') AS active,
-                   count(*) FILTER (WHERE c.status = 'profiled') AS profiled,
-                   count(*) FILTER (WHERE c.status = 'pending_uncertain') AS pending,
+            WITH latest AS (
+              SELECT platform, user_id, max(updated_at) AS updated_at
+              FROM (
+                SELECT platform, user_id, updated_at FROM memory_fact_cluster
+                UNION ALL
+                SELECT platform, user_id, written_at AS updated_at
+                FROM memory_persona_fact_raw
+              ) u
+              GROUP BY platform, user_id
+            )
+            SELECT l.platform, l.user_id,
+                   count(c.id) FILTER (WHERE c.status = 'active') AS active,
+                   count(c.id) FILTER (WHERE c.status = 'profiled') AS profiled,
+                   count(c.id) FILTER (WHERE c.status = 'pending_uncertain') AS pending,
                    max(c.score) AS max_score,
-                   max(c.updated_at) AS updated_at
-            FROM memory_fact_cluster c {where}
-            GROUP BY c.platform, c.user_id
-            ORDER BY max(c.updated_at) DESC
+                   max(l.updated_at) AS updated_at
+            FROM latest l
+            LEFT JOIN memory_fact_cluster c
+              ON c.platform = l.platform AND c.user_id = l.user_id
+            {where}
+            GROUP BY l.platform, l.user_id
+            ORDER BY max(l.updated_at) DESC
             LIMIT ${len(params)+2} OFFSET ${len(params)+1}
             """,
             *params,
@@ -255,7 +276,7 @@ async def fetch_relation_graph_data(backend) -> dict:
             SELECT id, platform, subject_uid, object_uid, subject_name,
                    object_name, relation_label, statement, status,
                    confidence, evidence_count, last_seen, occurred_at,
-                   supersede_reason
+                   supersede_reason, superseded_at
             FROM memory_entity_edge
             ORDER BY evidence_count DESC, last_seen DESC
             LIMIT $1

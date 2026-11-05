@@ -239,13 +239,44 @@
   ];
   var i = Math.floor(Math.random() * quips.length);
   el.textContent = quips[i];
-  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-  setInterval(function () {
+  var reducedMq = window.matchMedia("(prefers-reduced-motion: reduce)");
+  var tickTimer = 0;
+  var swapTimer = 0;
+
+  // Stop the rotation and clear any pending swap so no timer survives a
+  // switch to reduced motion (a half-applied swap must not leave the class on).
+  function stop() {
+    if (tickTimer) { clearTimeout(tickTimer); tickTimer = 0; }
+    if (swapTimer) { clearTimeout(swapTimer); swapTimer = 0; el.classList.remove("quip-swap"); }
+  }
+
+  function schedule() {
+    if (!tickTimer) tickTimer = setTimeout(tick, 9000);
+  }
+
+  function tick() {
+    tickTimer = 0;
+    // Re-read the preference on every tick: it can flip at runtime (OS
+    // setting or devtools) without a page reload.
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     i = (i + 1) % quips.length;
     el.classList.add("quip-swap");
-    setTimeout(function () {
+    swapTimer = setTimeout(function () {
+      swapTimer = 0;
       el.textContent = quips[i];
       el.classList.remove("quip-swap");
     }, 280);
-  }, 9000);
+    schedule();
+  }
+
+  function onReducedChange() {
+    if (reducedMq.matches) stop();
+    else schedule();
+  }
+
+  // Initial semantic is unchanged: under reduced motion the quip is shown
+  // once and never rotates until the preference is turned off dynamically.
+  if (!reducedMq.matches) schedule();
+  if (reducedMq.addEventListener) reducedMq.addEventListener("change", onReducedChange);
+  else if (reducedMq.addListener) reducedMq.addListener(onReducedChange);
 })();
