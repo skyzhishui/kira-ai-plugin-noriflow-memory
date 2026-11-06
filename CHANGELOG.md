@@ -1,21 +1,27 @@
 # Changelog
 
-## Unreleased
+## v1.18.5 (2026-11-06)
 
-- 本 PR 的发布版本保持为 `1.18.5`；当前代码已包含此前评审阶段记录中标为 v1.18.9 的 raw-only 用户空分数显示修复，以及下方本轮修复内容。`v1.18.6`～`v1.18.9` 标题仅用于记录开发/评审阶段，不代表已正式发布的插件版本。
-- 统一 PostgreSQL/SQLite 跨会话摘要的应用时钟边界，并钳制未来时间摘要，避免时钟偏差导致召回不一致。
-- 兼容保存含历史跨字段冲突的配置；主动修改冲突字段时仍严格校验。
-- 防止簇/摘要弹窗重复提交；回填状态连续获取失败后保持操作按钮禁用，需重新探测后恢复。
+PR #9（`v1.18.1`–`v1.18.5`：检索性能优化、上游功能移植、评审修复与注释合规）正式发布，插件版本号保持 `1.18.5`。
 
-## v1.18.9 (2026-11-05)
+以下按开发阶段分组记录。此前版本号 `v1.18.6`～`v1.18.9` 仅为评审过程中的阶段性记录标题，从未单独发布；其内容全部包含在本版本内。
+
+### 发布前评审收尾
+
+- 统一 PostgreSQL/SQLite 跨会话摘要的应用时钟边界（上界改为应用时钟绑定参数，不再使用数据库 `now()`），避免应用与数据库时钟偏差导致召回静默缺失；
+- `insert_chat_summary` 双后端持久化前钳制未来 `occurred_at`，`document_id` 幂等键保持原值；避免坏时间戳摘要先隐藏后突然抢占 `top_k`；
+- 配置保存兼容升级前遗留的跨字段冲突组合（仅跳过未被本次保存修改的字段组，行为与启动期回退一致），WebUI 明确提示被跳过的键；用户主动修改冲突字段时仍严格校验；
+- 簇修正/摘要修正弹窗保存期间禁用按钮，防重复 PUT；回填状态连续获取失败后保持操作按钮禁用，需重新探测确认状态后才恢复。
+
+### 空分数显示修复
 
 - 修复 raw-only 用户列表的最高分为空时显示为 `null`；无画像分数现在显示为 `—`。
 
-## v1.18.8 (2026-11-05)
+### 第三轮评审修复（20 行内 + 1 body + 3 项遗漏）
 
 PR #9 CodeRabbit 第三轮评审修复：20 条行内反馈、1 条 body-only 反馈，以及上一轮确认遗漏的 3 项。
 
-### fix: 后端与数据一致性
+#### fix: 后端与数据一致性
 
 - naming 阈值校验改为 `naming_promote_threshold * decay_factor >= demote_threshold`，与实际衰减顺序一致；同步更新 schema 提示；
 - 多账号画像去重排序纳入分组最高分，PG/SQLite 保持一致；
@@ -23,7 +29,7 @@ PR #9 CodeRabbit 第三轮评审修复：20 条行内反馈、1 条 body-only �
 - 用户列表纳入只有原始事实、尚未成簇的用户；关系图数据补齐 `superseded_at`；
 - 补充配置、memo、画像排序、raw-only 用户和关系图字段回归测试。
 
-### fix: WebUI 与可访问性
+#### fix: WebUI 与可访问性
 
 - 大图斥力改为空间网格近似，避免 stride 采样遗漏节点；SVG 卸载后停止残留 rAF；簇列表增加请求序号守卫；
 - 弹窗增加焦点陷阱、背景 inert、关闭后焦点恢复；画像行、关系行、图节点和边支持键盘操作；图谱平移改用 `getScreenCTM().inverse()`；
@@ -34,13 +40,13 @@ PR #9 CodeRabbit 第三轮评审修复：20 条行内反馈、1 条 body-only �
 
 Docstring Coverage 门禁在本地无对应配置/工具，无法复现；本轮新增公共接口未引入无意义文档占位，保留现状并记录待 CI 反馈。
 
-## v1.18.7 (2026-11-05)
+### 第二轮评审修复（16 行内 + 2 follow-up + 4 nitpick）
 
 PR #9 CodeRabbit 第二轮评审（16 行内 + 2 follow-up + 4 nitpick）修复：后端 7 项、WebUI JS 9 项、
 CSS 可访问性 2 项、测试补强 2 条 nitpick；2 条迁移类 nitpick 评估后不改（014 CONCURRENTLY 需改
 迁移执行器且有 INVALID 索引风险，015 为部署期测量建议非代码缺陷）。
 
-### fix: 后端（评审二轮）
+#### fix: 后端（评审二轮）
 
 - **清空 naming_promote_threshold 恢复派生**：可选字段空值此前按省略键保存，旧显式值永续；提交
   null 时派生值被写死、之后刻度变化不再跟随。现 `prepare_save` 对 null 持久化 null 本身，加载时
@@ -60,7 +66,7 @@ CSS 可访问性 2 项、测试补强 2 条 nitpick；2 条迁移类 nitpick 评
   (category, statement) 去重（非空/最新 occurred_at 优先）再 row_number 截断，跨账号相同
   statement 不再挤占 per_section_limit 名额。
 
-### fix: WebUI（评审二轮）
+#### fix: WebUI（评审二轮）
 
 - 弹窗关闭竞态：旧保存请求的 close 回调不再清空已替换的新弹窗（仅本弹窗仍挂载时清空）；
 - **主导航 tab 改为 `<button>`（Major）**：Tab/Enter/Space 键盘可达，active 项 aria-current="page"，
@@ -78,7 +84,7 @@ CSS 可访问性 2 项、测试补强 2 条 nitpick；2 条迁移类 nitpick 评
   循环重载）；
 - 可选 float 字段清空提交 null 恢复派生（见后端第一条）。
 
-### test: 评审二轮 nitpick 补强
+#### test: 评审二轮 nitpick 补强
 
 - test_recall_lazy_embeddings：启用 rerank stub 使 use_rerank=True、断言候选池 limit==20、stub
   按 limit 截断贴近真实后端；
@@ -87,11 +93,11 @@ CSS 可访问性 2 项、测试补强 2 条 nitpick；2 条迁移类 nitpick 评
 
 全量 14 测试套件通过；web 改动以 node --check + 手工验收步骤覆盖。
 
-## v1.18.6 (2026-11-04)
+### 首轮评审修复（2 Major + 7 Minor）
 
 PR #9 CodeRabbit 评审轮（2 Major + 7 Minor）9 项修复：维护页控件类型、跨会话查询边界与排除范围、截断判定、naming 提示词口径、WebUI 四项。
 
-### fix: 评审确认的缺陷（9 项）
+#### fix: 评审确认的缺陷（9 项）
 
 - **维护页 Optional 字段控件误判**（Major）：`_field_type` 现解包 `Optional[X]`/`X | None`
   （含嵌套与 PEP 604）后按内层类型分类，`naming_promote_threshold`（`Optional[float]`）不再
@@ -122,11 +128,11 @@ PR #9 CodeRabbit 评审轮（2 Major + 7 Minor）9 项修复：维护页控件�
 
 全量 14 测试套件通过；web 四项无自动化覆盖（node --check + 手工路径推演验收）。
 
-## v1.18.5 (2026-11-04)
+### 存量注释/docstring 英文化（历史清理批）
 
 存量中文注释/docstring 全面英文化（历史清理批）。
 
-### docs: 存量注释英文化
+#### docs: 存量注释英文化
 
 - v1.18.4 评审批仅覆盖 1.18.0→1.18.3 增量行；本批清理此前全部存量：
   54 个文件、+3377/-2036 行
