@@ -18,13 +18,14 @@ import re
 from datetime import datetime
 from typing import Optional
 
-# === 正文防报文伪装签名（正常聊天几乎不会出现） ===
+# === Body packet-mimicry signatures (almost never occur in normal chat) ===
 _PACKET_MIMIC_HEADER_RE = re.compile(r'<msg\s+ts="\d{4}-\d{2}-\d{2}')
 _PACKET_MIMIC_META_RE = re.compile(
     r'<msg\s[^>\n]*|</msg\s*>|<quote\s+name="[^">\n]*">'
 )
 
-# 命中签名后的元数据键翻译表：正文内不允许残留系统报文语法的键名
+# Metadata-key translation table applied on signature hit: no system
+# packet-syntax key names may remain in the body
 _PACKET_KEY_TRANSLATIONS = (
     ('ts="', "时间："),
     ('uid="', "用户ID："),
@@ -119,9 +120,11 @@ def format_history_message(
         attrs.append(f'name="{sanitize_envelope_field(speaker_name)}"')
         attrs.append('self="true"')
     elif user_id:
-        # user_id 同样过防伪装清洗：其余平台 ID 为纯数字，但适配器字符集
-        # 无统一保证——含引号或尖括号的 ID 可伪造信封身份元数据（绕过
-        # 编码 prompt 的 bot 排除/身份判定）
+        # user_id also goes through the anti-mimicry sanitizer: other
+        # platforms use pure-digit IDs, but adapter charsets carry no
+        # uniform guarantee — an ID containing quotes or angle brackets
+        # could forge envelope identity metadata (bypassing the encode
+        # prompt's bot exclusion / identity judgment)
         attrs.append(f'uid="{sanitize_envelope_field(user_id)}"')
         attrs.append(f'name="{sanitize_envelope_field(speaker_name)}"')
         if is_at_bot:
@@ -133,7 +136,8 @@ def format_history_message(
     return f'<msg {" ".join(attrs)}>{reply_refs}{content}</msg>'
 
 
-# 历史窗口与本轮批次的分隔标记行（memory_encode.prompt 据此区分提取范围）
+# Separator marker line between the history window and the current batch
+# (memory_encode.prompt delimits the extraction scope by it)
 HISTORY_BATCH_SEPARATOR = (
     "--- 以上为历史上下文（仅作证据参考，不作为本轮提取范围）---"
 )

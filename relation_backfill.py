@@ -52,10 +52,10 @@ from .alias_store import is_placeholder_name
 from .db import MemoryDatabase
 from .entity_edge import edge_has_bot_endpoint, parse_relation, resolve_bot_forms
 
-try:  # nori-core 宿主
+try:  # nori-core host
     from nori_core.models_client.prompt import PromptLoader
     from nori_core.utils.json_utils import safe_parse_llm_json
-except ImportError:  # kira 宿主（vendor 副本同 API）
+except ImportError:  # kira host (vendored copies, same API)
     from .prompt_loader import PromptLoader
     from .json_utils import safe_parse_llm_json
 
@@ -65,19 +65,24 @@ try:  # kira host: route through the host logging manager (std logging
     from core.logging_manager import get_logger as _get_logger
 
     logger = _get_logger("noriflow_memory.relation_backfill", "cyan")
-except ImportError:  # kira 宿主（模块与上游 nori 版保持同构）
+except ImportError:  # kira host (module kept isomorphic with upstream nori)
     import logging
 
     logger = logging.getLogger(__name__)
 
 _RELATIONS_PROMPT_NAME = "fact_relations"
 DEFAULT_BATCH_SIZE = 40
-# 水位 kv 键：已成功回填到的最大簇 id——增量重跑只取其后的新簇，
-# 不再对已回填簇重复调 LLM（数据侧另有 count_on_conflict=False 双保险）
+# Watermark kv key: the largest cluster id successfully backfilled to —
+# incremental reruns only pick up newer clusters, never re-calling the LLM
+# on already-backfilled clusters (the data side additionally carries the
+# count_on_conflict=False double safeguard)
 _WATERMARK_KEY = "relation_backfill_watermark"
-# 复活簇回填待办 kv 键（JSON id 数组，容量上限防无界增长）：merge 复活 /
-# 维护页手工复活的簇通常已在水位之下，增量扫描永远取不到——登记待办
-# 后每轮回填按 id 精取补提取（backfill|{id} evidence_key 幂等，重复无害）
+# Revived-cluster backfill todo kv key (JSON id array, capacity cap against
+# unbounded growth): clusters revived by merge / manually via the
+# maintenance page usually sit below the watermark, so incremental scans
+# never reach them — after registration each backfill round fetches them
+# precisely by id for extraction (backfill|{id} evidence_key is idempotent;
+# repeats are harmless)
 _BACKFILL_PENDING_KEY = "relation_backfill_pending_ids"
 _BACKFILL_PENDING_MAX = 500
 
@@ -307,9 +312,12 @@ class RelationBackfill:
             except Exception:
                 logger.warning("回填水位读取失败（退化为全量）", exc_info=True)
                 after_id, mode = 0, "full"
-        # 复活簇待办：水位之下的复活簇（merge/手工复活）按 id 精取。
-        # take 即清空——失败面（精取失败/批处理失败）须重新登记回待办，
-        # 否则水位之下的簇在增量模式永远失去重试机会（只能全量重跑）
+        # Revived-cluster todo: revived clusters below the watermark (merge /
+        # manual revival) are fetched precisely by id. take clears the list —
+        # on any failure (precise fetch / batch processing) the ids must be
+        # re-registered into the todo, otherwise below-watermark clusters
+        # would never get retried in incremental mode (only a full rerun
+        # would reach them)
         revived_pending = await take_backfill_pending(self._db)
         revived = []
         revived_retry: set[int] = set()
@@ -338,9 +346,10 @@ class RelationBackfill:
         directory = build_directory(
             await self._db.fetch_alias_directory(), bot, self._bot_nickname
         )
-        # uid -> 规范名（写侧守卫源）：LLM 输出"未知"/uid 兜底形时用
-        # 目录名顶替（bot 通配条目不作规范名源）；未命中留空由 upsert
-        # 语句保旧名
+        # uid -> canonical name (write-side guard source): when the LLM
+        # outputs the "unknown"/uid fallback form, substitute the directory
+        # name (bot wildcard entries are not canonical-name sources); left
+        # empty on miss so the upsert statement keeps the old name
         names_by_owner: dict[tuple[str, str], str] = {}
         for name, entry in directory.items():
             if not entry.platform:
@@ -385,7 +394,8 @@ class RelationBackfill:
                 )
 
         stopped = False
-        # 复活簇批（待办批；水位不动——这些簇本就在水位之下）
+        # Revived-cluster batches (todo batches; watermark untouched — these
+        # clusters sit below the watermark anyway)
         for batch in _chunked(revived, self._batch_size):
             try:
                 await _process(batch)
@@ -394,9 +404,11 @@ class RelationBackfill:
                 break
             revived_retry -= {int(c["id"]) for c in batch}
         if revived_retry:
-            # 中途失败的复活批：重新登记待办，下轮增量重试
+            # Revived batch that failed midway: re-register the todo, retry
+            # in the next incremental round
             await self._requeue_backfill_pending(sorted(revived_retry))
-        # 增量/全量批：id 窗口分页，每批成功即推水位
+        # Incremental / full batches: id-window paging, watermark advances
+        # per successful batch
         if not stopped:
             while True:
                 try:
@@ -458,7 +470,8 @@ class RelationBackfill:
             (edges written, validation-discarded count).
         """
         by_id = {int(c["id"]): c for c in batch}
-        # 批内词典：陈述子串命中的目录名（含 bot）——提示词有界
+        # Batch dictionary: directory names hit by statement substring
+        # matching (bot included) — keeps the prompt bounded
         names: list[str] = []
         statements = [str(c["canonical_statement"] or "") for c in batch]
         for name in directory:
@@ -491,7 +504,8 @@ class RelationBackfill:
                 continue
             key = (row["platform"], row["subject_uid"], row["object_uid"], row["relation_label"])
             if key in seen_struct_keys:
-                # 同批重复结构键：留首条（evidence_key 相同，落库也只会幂等）
+                # Duplicate structural key within the batch: keep the first
+                # (same evidence_key; the DB upsert would dedupe anyway)
                 discarded += 1
                 continue
             seen_struct_keys.add(key)
@@ -579,8 +593,10 @@ class RelationBackfill:
             "confidence": rel.confidence,
             "occurred_at": cluster["occurred_at"] or datetime.now(),
             "evidence_key": f"backfill|{cluster_id}",
-            # 回填通道专用：命中已有边只刷新不计分（见模块 docstring 与
-            # db.upsert_entity_edge——线上提取/补编码不传，默认照常计分）
+            # Backfill-channel specific: on hitting an existing edge, refresh
+            # only without counting (see the module docstring and
+            # db.upsert_entity_edge — online extraction / encode catch-up do
+            # not pass this and keep counting as usual)
             "count_on_conflict": False,
             "is_bot_edge": edge_has_bot_endpoint(
                 rel.subject_user_id, rel.object_user_id, self._bot_forms()

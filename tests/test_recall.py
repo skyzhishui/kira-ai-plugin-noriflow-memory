@@ -24,6 +24,8 @@ Coverage:
 - build_search_text tokenization + both write points land search_text;
 - hybrid retrieval: dual-leg query, RRF fusion order, single leg when
   disabled, row-exclusion push-down;
+- BM25 tsv missing (schema without migration 015): expression-form
+  fallback, correct results, latched until restart;
 - rolling restore block: skip the latest K batches, oldest->newest
   presentation, budget truncation, memo-driven recall row exclusion, no
   exclusion after TTL expiry;
@@ -52,6 +54,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _harness import load_module  # noqa: E402
+
+import asyncpg  # noqa: E402 -- used to emulate the pre-migration column error
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 
@@ -200,7 +204,8 @@ def _hint_row(row_id: int, content: str, *, relevance: float = 0.9, **extra) -> 
 
 
 def _make_kernel(db, *, window_batches=None, rerank=None, **cfg_over) -> LocalMemoryKernel:
-    # 时间标注既有断言锁旧纯相对形态；mode 专项覆盖见 test_time_label.py
+    # Existing assertions pin the time label to the old purely-relative
+    # form; mode-specific coverage lives in test_time_label.py
     cfg_over.setdefault("recall_time_label_mode", "relative")
     config = LocalMemoryConfig(dsn="postgresql://stub", **cfg_over)
     provider = None if window_batches is None else (lambda: window_batches)
@@ -296,11 +301,15 @@ async def test_dedup_early_stop_at_top_k() -> None:
 
 
 async def test_write_dedup_skips_mismatched_vector_dims() -> None:
-    """M4 维度跳过：换 embedding 模型后同库新旧维度向量共存（SQLite 后端
-    无固定维度列）——维度不匹配的比对对不构成去重证据。原先 zip 静默截断
-    产生的无意义分数可能 ≥ 阈值假命中：读侧丢召回行、写侧静默丢摘要。"""
-    # 读侧守卫（len(unit) != len(kept_vec) -> continue）：3 维与 4 维同向
-    # "近重复"对必须双双保留（若仍 zip 截断比对，cosine=1.0 假命中会丢行）
+    """M4 dimension skip: after an embedding model swap, old- and new-dim
+    vectors coexist in the same db (the SQLite backend has no fixed dim
+    column) -- dimension-mismatched comparison pairs do not constitute
+    dedup evidence. Meaningless scores from the previous silent zip
+    truncation could fake-hit the threshold: dropping recall rows on the
+    read side, silently losing summaries on the write side."""
+    # Read-side guard (len(unit) != len(kept_vec) -> continue): a 3-dim and
+    # a 4-dim same-direction "near-duplicate" pair must both be kept (if
+    # zip-truncated comparison remains, the cosine=1.0 false hit drops rows)
     a = _row("a", 0.9, _NOW - timedelta(days=10), _vec_str([1.0, 0.0, 0.0]))
     b = _row("b", 0.8, _NOW - timedelta(days=11), _vec_str([1.0, 0.0, 0.0, 0.0]))
     db = _CaptureDB(rows=[a, b])
@@ -309,9 +318,11 @@ async def test_write_dedup_skips_mismatched_vector_dims() -> None:
         "维度不匹配 = 非重复，不得作为读侧去重证据"
     )
 
-    # 写侧端到端（ingest 走 apply_write_dedup=True）：窗口比对用真
-    # SQLite 打分逻辑（fetch_recent_summary_scores 的 _cosine 维度过滤），
-    # 连接层用既有 _FetchSeqConn 桩喂同会话窗口行
+    # Write side end-to-end (ingest with apply_write_dedup=True): the
+    # window comparison uses the real SQLite scoring logic
+    # (fetch_recent_summary_scores's _cosine dim filter); the connection
+    # layer uses the existing _FetchSeqConn stub to feed same-session
+    # window rows
     inserted: list[str] = []
 
     def _kernel_with_window(window_vec: list[float]) -> LocalMemoryKernel:
@@ -332,8 +343,9 @@ async def test_write_dedup_skips_mismatched_vector_dims() -> None:
 
         return _make_kernel(_WindowDB())
 
-    # 窗口内是旧模型 4 维向量；新批次经 _StubEmbedding 产出 1 维向量——
-    # 维度不匹配的窗口行不产生分数（best=0），摘要必须正常落库
+    # The window holds old-model 4-dim vectors; the new batch goes through
+    # _StubEmbedding producing 1-dim vectors -- dimension-mismatched window
+    # rows yield no score (best=0), so the summary must land normally
     doc_id = await _kernel_with_window([1.0, 0.0, 0.0, 0.0]).ingest(
         "新模型批次摘要", "s1", "u1", platform="napcat",
         apply_write_dedup=True,
@@ -342,8 +354,10 @@ async def test_write_dedup_skips_mismatched_vector_dims() -> None:
         "维度不匹配不构成写侧去重证据，新批次必须正常落库"
     )
 
-    # 对照组：窗口行同为 1 维且与新批次向量同向（cosine=1.0 ≥ 0.85）——
-    # 写入去重照常命中跳过（document_id 幂等返回但行不落库）
+    # Control group: the window row is also 1-dim and same-direction as the
+    # new batch vector (cosine=1.0 >= 0.85) -- write dedup hits and skips
+    # as usual (document_id is returned idempotently but the row is not
+    # stored)
     inserted.clear()
     doc_id2 = await _kernel_with_window([0.5]).ingest(
         "对照组摘要", "s1", "u1", platform="napcat",
@@ -968,7 +982,11 @@ async def test_hybrid_two_legs_rrf_fusion() -> None:
     assert len(pool.conn.queries) == 2, "须发出向量+BM25 两路查询"
     vec_sql, bm25_sql = pool.conn.queries[0][0], pool.conn.queries[1][0]
     assert "ORDER BY embedding <=> $1::vector" in vec_sql
-    assert "to_tsvector('simple', search_text)" in bm25_sql
+    assert "tsv @@ to_tsquery('simple', $" in bm25_sql
+    assert "ORDER BY ts_rank(tsv, " in bm25_sql
+    assert "to_tsvector('simple', search_text)" not in bm25_sql, (
+        "migration 015 materializes tsv; the BM25 leg must read the column"
+    )
     assert "to_tsquery('simple', $" in bm25_sql, "OR 连接用 to_tsquery"
     assert "plainto_tsquery" not in bm25_sql, "AND 语义（plainto）须废弃"
     for sql_i, params_i in pool.conn.queries:
@@ -993,6 +1011,75 @@ async def test_hybrid_two_legs_rrf_fusion() -> None:
     )
     assert all("rrf" in r for r in rows)
     print("PASS test_hybrid_two_legs_rrf_fusion")
+
+
+class _NoTsvConn:
+    """fetch stub emulating a schema without migration 015, routed by SQL
+    content: the vector leg returns its own (empty) results, the tsv-form
+    BM25 leg raises UndefinedColumnError, the legacy expression form
+    succeeds -- so BM25-origin assertions cannot pass via the vector leg."""
+
+    def __init__(
+        self,
+        vec_results: list[list[dict]],
+        legacy_results: list[list[dict]],
+    ) -> None:
+        self._vec_results = list(vec_results)
+        self._legacy_results = list(legacy_results)
+        self.queries: list[tuple[str, tuple]] = []
+
+    async def fetch(self, sql, *params):
+        self.queries.append((sql, params))
+        # Route by FTS shape: both legs' SELECT list carries the cosine
+        # distance expression ("embedding <=>"), so the leg can only be told
+        # apart by its FTS clauses. The legacy form is checked first (it also
+        # contains "@@ to_tsquery", but never "tsv @@" / "ts_rank(tsv").
+        if "to_tsvector('simple', search_text) @@" in sql:
+            return self._legacy_results.pop(0) if self._legacy_results else []
+        if "@@ to_tsquery" in sql:
+            raise asyncpg.UndefinedColumnError('column "tsv" does not exist')
+        return self._vec_results.pop(0) if self._vec_results else []
+
+
+async def test_bm25_tsv_missing_falls_back_and_latches() -> None:
+    """Missing tsv column (schema without migration 015): the BM25 leg
+    degrades to the expression form (correct, slower) instead of failing
+    the whole leg; the fallback latches so later recalls skip the failed
+    probe until restart."""
+    db = MemoryDatabase.__new__(MemoryDatabase)
+    pool = _ExecPool()
+    pool.conn = _NoTsvConn(
+        vec_results=[[], []],  # both recalls: empty vector leg
+        legacy_results=[
+            [_leg_row(3, "bm25-only", 0.5)],  # legacy BM25 retry (recall 1)
+            [_leg_row(3, "bm25-only", 0.5)],  # legacy BM25 direct (recall 2)
+        ],
+    )
+    db._pool = pool
+    rows = await db.search_chat_summaries(
+        query_vec=[0.1], limit=20, scope="session", session_id="s1",
+        query_text="明日方舟", hybrid=True, rrf_k=60,
+    )
+    assert len(pool.conn.queries) == 3, "首轮须为 tsv 探测失败 + 表达式回退共三查"
+    assert "tsv @@" in pool.conn.queries[1][0], "首轮先按 tsv 列探测"
+    legacy_sql = pool.conn.queries[2][0]
+    assert "to_tsvector('simple', search_text) @@" in legacy_sql, "回退用表达式形态"
+    assert "ts_rank(to_tsvector('simple', search_text), " in legacy_sql
+    # vector leg returned nothing, so every hit here can only come from the
+    # legacy BM25 leg -- this is the actual fusion assertion
+    assert [r["document_id"] for r in rows] == ["bm25-only"], "回退轮结果正确融合"
+    await db.search_chat_summaries(
+        query_vec=[0.1], limit=20, scope="session", session_id="s1",
+        query_text="明日方舟", hybrid=True, rrf_k=60,
+    )
+    assert len(pool.conn.queries) == 5, "闩锁后第二轮只发两查（向量+表达式）"
+    bm25_2 = pool.conn.queries[4][0]
+    assert "to_tsvector('simple', search_text) @@" in bm25_2
+    assert "tsv @@" not in bm25_2 and "ts_rank(tsv" not in bm25_2, (
+        "闩锁生效：不再探测 tsv 列"
+    )
+    assert db._bm25_tsv_missing is True, "闩锁置位（重启后重探测）"
+    print("PASS test_bm25_tsv_missing_falls_back_and_latches")
 
 
 async def test_hybrid_disabled_single_leg() -> None:
@@ -1127,10 +1214,12 @@ async def test_rollout_memo_ttl_expiry() -> None:
 
 
 async def test_rollout_no_commit_keeps_row_recallable() -> None:
-    """L6 两阶段 memo 的 no-commit 可见性：build 只把 ids 暂存
-    _rollout_pending（recall 排除只读 _rollout_memo）——未 commit 时该批次
-    行必须仍可被 search 召回（prompt 组装被丢弃时不得双通道失踪），
-    commit 后才进入排除。一测锁两态。"""
+    """L6 no-commit visibility of the two-phase memo: build only stashes
+    ids into _rollout_pending (recall exclusion reads only _rollout_memo)
+    -- before commit, the batch's rows must still be recallable by search
+    (they must not vanish from both channels when the prompt assembly is
+    discarded); exclusion kicks in only after commit. One test locks both
+    states."""
     db = _RolloutDB(
         rows=[_leg_row(1, "bridge-batch", 0.9)],
         rollout_rows=[_rollout_row("bridge-batch", "窗口外桥接批摘要", 4)],
@@ -1140,7 +1229,8 @@ async def test_rollout_no_commit_keeps_row_recallable() -> None:
     text = await kernel.build_recent_rollout_text("s1")
     assert "窗口外桥接批摘要" in text, "build 须返回包含该批次行"
 
-    # 未 commit：pending 不泄漏进 recall 排除，行仍可被召回
+    # No commit yet: pending does not leak into recall exclusion, the row
+    # stays recallable
     items = await kernel.search(query="Q", session_id="s1")
     assert db.search_kwargs.get("exclude_document_ids") is None, (
         "build 后未 commit，pending ids 不得送进召回排除"
@@ -1149,7 +1239,7 @@ async def test_rollout_no_commit_keeps_row_recallable() -> None:
         "未 commit 时该批次行必须仍可被 search 召回"
     )
 
-    # commit 后：同一会话的 recall 才排除该行
+    # After commit: recall for the same session excludes the row
     kernel.commit_rollout_memo("s1")
     await kernel.search(query="Q", session_id="s1")
     assert db.search_kwargs.get("exclude_document_ids") == ["bridge-batch"], (
@@ -1484,6 +1574,7 @@ async def main() -> None:
     await test_insert_writes_search_text()
     await test_update_encoded_rewrites_search_text()
     await test_hybrid_two_legs_rrf_fusion()
+    await test_bm25_tsv_missing_falls_back_and_latches()
     await test_hybrid_disabled_single_leg()
     await test_exclude_document_ids_clause()
     await test_hybrid_fallback_threshold_scale_guard()

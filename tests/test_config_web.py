@@ -21,11 +21,13 @@ except ModuleNotFoundError:  # Python 3.10 has no stdlib tomllib; tomli ships vi
     import tomli as tomllib  # noqa: F401
 import unittest
 from pathlib import Path
+from typing import Literal, Optional
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN_DIR))
 
-# config_web 用包内相对导入：先挂包桩再加载（与主测试 _load_plugin_module 同法）
+# config_web uses package-relative imports: install the package stub
+# first, then load (same as _load_plugin_module in the main tests)
 import types  # noqa: E402
 
 _pkg = types.ModuleType("noriflow_memory_pkg")
@@ -37,6 +39,8 @@ from noriflow_memory_pkg.config import LocalMemoryConfig  # noqa: E402
 from noriflow_memory_pkg.config_web import (  # noqa: E402
     SaveBlocked,
     _MASK,
+    _field_type,
+    _literal_options,
     build_payload,
     config_schema,
     mask_values,
@@ -46,26 +50,81 @@ from noriflow_memory_pkg.config_web import (  # noqa: E402
 )
 
 
+class TestFieldType(unittest.TestCase):
+    """`_field_type` maps pydantic annotations to frontend control types."""
+
+    def test_scalar_annotations(self):
+        self.assertEqual(_field_type(bool), "bool")
+        self.assertEqual(_field_type(int), "int")
+        self.assertEqual(_field_type(float), "float")
+        self.assertEqual(_field_type(str), "str")
+
+    def test_optional_scalars_unwrap_to_inner_type(self):
+        # Regression: Optional[float] used to fall through to the "list"
+        # fallback (multi-line textarea -> empty value submitted as [], 422)
+        self.assertEqual(_field_type(Optional[float]), "float")
+        self.assertEqual(_field_type(Optional[str]), "str")
+        self.assertEqual(_field_type(Optional[int]), "int")
+        self.assertEqual(_field_type(Optional[bool]), "bool")
+
+    def test_pep604_optional_spelling(self):
+        self.assertEqual(_field_type(float | None), "float")
+        self.assertEqual(_field_type(None | str), "str")
+
+    def test_nested_optional(self):
+        self.assertEqual(_field_type(Optional[Optional[float]]), "float")
+        self.assertEqual(_field_type(float | None | None), "float")
+
+    def test_optional_list_stays_list(self):
+        # A list field that may be None is still rendered as a list control
+        self.assertEqual(_field_type(Optional[list[str]]), "list")
+        self.assertEqual(_field_type(list[str] | None), "list")
+        self.assertEqual(_field_type(list[str]), "list")
+
+    def test_literal_is_str_with_options(self):
+        ann = Literal["relative", "absolute", "both"]
+        self.assertEqual(_field_type(ann), "str")
+        self.assertEqual(_literal_options(ann), ["relative", "absolute", "both"])
+        # Optional[Literal[...]] unwraps too; None is not offered as an option
+        opt = Optional[Literal["a", "b"]]
+        self.assertEqual(_field_type(opt), "str")
+        self.assertEqual(_literal_options(opt), ["a", "b"])
+        self.assertIsNone(_literal_options(str))
+        self.assertIsNone(_literal_options(Optional[float]))
+
+    def test_non_optional_union_keeps_fallback(self):
+        # No single control type can serve a multi-type union: keeps the
+        # historical "list" fallback rather than silently picking one member
+        self.assertEqual(_field_type(int | str), "list")
+
+
 class TestSchema(unittest.TestCase):
     def test_schema_covers_all_fields_with_annotations(self):
         self.assertEqual(set(config_schema()), set(LocalMemoryConfig.model_fields))
         s = config_schema()
-        # restart 标注：装配期展开 vs 运行时读
+        # restart annotation: expanded at assembly time vs read at runtime
         self.assertTrue(s["dsn"]["restart"])
         self.assertTrue(s["pool_max"]["restart"])
         self.assertTrue(s["alias_stopwords"]["restart"])
         self.assertFalse(s["recall_top_k"]["restart"])
-        self.assertFalse(s["backfill_interval_seconds"]["restart"])  # 运行时读（热加载批）
-        self.assertFalse(s["failure_threshold"]["restart"])  # 熔断器运行时读
+        self.assertFalse(s["backfill_interval_seconds"]["restart"])  # read at runtime (hot-reload batch)
+        self.assertFalse(s["failure_threshold"]["restart"])  # circuit breaker reads it at runtime
         self.assertFalse(s["tool_scope_locked"]["restart"])
-        # sensitive：dsn 命中；非敏感不受影响
+        # sensitive: dsn matches; non-sensitive keys are unaffected
         self.assertTrue(s["dsn"]["sensitive"])
         self.assertFalse(s["recall_top_k"]["sensitive"])
-        # 类型映射
+        # type mapping
         self.assertEqual(s["topic_blacklist"]["type"], "list")
         self.assertEqual(s["recall_relevance_threshold"]["type"], "float")
         self.assertEqual(s["recall_time_decay_enabled"]["type"], "bool")
-        # default_factory 字段（topic_blacklist）默认值可 JSON 序列化且非哨兵
+        # Optional[float] renders as a float control (not the list fallback):
+        # its unset default is None, which an empty list control would submit
+        # as [] and pydantic would 422 on every save
+        self.assertEqual(s["naming_promote_threshold"]["type"], "float")
+        self.assertIsNone(s["naming_promote_threshold"]["default"])
+        self.assertGreater(s["naming_promote_threshold"]["min"], 0.0)  # gt=0 -> exclusive bound nudged inside
+        # default_factory field (topic_blacklist): its default is
+        # JSON-serializable and is not a sentinel
         json.dumps(s["topic_blacklist"]["default"])
         self.assertEqual(s["topic_blacklist"]["default"], [])
 
@@ -83,7 +142,7 @@ class TestMask(unittest.TestCase):
         masked = mask_values(vals)
         self.assertEqual(masked["dsn"], _MASK)
         self.assertEqual(masked["recall_top_k"], 5)
-        # 哨兵还原取现值；空串不掩码
+        # sentinel restore uses current values; empty string is not masked
         self.assertEqual(mask_values({"dsn": ""})["dsn"], "")
         out = unmask_values(masked, vals)
         self.assertEqual(out["dsn"], "postgres://u:p@h/db")
@@ -94,7 +153,7 @@ class TestPayload(unittest.TestCase):
         d = build_payload({"dsn": "postgres://u:p@h/db", "pool_max": 8})
         self.assertEqual(d["values"]["dsn"], _MASK)
         self.assertEqual(d["values"]["pool_max"], 8)
-        self.assertEqual(d["values"]["recall_top_k"], 5)  # 缺键补默认
+        self.assertEqual(d["values"]["recall_top_k"], 5)  # missing key filled with the default
         self.assertEqual(d["groups"][0]["key"], "conn")
 
 
@@ -103,7 +162,7 @@ class TestPrepareSave(unittest.TestCase):
 
     def test_partial_submit_keeps_current_values(self):
         r = prepare_save({"recall_top_k": 7}, self.HOST)
-        # 未提交字段沿用现值（不落模型默认）
+        # unsubmitted fields keep current values (not model defaults)
         self.assertEqual(r["validated"].dsn, self.HOST["dsn"])
         self.assertEqual(r["validated"].pool_max, 8)
         self.assertEqual(r["changed"], {"recall_top_k": 7})
@@ -125,6 +184,103 @@ class TestPrepareSave(unittest.TestCase):
         r = prepare_save({"pool_max": 16}, self.HOST)
         self.assertEqual(r["restart_required"], ["pool_max"])
 
+    def test_unset_optional_field_does_not_reject_save(self):
+        # Regression: with no naming_promote_threshold key in the host config
+        # (unset Optional[float]), the whole form round-trip must validate --
+        # previously the field was a list control whose empty value was
+        # submitted as [], failing float coercion (422 on every save)
+        payload = build_payload({})
+        r = prepare_save(dict(payload["values"]), {})
+        self.assertEqual(r["changed"], {})
+        self.assertEqual(r["validated"].naming_promote_threshold, 3.0)  # derived from score_start_high
+        # an explicit value is accepted as-is
+        r2 = prepare_save({"naming_promote_threshold": 4.5}, self.HOST)
+        self.assertEqual(r2["changed"], {"naming_promote_threshold": 4.5})
+
+    def test_legacy_cross_field_conflict_does_not_block_unrelated_save(self):
+        # A stored combination that was legal before the naming x decay guard
+        # (3 * 0.9 = 2.7 < 3) must not block saving an unrelated field. The
+        # failing group is untouched by this save, so validation reuses the
+        # startup fallback defaults and nothing in that group is persisted.
+        host = {
+            "dsn": "postgres://u:p@h/db",
+            "naming_promote_threshold": 3.0,
+            "demote_threshold": 3.0,
+            "decay_factor": 0.9,
+        }
+        submitted = dict(host)
+        submitted["recall_top_k"] = 7
+        r = prepare_save(submitted, host)
+        self.assertEqual(r["changed"], {"recall_top_k": 7})
+        self.assertEqual(
+            r["legacy_fallback"],
+            ["decay_factor", "demote_threshold", "naming_promote_threshold"],
+        )
+        # Validation used startup-equivalent defaults; the host keeps its raw
+        # values because none of the group keys entered `changed`.
+        self.assertEqual(r["validated"].decay_factor, 0.9)
+        self.assertEqual(r["validated"].demote_threshold, 2.0)
+        self.assertEqual(r["validated"].naming_promote_threshold, 3.0)
+
+    def test_editing_the_conflicting_group_still_rejects(self):
+        # Same legacy host, but this save edits a group member and the
+        # resulting combination is still illegal: the constraint stays
+        # enforced (no blind relaxation) with the validator's explanation.
+        host = {
+            "dsn": "postgres://u:p@h/db",
+            "naming_promote_threshold": 3.0,
+            "demote_threshold": 3.0,
+            "decay_factor": 0.9,
+        }
+        with self.assertRaises(ValueError) as cm:
+            prepare_save({"decay_factor": 0.95, "recall_top_k": 7}, host)
+        self.assertIn("配置校验失败", str(cm.exception))
+
+    def test_legacy_derived_naming_conflict_does_not_block_unrelated_save(self):
+        # Derived naming threshold (None) with a legacy decay: 3 * 0.5 = 1.5
+        # < 2. The fallback group self-reported by the validator is
+        # (demote_threshold, score_start_high, decay_factor).
+        host = {
+            "dsn": "postgres://u:p@h/db",
+            "score_start_high": 3,
+            "demote_threshold": 2.0,
+            "decay_factor": 0.5,
+        }
+        submitted = dict(host)
+        submitted["recall_top_k"] = 7
+        r = prepare_save(submitted, host)
+        self.assertEqual(r["changed"], {"recall_top_k": 7})
+        self.assertEqual(
+            r["legacy_fallback"],
+            ["decay_factor", "demote_threshold", "score_start_high"],
+        )
+        self.assertEqual(r["validated"].decay_factor, 0.9)
+
+    def test_clearing_optional_restores_lazy_derivation(self):
+        # Explicit value -> clear (submitted null) must persist null, not the
+        # derived number: the model resolves None to score_start_high at
+        # construction, so freezing that number would stop later
+        # score_start_high changes from re-deriving.
+        host = {
+            "dsn": "postgres://u:p@h/db",
+            "score_start_high": 3,
+            "naming_promote_threshold": 4.5,
+        }
+        cleared = prepare_save({"naming_promote_threshold": None}, host)
+        self.assertEqual(cleared["changed"], {"naming_promote_threshold": None})
+        # Host state after the save: the key is null (unset), not 3.0
+        host_after = dict(host)
+        host_after.update(cleared["changed"])
+        self.assertIsNone(host_after["naming_promote_threshold"])
+        # A later score_start_high change re-derives the effective value
+        # (4 keeps the hysteresis band 6-2 >= the one-evidence increment)
+        bumped = prepare_save({"score_start_high": 4}, host_after)
+        self.assertEqual(bumped["validated"].naming_promote_threshold, 4.0)
+        self.assertNotIn("naming_promote_threshold", bumped["changed"])
+        # Clearing an already-unset field is a no-op
+        noop = prepare_save({"naming_promote_threshold": None}, host_after)
+        self.assertEqual(noop["changed"], {})
+
 
 class TestPersistHostConfig(unittest.TestCase):
     def test_merge_into_existing_file(self):
@@ -142,10 +298,10 @@ class TestPersistHostConfig(unittest.TestCase):
             )
             self.assertEqual(on_disk["dsn"], "postgres://new")
             self.assertEqual(on_disk["recall_top_k"], 7)
-            self.assertTrue(on_disk["enabled"])  # 非配置字段不被触碰
+            self.assertTrue(on_disk["enabled"])  # non-config fields are left untouched
 
 
-# ---------------- handler 编排（复用主测试文件的桩链路） ----------------
+# -------- handler orchestration (reuses the main test stubs) --------
 
 
 class TestConfigApi(unittest.TestCase):
@@ -183,8 +339,9 @@ class TestConfigApi(unittest.TestCase):
             async def set_plugin_enabled(self, pid, enabled):
                 self.enabled[pid] = enabled
 
-        # handler 内延迟 import core.plugin.manager：测试环境 core
-        # 是桩包，预注一个带 PLUGIN_CONFIG_DIR 的桩模块（指向临时目录）
+        # The handler lazily imports core.plugin.manager: core is a stub
+        # package in tests, so pre-inject a stub module carrying
+        # PLUGIN_CONFIG_DIR (pointing at the temp directory)
         core_pkg = sys.modules.get("core")
         if core_pkg is not None and "core.plugin.manager" not in sys.modules:
             reg_stub = types.ModuleType("core.plugin.manager")
@@ -217,13 +374,13 @@ class TestConfigApi(unittest.TestCase):
         inst = self._make_inst(host)
         pm = inst.ctx.plugin_mgr
 
-        # GET：schema + 掩码值
+        # GET: schema + masked values
         d = asyncio.run(inst.api_memory_config_get())
         self.assertEqual(d["groups"][0]["key"], "conn")
         self.assertEqual(d["values"]["dsn"], _MASK)
         self.assertEqual(d["values"]["recall_top_k"], 5)
 
-        # PUT：热字段 + restart 字段
+        # PUT: hot field + restart field
         reg_stub = sys.modules.get("core.plugin.manager")
         if reg_stub is not None:
             reg_stub.PLUGIN_CONFIG_DIR = Path(self._tmp_config_dir.name)
@@ -238,10 +395,10 @@ class TestConfigApi(unittest.TestCase):
         self.assertTrue(r["saved"])
         self.assertEqual(r["changes"], 2)
         self.assertEqual(r["restart_required"], ["pool_max"])
-        # 运行时实例热更新
+        # runtime instance hot-update
         self.assertEqual(inst._config.recall_top_k, 7)
         self.assertEqual(inst._config.pool_max, 16)
-        # 宿主真相源（内存 + 磁盘）
+        # host source of truth (memory + disk)
         self.assertEqual(pm.plugin_configs["kira-ai-plugin-noriflow-memory"]["recall_top_k"], 7)
         on_disk = json.loads(
             (Path(self._tmp_config_dir.name) / "kira-ai-plugin-noriflow-memory.json")
@@ -258,7 +415,7 @@ class TestConfigApi(unittest.TestCase):
         with self.assertRaises(self.HTTPException) as cm2:
             asyncio.run(inst.api_memory_config_put({"values": {"dsn": ""}}))
         self.assertEqual(cm2.exception.status_code, 400)
-        # 无变化短路
+        # no-change short-circuit
         host_now = dict(inst.ctx.plugin_mgr.get_plugin_config("kira-ai-plugin-noriflow-memory"))
         r = asyncio.run(inst.api_memory_config_put({"values": host_now}))
         self.assertFalse(r["saved"])

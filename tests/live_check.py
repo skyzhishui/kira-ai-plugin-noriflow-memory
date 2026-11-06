@@ -31,7 +31,8 @@ import asyncpg
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = "/data/KiraAI/data/config/plugins/kira-ai-plugin-noriflow-memory.json"
 
-# 让脚本可直接引用插件内模块（包上下文）
+# Make plugin modules importable directly from this script
+# (package context)
 sys.path.insert(0, str(PLUGIN_DIR.parent))
 
 
@@ -44,7 +45,7 @@ def _load_config() -> dict:
 async def main() -> int:
     results: list[tuple[str, bool, str]] = []
 
-    # 1. 配置
+    # 1. Config
     try:
         cfg = _load_config()
         dsn = str(cfg.get("dsn", "") or "").strip()
@@ -55,7 +56,7 @@ async def main() -> int:
         _report(results)
         return 1
 
-    # 动态加载插件模块（包上下文）
+    # Dynamically load plugin modules (package context)
     pkg_name = "noriflow_memory_live_pkg"
     import types
 
@@ -91,7 +92,7 @@ async def main() -> int:
     )
     db = db_mod.MemoryDatabase(config)
 
-    # 2. 连接 + 迁移（幂等：执行两次）
+    # 2. Connect + migrate (idempotent: run twice)
     try:
         await db.connect()
         migrations = PLUGIN_DIR / "migrations"
@@ -103,7 +104,7 @@ async def main() -> int:
         _report(results)
         return 1
 
-    # 3. 摘要写入 + 清理
+    # 3. Summary write + cleanup
     try:
         probe = f"livecheck-{int(time.time())}"
         content = f'<msg ts="2026-01-01 00:00:00" uid="u-live" name="tester">回环测试 {probe}</msg>'
@@ -140,7 +141,7 @@ async def main() -> int:
     except Exception as exc:
         results.append(("摘要清理", False, str(exc)))
 
-    # 4. 维护数据层查询
+    # 4. Maintenance data-layer queries
     try:
         overview = await webui_store.fetch_overview(db.pool)
         results.append((
@@ -160,7 +161,7 @@ async def main() -> int:
     except Exception as exc:
         results.append(("维护查询-列表", False, str(exc)))
 
-    # 5. 画像拼装（无数据时返回空文本属预期）
+    # 5. Profile assembly (empty text is expected with no data)
     try:
         persona_mod = load("persona_service")
         svc = persona_mod.LocalPersonaService(
@@ -171,13 +172,13 @@ async def main() -> int:
     except Exception as exc:
         results.append(("画像拼装", False, str(exc)))
 
-    # 清理：关闭连接池
+    # Cleanup: close the connection pool
     try:
         await db.close()
     except Exception:
         pass
 
-    # 信封格式冒烟（不依赖 DB）
+    # Envelope format smoke check (no DB dependency)
     line = envelope_mod.format_history_message(
         speaker_name="t", content="hello",
         user_id="u1", nickname="t", cardname="c",

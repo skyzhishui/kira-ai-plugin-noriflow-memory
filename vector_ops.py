@@ -114,10 +114,13 @@ class EmbeddingService:
             )
             return results
 
-        # 返回形态防御（同样按 fail-open 处理，对齐上方异常语义）：部分
-        # OpenAI 兼容网关异常时会返回条数不齐或含 null 的列表——后处理
-        # 在 try 外，越界/None 若不在此拦截会炸掉调用链（补算任务整轮
-        # 停摆、retain 批次上抛），且服务端响应形态不变时每周期复现
+        # Return-shape defense (also treated as fail-open, aligned with the
+        # exception semantics above): some OpenAI-compatible gateways return
+        # lists with mismatched counts or null entries on failure — the
+        # post-processing runs outside the try block, so an unguarded
+        # out-of-range/None entry would blow up the call chain (backfill
+        # task stalled for a whole round, retain batch raised), and would
+        # recur every cycle while the server response shape stays unchanged.
         if not isinstance(vectors, list) or len(vectors) != len(indexes):
             logger.warning(
                 "embedding 批量返回条数不符（期望 %d 实得 %s），整批置 NULL 待补算",

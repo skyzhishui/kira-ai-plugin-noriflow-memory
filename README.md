@@ -150,6 +150,8 @@ flowchart TD
 | score_cap / promote_threshold / demote_threshold | float | 10 / 6 / 2 | 分数封顶 / 进画像阈值 / 降级迟滞下界（迟滞带 = promote − demote 不得小于单条证据最大加分 `max(score_start_high, score_start_medium)`，否则降档簇一条证据即可回档、画像反复翻转；promote 不得大于 score_cap（相等允许），否则晋升静默停摆；均由 `model_validator` 装配期强制校验，非法组合保存即被拒） |
 | decay_factor / decay_interval_days | float / integer | 0.9 / 14 | 每周期衰减系数与周期天数（interval 兼缺席冻结窗口粒度；pending 死亡窗口由 pending_dead_days 独立控制） |
 | recent_expire_days / recent_promote_threshold | integer / float | 30 / 4 | 近期维度过期天数与进画像阈值 |
+| naming_promote_threshold | float | 派生 | 称呼偏好维度进画像阈值（留空从 score_start_high 派生，缺省刻度即 3.0：本人明确称呼要求单次晋档；显式设置不得大于 score_cap） |
+| naming_prompt_enabled | bool | true | 编码提示词附加称呼偏好判定节（关闭后退回基础规则） |
 | commitment_expire_days | integer | 60 | 约定维度过期天数：最近一次被确认后超此天数无新证据，降待定出画像（簇体保留可复活；持续被提起的约定自动续期） |
 | decay_requires_activity | bool | true | 缺席冻结（衰减/降级仅作用于本周期活跃用户） |
 | sticky_evidence_count | integer | 4 | 证据地板阈值（0=禁用；被裁定更正/演变的簇豁免） |
@@ -191,6 +193,10 @@ flowchart TD
 | recent_rollout_enabled | bool | true | 滚动补回（窗口外最近批次摘要注入） |
 | recent_rollout_batches | integer | 3 | 滚动补回批次数 |
 | recent_rollout_max_chars | integer | 1500 | 滚动补回字符预算 |
+| cross_session_summary_enabled | bool | false | 跨会话近期摘要（私聊前置当前用户其他会话的近期摘要；recall 同轮排除已注入行） |
+| cross_session_summary_top_k | integer | 2 | 跨会话摘要候选条数 |
+| cross_session_summary_max_chars | integer | 1500 | 跨会话摘要整块字符预算（含前言） |
+| cross_session_summary_max_age_days | integer | 30 | 跨会话摘要陈旧上限（天，0=不限） |
 | max_persona_profiles | integer | 3 | 群聊单轮画像人数上限 |
 | topic_blacklist | list | 空 | 话题黑名单（命中关键词的记忆不注入） |
 | rerank_enabled | bool | true | 启用重排序（需 default_rerank） |
@@ -230,6 +236,8 @@ flowchart TD
 ```bash
 python tests/test_noriflow_memory.py        # 全链桩测试（装配/retain/工具/维护 API/回归批）
 python tests/test_recall.py                 # 召回链路（去重/扩选/混合检索/滚动补回/实体词典）
+python tests/test_recall_lazy_embeddings.py # 召回去重向量惰性取回（分页补取/止损闩锁/兼容路径/migration 015）
+python tests/test_cross_session_naming.py   # 跨会话摘要注入 + 称呼偏好低门槛 + 截断防护 + 准则收敛（v1.18.2）
 python tests/test_alias_store.py            # 持久实体别名层
 python tests/test_entity_edge.py            # 实体关系边（提取落库/边注入）
 python tests/test_relation_backfill.py      # 存量关系回填 + 关系图谱数据层

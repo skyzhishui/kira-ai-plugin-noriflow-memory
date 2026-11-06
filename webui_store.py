@@ -30,18 +30,22 @@ from .time_labels import resolve_local_tz
 
 logger = get_logger("noriflow_memory.webui", "cyan")
 
-# 画像六维（原始事实/簇的 category 值域）
+# Profile six dimensions (category value domain of raw facts / clusters)
 _CATEGORIES = frozenset(
     {"identity", "stable", "interaction", "naming", "recent", "uncertain"}
 )
-# 簇状态机值域（WebUI 可手工设置的终态；replaced 为合并管线专属墓碑，
-# 只读可见不可手设——手迁出会破坏继任链 replaced_by 语义）
+# Cluster state-machine value domain (terminal states manually settable in
+# the WebUI; replaced is a merge-pipeline-only tombstone, read-only and not
+# manually settable — moving out by hand would break the successor-chain
+# semantics of replaced_by)
 _CLUSTER_STATUSES = frozenset({"active", "profiled", "pending_uncertain", "dead"})
-# 簇状态过滤白名单（查询侧；含 replaced——待定栏数据源含 replaced 陈述，
-# 管理员需能按状态筛到这些行）
+# Cluster status filter whitelist (query side; includes replaced — the
+# pending section's data source includes replaced statements, and admins
+# need to filter down to those rows by status)
 _CLUSTER_STATUS_FILTER = frozenset({"active", "profiled", "pending_uncertain", "dead", "replaced"})
-# 关系边状态值域（人工可改的全部三态；置 superseded 后新证据不再自动激活
-# ——upsert 墓碑保护，恢复走人工置回）
+# Relation-edge status value domain (all three states a human may change;
+# once superseded, new evidence no longer auto-activates — upsert tombstone
+# protection; recovery goes through manually setting it back)
 _EDGE_STATUSES = frozenset({"active", "pending", "superseded"})
 
 # {source} argument for the shared db.base PROFILE_UPSERT_SQL template
@@ -288,8 +292,9 @@ async def fetch_clusters(
         "category": category.strip() if category.strip() in _CATEGORIES else "",
         "status": status.strip() if status.strip() in _CLUSTER_STATUS_FILTER else "",
         "session_id": session_id.strip(),
-        # 簇无 session 列：按证据键 {session}|{date} 前缀匹配（元字符转义
-        # 而非剥离——含 _/% 的会话 ID 也能如实匹配）
+        # Clusters have no session column: prefix-match on the evidence key
+        # {session}|{date} (metacharacters escaped rather than stripped —
+        # session IDs containing _/% still match faithfully)
         "session_evidence_prefix": _escape_like(session_id.strip()) + "|%",
         "q": q.strip(),
         "q_pattern": _like_contains_pattern(q.strip()) if q.strip() else "",
@@ -370,7 +375,8 @@ async def update_cluster(
                 and new_status is not None
                 and new_status != "replaced"
             ):
-                # 墓碑簇只读：手迁出会使 replaced_by 指向的继任链断裂
+                # Tombstone cluster is read-only: moving it out by hand would
+                # break the successor chain pointed at by replaced_by
                 raise HTTPException(
                     status_code=422,
                     detail="replaced 是合并管线墓碑状态，不可手工迁出"
@@ -406,12 +412,13 @@ async def update_cluster(
                 statement_changed,
             )
 
-            # 画像表投影同步（related_user_ids 随簇对齐——迁移 005 的
-            # "簇即唯一真相源"投影不变量，与 promote/replace 路径同型）
+            # Profile-table projection sync (related_user_ids aligned with
+            # the cluster — migration 005's "cluster as the single source of
+            # truth" projection invariant, same shape as promote/replace)
             profiled_now = final_status == "profiled"
             if profiled_now:
                 if _dialect(backend) == "sqlite":
-                    # SQLite：时间戳由 Python 供给
+                    # SQLite: the timestamp is supplied by Python
                     await conn.execute(
                         PROFILE_UPSERT_SQL.format(
                             source=_PROFILE_VALUES_SOURCE, updated_at="$8"
@@ -514,8 +521,9 @@ async def fetch_profile_preview(
         "user_id": user_id,
         "display_name": display_name,
         "injection_text": injection_text,
-        # sections/uncertain 维持既有字符串结构（消费方兼容）；
-        # 发生时间经 *_meta 附加，不破坏旧契约
+        # sections/uncertain keep the existing string structure (consumer
+        # compatibility); occurred times ride along in *_meta without
+        # breaking the old contract
         "sections": {
             category: [s for s, _ in items]
             for category, items in sections.items()
@@ -634,7 +642,8 @@ async def update_summary(backend, summary_id: int, body: dict) -> dict:
                 build_search_text(content),
             )
             if row is not None and _dialect(backend) == "sqlite":
-                # FTS5 影子表同步（BM25 路与新正文对齐）
+                # FTS5 shadow-table sync (keeps the BM25 leg aligned with the
+                # new body)
                 await conn.execute(
                     "DELETE FROM memory_chat_summary_fts WHERE summary_id = $1",
                     int(row["id"]),
@@ -708,7 +717,8 @@ async def fetch_relation_graph(backend, bot_user_id: str = "") -> dict:
     data = await _impl(backend).fetch_relation_graph_data(backend)
     rows = data["rows"]
     edges = rows
-    # uid -> 最新非占位别名（last_seen 降序扫描首见即最新）
+    # uid -> latest non-placeholder alias (last_seen-descending scan, first
+    # sight is the latest)
     names: dict[tuple[str, str], str] = {}
     for r in data["alias_rows"]:
         nm = str(r["name"] or "").strip()
@@ -769,6 +779,9 @@ async def fetch_relation_graph(backend, bot_user_id: str = "") -> dict:
                 "last_seen": _dt(e["last_seen"]),
                 "occurred_at": _dt(e["occurred_at"]),
                 "supersede_reason": e.get("supersede_reason") or "",
+                # Timestamp of the tombstone (empty when the edge never was
+                # superseded); the graph detail pane appends it to the reason.
+                "superseded_at": _dt(e.get("superseded_at")),
             }
             for e in edges
         ],

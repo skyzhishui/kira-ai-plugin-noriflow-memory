@@ -29,7 +29,9 @@ from types import SimpleNamespace
 TESTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(TESTS_DIR))
 
-import test_noriflow_memory as tnm  # noqa: E402  复用其插件级桩（import 即装配）
+# Importing performs the stub assembly (reuses test_noriflow_memory's
+# plugin-level stubs) -- do not reorder this import after first use of tnm.
+import test_noriflow_memory as tnm  # noqa: E402  reuses plugin-level stubs
 
 mod = tnm.mod
 
@@ -54,12 +56,12 @@ def _try_zoneinfo(name: str):
 
     try:
         return ZoneInfo(name)
-    except Exception:  # pragma: no cover - 环境相关
+    except Exception:  # pragma: no cover - environment-dependent
         return None
 
 
 # ---------------------------------------------------------------------------
-#  Bug1 memory_search 实体词典键
+#  Bug1 memory_search entity dictionary keys
 # ---------------------------------------------------------------------------
 
 
@@ -70,7 +72,7 @@ class TestBug1ToolEntityDirectory(unittest.TestCase):
             "allowed_users": ["u1"],
             "tool_scope_locked": True,
         })
-        # 历史行缓存以复合 sid 为键（observe_message 同款）
+        # History rows cache keyed by composite sid (same as observe_message)
         inst._append_history(
             "napcat:gm:10086", "m1", '<msg uid="u9" name="小白">早</msg>',
             uid="u9", platform="napcat", nickname="小白",
@@ -104,7 +106,7 @@ class TestBug1ToolEntityDirectory(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-#  Bug2 边时间限定 naive 时区口径
+#  Bug2 edge time qualifier naive-timestamp timezone convention
 # ---------------------------------------------------------------------------
 
 
@@ -122,7 +124,7 @@ class TestBug2EdgeTimeQualifier(unittest.TestCase):
         if _try_zoneinfo("Asia/Tokyo") is None:
             self.skipTest("tzdata 不可用")
         kernel = self._kernel("Asia/Tokyo")
-        # naive 视为已是 Tokyo 墙钟：9月1日不得漂移成 9月2日
+        # naive treated as Tokyo wall clock: Sep 1 must not drift to Sep 2
         self.assertEqual(
             kernel._edge_time_qualifier(datetime(2026, 9, 1, 23, 30)),
             "截至9月1日",
@@ -132,7 +134,7 @@ class TestBug2EdgeTimeQualifier(unittest.TestCase):
         if _try_zoneinfo("Asia/Tokyo") is None:
             self.skipTest("tzdata 不可用")
         kernel = self._kernel("Asia/Tokyo")
-        # UTC 9月1日 15:00 = Tokyo 9月2日 00:00
+        # UTC Sep 1 15:00 = Tokyo Sep 2 00:00
         self.assertEqual(
             kernel._edge_time_qualifier(
                 datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc)
@@ -142,7 +144,7 @@ class TestBug2EdgeTimeQualifier(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-#  Bug3 复活簇待办失败重登记
+#  Bug3 revived-cluster todo re-registers on failure
 # ---------------------------------------------------------------------------
 
 
@@ -170,7 +172,7 @@ class _RequeueDB:
         return 0
 
     async def fetch_alias_directory(self):
-        # 对齐 db.fetch_alias_directory 的返回序：(platform, uid, name)
+        # matches db.fetch_alias_directory return order: (platform, uid, name)
         return [("qq", "200", "小李")]
 
     async def fetch_confirmed_relation_sources(self, after_id, limit=None):
@@ -188,8 +190,9 @@ class TestBug3BackfillPendingRequeue(unittest.TestCase):
         )
         summary = asyncio.run(backfill.run())
         self.assertEqual(summary["batches_failed"], 1)
-        # 待办已被 take 清空，失败批须重新登记回 kv（水位 100 之下，
-        # 不重登记则增量模式永远不再补提取）
+        # The todo was already cleared by take; the failed batch must be
+        # re-registered back into kv (below watermark 100 -- without
+        # re-registration, incremental mode would never retry extraction)
         self.assertEqual(json.loads(db.kv["relation_backfill_pending_ids"]), [7])
 
     def test_successful_revived_batch_not_requeued(self):
@@ -205,7 +208,7 @@ class TestBug3BackfillPendingRequeue(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-#  Bug4 归一化遍预算短路
+#  Bug4 normalization pass budget short-circuit
 # ---------------------------------------------------------------------------
 
 
@@ -258,7 +261,7 @@ class TestBug4BudgetShortCircuit(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-#  Bug5 反向回声预检与落库同事务
+#  Bug5 reverse-echo pre-check and write share one transaction
 # ---------------------------------------------------------------------------
 
 

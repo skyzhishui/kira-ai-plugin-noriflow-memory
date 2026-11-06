@@ -478,8 +478,16 @@ class SQLiteMemoryDatabase(MemoryBackend):
 
         Syncs the FTS5 shadow table in the same transaction (BM25 leg);
         parameter semantics in the postgres namesake.
+
+        Future occurred_at is clamped to now before persistence (byte-for-
+        byte aligned with the PG backend); document_id keeps the original
+        input time (idempotency keys must not shift with the clamp).
         """
-        occurred = sqlite_format_ts(_ensure_tz(occurred_at))
+        occurred_at = _ensure_tz(occurred_at)
+        now = datetime.now().astimezone()
+        if occurred_at > now:
+            occurred_at = now
+        occurred = sqlite_format_ts(occurred_at)
         written = _now_ts()
         search_text = build_search_text(content)
         blob = _pack_vector(embedding, self._embedding_dims)
@@ -525,7 +533,18 @@ class SQLiteMemoryDatabase(MemoryBackend):
         embedding: list[float] | None,
     ) -> None:
         """Insert a raw persona fact (extracted_flag=0, awaiting the merge
-        agent)."""
+        agent).
+
+        Future occurred_at is clamped to now before persistence (byte-for-
+        byte aligned with the PG backend): the recent section orders by
+        occurred_at first, so a future value would pin itself to the top.
+        document_id / evidence_key keep the original input time (idempotency
+        keys must not shift with the clamp).
+        """
+        occurred_at = _ensure_tz(occurred_at)
+        now = datetime.now().astimezone()
+        if occurred_at > now:
+            occurred_at = now
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
@@ -541,7 +560,7 @@ class SQLiteMemoryDatabase(MemoryBackend):
                 document_id, platform, user_id,
                 _json_list(related_user_ids), display_name, category,
                 statement, confidence, session_id, group_id, evidence_key,
-                sqlite_format_ts(_ensure_tz(occurred_at)), _now_ts(),
+                sqlite_format_ts(occurred_at), _now_ts(),
                 _pack_vector(embedding, self._embedding_dims),
             )
 
@@ -840,6 +859,122 @@ class SQLiteMemoryDatabase(MemoryBackend):
             rows = await conn.fetch(sql, *params)
         return _decode_rows(rows)
 
+    async def fetch_recent_cross_session_summaries(
+        self,
+        *,
+        current_session_id: str,
+        user_keys: list[str],
+        limit: int,
+        max_age_days: int = 0,
+        current_platform: str = "",
+        current_session_type: str = "",
+    ) -> list[dict]:
+        """Recent encoded summaries of the user's other sessions (cross-session
+        injection source), newest first (SQLite twin of the PG method;
+        participants array-overlap via json_each EXISTS).
+
+        Current-session exclusion is scoped exactly like the PG side: the
+        bare session id is not unique (a DM with a user and a group chat may
+        share it), so the exclusion also pins platform + session type; the
+        type comes from group_id, which the write side sets to session_id
+        for a group chat and '' for a DM. Future-dated rows are always
+        dropped (occurred_at <= the application now), as on PG.
+
+        Args:
+            current_session_id: bare session id to exclude.
+            user_keys: composite identity keys ("platform:uid") of the user.
+            limit: max rows (callers bound by cross_session_summary_top_k).
+            max_age_days: drop rows older than this (0 = unlimited; the
+                cutoff is bound as a canonical TEXT timestamp, matching the
+                write-side sqlite_format_ts format).
+            current_platform: platform tag of the current session (empty =
+                no platform scoping, legacy callers).
+            current_session_type: "dm" / "gm" of the current session (any
+                other value falls back to the bare-id exclusion).
+
+        Returns:
+            Dict rows (document_id / session_id / content / occurred_at),
+            occurred_at DESC, id DESC.
+        """
+        keys = [
+            stripped
+            for key in user_keys
+            if key is not None and (stripped := str(key).strip())
+        ]
+        if not keys:
+            return []
+        p = _Params(None)
+        sid_ph = p.add(current_session_id)
+        excluded_sql = f"session_id <> {sid_ph}"
+        if current_session_type in ("dm", "gm"):
+            plat_sql = ""
+            if current_platform:
+                plat_sql = f" AND platform = {p.add(current_platform)}"
+            type_sql = (
+                "group_id <> ''"
+                if current_session_type == "gm"
+                else "group_id = ''"
+            )
+            excluded_sql = (
+                f"NOT (session_id = {sid_ph}{plat_sql} AND {type_sql})"
+            )
+        now_dt = _ensure_tz(datetime.now(timezone.utc))
+        now_ts = sqlite_format_ts(now_dt)
+        conds = [
+            "summarized",
+            "kind = 'chat_summary'",
+            "NOT archived",
+            excluded_sql,
+            _overlap_cond(p, "participants", keys) or "0",
+            # Upper bound mirrors the PG side's occurred_at <= $now; the
+            # canonical UTC TEXT format keeps the comparison lexicographic.
+            # Both backends bind the application clock (no DB now()).
+            f"occurred_at <= {p.add(now_ts)}",
+        ]
+        if int(max_age_days) > 0:
+            cutoff = now_dt - timedelta(days=int(max_age_days))
+            conds.append(
+                f"occurred_at >= {p.add(sqlite_format_ts(_ensure_tz(cutoff)))}"
+            )
+        sql = (
+            "SELECT document_id, session_id, content, occurred_at "
+            f"FROM {CHAT_SUMMARY_TABLE} "  # noqa: S608
+            f"WHERE {' AND '.join(conds)} "
+            f"ORDER BY occurred_at DESC, id DESC LIMIT {p.add(int(limit))}"
+        )
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(sql, *p.values)
+        return _decode_rows(rows)
+
+    async def fetch_embeddings_by_ids(self, *, ids: list[int]) -> dict[int, object]:
+        """Fetch embeddings by primary key in one batch (lazy recall dedup,
+        perf P2).
+
+        The retrieval SELECT no longer ships the vector BLOB with every row;
+        near-duplicate dedup only consumes the truncated head rows, fetched
+        precisely here by id. Rows whose embedding is NULL do not appear in
+        the returned dict; callers treat them as missing vectors (excluded
+        from comparisons, never dropped).
+
+        Args:
+            ids: primary keys of the rows whose vectors are needed.
+
+        Returns:
+            {id: embedding} mapping (embedding decoded to a float list, the
+            same shape ``_decode_row`` produces for SELECTs).
+        """
+        clean = sorted({int(i) for i in ids if i is not None})
+        if not clean:
+            return {}
+        placeholders = ", ".join(f"${n}" for n in range(1, len(clean) + 1))
+        sql = (
+            f"SELECT id, embedding FROM {CHAT_SUMMARY_TABLE} "  # noqa: S608
+            f"WHERE id IN ({placeholders}) AND embedding IS NOT NULL"
+        )
+        async with self.pool.acquire() as conn:
+            rows = _decode_rows(await conn.fetch(sql, *clean))
+        return {row["id"]: row["embedding"] for row in rows}
+
     async def fetch_recent_summary_scores(
         self, *, query_vec: list[float], session_id: str, limit: int, platform: str = ""
     ) -> list[dict]:
@@ -1006,9 +1141,11 @@ class SQLiteMemoryDatabase(MemoryBackend):
         connection session — consistent under the single-writer model).
         """
         async with self.pool.acquire() as conn:
-            # 占位符编号固定：session=$1、skip=$2、platform 恒占最高槽
-            # $3（缺席不挤占）——_translate 按 $n 显式下标绑定，若条件
-            # 分支收缩 params 而 LIMIT 槽位写死会越界（IndexError）
+            # Placeholder numbering is fixed: session=$1, skip=$2, and
+            # platform always occupies the highest slot $3 (absent slots are
+            # not squeezed out) — _translate binds by explicit $n index, so a
+            # conditional branch shrinking params while the LIMIT slot is
+            # hard-coded would go out of bounds (IndexError)
             count_sql = (
                 "SELECT count(*) FROM ("
                 f"SELECT kind FROM {CHAT_SUMMARY_TABLE} "  # noqa: S608
@@ -1158,6 +1295,7 @@ class SQLiteMemoryDatabase(MemoryBackend):
         score_cap: float,
         promote_threshold: float,
         recent_promote_threshold: float,
+        naming_promote_threshold: float = 3.0,
         contradict_cluster_ids: list[int] | None = None,
     ) -> dict:
         """Dispose of one raw fact in a single transaction
@@ -1290,6 +1428,22 @@ class SQLiteMemoryDatabase(MemoryBackend):
                     raise RuntimeError(f"建簇来源事实不存在: fact_id={fact_id}")
 
                 if action == "create":
+                    # Dimension thresholds (recent/naming have their own lower
+                    # values, others use the generic one) -- a start score that
+                    # already meets it promotes at cluster creation (see the
+                    # profile row write after the INSERT)
+                    create_threshold = (
+                        float(recent_promote_threshold)
+                        if raw["category"] == "recent"
+                        else float(naming_promote_threshold)
+                        if raw["category"] == "naming"
+                        else float(promote_threshold)
+                    )
+                    create_status = (
+                        "profiled"
+                        if float(start_score) >= create_threshold
+                        else "active"
+                    )
                     row = await conn.fetchrow(
                         f"""
                         INSERT INTO {FACT_CLUSTER_TABLE}
@@ -1298,19 +1452,38 @@ class SQLiteMemoryDatabase(MemoryBackend):
                              source_fact_ids, last_evidence_at, occurred_at,
                              related_user_ids, embedding, written_at,
                              updated_at)
-                        VALUES ($1, $2, $3, $4, $5, 'active', 1, $6, $7,
-                                $8, $8, $9, $10, $11, $11)
+                        VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8,
+                                $9, $9, $10, $11, $12, $12)
                         RETURNING id
                         """,  # noqa: S608
                         raw["platform"], raw["user_id"], raw["category"],
-                        raw["statement"], float(start_score),
+                        raw["statement"], float(start_score), create_status,
                         _json_list([raw["evidence_key"]]),
                         _json_list([int(fact_id)]),
                         raw["occurred_at"], raw["related_user_ids"],
                         raw["embedding"], now,
                     )
+                    if create_status == "profiled":
+                        # Immediate promote on cluster creation (PG parity,
+                        # nori 96214f4): a start score already meeting the
+                        # dimension threshold (single explicit naming
+                        # statement) promotes at creation with the profile
+                        # row written in the same transaction, no promotion
+                        # pass needed (avoids the same-cycle decay timing
+                        # window); below-threshold creation is unchanged
+                        # (active)
+                        await conn.execute(
+                            PROFILE_UPSERT_SQL.format(
+                                source="VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                                updated_at="$8",
+                            ),
+                            raw["platform"], raw["user_id"], raw["category"],
+                            int(row["id"]), raw["statement"],
+                            float(start_score),
+                            raw["related_user_ids"] or "[]", now,
+                        )
                     return {"action": "create", "cluster_id": int(row["id"]),
-                            "score": float(start_score), "status": "active"}
+                            "score": float(start_score), "status": create_status}
 
                 # action == "replace": the new cluster inherits the old
                 # cluster's score and the old one demotes to replaced
@@ -1330,6 +1503,8 @@ class SQLiteMemoryDatabase(MemoryBackend):
                 threshold = (
                     float(recent_promote_threshold)
                     if raw["category"] == "recent"
+                    else float(naming_promote_threshold)
+                    if raw["category"] == "naming"
                     else float(promote_threshold)
                 )
                 new_status = "profiled" if new_score >= threshold else "active"
@@ -1532,15 +1707,17 @@ class SQLiteMemoryDatabase(MemoryBackend):
                         f"updated_at = $1 WHERE id IN ({phs})",
                         now, *expired_ids,
                     )
-                    # DELETE 无 $1（now）前缀参——占位符自成 $1..$n，不能
-                    # 复用为 UPDATE 准备的 $2..$n+1（错位绑定/越界）
+                    # DELETE has no $1 (now) prefix param — placeholders run
+                    # $1..$n on their own and must not reuse the $2..$n+1
+                    # prepared for the UPDATE (misbound / out-of-bounds)
                     del_phs = ", ".join(f"${i + 1}" for i in range(len(expired_ids)))
                     del_status = await conn.execute(
                         "DELETE FROM memory_user_profile WHERE cluster_id "
                         f"IN ({del_phs})",
                         *expired_ids,
                     )
-                    # 先 await 再切分：await 直链 .rsplit 会作用于协程对象
+                    # Await before splitting: chaining .rsplit directly onto
+                    # the await would act on the coroutine object
                     expired_cleaned = int(del_status.rsplit(" ", 1)[-1])
 
                 # 2) Non-recent score decay (evidence floor inside the SQL
@@ -1585,7 +1762,8 @@ class SQLiteMemoryDatabase(MemoryBackend):
                         f"updated_at = $1 WHERE id IN ({phs})",
                         now, *demoted_ids,
                     )
-                    # 同上：DELETE 占位符自成 $1..$n
+                    # Same as above: the DELETE placeholders run $1..$n on
+                    # their own
                     del_phs = ", ".join(f"${i + 1}" for i in range(len(demoted_ids)))
                     del_status = await conn.execute(
                         "DELETE FROM memory_user_profile WHERE cluster_id "
@@ -1619,7 +1797,11 @@ class SQLiteMemoryDatabase(MemoryBackend):
         }
 
     async def promote_pass(
-        self, *, promote_threshold: float, recent_promote_threshold: float
+        self,
+        *,
+        promote_threshold: float,
+        recent_promote_threshold: float,
+        naming_promote_threshold: float = 3.0,
     ) -> int:
         """Promotion pass: active clusters reaching the threshold become
         profiled with a profile-table upsert (single transaction)."""
@@ -1631,9 +1813,12 @@ class SQLiteMemoryDatabase(MemoryBackend):
                     "canonical_statement, score, related_user_ids FROM "
                     f"{FACT_CLUSTER_TABLE} "
                     "WHERE status = 'active' AND score >= CASE "
-                    "WHEN category = 'recent' THEN $2 ELSE $1 END",
+                    "WHEN category = 'recent' THEN $2 "
+                    "WHEN category = 'naming' THEN $3 "
+                    "ELSE $1 END",
                     promote_threshold,
                     recent_promote_threshold,
+                    naming_promote_threshold,
                 )
                 if promoted:
                     ids = [int(r["id"]) for r in promoted]
@@ -1756,9 +1941,11 @@ class SQLiteMemoryDatabase(MemoryBackend):
             )
         out = []
         for r in rows:
-            # 解析失败（旧格式/手工编辑）视作最旧——None 流入别名行会让
-            # alias_upsert 的 _ensure_tz 抛错毒化整批，绑定也随之丢失；
-            # 远古占位时间在 last_seen 单调（MAX）语义下不覆盖真实观测
+            # Unparseable (old format / hand edits) counts as oldest — None
+            # flowing into alias rows would make alias_upsert's _ensure_tz
+            # raise and poison the whole batch, dropping its bindings too;
+            # epoch-old placeholder times never override real observations
+            # under last_seen's monotonic (MAX) semantics
             seen = sqlite_parse_ts(r["last_seen"]) or datetime.min.replace(
                 tzinfo=timezone.utc
             )
@@ -1772,7 +1959,8 @@ class SQLiteMemoryDatabase(MemoryBackend):
         resolution source for the graph read side)."""
         async with self.pool.acquire() as conn:
 
-            # None=全表(原语义);空列表/过滤后空=无待解析 owner 返回 {}
+            # None = whole table (original semantics); empty list / empty
+            # after filtering = no owners to resolve, return {}
             if owners is not None:
                 pairs = [(str(p or ""), str(u or "")) for p, u in owners if u]
                 if not pairs:
@@ -2000,9 +2188,11 @@ class SQLiteMemoryDatabase(MemoryBackend):
     ) -> list[dict]:
         """Injection candidate edges: active with an endpoint hitting the
         node set (bot-endpoint edges included when bot_keys is non-empty)."""
-        # 字符串/字节串会被逐元素迭代成 ['q','q',':',...] 静默空结果——
-        # 静默 miss 正是本函数要根除的形态，故 fail fast 而非归一兼容
-        # （空串 falsy 天然迭代为空，保持旧容忍）
+        # A str/bytes would be iterated element-wise into ['q','q',':',...]
+        # yielding a silently empty result — silent misses are exactly what
+        # this function exists to eradicate, so fail fast instead of
+        # normalizing for compatibility (empty strings are falsy and
+        # naturally iterate to empty; old tolerance kept)
         if (isinstance(node_keys, (str, bytes)) and node_keys) or (
             isinstance(bot_keys, (str, bytes)) and bot_keys
         ):
@@ -2337,7 +2527,9 @@ class SQLiteMemoryDatabase(MemoryBackend):
         """Per-section profile rows (data source for the first five
         sections), statement + occurred_at (via cluster_id join; None
         when the cluster row is missing — the assembler then omits the
-        time label). Ownership and ordering identical to the PG version."""
+        time label). Ownership and ordering identical to the PG version
+        (NULLS LAST needs SQLite 3.30 — no extra floor here: connect()
+        already enforces >= 3.35 for RETURNING)."""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
@@ -2346,7 +2538,10 @@ class SQLiteMemoryDatabase(MemoryBackend):
                            c.occurred_at AS occurred_at,
                            row_number() OVER (
                                PARTITION BY m.category
-                               ORDER BY m.score DESC, m.updated_at DESC, m.id ASC
+                               ORDER BY CASE WHEN m.category = 'recent'
+                                        THEN COALESCE(c.occurred_at, m.updated_at)
+                                   END DESC NULLS LAST,
+                                        m.score DESC, m.updated_at DESC, m.id ASC
                            ) AS rn
                     FROM memory_user_profile m
                     LEFT JOIN memory_fact_cluster c ON c.id = m.cluster_id
@@ -2391,8 +2586,16 @@ class SQLiteMemoryDatabase(MemoryBackend):
         self, platforms: list[str], user_ids: list[str], per_section_limit: int
     ) -> dict[str, list[tuple[str, object]]]:
         """Per-section profile rows with multi-account keys merged (key
-        semantics/ordering/dedup identical to the PG version); dedup
-        prefers non-null occurred_at across same-text entries."""
+        semantics/ordering/dedup identical to the PG version).
+
+        Cross-key dedup runs BEFORE the per-section cap: identical statement
+        texts are collapsed within a category (one representative per
+        statement, preferring non-null / latest occurred_at), then
+        row_number truncates -- a statement present on several linked
+        accounts must not consume several slots and push an older distinct
+        event out of the section. Ranking uses the MAX score of the
+        statement's duplicate group (the representative is the latest copy,
+        which may be the lower-scored one), matching the PG version."""
         pairs = list(zip(platforms, user_ids))
         async with self.pool.acquire() as conn:
             if not pairs:
@@ -2404,15 +2607,34 @@ class SQLiteMemoryDatabase(MemoryBackend):
             rows = await conn.fetch(
                 f"""
                 SELECT category, statement, occurred_at FROM (
-                    SELECT m.category, m.statement,
-                           c.occurred_at AS occurred_at,
+                    SELECT category, statement, occurred_at,
                            row_number() OVER (
-                               PARTITION BY m.category
-                               ORDER BY m.score DESC, m.updated_at DESC, m.id ASC
+                               PARTITION BY category
+                               ORDER BY CASE WHEN category = 'recent'
+                                        THEN sort_ts
+                                   END DESC NULLS LAST,
+                                        best_score DESC, updated_at DESC, id ASC
                            ) AS rn
-                    FROM memory_user_profile m
-                    LEFT JOIN memory_fact_cluster c ON c.id = m.cluster_id
-                    WHERE (m.platform, m.user_id) IN ({pair_sql})
+                    FROM (
+                        SELECT m.category, m.statement,
+                               c.occurred_at AS occurred_at,
+                               COALESCE(c.occurred_at, m.updated_at) AS sort_ts,
+                               m.score, m.updated_at, m.id,
+                               max(m.score) OVER (
+                                   PARTITION BY m.category, m.statement
+                               ) AS best_score,
+                               row_number() OVER (
+                                   PARTITION BY m.category, m.statement
+                                   ORDER BY (c.occurred_at IS NULL),
+                                            c.occurred_at DESC,
+                                            m.score DESC,
+                                            m.updated_at DESC, m.id ASC
+                               ) AS dup_rn
+                        FROM memory_user_profile m
+                        LEFT JOIN memory_fact_cluster c ON c.id = m.cluster_id
+                        WHERE (m.platform, m.user_id) IN ({pair_sql})
+                    ) d
+                    WHERE dup_rn = 1
                 ) t
                 WHERE rn <= {p.add(per_section_limit)}
                 ORDER BY category, rn
@@ -2721,9 +2943,11 @@ class SQLiteMemoryDatabase(MemoryBackend):
                     if status not in ("active", "profiled"):
                         return _unchanged()
                     if row["contradicted_at"] is not None:
-                        # 已打过矛盾标记：与 PG 版 RETURNING 未命中分支
-                        # 同款——回读现态报 changed=False（BEGIN IMMEDIATE
-                        # 下本读即最新，重复 dispute 不假报状态变化）
+                        # Contradiction flag already set: same as the PG
+                        # RETURNING-miss branch — read back the current state
+                        # and report changed=False (under BEGIN IMMEDIATE this
+                        # read sees the latest state, so a repeated dispute
+                        # never falsely reports a status change)
                         return _unchanged()
                     await conn.execute(
                         f"UPDATE {FACT_CLUSTER_TABLE} SET contradicted_at = $2 "
@@ -2811,8 +3035,9 @@ class SQLiteMemoryDatabase(MemoryBackend):
                 ids = [int(r["id"]) for r in rows]
                 if ids:
                     # $1=archived_at, $2=written_at cutoff, $3=reinforce
-                    # cutoff, $4..=ids（编号不与 SET 子句撞号——shim 按首
-                    # 次出现顺序绑定参数）
+                    # cutoff, $4..=ids (numbering must not collide with the
+                    # SET clause — the shim binds params by first-appearance
+                    # order)
                     phs = ", ".join(f"${i + 4}" for i in range(len(ids)))
                     # UPDATE-time re-check: the candidate snapshot may be
                     # stale by the time the UPDATE lands (concurrent

@@ -3,9 +3,10 @@
 Design (essential difference from hindsight):
 - persona == a **deterministic projection** of table content: field
   template (8 dimensions + conditional "other names" slot) + fixed ordering
-  (score DESC -> updated_at DESC -> id ASC) + per-slot cap; identical table
-  content produces byte-identical persona text; no LLM involvement, no
-  full rewrite, persona change iff cluster state changes;
+  (recent time-first via COALESCE(cluster.occurred_at, updated_at) DESC,
+  every other slot score DESC -> updated_at DESC -> id ASC) + per-slot cap;
+  identical table content produces byte-identical persona text; no LLM
+  involvement, no full rewrite, persona change iff cluster state changes;
 - data source: the first five slots come from the profile table (projection
   rows of profiled clusters); the pending-info slot from the cluster table
   (pending_uncertain plus halved replaced scores, so swaying/degraded
@@ -35,21 +36,26 @@ from .time_labels import memory_time_label, resolve_local_tz
 
 logger = get_logger("noriflow_memory.persona", "cyan")
 
-# 慢调用哨兵阈值（毫秒）：超过则把耗时观测从 DEBUG 升级为 WARNING
-# （与上游 nori 口径一致：500ms）
+# Slow-call sentinel threshold (ms): past it, timing observations are
+# escalated from DEBUG to WARNING (same as the upstream nori: 500ms)
 SLOW_CALL_THRESHOLD_MS = 500.0
 
-# 注入文本骨架三件套：逐字对齐 hindsight_persona（消费侧跨插件契约）。
+# Injection text skeleton trio: byte-aligned with hindsight_persona (a
+# consumer-side cross-plugin contract).
 INJECTION_HEADER = "# 用户画像-背景信息"
 INJECTION_DISCLAIMER = "以下记录属于内部推理素材，回复时请概括转述，不要逐字照读。"
 INJECTION_FOOTER = "把它当作理解对方的一份额外参考即可；一旦与当前对话冲突，以当前对话为准。"
 
-# 栏位固定顺序：(category, 栏名, PersonProfile 字段名)。
-# 字段名是上游 persona 模块的运行时序列化契约，不可改动。
-# preference/commitment（画像 8 维度扩展，对齐 nori 侧）：暂无核心侧
-# 专属字段（get_profile 为休眠 API，宿主只消费注入 markdown），序列化
-# 时 preference 并入 established_notes、commitment 并入 memory_points
-# （记忆要点——语义恰为"要记住的约定"）；核心侧加字段后改为直映射。
+# Fixed section order: (category, section title, PersonProfile field).
+# Field names are the upstream persona module's runtime serialization
+# contract and must not change.
+# preference/commitment (profile 8-dimension extension, aligned with the
+# nori side): no core-side dedicated fields yet (get_profile is a dormant
+# API; the host only consumes the injected markdown), so at serialization
+# time preference merges into established_notes and commitment into
+# memory_points (memory points — semantically exactly "agreements to
+# remember"); switch to direct mapping once the core side grows
+# dedicated fields.
 _SECTION_ORDER = [
     ("identity", "基本信息", "persona_backdrop"),
     ("naming", "称呼偏好", "addressing_style"),
@@ -62,10 +68,13 @@ _SECTION_ORDER = [
 _UNCERTAIN_TITLE = "待定信息"
 _EMPTY_ITEM = "暂无"
 _PER_SECTION_LIMIT = 5
-# 时效栏：条目带发生时间尾注，口径对齐 recall 记忆块（time_labels）
+# Time-labeled section: items carry an occurred-at suffix, same wording
+# as the recall memory block (time_labels)
 _TIME_LABELED_CATEGORIES = {"recent"}
-# "其他名称"栏：唯一非事实栏（alias 层历史名变体，身份参考元数据），
-# 置于基本信息之后；无变体整栏省略（不写"暂无"占位），最多最近 5 个
+# "Other names" section: the only non-fact section (historical name
+# variants from the alias layer, identity-reference metadata), placed
+# after basic info; omitted entirely when no variants exist (no "no
+# entries yet" placeholder), at most the latest 5
 _ALIAS_SECTION_TITLE = "其他名称"
 _ALIAS_NAMES_LIMIT = 5
 
@@ -119,7 +128,8 @@ class LocalPersonaService:
         self._tz_cache = None
 
     # ------------------------------------------------------------------
-    #  写接口：均为语义适配 no-op（表驱动画像，唯一变更通道是评分状态机）
+    #  Write side: all semantic-adaptation no-ops (table-driven profile;
+    #  the only mutation channel is the score state machine)
     # ------------------------------------------------------------------
 
     async def ensure_profile_model(
@@ -162,7 +172,7 @@ class LocalPersonaService:
         )
 
     # ------------------------------------------------------------------
-    #  读接口：拼装与解析
+    #  Read side: assembly and parsing
     # ------------------------------------------------------------------
 
     async def get_profile(
@@ -201,7 +211,8 @@ class LocalPersonaService:
                 elapsed_ms,
             )
             if elapsed_ms > SLOW_CALL_THRESHOLD_MS:
-                # 慢查询哨兵（与上游 nori 口径一致：>500ms 升级 WARNING）
+                # Slow-call sentinel (same as the upstream nori: >500ms
+                # escalates to WARNING)
                 logger.warning(
                     "build_profile_text 慢调用 %.3f ms（user=%s）",
                     elapsed_ms,
@@ -224,7 +235,8 @@ class LocalPersonaService:
         """
         if not platform:
             return ""
-        # 抬头名先取：其他名称栏需以当前称呼做排除
+        # Fetch the header name first: the other-names section needs the
+        # current addressing for exclusion
         keys = self._linked_keys(platform, user_id)
         if keys is not None:
             platforms = [p for p, _ in keys]
@@ -273,8 +285,9 @@ class LocalPersonaService:
                 elapsed_ms,
             )
             if elapsed_ms > SLOW_CALL_THRESHOLD_MS:
-                # 慢查询哨兵（与 build_profile_text 同口径：>500ms 升级 WARNING，
-                # 群聊画像构建同样纳入观测；带 session_id 便于群聊排障定位）
+                # Slow-call sentinel (same rule as build_profile_text: >500ms
+                # escalates to WARNING; group profile builds are observed too;
+                # session_id is included to ease group-chat triage)
                 logger.warning(
                     "build_multi_profile_text 慢调用 %.3f ms（session=%s, candidates=%d）",
                     elapsed_ms,
@@ -308,8 +321,10 @@ class LocalPersonaService:
         injected_names: list[str] = []
         seen: set[tuple[tuple[str, str], ...]] = set()
         for candidate in candidates:
-            # 身份级去重：账号键（无映射）或 linked 键组（多渠道同一人）
-            # 作为去重键——qq/web 关联账号在候选中同时出现时仅注入一份
+            # Identity-level dedup: account key (no mapping) or linked key
+            # group (same person across channels) is the dedup key — when a
+            # qq/web linked pair both appear in candidates, only one copy
+            # injects
             keys = self._linked_keys(candidate.platform, candidate.user_id)
             identity_key = tuple(keys) if keys is not None else (
                 (candidate.platform, candidate.user_id),
@@ -317,7 +332,8 @@ class LocalPersonaService:
             if identity_key in seen:
                 continue
             seen.add(identity_key)
-            # 抬头名先取：其他名称栏需以当前称呼做排除
+            # Fetch the header name first: the other-names section needs the
+            # current addressing for exclusion
             display_name = candidate.display_name or candidate.user_id
             markdown = await self._assemble_profile_markdown(
                 candidate.platform, candidate.user_id, current_name=display_name
@@ -346,7 +362,7 @@ class LocalPersonaService:
         )
 
     # ------------------------------------------------------------------
-    #  内部：拼装 / 过滤 / 解析
+    #  Internal: assembly / filtering / parsing
     # ------------------------------------------------------------------
 
     def _linked_keys(self, platform: str, user_id: str) -> list[tuple[str, str]] | None:
@@ -474,8 +490,9 @@ class LocalPersonaService:
                 "画像话题黑名单过滤: %d -> %d 行（黑名单: %s）",
                 len(lines), len(filtered), blacklist,
             )
-        # 有效条目全被滤光（只剩栏目标题与"暂无"占位）视为无内容，
-        # 返回空串不注入空壳档案
+        # All effective items filtered out (only section titles and "no
+        # entries yet" placeholders remain) counts as no content — return
+        # an empty string instead of injecting an empty shell profile
         has_content = any(
             line.lstrip().startswith("- ") and line.strip() != f"- {_EMPTY_ITEM}"
             for line in filtered

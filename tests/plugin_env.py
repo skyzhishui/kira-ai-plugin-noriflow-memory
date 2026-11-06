@@ -145,7 +145,8 @@ def install_host_stubs() -> None:
     prompt_mod = types.ModuleType("core.prompt_manager")
 
     class Prompt:
-        # 对齐宿主签名：persist/end 是注入与持久化断言的依据
+        # Mirrors the host signature: persist/end back the inject and
+        # persistence assertions
         def __init__(self, content="", name="", source="", persist=True,
                      end=None, **kwargs):
             self.content = content
@@ -160,7 +161,8 @@ def install_host_stubs() -> None:
     provider_mod = types.ModuleType("core.provider")
 
     class LLMRequest:
-        # 桩：仅承接 clients.FastLlmExit 用到的构造参数与 tool_choice 推导
+        # Stub: only carries the constructor args clients.FastLlmExit uses
+        # plus the tool_choice derivation
         def __init__(self, messages=None, tools=None, tool_funcs=None,
                      tool_set=None, tool_choice=None):
             self.messages = messages or []
@@ -172,7 +174,8 @@ def install_host_stubs() -> None:
 
     if "fastapi" not in sys.modules:
         try:
-            import fastapi  # noqa: F401  真包优先（HTTPException 断言语义一致）
+            # Real package preferred (HTTPException assert semantics match)
+            import fastapi  # noqa: F401
         except ImportError:
             fastapi_stub = types.ModuleType("fastapi")
 

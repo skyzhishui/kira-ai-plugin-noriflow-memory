@@ -278,6 +278,18 @@
     "default": 4.0,
     "hint": "recent 动态分数达到该值进入画像。"
   },
+  "naming_promote_threshold": {
+    "type": "float",
+    "name": "称呼偏好进画像阈值",
+    "default": null,
+    "hint": "naming（称呼偏好）维度进画像阈值。留空/不设（缺省）从 score_start_high 派生（缺省刻度即 3.0）：本人明确称呼要求单次即晋档，且任何评分刻度下按构造成立；显式设置时按本值生效，乘以 decay_factor 后不得小于 demote_threshold（否则晋档后下一轮衰减即被降级）、不得大于 score_cap。留空即派生，无需手填。"
+  },
+  "naming_prompt_enabled": {
+    "type": "switch",
+    "name": "称呼偏好判定节",
+    "default": true,
+    "hint": "编码提示词附加 naming 称呼偏好专项判定节（证据分级：仅记录本人希望被如何称呼/明确反感的称呼）；关闭后退回基础规则。"
+  },
   "decay_requires_activity": {
     "type": "switch",
     "name": "缺席冻结",
@@ -561,5 +573,29 @@
     "name": "滚动补回字符预算",
     "default": 1500,
     "hint": "补回块字符预算：超限按批丢弃更旧批次，单批超限截断。"
+  },
+  "cross_session_summary_enabled": {
+    "type": "switch",
+    "name": "跨会话近期摘要",
+    "default": false,
+    "hint": "私聊回合前置当前用户在其他会话的近期对话摘要（仅私聊注入）；召回同轮排除已注入行防重复暴露。"
+  },
+  "cross_session_summary_top_k": {
+    "type": "integer",
+    "name": "跨会话摘要条数",
+    "default": 2,
+    "hint": "跨会话摘要候选条数（按发生时间新→旧取）。"
+  },
+  "cross_session_summary_max_chars": {
+    "type": "integer",
+    "name": "跨会话摘要字符预算",
+    "default": 1500,
+    "hint": "整块字符预算（含前言）：超限丢弃更旧条目，首条超限截断（正文残留过短则整条放弃）。"
+  },
+  "cross_session_summary_max_age_days": {
+    "type": "integer",
+    "name": "跨会话摘要陈旧上限（天）",
+    "default": 30,
+    "hint": "超过该天数的其他会话摘要不再注入；0 = 不限。"
   }
 }

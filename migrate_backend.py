@@ -201,7 +201,8 @@ def _fmt_pending_ts(value) -> str | None:
     if value is None:
         return None
     if isinstance(value, str):
-        # 只归一化结尾的时区 Z：全局 replace 会误伤字符串其他位置的 Z
+        # Normalize a trailing timezone Z only: a global replace would also
+        # hit Z characters elsewhere in the string
         text = value[:-1] + "+00:00" if value.endswith("Z") else value
         value = datetime.fromisoformat(text)
     if value.tzinfo is None:

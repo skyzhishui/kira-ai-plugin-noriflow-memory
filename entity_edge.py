@@ -34,14 +34,16 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
-# label 词长约束（2-8 字中文短语，从消息原文取词形）
+# Label length constraint (2-8 char Chinese phrase, word form taken
+# from message text)
 _LABEL_MIN_CHARS = 2
 _LABEL_MAX_CHARS = 8
-# statement 上限（防 LLM 把整段塞进陈述行）
+# Statement cap (stops the LLM stuffing a paragraph into one statement line)
 _STATEMENT_MAX_CHARS = 200
 _VALID_CONFIDENCES = frozenset({"high", "medium"})
 
-# P3 注入小节标题（对齐 "# 相关长期记忆" 的免责口径）
+# P3 injection section header (same disclaimer wording as the
+# "# related long-term memory" header)
 RELATION_HEADER = "# 相关人物关系（仅供背景参考，不要提及记忆来源，不要逐字复述）"
 
 
@@ -302,7 +304,7 @@ def select_relation_edges(
         object_bot = object_key in bot_keys
         if subject_bot or object_bot:
             if subject_bot and object_bot:
-                continue  # 两端都是 bot 形态：无对端，无意义
+                continue  # both endpoints bot-shaped: no peer, meaningless
             other_key = object_key if subject_bot else subject_key
             if other_key in node_set:
                 scenario, anchor = "A", other_key

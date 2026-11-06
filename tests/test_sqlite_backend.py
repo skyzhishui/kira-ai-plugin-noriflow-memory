@@ -93,7 +93,7 @@ def _vec(*values: float) -> list[float]:
 
 
 # ---------------------------------------------------------------------------
-#  用例
+#  Test cases
 # ---------------------------------------------------------------------------
 
 
@@ -122,13 +122,13 @@ async def main_async() -> None:
     db = SQLiteMemoryDatabase(config)
     await db.connect()
     applied = await db.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
-    check("migrations_applied", applied == [1, 11, 12, 13], str(applied))
+    check("migrations_applied", applied == [1, 11, 12, 13, 14], str(applied))
     applied_again = await db.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
     check("migrations_idempotent", applied_again == [])
 
     now = datetime(2026, 9, 12, 12, 0, 0, tzinfo=timezone.utc)
 
-    # ---- 写入链路：摘要 + 幂等 ----
+    # ---- Write path: summaries + idempotency ----
     await db.insert_chat_summary(
         document_id="10086-aaaa1111",
         kind="chat_summary", platform="qq", session_id="10086",
@@ -137,7 +137,7 @@ async def main_async() -> None:
         occurred_at=now, embedding=_vec(1.0, 0.0, 0.0, 0.0), summarized=True,
     )
     await db.insert_chat_summary(
-        document_id="10086-aaaa1111",  # 同幂等键重放
+        document_id="10086-aaaa1111",  # same idempotency key replay
         kind="chat_summary", platform="qq", session_id="10086",
         group_id="10086", user_id="u1", participants=["qq:u1"],
         content="重复内容", occurred_at=now, embedding=None, summarized=True,
@@ -150,7 +150,7 @@ async def main_async() -> None:
         occurred_at=now + timedelta(minutes=5),
         embedding=_vec(0.0, 1.0, 0.0, 0.0), summarized=True,
     )
-    # 降级原文行（summarized=false，待补编码遍消费）
+    # Degraded raw rows (summarized=false, consumed by the re-encode pass)
     await db.insert_chat_summary(
         document_id="10086-cccc3333",
         kind="chat_summary", platform="qq", session_id="10086",
@@ -164,7 +164,7 @@ async def main_async() -> None:
     )
     check("summary_idempotent", int(row) == 3, str(row))
 
-    # ---- 收敛管线 1：embedding 补算 ----
+    # ---- Convergence pipeline 1: embedding backfill ----
     missing = await db.fetch_missing_embeddings("memory_chat_summary", 10)
     check("backfill_scan_finds_null", [m[0] for m in missing] == [3],
           str(missing))
@@ -172,11 +172,13 @@ async def main_async() -> None:
     missing = await db.fetch_missing_embeddings("memory_chat_summary", 10)
     check("backfill_converged", missing == [])
 
-    # ---- 收敛管线 2：search_text 补算（写入点已全落，扫应为空）----
+    # ---- Convergence pipeline 2: search_text backfill (all write points
+    # landed already, the scan should be empty) ----
     no_st = await db.fetch_missing_search_text(10)
     check("search_text_converged", no_st == [], str(no_st))
 
-    # ---- recall：双路融合 + 近时排除 + 黑名单 + 行排除 ----
+    # ---- recall: dual-leg fusion + recency exclusion + blacklist + row
+    # exclusion ----
     hits = await db.search_chat_summaries(
         query_vec=_vec(1.0, 0.0, 0.0, 0.0), limit=5,
         scope="session", session_id="10086", platform="qq",
@@ -239,7 +241,7 @@ async def main_async() -> None:
         "10086-aaaa1111" not in [h["document_id"] for h in rowex],
     )
 
-    # 写入侧近重去重的打分路径
+    # Scoring path for write-side near-duplicate dedup
     scores = await db.fetch_recent_summary_scores(
         query_vec=_vec(1.0, 0.0, 0.0, 0.0), session_id="10086", limit=2,
         platform="qq",
@@ -247,13 +249,14 @@ async def main_async() -> None:
     check(
         "write_dedup_scores",
         len(scores) == 2
-        and [r["id"] for r in scores] == [2, 1]  # occurred_at 倒序（非分数序）
+        # rows come back by occurred_at desc, not by score
+        and [r["id"] for r in scores] == [2, 1]
         and abs(scores[0]["score"] - 0.0) < 1e-6
         and abs(scores[1]["score"] - 1.0) < 1e-6,
         str(scores),
     )
 
-    # ---- 收敛管线 3：补编码遍消费 summarized=false ----
+    # ---- Convergence pipeline 3: re-encode pass (summarized=false) ----
     pending_rows = await db.fetch_unsummarized_summaries(10)
     check(
         "reencode_scan_finds_raw",
@@ -279,7 +282,7 @@ async def main_async() -> None:
         hits and hits[0]["document_id"] == "10086-cccc3333",
     )
 
-    # ---- 参与者扩选 / 滚动补回 ----
+    # ---- Participant expansion / rolling rollout fill-back ----
     parts = await db.fetch_recent_session_participants(
         session_id="10086", limit=10, platform="qq"
     )
@@ -295,7 +298,8 @@ async def main_async() -> None:
         str([r["document_id"] for r in rollout]),
     )
 
-    # ---- 收敛管线 4：pending facts 入簇（create/merge/replace）----
+    # ---- Convergence pipeline 4: pending facts into clusters
+    # (create/merge/replace) ----
     await db.insert_persona_fact_raw(
         document_id="u1@10086|2026-09-12-d1",
         platform="qq", user_id="u1", related_user_ids=["u2"],
@@ -305,7 +309,7 @@ async def main_async() -> None:
         embedding=_vec(1.0, 0.0, 0.0, 0.0),
     )
     await db.insert_persona_fact_raw(
-        document_id="u1@10086|2026-09-12-d1",  # 幂等键重放
+        document_id="u1@10086|2026-09-12-d1",  # idempotency key replay
         platform="qq", user_id="u1", related_user_ids=["u2"],
         display_name="小明", category="stable", statement="重复事实",
         confidence="high", session_id="10086", group_id="10086",
@@ -332,7 +336,8 @@ async def main_async() -> None:
     )
     cluster_id = out["cluster_id"]
 
-    # 同一 fact 重放：乐观锁翻标志失败 -> skipped（与 PG 同语义）
+    # Same-fact replay: optimistic-lock flag flip fails -> skipped (same
+    # semantics as PG)
     out = await db.apply_fact_merge(
         fact_id=fact_id, action="merge", cluster_id=cluster_id,
         evidence_key="10086|2026-09-13", start_score=3.0, score_cap=10.0,
@@ -353,7 +358,7 @@ async def main_async() -> None:
         rows = await db.fetch_pending_facts(10)
         return next(r["id"] for r in rows if r["document_id"].endswith(doc_suffix))
 
-    # 新事实 + 新证据键 -> 计分 +1
+    # New fact + new evidence key -> score +1
     fid = await _insert_pending(
         "m1", "小明沉迷塞尔达", "10086|2026-09-13", _vec(1.0, 0.0, 0.0, 0.0),
     )
@@ -367,7 +372,7 @@ async def main_async() -> None:
         "merge_scores", out["score"] == 6.0 and out["status"] == "active",
         str(out),
     )
-    # 新事实 + 重复证据键 -> 去重不计分
+    # New fact + duplicate evidence key -> dedup, no scoring
     fid = await _insert_pending(
         "m2", "小明爱玩塞尔达", "10086|2026-09-13", _vec(1.0, 0.0, 0.0, 0.0),
     )
@@ -389,7 +394,7 @@ async def main_async() -> None:
     )
     check("merge_score_cap", out["score"] == 9.0, str(out))
 
-    # 晋档遍
+    # Promote pass (to profile)
     promoted = await db.promote_pass(
         promote_threshold=9.0, recent_promote_threshold=4.0
     )
@@ -402,7 +407,84 @@ async def main_async() -> None:
     name = await db.fetch_latest_display_name("qq", "u1")
     check("display_name", name == "小明", str(name))
 
-    # 簇候选检索（向量 + 标量退化）
+    # ---- review regression: multi-account profile dedup runs before the
+    # per-section cap (duplicate statements must not eat section slots) ----
+    async with db.pool.acquire() as conn:
+        for cid, uid, stmt, score in (
+            (900001, "up1", "重复称呼", 9.5),
+            (900003, "up1", "补充事实", 8.0),
+            (900002, "up2", "重复称呼", 9.0),
+        ):
+            await conn.execute(
+                "INSERT INTO memory_user_profile (platform, user_id, category,"
+                " cluster_id, statement, score, related_user_ids)"
+                " VALUES ('qq', $1, 'stable', $2, $3, $4, '[]')",
+                uid, cid, stmt, score,
+            )
+    multi = await db.fetch_profile_sections_multi(
+        ["qq", "qq"], ["up1", "up2"], 2
+    )
+    check(
+        "multi_profile_dedup_before_cap",
+        [s for s, _ in multi.get("stable", [])] == ["重复称呼", "补充事实"],
+        str(multi),
+    )
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM memory_user_profile WHERE user_id IN ('up1', 'up2')"
+        )
+
+    # ---- review regression: dedup ranking uses the statement group's MAX
+    # score, not the representative row's score ----
+    # The representative is the latest copy (newest occurred_at), which may
+    # be the lower-scored one; ordering by that row's score would rank the
+    # whole statement below a less relevant distinct fact and push it out of
+    # the per-section cap.
+    async with db.pool.acquire() as conn:
+        for cid, stmt, score, occurred in (
+            (910001, "重复评分陈述", 2.0, "2026-09-20T00:00:00Z"),
+            (910002, "另一条陈述", 5.0, "2026-09-15T00:00:00Z"),
+            (910003, "重复评分陈述", 9.0, "2026-09-10T00:00:00Z"),
+        ):
+            await conn.execute(
+                "INSERT INTO memory_fact_cluster (id, platform, user_id,"
+                " category, canonical_statement, score, occurred_at)"
+                " VALUES ($1, 'qq', 'up3', 'stable', $2, $3, $4)",
+                cid, stmt, score, occurred,
+            )
+            await conn.execute(
+                "INSERT INTO memory_user_profile (platform, user_id, category,"
+                " cluster_id, statement, score, related_user_ids)"
+                " VALUES ('qq', 'up3', 'stable', $1, $2, $3, '[]')",
+                cid, stmt, score,
+            )
+    capped = await db.fetch_profile_sections_multi(["qq"], ["up3"], 1)
+    check(
+        "multi_profile_dedup_ranks_by_group_max_score",
+        [s for s, _ in capped.get("stable", [])] == ["重复评分陈述"],
+        str(capped),
+    )
+    both = await db.fetch_profile_sections_multi(["qq"], ["up3"], 2)
+    check(
+        "multi_profile_dedup_group_max_score_order",
+        [s for s, _ in both.get("stable", [])] == ["重复评分陈述", "另一条陈述"],
+        str(both),
+    )
+    # The representative row (and its displayed time) is still the latest copy
+    check(
+        "multi_profile_dedup_representative_is_latest",
+        both["stable"][0][1].isoformat() == "2026-09-20T00:00:00+00:00",
+        str(both["stable"][0]),
+    )
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM memory_user_profile WHERE user_id = 'up3'"
+        )
+        await conn.execute(
+            "DELETE FROM memory_fact_cluster WHERE user_id = 'up3'"
+        )
+
+    # Cluster candidate search (vector + scalar fallback)
     cands = await db.search_cluster_candidates(
         platform="qq", user_id="u2", category="stable", related_user_ids=[],
         embedding=_vec(1.0, 0.0, 0.0, 0.0), top_k=5,
@@ -421,7 +503,8 @@ async def main_async() -> None:
         cands and cands[0]["id"] == cluster_id,
     )
 
-    # replace：更正陈述，旧簇半分墓碑，画像投影切换
+    # replace: corrects the statement; the old cluster gets a half-score
+    # tombstone and the profile projection switches
     await db.insert_persona_fact_raw(
         document_id="u1@10086|2026-09-12-d2",
         platform="qq", user_id="u1", related_user_ids=[],
@@ -453,7 +536,7 @@ async def main_async() -> None:
         sections.get("stable") == [("小明其实更喜欢空洞骑士", now)], str(sections),
     )
 
-    # 衰减遍（缺席冻结 + 证据地板 + 死亡窗口）
+    # Decay pass (absence freeze + evidence floor + death window)
     stats = await db.decay_pass(
         decay_factor=0.8, demote_threshold=3.0, pending_dead_days=90,
         recent_expire_days=30, activity_since=now - timedelta(days=1),
@@ -474,14 +557,15 @@ async def main_async() -> None:
         await db.get_kv("decay_last_run") == "2026-09-12T12:00:00.000000Z",
     )
 
-    # ---- alias 层 ----
+    # ---- alias layer ----
     await db.alias_upsert([
         {"platform": "qq", "user_id": "u1", "name": "小明",
          "last_seen": now, "source": "batch"},
         {"platform": "qq", "user_id": "u2", "name": "小红",
          "last_seen": now + timedelta(minutes=1), "source": "batch"},
     ])
-    await db.alias_upsert([  # 更晚 last_seen 翻转 source；更早重放不回退
+    # Later last_seen flips source; earlier replay does not roll back
+    await db.alias_upsert([
         {"platform": "qq", "user_id": "u1", "name": "明哥",
          "last_seen": now + timedelta(minutes=2), "source": "reconcile"},
         {"platform": "qq", "user_id": "u2", "name": "小红",
@@ -497,7 +581,8 @@ async def main_async() -> None:
     directory = await db.fetch_alias_directory()
     check("alias_directory", len(directory) == 3)
 
-    # ---- 关系边：幂等/双证据/反向回声/墓碑 ----
+    # ---- relation edges: idempotency / dual evidence / reverse echo /
+    # tombstone ----
     edge_row = {
         "platform": "qq", "subject_uid": "u1", "object_uid": "u2",
         "subject_name": "小明", "object_name": "小红",
@@ -507,7 +592,7 @@ async def main_async() -> None:
         "min_evidence": 2,
     }
     await db.upsert_entity_edge([dict(edge_row)])
-    await db.upsert_entity_edge([dict(edge_row)])  # 同键重放不涨计数
+    await db.upsert_entity_edge([dict(edge_row)])  # replay does not bump count
     edges = await db.pool.conn.fetch(
         "SELECT evidence_count, status FROM memory_entity_edge"
     )
@@ -560,7 +645,8 @@ async def main_async() -> None:
         str([e["relation_label"] for e in active]),
     )
 
-    # 反向回声：镜像方向已在库，反向新边整行跳过
+    # Reverse echo: the mirrored direction is already stored, so the new
+    # reverse edge is skipped as a whole row
     echo = dict(edge_row)
     echo.update(
         subject_uid="u2", object_uid="u1", subject_name="小红",
@@ -601,10 +687,12 @@ async def main_async() -> None:
     by_ids = await db.fetch_confirmed_relation_sources_by_ids([new_cluster])
     check("confirmed_sources_by_ids", len(by_ids) == 1)
 
-    # ---- WebUI 数据层（sqlite 方言派发全函数）----
-    # 装配契约回归锁：API 层（main._pool_or_503）必须传 backend 而非裸池
-    # ——webui_store 按 backend.dialect 派发方言，裸池会被兜底成 postgres，
-    # 把 PG 方言 SQL 打进 SQLite（上线日事故：unrecognized token ":"）
+    # ---- WebUI data layer (sqlite dialect dispatch, all functions) ----
+    # Assembly contract regression lock: the API layer (main._pool_or_503)
+    # must pass the backend, not a bare pool -- webui_store dispatches the
+    # dialect by backend.dialect and a bare pool falls back to postgres,
+    # firing PG-dialect SQL into SQLite (launch-day incident: unrecognized
+    # token ":")
     check(
         "webui_dialect_dispatch_contract",
         webui._dialect(db) == "sqlite"
@@ -684,8 +772,9 @@ async def main_async() -> None:
         "webui_update_summary_fts_sync",
         [int(r["summary_id"]) for r in fts_hit] == [2], str(fts_hit),
     )
-    # embedding 置 NULL 后该行退出召回（与 PG 同语义）；补算回填后
-    # hybrid 召回命中的是新正文
+    # After the embedding is set to NULL the row drops out of recall (same
+    # semantics as PG); once the backfill refills it, hybrid recall hits
+    # the new content
     await db.update_embedding("memory_chat_summary", 2, _vec(0.0, 1.0, 0.0, 0.0))
     hits = await db.search_chat_summaries(
         query_vec=_vec(0.0, 1.0, 0.0, 0.0), limit=5,
@@ -707,11 +796,25 @@ async def main_async() -> None:
     check("webui_delete_summary_fts_cleanup", int(left) == 0, str(left))
 
     graph = await webui.fetch_relation_graph(db, bot_user_id="bot")
+    superseded_edges = [e for e in graph["edges"] if e["status"] == "superseded"]
     check(
         "webui_relation_graph",
         graph["stats"]["edges"] == 2
         and graph["stats"]["edges_superseded"] == 1
         and any(n["is_bot"] for n in graph["nodes"]), str(graph["stats"]),
+    )
+    # The detail pane renders "reason · superseded_at": the tombstone timestamp
+    # must reach the payload as a formatted string, empty for live edges.
+    check(
+        "webui_relation_graph_superseded_at",
+        len(superseded_edges) == 1
+        and isinstance(superseded_edges[0]["superseded_at"], str)
+        and bool(superseded_edges[0]["superseded_at"])
+        and all(
+            e["superseded_at"] == ""
+            for e in graph["edges"] if e["status"] != "superseded"
+        ),
+        str([(e["status"], e["superseded_at"]) for e in graph["edges"]]),
     )
 
     out = await webui.update_relation_edge(
@@ -742,7 +845,7 @@ async def main_async() -> None:
         str(overview),
     )
 
-    # delete_chat_summary（工具路径）+ 作用域 + FTS 清理
+    # delete_chat_summary (tool path) + scoping + FTS cleanup
     ok = await db.delete_chat_summary(
         "10086-aaaa1111", scope_session_id="10086", scope_user_id="u1"
     )
@@ -750,9 +853,11 @@ async def main_async() -> None:
     ok = await db.delete_chat_summary("10086-cccc3333", scope_user_id="other")
     check("tool_delete_scope_blocks", ok is False)
 
-    # ---- v1.15.2 review 回归：BM25 where 感知填充 / promote 关联列 / ----
-    # ---- decay 参与者门控 / 画像 related_user_ids 启动自修复          ----
-    # 自建数据段（上方 webui 段已清空 u1 数据，计数断言不受影响）
+    # ---- v1.15.2 review regression: BM25 where-aware fill / promote ----
+    # ---- related columns / decay participant gating / startup self- ----
+    # ---- repair of profile related_user_ids                       ----
+    # Self-seeded data segment (the webui section above already wiped u1's
+    # data; count assertions are unaffected)
     await db.insert_chat_summary(
         document_id="91086-p111",
         kind="chat_summary", platform="qq", session_id="91086",
@@ -773,12 +878,14 @@ async def main_async() -> None:
         document_id="20001-decoy",
         kind="chat_summary", platform="qq", session_id="20001",
         group_id="20001", user_id="u9", participants=["qq:u9"],
-        content="团子团子团子团子团子团子",  # FTS 词频远超 p222
+        content="团子团子团子团子团子团子",  # FTS term frequency far above p222
         occurred_at=now + timedelta(hours=3),
         embedding=_vec(0.0, 0.0, 0.0, 1.0), summarized=True,
     )
-    # BM25 路必须在 where（会话限定）之后取 top-limit：旧实现先取 FTS 全库
-    # top-1（被 decoy 的词频霸占）再与 where 相交，BM25 路欠填为空
+    # The BM25 leg must take its top-limit after the where (session-scope)
+    # filter: the old implementation fetched the FTS top-1 across the whole
+    # db (dominated by the decoy's term frequency) before intersecting with
+    # where, leaving the BM25 leg under-filled and empty
     fill = await db.search_chat_summaries(
         query_vec=_vec(1.0, 0.0, 0.0, 0.0), limit=1,
         scope="session", session_id="91086", platform="qq",
@@ -790,8 +897,9 @@ async def main_async() -> None:
         str([(h["document_id"], round(h.get("rrf", 0), 4)) for h in fill]),
     )
 
-    # promote_pass 画像行 related_user_ids 必须是合法 JSON 数组
-    # （v1.15.1 及之前 raw JSON TEXT 被 _json_list 按字符迭代成字符数组）
+    # promote_pass profile rows: related_user_ids must be a valid JSON
+    # array (up to v1.15.1, raw JSON TEXT was iterated character by
+    # character by _json_list into a char array)
     await db.insert_persona_fact_raw(
         document_id="u8@91086|2026-09-12-r1",
         platform="qq", user_id="u8", related_user_ids=["u2"],
@@ -811,11 +919,18 @@ async def main_async() -> None:
         promote_threshold=9.0, recent_promote_threshold=4.0,
         occurred_at=now,
     )
-    check("regress_promote_create", out["action"] == "create", str(out))
+    # start_score (9.0) already meets the dimension threshold (9.0): promote
+    # at cluster creation with the profile row in the same transaction (port
+    # of nori 96214f4 in v1.18.2), so the promotion pass has nothing to do
+    check(
+        "regress_promote_create",
+        out["action"] == "create" and out["status"] == "profiled",
+        str(out),
+    )
     promoted = await db.promote_pass(
         promote_threshold=9.0, recent_promote_threshold=4.0
     )
-    check("regress_promote_pass", promoted == 1, str(promoted))
+    check("regress_promote_pass", promoted == 0, str(promoted))
     async with db.pool.acquire() as conn:
         prow = await conn.fetchrow(
             "SELECT id, related_user_ids FROM memory_user_profile "
@@ -828,9 +943,11 @@ async def main_async() -> None:
         str(dict(prow) if prow else None),
     )
 
-    # decay 活跃度门控必须覆盖仅以参与者身份出现的用户（u8 只在
-    # p111 的 participants 里，非任何批次的 user_id）——旧实现迭代
-    # JSON TEXT 字符串，参与者键组全丢，u8 簇被错误冻结不衰减
+    # The decay activity gate must cover users appearing only as
+    # participants (u8 is only in p111's participants, never the user_id
+    # of any batch) -- the old implementation iterated the JSON TEXT
+    # string, dropping the whole participant key set, so u8's cluster was
+    # wrongly frozen and never decayed
     await db.decay_pass(
         decay_factor=0.8, demote_threshold=3.0, pending_dead_days=90,
         recent_expire_days=30, activity_since=now - timedelta(days=1),
@@ -847,8 +964,10 @@ async def main_async() -> None:
         str(dict(u8row) if u8row else None),
     )
 
-    # 启动自修复：手工写入历史缺陷形态（字符数组），重跑迁移触发修复；
-    # 合法形态（含全单字符 uid 的数组，拼接后非合法 JSON）不得误伤
+    # Startup self-repair: hand-write the legacy defect shape (char array),
+    # then re-run migrations to trigger the repair; valid shapes (an array
+    # of all single-char uids, whose concatenation is not valid JSON) must
+    # not be damaged
     corrupted = json.dumps(list('["u2"]'), ensure_ascii=False)
     valid_ambiguous = '["a", "b"]'
     async with db.pool.acquire() as conn:
@@ -886,9 +1005,10 @@ async def main_async() -> None:
         kept == valid_ambiguous, str(kept),
     )
 
-    # ---- 评审回归：SQLite LIKE 元字符字面匹配 ----
-    # SQLite 的 LIKE 无默认转义符，反斜杠转义模式（\_ \%）不声明
-    # ESCAPE 会被解析成「字面反斜杠 + 通配」，含 _/% 的关键字假阴性
+    # ---- review regression: SQLite LIKE metacharacter literal matching ----
+    # SQLite LIKE has no default escape character; backslash-escaped
+    # patterns (\_ \%) without an ESCAPE clause parse as "literal backslash
+    # + wildcard", giving false negatives for keywords containing _/%
     await db.insert_chat_summary(
         document_id="10086-dddd4444",
         kind="chat_summary", platform="qq", session_id="10086",
@@ -927,10 +1047,92 @@ async def main_async() -> None:
         (await webui.fetch_clusters(db, 1, 10, q="qq_123"))["total"] == 1,
     )
 
-    # ---- 评审回归：decay 画像级联 DELETE 的行数解析 ----
-    # `await conn.execute(...).rsplit(...)` 的 await 直链会先对协程对象
-    # 取 .rsplit 抛 AttributeError，整个衰减事务回滚——recent 过期与
-    # profiled 降级两条画像级联路径必须有非空命中时仍能走通
+    # ---- review regression: raw-only users reach the user picker ----
+    # fetch_users used to source its user set from memory_fact_cluster alone,
+    # so a user whose facts never converged into a cluster stayed invisible on
+    # the maintenance page and their memory could not be erased from the UI.
+    # The user set must be the union of cluster owners and raw-fact owners,
+    # with zero cluster counts for the latter.
+    await db.insert_persona_fact_raw(
+        document_id="u_rawonly@10086|2026-09-12-r1",
+        platform="qq", user_id="u_rawonly", related_user_ids=[],
+        display_name="无簇用户", category="stable", statement="只有原始事实",
+        confidence="high", session_id="10086", group_id="10086",
+        evidence_key="10086|2026-09-19", occurred_at=now, embedding=None,
+    )
+    raw_only = await webui.fetch_users(db, keyword="u_rawonly", page=1, size=10)
+    check(
+        "regress_users_raw_only_listed",
+        raw_only["total"] == 1
+        and raw_only["items"][0]["user_id"] == "u_rawonly"
+        and raw_only["items"][0]["display_name"] == "无簇用户",
+        str(raw_only),
+    )
+    check(
+        "regress_users_raw_only_zero_clusters",
+        raw_only["items"][0]["active"] == 0
+        and raw_only["items"][0]["profiled"] == 0
+        and raw_only["items"][0]["pending"] == 0
+        and raw_only["items"][0]["max_score"] is None,
+        str(raw_only["items"][0]),
+    )
+    listed = await webui.fetch_users(db, keyword="", page=1, size=100)
+    check(
+        "regress_users_raw_only_in_unfiltered_page",
+        any(i["user_id"] == "u_rawonly" for i in listed["items"]),
+        str([i["user_id"] for i in listed["items"]]),
+    )
+    # Pagination and keyword filtering must both run over the union source
+    # (a raw-only user must be pageable and filterable, not only visible on
+    # an unfiltered first page).
+    raw_page1 = await webui.fetch_users(db, keyword="u_rawonly", page=1, size=1)
+    raw_page2 = await webui.fetch_users(db, keyword="u_rawonly", page=2, size=1)
+    check(
+        "regress_users_raw_only_pagination",
+        raw_page1["total"] == 1
+        and raw_page2["total"] == 1
+        and len(raw_page1["items"]) == 1
+        and raw_page2["items"] == [],
+        f"p1={raw_page1} p2={raw_page2}",
+    )
+    union_page1 = await webui.fetch_users(db, keyword="u", page=1, size=1)
+    union_page2 = await webui.fetch_users(db, keyword="u", page=2, size=1)
+    check(
+        "regress_users_union_pagination",
+        union_page1["total"] == union_page2["total"]
+        and union_page1["total"] >= 2
+        and len(union_page1["items"]) == 1
+        and len(union_page2["items"]) == 1
+        and union_page1["items"][0]["user_id"]
+        != union_page2["items"][0]["user_id"],
+        f"p1={union_page1} p2={union_page2}",
+    )
+    miss = await webui.fetch_users(db, keyword="no-such-user", page=1, size=10)
+    check(
+        "regress_users_keyword_miss",
+        miss["total"] == 0 and miss["items"] == [],
+        str(miss),
+    )
+    # PG/SQLite alignment (static): both dialect bodies must source users
+    # from the cluster ∪ raw-fact union and take the newest write time from
+    # both tables (PG has no live-db harness here; live_check covers it).
+    for impl_name in ("webui_store_pg.py", "webui_store_sqlite.py"):
+        src = (PLUGIN_DIR / impl_name).read_text(encoding="utf-8")
+        check(
+            f"regress_users_union_source_{impl_name}",
+            "SELECT platform, user_id FROM memory_fact_cluster" in src
+            and "SELECT platform, user_id FROM memory_persona_fact_raw" in src
+            and "UNION" in src
+            and "max(updated_at) AS updated_at" in src
+            and "written_at AS updated_at" in src,
+            "user source must union cluster owners and raw-fact owners",
+        )
+
+    # ---- review regression: row-count parsing of decay profile cascade ----
+    # A direct `await conn.execute(...).rsplit(...)` chain calls .rsplit on
+    # the coroutine object first and raises AttributeError, rolling back
+    # the whole decay transaction -- both profile cascade paths (recent
+    # expiry and profiled demotion) must still work with non-empty hits
     async with db.pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO memory_fact_cluster (platform, user_id, category,"
@@ -983,12 +1185,15 @@ async def main_async() -> None:
         "regress_decay_profile_rows_gone", int(left) == 0, str(left),
     )
 
-    # ---- 评审回归：滚动补回 count_sql 占位符编号 ----
-    # _translate 按 $n 显式下标绑定；platform 为空（默认值）时 params
-    # 收缩为 2 个但 LIMIT 槽位写死 $3 → IndexError，且 kernel 侧
-    # _guarded_call 会吞掉异常——默认路径上滚动补回整个静默失效。
-    # 回归点会话 10086 只剩 cccc/dddd 两批（早段已删 aaaa/bbbb）：
-    # skip=1 → 窗口顶 1 批 dddd，bot=0 → offset=1 → 应得次新 cccc
+    # ---- review regression: rolling rollout fill-back count_sql placeholder
+    # numbering ----
+    # _translate binds by explicit $n index; when platform is empty (the
+    # default) params shrink to 2 but the LIMIT slot is hardcoded to $3 ->
+    # IndexError, and the kernel-side _guarded_call swallows the exception
+    # -- on the default path the rolling rollout fill-back silently no-ops
+    # entirely. Regression setup: session 10086 has only the cccc/dddd
+    # batches left (aaaa/bbbb were deleted earlier); skip=1 -> window top is
+    # 1 batch dddd, bot=0 -> offset=1 -> expect the next-newer batch cccc
     rollout = await db.fetch_recent_rollout_summaries(
         session_id="10086", skip_batches=1, limit=5
     )
@@ -1004,9 +1209,151 @@ async def main_async() -> None:
         "regress_rollout_platform_nomatch", rollout == [], str(rollout),
     )
 
+    # ---- review regression: future occurred_at clamped before persistence
+    # (both backends, byte-aligned behavior) ----
+    future = datetime.now(timezone.utc) + timedelta(days=3)
+    future_doc = "u1@10086|2026-09-12-future"
+    future_key = "10086|2026-09-12"
+    await db.insert_persona_fact_raw(
+        document_id=future_doc,
+        platform="qq", user_id="u1", related_user_ids=[],
+        display_name="小明", category="stable", statement="未来的事实",
+        confidence="high", session_id="10086", group_id="10086",
+        evidence_key=future_key, occurred_at=future, embedding=None,
+    )
+    async with db.pool.acquire() as conn:
+        frow = await conn.fetchrow(
+            "SELECT document_id, evidence_key, occurred_at "
+            "FROM memory_persona_fact_raw WHERE document_id = $1",
+            future_doc,
+        )
+    sqlite_ts = db_pkg.sqlite_parse_ts(frow["occurred_at"])
+    check(
+        "future_fact_clamped_sqlite",
+        sqlite_ts <= datetime.now(timezone.utc) + timedelta(seconds=5)
+        and frow["document_id"] == future_doc
+        and frow["evidence_key"] == future_key,
+        str(dict(frow)),
+    )
+
+    class _CaptureConn:
+        def __init__(self):
+            self.calls = []
+
+        async def execute(self, sql, *args):
+            self.calls.append((sql, args))
+
+    class _CaptureAcquire:
+        def __init__(self, conn):
+            self._conn = conn
+
+        async def __aenter__(self):
+            return self._conn
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _CapturePool:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def acquire(self):
+            return _CaptureAcquire(self._conn)
+
+    cap_conn = _CaptureConn()
+    pg = db_pkg.MemoryDatabase(LocalMemoryConfig(dsn="postgresql://stub"))
+    pg._pool = _CapturePool(cap_conn)
+    await pg.insert_persona_fact_raw(
+        document_id=future_doc,
+        platform="qq", user_id="u1", related_user_ids=[],
+        display_name="小明", category="stable", statement="未来的事实",
+        confidence="high", session_id="10086", group_id="10086",
+        evidence_key=future_key, occurred_at=future, embedding=None,
+    )
+    _, pargs = cap_conn.calls[-1]
+    pg_ts = pargs[11]
+    check(
+        "future_fact_clamped_postgres",
+        pg_ts <= datetime.now(timezone.utc) + timedelta(seconds=5)
+        and pargs[0] == future_doc
+        and pargs[10] == future_key,
+        str(pg_ts),
+    )
+    check(
+        "future_fact_clamp_backends_aligned",
+        abs((pg_ts - sqlite_ts).total_seconds()) < 5,
+        f"pg={pg_ts} sqlite={sqlite_ts}",
+    )
+
+    # ---- review regression: chat summary occurred_at clamped the same way
+    # (future rows would otherwise pin the cross-session/recent sections) ----
+    future_summary_doc = "10086-futuresummary"
+    await db.insert_chat_summary(
+        document_id=future_summary_doc, kind="chat_summary", platform="qq",
+        session_id="10086", group_id="", user_id="u1",
+        participants=["qq:u1"], content="未来的摘要",
+        occurred_at=future, summarized=True, embedding=None,
+    )
+    async with db.pool.acquire() as conn:
+        srow = await conn.fetchrow(
+            "SELECT document_id, occurred_at FROM memory_chat_summary "
+            "WHERE document_id = $1",
+            future_summary_doc,
+        )
+    sqlite_summary_ts = db_pkg.sqlite_parse_ts(srow["occurred_at"])
+    check(
+        "future_summary_clamped_sqlite",
+        sqlite_summary_ts <= datetime.now(timezone.utc) + timedelta(seconds=5)
+        and srow["document_id"] == future_summary_doc,
+        str(dict(srow)),
+    )
+
+    # document_id stays the idempotency key (the clamp must not rebase it):
+    # a repeat insert with the same key is still a no-op.
+    await db.insert_chat_summary(
+        document_id=future_summary_doc, kind="chat_summary", platform="qq",
+        session_id="10086", group_id="", user_id="u1",
+        participants=["qq:u1"], content="未来的摘要（重复写入）",
+        occurred_at=future + timedelta(days=1), summarized=True, embedding=None,
+    )
+    async with db.pool.acquire() as conn:
+        dup = await conn.fetchrow(
+            "SELECT count(*) AS n FROM memory_chat_summary "
+            "WHERE document_id = $1",
+            future_summary_doc,
+        )
+    check(
+        "future_summary_idempotent_sqlite",
+        int(dup["n"]) == 1,
+        str(dict(dup)),
+    )
+
+    cap_conn2 = _CaptureConn()
+    pg2 = db_pkg.MemoryDatabase(LocalMemoryConfig(dsn="postgresql://stub"))
+    pg2._pool = _CapturePool(cap_conn2)
+    await pg2.insert_chat_summary(
+        document_id=future_summary_doc, kind="chat_summary", platform="qq",
+        session_id="10086", group_id="", user_id="u1",
+        participants=["qq:u1"], content="未来的摘要",
+        occurred_at=future, summarized=True, embedding=None,
+    )
+    _, sargs = cap_conn2.calls[-1]
+    pg_summary_ts = sargs[8]
+    check(
+        "future_summary_clamped_postgres",
+        pg_summary_ts <= datetime.now(timezone.utc) + timedelta(seconds=5)
+        and sargs[0] == future_summary_doc,
+        str(pg_summary_ts),
+    )
+    check(
+        "future_summary_clamp_backends_aligned",
+        abs((pg_summary_ts - sqlite_summary_ts).total_seconds()) < 5,
+        f"pg={pg_summary_ts} sqlite={sqlite_summary_ts}",
+    )
+
     await db.close()
 
-    # ---- 持久化：close 后重开数据仍在 ----
+    # ---- persistence: data survives close + reopen ----
     db2 = SQLiteMemoryDatabase(config)
     await db2.connect()
     await db2.apply_migrations(PLUGIN_DIR / "migrations_sqlite")
@@ -1014,9 +1361,11 @@ async def main_async() -> None:
     check("reopen_persists", left == "2026-09-12T12:00:00.000000Z")
     await db2.close()
 
-    # commitment 维度过期（对齐 nori 8 维画像）：起算点
-    # COALESCE(last_evidence_at, occurred_at)，超窗降 pending_uncertain
-    # 出画像（簇体保留可复活）——置尾执行：改簇状态不影响前序断言
+    # commitment dimension expiry (aligned with nori's 8-dim profile): the
+    # baseline is COALESCE(last_evidence_at, occurred_at); over the window
+    # it demotes to pending_uncertain and leaves the profile (the cluster
+    # body is kept and revivable) -- run at the tail so the status change
+    # does not affect earlier assertions
     old_ts = db_pkg.sqlite_format_ts(now - timedelta(days=100))
     db3 = SQLiteMemoryDatabase(config)
     await db3.connect()
@@ -1399,9 +1748,10 @@ async def _migrate_backend_checks() -> None:
                 rows = await conn.fetch("SELECT payload,updated_at FROM memory_retain_pending")
             check(f"migrate_pending_{type(shape).__name__}",
                   code == 0 and len(rows) == 1 and json.loads(rows[0]["payload"]) == pending_payload
-                  # 运行时同款格式（isoformat 微秒 + 偏移）：Z 后缀会让
-                  # updated_at <= cutoff 的字符串比较永假（'Z' > '+'），
-                  # 迁移行删不掉；Python<3.11 的 fromisoformat 也不认 Z
+                  # runtime's own format (isoformat microseconds + offset):
+                  # a Z suffix makes the updated_at <= cutoff string compare
+                  # always false ('Z' > '+'), so migrated rows would never
+                  # be deleted; Python<3.11 fromisoformat rejects Z too
                   and rows[0]["updated_at"]
                   == now.astimezone(timezone.utc).isoformat(timespec="microseconds")
                   and rows[0]["updated_at"] <= datetime.now(timezone.utc).isoformat(timespec="microseconds"))

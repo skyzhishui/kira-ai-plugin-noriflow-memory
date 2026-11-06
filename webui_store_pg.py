@@ -46,41 +46,63 @@ async def fetch_overview(backend) -> tuple[dict, list]:
 
 
 async def fetch_users_data(backend, keyword: str, page: int, size: int) -> dict:
-    """Users with facts/clusters (persona page user selector data source): raw query."""
+    """Users with facts/clusters (persona page user selector data source): raw query.
+
+    The user set is the union of cluster owners and raw-fact owners: a user
+    whose facts have not converged into a cluster yet still owns memory and
+    must stay reachable (and erasable) from the persona page. Cluster counts
+    for such raw-only users fall out as 0 from the LEFT JOIN; their
+    updated_at comes from the newest raw-fact write instead.
+    """
     params: list = []
     where = ""
     if keyword:
         params.append(_like_contains_pattern(keyword))
-        where = "WHERE c.user_id ILIKE $1"
+        where = "WHERE l.user_id ILIKE $1"
     async with _pool(backend).acquire() as conn:
         total = await conn.fetchval(
             f"""
             SELECT count(*) FROM (
-              SELECT 1 FROM memory_fact_cluster c {where}
-              GROUP BY c.platform, c.user_id
-            ) t
+              SELECT platform, user_id FROM memory_fact_cluster
+              UNION
+              SELECT platform, user_id FROM memory_persona_fact_raw
+            ) l {where}
             """,
             *params,
         )
         rows = await conn.fetch(
             f"""
-            SELECT c.platform, c.user_id,
-                   count(*) FILTER (WHERE c.status = 'active') AS active,
-                   count(*) FILTER (WHERE c.status = 'profiled') AS profiled,
-                   count(*) FILTER (WHERE c.status = 'pending_uncertain') AS pending,
+            WITH latest AS (
+              SELECT platform, user_id, max(updated_at) AS updated_at
+              FROM (
+                SELECT platform, user_id, updated_at FROM memory_fact_cluster
+                UNION ALL
+                SELECT platform, user_id, written_at AS updated_at
+                FROM memory_persona_fact_raw
+              ) u
+              GROUP BY platform, user_id
+            )
+            SELECT l.platform, l.user_id,
+                   count(c.id) FILTER (WHERE c.status = 'active') AS active,
+                   count(c.id) FILTER (WHERE c.status = 'profiled') AS profiled,
+                   count(c.id) FILTER (WHERE c.status = 'pending_uncertain') AS pending,
                    max(c.score) AS max_score,
-                   max(c.updated_at) AS updated_at
-            FROM memory_fact_cluster c {where}
-            GROUP BY c.platform, c.user_id
-            ORDER BY max(c.updated_at) DESC
+                   max(l.updated_at) AS updated_at
+            FROM latest l
+            LEFT JOIN memory_fact_cluster c
+              ON c.platform = l.platform AND c.user_id = l.user_id
+            {where}
+            GROUP BY l.platform, l.user_id
+            ORDER BY max(l.updated_at) DESC
             OFFSET ${len(params)+1} LIMIT ${len(params)+2}
             """,
             *params,
             (page - 1) * size,
             size,
         )
-        # 名字映射只查当前页用户（原全表 DISTINCT ON 在大库上是与分页
-        # 查询不成比例的整表扫描）
+        # Name mapping only queries users on the current page (the original
+        # whole-table DISTINCT ON was a scan disproportionate to the paged
+        # query on a large DB)
         pairs = [(r["platform"], r["user_id"]) for r in rows]
         names = []
         if pairs:
@@ -148,8 +170,9 @@ async def fetch_clusters_data(
     if filters["status"]:
         add("status = ${n}", filters["status"])
     if filters["session_id"]:
-        # 簇无 session 列：按证据键 {session}|{date} 前缀匹配（元字符转义
-        # 而非剥离——含 _/% 的会话 ID 也能如实匹配）
+        # Clusters have no session column: prefix-match on the evidence key
+        # {session}|{date} (metacharacters escaped rather than stripped —
+        # session IDs containing _/% still match faithfully)
         add(
             "EXISTS (SELECT 1 FROM unnest(evidence_keys) e WHERE e LIKE ${n})",
             filters["session_evidence_prefix"],
@@ -223,7 +246,7 @@ async def fetch_relation_graph_data(backend) -> dict:
             SELECT id, platform, subject_uid, object_uid, subject_name,
                    object_name, relation_label, statement, status,
                    confidence, evidence_count, last_seen, occurred_at,
-                   supersede_reason
+                   supersede_reason, superseded_at
             FROM memory_entity_edge
             ORDER BY evidence_count DESC, last_seen DESC
             LIMIT $1

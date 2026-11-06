@@ -1,6 +1,6 @@
 -- 001_init.sql: SQLite backend merged initialization (terminal schema).
 --
--- Equivalent to the叠加后的 PG migrations 001-010 terminal shape (dual-storage
+-- Equivalent to the stacked PG migrations 001-010 terminal shape (dual-storage
 -- plan §7): fresh SQLite installs land on the final schema in one file, and
 -- this file also registers versions 2..10 in _memory_local_migrations so the
 -- shared version sequence keeps future paired migrations (011_pg + 011_sqlite)

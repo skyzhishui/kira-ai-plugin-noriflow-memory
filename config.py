@@ -6,27 +6,35 @@ connection pool / embedding / backfill / breaker fields; recall, merge
 agent, and scoring-state-machine fields land with M3-M5 milestones.
 """
 
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
-# 跨字段校验（model_validator）涉及的配置键：兜底回退范围的防御性上限。
-# 精确回退依赖校验器抛 CrossFieldConfigError 自报管辖键（main._try_build_config
-# 据此只回退真正非法的那组，不牵连其他组合法的显式配置）；仅当跨字段错误
-# 拿不到自报键（未来新增校验器漏带 keys）时，才退回整表回退。
-# 字段级约束（gt/ge 等）不走此表——pydantic 错误自带 loc，可逐项定位。
+# Config keys involved in cross-field validation (model_validator): the
+# defensive upper bound of the fallback reset scope. Precise fallback
+# relies on each validator raising CrossFieldConfigError and self-
+# reporting the keys it governs (main._try_build_config resets only the
+# actually-illegal group, never touching explicit configs of other legal
+# combinations); the whole-table fallback kicks in only when a cross-
+# field error carries no self-reported keys (a future validator
+# forgetting to pass keys). Field-level constraints (gt/ge etc.) do not
+# go through this table -- pydantic errors carry loc and can be
+# pinpointed per field.
 CROSS_FIELD_VALIDATED_KEYS: tuple = (
     "pool_min", "pool_max",
     "score_cap", "promote_threshold", "demote_threshold",
-    "recent_promote_threshold", "score_start_high", "score_start_medium",
+    "recent_promote_threshold", "naming_promote_threshold",
+    "score_start_high", "score_start_medium",
 )
 
 
 class CrossFieldConfigError(ValueError):
-    """跨字段校验失败：keys 声明该校验器管辖、需一并回退默认值的配置键。
+    """Cross-field validation failure: keys declares the config keys this
+    validator governs, which must be reset to defaults together.
 
-    pydantic 会把本异常实例原样放进 ValidationError.errors()[i]["ctx"]["error"]，
-    兜底层据此精确定位回退哪一组键。
+    pydantic places this exception instance verbatim into
+    ValidationError.errors()[i]["ctx"]["error"]; the fallback layer uses
+    it to pinpoint exactly which key group to reset.
     """
 
     def __init__(self, message: str, keys) -> None:
@@ -89,7 +97,7 @@ class LocalMemoryConfig(BaseModel):
         default=64, ge=1, description="补算任务单表单批扫描行数"
     )
 
-    # ---- M4：合并 agent ----
+    # ---- M4: merge agent ----
     merge_interval_hours: float = Field(default=6.0, gt=0, description="合并 agent 执行周期（小时）")
     merge_batch_size: int = Field(default=200, ge=1, description="归一化遍单批拉取的 raw 事实数")
     candidate_top_k: int = Field(default=20, ge=1, description="候选簇向量检索 top-K")
@@ -97,7 +105,7 @@ class LocalMemoryConfig(BaseModel):
         default=200, ge=0, description="每周期 LLM 裁定调用预算（超出顺延下周期）"
     )
 
-    # ---- M4/M5：评分状态机 ----
+    # ---- M4/M5: scoring state machine ----
     score_start_high: int = Field(
         default=3, ge=0,
         description="high 置信事实起步分（非负：负数会让迟滞带校验的"
@@ -131,6 +139,24 @@ class LocalMemoryConfig(BaseModel):
     decay_interval_days: int = Field(default=14, ge=1, description="衰减周期（天），兼缺席冻结窗口粒度")
     recent_expire_days: int = Field(default=30, ge=1, description="recent 维度过期天数")
     recent_promote_threshold: float = Field(default=4.0, description="recent 维度进画像阈值")
+    naming_promote_threshold: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="naming（称呼偏好）维度进画像阈值：缺省（None/不设）从"
+        " score_start_high 派生——本人明确称呼要求（confidence=high，起步分"
+        "即 score_start_high）单次即可晋档入画像，该承诺在任何评分刻度下按"
+        "构造成立（缺省刻度下即 3.0）；显式设置时按本值生效（高于 "
+        "score_start_high 则退化为需二次证据累积，属合法保守配置），且衰减后"
+        "（naming_promote_threshold × decay_factor）不得低于 demote_threshold"
+        "（否则晋档后下一轮衰减即被降级）、不得大于 "
+        "score_cap（均装配期校验）",
+    )
+    naming_prompt_enabled: bool = Field(
+        default=True,
+        description="naming 附加编码段开关（只控制编码提示词扩展节附加与否，"
+        "对齐 relation_extract_enabled 模式；关闭后编码提示词不含该段，"
+        "naming 提取退回基础规则行为）",
+    )
     commitment_expire_days: int = Field(
         default=60,
         ge=1,
@@ -158,7 +184,7 @@ class LocalMemoryConfig(BaseModel):
         description="画像锚定条数：每维度按注入排序前 N 条豁免分数衰减与降级，被新确认事实顶替掉出前 N 名才恢复自然衰减（0=禁用；应与注入每栏条数一致）",
     )
 
-    # ---- M3：recall ----
+    # ---- M3: recall ----
     recall_top_k: int = Field(default=5, ge=1, description="召回条数上限")
     recall_relevance_threshold: float = Field(
         default=0.0,
@@ -180,13 +206,16 @@ class LocalMemoryConfig(BaseModel):
         gt=0,
         description="时间衰减半衰期（天）：距今天数达到该值的记忆排序分减半，越小越偏好近期",
     )
-    # KiraAI 版新增：摘要记忆 recall 会话隔离（true=仅召回本会话摘要，
-    # false=跨会话召回）；画像不设隔离（画像按用户跨会话聚合）
+    # KiraAI-edition addition: summary-memory recall session isolation
+    # (true=recall only this session's summaries, false=recall across
+    # sessions); profiles have no isolation (profiles aggregate per user
+    # across sessions)
     summary_recall_session_scoped: bool = Field(
         default=True,
         description="摘要记忆 recall 是否会话隔离（true 仅召回本会话，默认隔离）",
     )
-    # ---- 摘要生命周期（归档态 + 访问强化；对齐 nori 侧 011 同名配置组）----
+    # ---- Summary lifecycle (archived state + access reinforcement;
+    # aligned with the nori-side 011 same-named config group) ----
     summary_lifecycle_enabled: bool = Field(
         default=False,
         description="摘要生命周期总开关：开启后合并 agent 周期执行归档遍"
@@ -225,7 +254,7 @@ class LocalMemoryConfig(BaseModel):
         " summary_lifecycle_enabled 门控——预累积强化信号，避免开启生命"
         "周期后首遍判据因无 last_recall_at 把存量高频记忆误归档",
     )
-    # ---- 主动记忆工具（对齐 nori 侧五件套）----
+    # ---- Active memory tools (aligned with the nori-side five-tool set) ----
     memory_tools_enabled: bool = Field(
         default=True,
         description="主动记忆维护工具总开关：memory_profile / "
@@ -244,7 +273,8 @@ class LocalMemoryConfig(BaseModel):
     rerank_enabled: bool = Field(default=True, description="是否启用重排序（需 model_config [rerank]）")
     rerank_candidates: int = Field(default=50, ge=1, description="进入重排序的向量候选数")
 
-    # ---- 召回质量优化（扩选/近时排除/去重/时间标注，同步自上游 nori 版） ----
+    # ---- Recall quality tuning (expansion / recent-range exclusion /
+    # dedup / time labeling, synced from upstream nori) ----
     recall_expansion_enabled: bool = Field(
         default=True,
         description="召回扩选：把会话最近 N 批摘要的参与者并入用户过滤，"
@@ -271,7 +301,8 @@ class LocalMemoryConfig(BaseModel):
         "v1.7.1 起不再驱动召回候选拕取旁路（旁路已整体移除——引用原文由"
         "适配层并入 recall query 走主路）",
     )
-    # ---- P1：持久实体别名层（窗口词典之后的持久命中来源） ----
+    # ---- P1: persistent entity alias layer (persistent hit source after
+    # the window dictionary) ----
     alias_enabled: bool = Field(
         default=True,
         description="持久实体别名层：memory_entity_alias 表（变体拆分后的历史名字流）"
@@ -287,7 +318,8 @@ class LocalMemoryConfig(BaseModel):
         default_factory=list,
         description="别名停用词：与常用词撞车的名字（如有人昵称叫『谢谢』），命中也不注入",
     )
-    # ---- P2：结构化关系提取落库（只写不查，灰度审计期） ----
+    # ---- P2: structured relation extraction storage (write-only, no
+    # query; grayscale audit period) ----
     relation_extract_enabled: bool = Field(
         default=False,
         description="P2 关系提取总开关：编码提示词附加 relations 扩展节，产出"
@@ -301,7 +333,8 @@ class LocalMemoryConfig(BaseModel):
         description="bot 端点边激活门槛：evidence_count（含本次证据，按 {session}|{date} 去重）"
         "达到该值才 pending→active（防玩笑/幻觉自我强化；人-人边单次声明即激活）",
     )
-    # ---- P3：边注入（场景 A 节点+边 / C bot 边 AT/引用门槛） ----
+    # ---- P3: edge injection (scenario A node+edge / scenario C bot-edge
+    # AT/reference gate) ----
     relation_inject_enabled: bool = Field(
         default=False,
         description="P3 边注入总开关：实体命中节点且边 label 词形出现在输入（场景 A）、"
@@ -398,7 +431,8 @@ class LocalMemoryConfig(BaseModel):
         description="召回日志文件路径（空=插件数据目录/memory_recall_log.jsonl）",
     )
 
-    # ---- 混合检索（方案 A：写侧 bigram 分词列 + tsvector GIN） ----
+    # ---- Hybrid search (plan A: write-side bigram tokenization column +
+    # tsvector GIN) ----
     hybrid_search_enabled: bool = Field(
         default=True,
         description="向量+BM25 混合检索：两路候选 RRF 融合（稀有条目——人名/游戏名/"
@@ -409,7 +443,8 @@ class LocalMemoryConfig(BaseModel):
         default=60, ge=1, description="RRF 融合常数 k（越大两路排名越平权）"
     )
 
-    # ---- 滚动补回：宿主窗口外最近批次摘要注入 ----
+    # ---- Rolling rollout fill-back: inject summaries of recent batches
+    # that rolled out of the host window ----
     recent_rollout_enabled: bool = Field(
         default=True,
         description="滚动补回：注入最近 N 批滚动出宿主可见窗口的同会话摘要"
@@ -421,8 +456,22 @@ class LocalMemoryConfig(BaseModel):
     recent_rollout_max_chars: int = Field(
         default=1500, ge=100, description="滚动补回块字符预算（超限按批丢弃旧批，单批超限截断）"
     )
+    cross_session_summary_enabled: bool = Field(
+        default=False,
+        description="跨会话近期摘要：私聊回合前置当前用户在其他会话的近期"
+        "摘要（仅 dm 注入；recall 同轮排除已注入行防重复暴露）",
+    )
+    cross_session_summary_top_k: int = Field(
+        default=2, ge=1, description="跨会话摘要候选条数"
+    )
+    cross_session_summary_max_chars: int = Field(
+        default=1500, ge=100, description="跨会话摘要整块字符预算（含前言；超限丢弃旧条，首条超限截断）"
+    )
+    cross_session_summary_max_age_days: int = Field(
+        default=30, ge=0, description="跨会话摘要最大陈旧天数（0=不限）"
+    )
 
-    # ---- 熔断 ----
+    # ---- Circuit breaker ----
     failure_threshold: int = Field(
         default=5,
         ge=1,
@@ -441,27 +490,36 @@ class LocalMemoryConfig(BaseModel):
 
     @model_validator(mode="after")
     def _hysteresis_band_guards_repromote(self) -> "LocalMemoryConfig":
-        """迟滞带校验：降档簇一条证据即可回档时，画像会在"降级→单条证据→再晋档"之间翻转。
+        """Hysteresis band validation: when a demoted cluster can climb
+        back with one piece of evidence, the profile flips between
+        "demote -> one piece of evidence -> promote again".
 
-        降档判定是严格小于（`score < demote_threshold`），故降档簇分数上界为
-        `demote_threshold - ε`；复活时按 `min(cap, score + start_score)` 累加，
-        再晋档要求 `score >= promote_threshold`。于是当
-        `band = promote - demote >= 单条证据最大加分` 时，
-        `demote - ε + 加分 < promote` 恒成立（band 恰等于加分也安全），一条证据
-        无法回档；band 小于加分时（如 5/3）降档簇 + 一条 high 即可回档。
+        Demotion is a strict less-than (`score < demote_threshold`), so a
+        demoted cluster's score ceiling is `demote_threshold - ε`; on
+        revival the score accumulates via `min(cap, score + start_score)`,
+        and re-promotion requires `score >= promote_threshold`. Hence when
+        `band = promote - demote >= the max single-evidence increment`,
+        `demote - ε + increment < promote` always holds (band exactly
+        equal to the increment is also safe), so one piece of evidence
+        cannot climb back; when band is smaller than the increment (e.g.
+        5/3), a demoted cluster + one high evidence suffices.
 
-        非法组合在配置装配期即抛出（维护页保存走同一模型，非法值返回 422），
-        不再只靠 description 文字约束。
+        Illegal combinations raise at config assembly time (the
+        maintenance page save goes through the same model; illegal values
+        return 422), no longer relying on description text alone.
 
-        浮点比较带 1e-9 容差：二进制浮点减法有表示误差（如 6.1 - 3.1 =
-        2.9999999999999996），数学上 band 恰等于加分（相等亦安全）的组合
-        不得因表示误差被误拒。
+        Float comparisons carry a 1e-9 tolerance: binary float subtraction
+        has representation error (e.g. 6.1 - 3.1 = 2.9999999999999996), so
+        a combination where band mathematically equals the increment
+        (equality is safe) must not be wrongly rejected over that error.
         """
         max_inc = max(self.score_start_high, self.score_start_medium)
         band = self.promote_threshold - self.demote_threshold
         if self.promote_threshold <= self.demote_threshold:
-            # 显式倒挂守卫：ge=0 已挡负起步分，此处关掉仅剩的
-            # promote==demote（零迟滞）与任何路径漏进来的倒挂组合
+            # Explicit inversion guard: ge=0 already blocks negative start
+            # scores; this closes the remaining promote==demote case (zero
+            # hysteresis) and any inverted combination leaking in through
+            # other paths
             raise CrossFieldConfigError(
                 f"promote_threshold ({self.promote_threshold}) 必须大于 "
                 f"demote_threshold ({self.demote_threshold})，迟滞带不得为零或负",
@@ -480,30 +538,124 @@ class LocalMemoryConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _promote_thresholds_within_cap(self) -> "LocalMemoryConfig":
-        """晋升阈值不得超过分数封顶，否则簇分数被 score_cap 封顶后永远达不到
-        阈值，晋升被静默关闭（此前维护页可直接配出该组合且无任何拦截——
-        含跨字段回退只复位 band 组、遗留小刻度 score_cap 的级联场景）。
+    def _resolve_naming_threshold_default(self) -> "LocalMemoryConfig":
+        """Derive the naming threshold default: None -> score_start_high.
 
-        相等允许：分数经 min(score_cap, ...) 可达封顶值（旧缺省
-        promote=10 == score_cap=10 即此形态）。浮点比较带 1e-9 容差，
-        与迟滞带校验同口径。
+        A derived default keeps the promise "one explicit naming statement
+        (high evidence, start score = score_start_high) promotes in a single
+        step" true by construction at any score scale, and avoids the
+        upgrade cascade: scaled legacy deployments (score_start_high already
+        scaled) stay valid without setting the new key, so no cross-field
+        fallback wipes their legal explicit scoring keys. Explicit values
+        win as-is (including conservative forms above score_start_high).
+        Defined before _promote_thresholds_within_cap so the cap check sees
+        the resolved value.
+
+        Derivation lower bound (review D4): score_start_high <= 0 is a legal
+        field value (ge=0), but deriving 0 would bypass this field's gt=0 --
+        every naming extraction (0-score starts included) would promote into
+        the profile at cluster creation. Reject and demand an explicit
+        naming threshold; the self-reported key fallback (both keys reset:
+        3.0 / None -> derived 3.0) always converges.
+
+        Decay-scaled demotion-floor guard (review): the decay pass first
+        multiplies every non-recent score by decay_factor (<= 1) and only
+        then demotes profiled clusters below demote_threshold. The score a
+        naming cluster is promoted with is exactly its threshold (a cluster
+        created or promoted at the threshold can sit right on it), so the
+        value the next decay pass compares is ``threshold * decay_factor``,
+        not the threshold itself. Requiring ``threshold >= demote`` is
+        therefore not enough: equality still decays below the demotion line
+        whenever decay_factor < 1 (the default 0.9 included), and anchors
+        (anchor_profile_size) only protect the top N rows of the dimension.
+        The guard validates the post-decay floor instead:
+        ``threshold * decay_factor >= demote_threshold``.
+
+        The guard self-reports the keys it governs: the explicit group
+        (naming_promote_threshold, demote_threshold, decay_factor) or, when
+        the threshold is derived, (score_start_high, demote_threshold,
+        decay_factor) -- resetting those always converges (default
+        3 * 0.9 = 2.7 >= default demote 2).
+        """
+        derived = self.naming_promote_threshold is None
+        if derived:
+            if self.score_start_high <= 0:
+                raise CrossFieldConfigError(
+                    f"score_start_high ({self.score_start_high}) <= 0 时无法派生"
+                    " naming_promote_threshold（派生值 0 会绕过 gt=0，任何 naming"
+                    " 提取建簇即晋档入画像）——请显式设置 naming_promote_threshold",
+                    ("naming_promote_threshold", "score_start_high"),
+                )
+            self.naming_promote_threshold = float(self.score_start_high)
+        decayed_floor = self.naming_promote_threshold * self.decay_factor
+        if decayed_floor + 1e-9 < self.demote_threshold:
+            raise CrossFieldConfigError(
+                f"naming_promote_threshold ({self.naming_promote_threshold}) × "
+                f"decay_factor ({self.decay_factor}) = {decayed_floor} 不得小于 "
+                f"demote_threshold ({self.demote_threshold})：衰减遍先按 "
+                f"decay_factor 衰减再按 demote_threshold 降级，衰减后低于降级线"
+                "的 naming 簇晋档后会在下一轮衰减遍被立即降级删除（画像反复抖动，"
+                "称呼承诺静默丢失）",
+                (
+                    ("demote_threshold", "score_start_high", "decay_factor")
+                    if derived
+                    else (
+                        "naming_promote_threshold",
+                        "demote_threshold",
+                        "decay_factor",
+                    )
+                ),
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _promote_thresholds_within_cap(self) -> "LocalMemoryConfig":
+        """Promotion thresholds must not exceed the score cap; otherwise
+        cluster scores are capped by score_cap and never reach the
+        threshold, silently disabling promotion (previously the
+        maintenance page could configure this combination with no
+        interception at all -- including the cascade where a cross-field
+        fallback resets only the band group and leaves a legacy
+        small-scale score_cap).
+
+        The naming dimension follows the same rule (included since the
+        v1.18.2 port): with naming_promote_threshold > score_cap, neither
+        the single-statement promote nor the promotion pass can reach the
+        threshold, and naming preferences silently never enter the
+        profile. Note only the cap upper bound is validated: the
+        "<= score_start_high" in the description is an effectiveness
+        precondition of the single-step promote promise, not a legality
+        constraint (exceeding it merely degrades to two-step evidence
+        accumulation, a legal conservative config), so it is not
+        hard-rejected here.
+
+        Equality is allowed: the score can reach the cap via
+        min(score_cap, ...) (the old default promote=10 == score_cap=10 is
+        exactly this form). Float comparisons carry a 1e-9 tolerance, same
+        as the hysteresis band check.
         """
         cap = self.score_cap
         if (
             self.promote_threshold > cap + 1e-9
             or self.recent_promote_threshold > cap + 1e-9
+            or self.naming_promote_threshold > cap + 1e-9
         ):
             raise CrossFieldConfigError(
                 f"promote_threshold ({self.promote_threshold}) / "
-                f"recent_promote_threshold ({self.recent_promote_threshold}) "
+                f"recent_promote_threshold ({self.recent_promote_threshold}) / "
+                f"naming_promote_threshold ({self.naming_promote_threshold}) "
                 f"不得大于 score_cap ({cap})：簇分数被 score_cap 封顶后永远达不到"
                 "晋升阈值，晋升会被静默关闭",
-                ("score_cap", "promote_threshold", "recent_promote_threshold"),
+                (
+                    "score_cap",
+                    "promote_threshold",
+                    "recent_promote_threshold",
+                    "naming_promote_threshold",
+                ),
             )
         return self
 
-    # ---- 主动工具安全 ----
+    # ---- Active tool safety ----
     tool_scope_locked: bool = Field(
         default=True,
         description="工具作用域锁定：开启时 memory_search/write/remove 忽略 LLM 显式传入的 "

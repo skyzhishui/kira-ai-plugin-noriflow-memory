@@ -1,19 +1,27 @@
-"""retain 攒批（私聊 N 轮合并编码）专项测试。
+"""Dedicated tests for retain batching (private-chat N-turn merged encoding).
 
-覆盖与 nori 仓 PR #25 对齐的语义（kira 架构适配版）：
+Covers semantics aligned with nori repo PR #25 (kira architecture
+adaptation):
 
-- 攒批门控：群聊 interval=1 逐轮路径零变化（不写 pending 表、失败回滚
-  水位线）；私聊 interval=N 攒批到点合并为单批次编码
-- 批次内容正确性：合并批次 = 各轮批次行拼接，历史窗口取攒批前快照
-- 双持久化：每轮 UPSERT 快照行、编码成功后删行
-- 失败回座：编码失败不丢批次（内存 + 表行都保留），下个触发点重试
-- 水位线语义：攒批路径不回滚水位线（真源已移交攒批缓存/表行）
-- 重启恢复：读表回灌轮数延续，回灌不立即编码
-- 空闲巡检：超龄批次强制编码落库
-- 会话逐出联动：LRU 逐出带攒批的会话时调度编码，不滞留
-- 停机收口：terminate 强制编码未满批
+- Batch gating: group chat interval=1 keeps the per-turn path unchanged
+  (no pending-table writes, watermark rolled back on failure); private
+  chat interval=N merges due batches into a single encode
+- Batch content correctness: the merged batch = concatenation of each
+  round's batch rows; the history window takes the pre-batch snapshot
+- Dual persistence: a snapshot row UPSERTed each turn, deleted after a
+  successful encode
+- Failure reseating: a failed encode loses no batch (both memory and
+  the table row are kept) and retries at the next trigger point
+- Watermark semantics: the batching path does not roll back the
+  watermark (source of truth already handed to the batch cache/rows)
+- Restart recovery: round counts refill from the table, and a refill
+  does not encode immediately
+- Idle sweep: over-age batches are force-encoded and persisted
+- Session eviction coupling: evicting an LRU session holding a batch
+  schedules its encode, nothing stranded
+- Shutdown closeout: terminate force-encodes unfinished batches
 
-运行：python -m pytest -q tests/test_memory_retain_batch.py
+Run: python -m pytest -q tests/test_memory_retain_batch.py
 """
 
 from __future__ import annotations
@@ -51,7 +59,7 @@ def _cfg(private: int = 5, group: int = 1, flush_idle_s: float = 1800.0) -> dict
 
 
 async def _turn(inst, ctx, session, text: str, mid: str) -> None:
-    """一轮对话：观察消息 -> 发出回合完成信号。"""
+    """One turn: observe a message, then fire the turn-complete signal."""
     await inst.observe_message(
         types.SimpleNamespace(message=make_msg("u1", text, mid=mid), session=session)
     )
@@ -59,7 +67,8 @@ async def _turn(inst, ctx, session, text: str, mid: str) -> None:
 
 
 def _spy_encode(inst, sink: list) -> None:
-    """在 kernel 边界抓取编码输入（conversation_text）。"""
+    """Capture the encoding input (conversation_text) at the kernel
+    boundary."""
     kernel = inst._memory_kernel
     original = kernel.retain_encoded
 
@@ -71,7 +80,7 @@ def _spy_encode(inst, sink: list) -> None:
 
 
 def _pending_sqls(inst) -> list:
-    """pending 表相关 SQL 调用（INSERT / DELETE）。"""
+    """Pending-table SQL calls (INSERT / DELETE)."""
     return [
         sql for kind, sql, _args in inst._db.pool.conn.sqls
         if kind == "execute" and "memory_retain_pending" in sql
@@ -79,10 +88,11 @@ def _pending_sqls(inst) -> list:
 
 
 class TestRetainBatchGating(unittest.TestCase):
-    """门控：谁攒批、谁逐轮。"""
+    """Gating: who batches, who encodes per turn."""
 
     def test_private_batches_five_turns_into_one_encode(self):
-        """私聊 5 轮合并为 1 次编码，批次含全部 5 轮内容。"""
+        """Private chat merges 5 turns into 1 encoding, batch includes
+        all 5 turns' content."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         captured: list[str] = []
@@ -103,7 +113,8 @@ class TestRetainBatchGating(unittest.TestCase):
         self.assertEqual(summaries[0]["group_id"], "", "私聊 group_id 为空")
 
     def test_group_interval_one_keeps_per_turn_encoding(self):
-        """群聊默认 interval=1：逐轮编码，且不写 pending 表（行为零变化）。"""
+        """Group chat defaults to interval=1: per-turn encoding, and no
+        pending-table writes (zero behavior change)."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(group=1))
         gm = FakeSession(sid="778899", stype="gm", adapter="napcat")
         captured: list[str] = []
@@ -122,7 +133,8 @@ class TestRetainBatchGating(unittest.TestCase):
         )
 
     def test_private_interval_one_keeps_per_turn_encoding(self):
-        """私聊 interval=1 时同样走逐轮路径（回滚开关）。"""
+        """Private chat with interval=1 also takes the per-turn path
+        (rollback switch)."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=1))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         captured: list[str] = []
@@ -138,10 +150,12 @@ class TestRetainBatchGating(unittest.TestCase):
         self.assertEqual(len(captured), 3)
 
     def test_batch_keeps_pre_batch_history_snapshot(self):
-        """第二批的历史窗口 = 攒批前的已消费行（等价 nori 的 exclude 回退）。
+        """The second batch's history window = the pre-batch consumed
+        rows (equivalent to nori's exclude fallback).
 
-        场景：前 5 轮合并编码为第 1 批；第 6 轮开第 2 批，其历史窗口
-        应含前 5 轮已消费的行（不重复进批次内容）。
+        Scenario: the first 5 turns merge-encode as batch 1; turn 6
+        opens batch 2, whose history window should contain the first 5
+        consumed rows (without re-entering batch content).
         """
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
@@ -152,10 +166,11 @@ class TestRetainBatchGating(unittest.TestCase):
             for i in range(5):
                 await _turn(inst, ctx, dm, f"第{i + 1}句", mid=f"b{i + 1}")
                 await asyncio.gather(*inst._retain_tasks)
-            # 第 6 轮开新批：历史窗口应回退到前 5 轮
+            # Turn 6 opens a new batch: the history window should fall
+            # back to the first 5 turns
             await _turn(inst, ctx, dm, "第6句", mid="b6")
             await asyncio.gather(*inst._retain_tasks)
-            # 强制冲刷第 2 批（巡检超龄）
+            # Force-flush batch 2 (sweep over-age)
             inst._retain_pending_at[dm.sid] = time.time() - 9999
             await inst._sweep_retain_pending()
             await asyncio.gather(*inst._retain_tasks)
@@ -173,10 +188,11 @@ class TestRetainBatchGating(unittest.TestCase):
 
 
 class TestRetainBatchPersistence(unittest.TestCase):
-    """双持久化：表行快照的生命周期。"""
+    """Dual persistence: the table-row snapshot lifecycle."""
 
     def test_row_written_each_turn_and_deleted_after_encode(self):
-        """每轮 UPSERT 快照行，编码成功后删行。"""
+        """Each turn UPSERTs a snapshot row; the row is deleted after a
+        successful encode."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
 
@@ -194,7 +210,8 @@ class TestRetainBatchPersistence(unittest.TestCase):
         self.assertEqual(len(deletes), 1, "编码成功后删行一次")
 
     def test_failed_encode_reseats_batch_and_keeps_row(self):
-        """编码失败：批次回座（内存 + 表行保留），后续触发点重试成功。"""
+        """Encode failure: the batch reseats (memory + table row kept)
+        and a later trigger retries successfully."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         kernel = inst._memory_kernel
@@ -218,16 +235,16 @@ class TestRetainBatchPersistence(unittest.TestCase):
 
         summaries = asyncio.run(scenario())
         self.assertEqual(len(summaries), 0, "失败批不落库")
-        # 失败回座：内存仍持有该批次，轮数保留
+        # Failure reseat: memory still holds the batch, rounds kept
         pending = inst._retain_pending.get(sid)
         self.assertIsNotNone(pending, "失败批次必须回座到内存 pending")
         self.assertEqual(int(getattr(pending, "_retain_rounds", 0)), 5)
-        # 表行仍在（未删）
+        # The table row is still there (not deleted)
         self.assertFalse(
             [s for s in _pending_sqls(inst) if s.lstrip().startswith("DELETE")],
             "失败时不得删行",
         )
-        # 下一轮触发重试并成功
+        # The next turn triggers a retry that succeeds
         state["fail"] = False
         captured: list[str] = []
 
@@ -254,7 +271,8 @@ class TestRetainBatchPersistence(unittest.TestCase):
         )
 
     def test_batch_failure_does_not_roll_back_watermark(self):
-        """攒批路径失败不回滚水位线（真源已移交攒批缓存/表行）。"""
+        """A batching-path failure does not roll back the watermark
+        (source of truth already handed to the batch cache/table row)."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         kernel = inst._memory_kernel
@@ -276,10 +294,12 @@ class TestRetainBatchPersistence(unittest.TestCase):
 
 
 class TestRetainBatchRecovery(unittest.TestCase):
-    """重启恢复 / 巡检 / 逐出联动。"""
+    """Restart recovery / sweep / eviction coupling."""
 
     def test_restore_continues_round_count_without_immediate_encode(self):
-        """读表回灌：轮数延续，且回灌不立即编码（续攒而非提前落库）。"""
+        """Table refill: round counts continue, and a refill does not
+        encode immediately (keep accumulating rather than persist
+        early)."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         payload = json.dumps(
@@ -320,7 +340,8 @@ class TestRetainBatchRecovery(unittest.TestCase):
         self.assertEqual(captured, [], "回灌不得立即编码未满批")
 
     def test_restored_batch_encodes_when_interval_reached(self):
-        """回灌后继续攒到间隔即编码。"""
+        """After a refill, accumulating to the interval triggers the
+        encode."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         payload = json.dumps(
@@ -364,7 +385,7 @@ class TestRetainBatchRecovery(unittest.TestCase):
         self.assertIn("攒批第1句", captured[0], "回灌批次内容应并入最终批次")
 
     def test_sweep_flushes_idle_batch(self):
-        """巡检：超龄批次强制编码落库。"""
+        """Sweep: over-age batches are force-encoded and persisted."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5, flush_idle_s=60))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         captured: list[str] = []
@@ -374,7 +395,7 @@ class TestRetainBatchRecovery(unittest.TestCase):
             for i in range(2):
                 await _turn(inst, ctx, dm, f"未满批第{i + 1}句", mid=f"i{i + 1}")
                 await asyncio.gather(*inst._retain_tasks)
-            # 伪造超龄：最后追加时间回拨 10 分钟
+            # Fake over-age: rewind the last-append time by 10 minutes
             inst._retain_pending_at[dm.sid] = time.time() - 600
             await inst._sweep_retain_pending()
             await asyncio.gather(*inst._retain_tasks)
@@ -383,7 +404,7 @@ class TestRetainBatchRecovery(unittest.TestCase):
         self.assertEqual(len(captured), 1, "超龄批次应被巡检强制编码")
 
     def test_sweep_keeps_fresh_batch(self):
-        """巡检：未超龄批次不动。"""
+        """Sweep: batches under the age limit are untouched."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5, flush_idle_s=1800))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         captured: list[str] = []
@@ -400,7 +421,8 @@ class TestRetainBatchRecovery(unittest.TestCase):
         self.assertEqual(captured, [], "未超龄批次不应被强制编码")
 
     def test_session_eviction_flushes_pending_batch(self):
-        """会话逐出联动：带攒批的会话被逐出时调度编码，不滞留。"""
+        """Session eviction coupling: evicting a session with a pending
+        batch schedules the encode, nothing stranded."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         other = FakeSession(sid="20002", stype="dm", adapter="napcat")
@@ -422,7 +444,8 @@ class TestRetainBatchRecovery(unittest.TestCase):
         self.assertEqual(len(captured), 1, "逐出时应调度该会话的攒批编码")
 
     def test_terminate_flushes_unfinished_batch(self):
-        """停机收口：未满批在 terminate 时强制编码。"""
+        """Shutdown closeout: unfinished batches are force-encoded at
+        terminate."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         captured: list[str] = []
@@ -439,14 +462,16 @@ class TestRetainBatchRecovery(unittest.TestCase):
         self.assertEqual(len(captured), 1, "停机前未满批应被强制编码")
 
 
-import json  # noqa: E402  (置于末尾以保持文件头导入整洁)
+import json  # noqa: E402  (kept at the bottom to keep the header imports tidy)
 
 
 class TestRetainBatchSQLiteBackend(unittest.TestCase):
-    """生产路径（SQLite 后端）真实往返：迁移 013 + pending 表读写。
+    """Real production-path roundtrip (SQLite backend): migration 013 +
+    pending-table reads/writes.
 
-    10.0.1.91 实机生产配置 storage_backend=sqlite，本组用例是发布阻塞项：
-    迁移可应用、UPSERT/SELECT/DELETE 在 sqlite shim 下可往返。
+    The production deployment runs storage_backend=sqlite; this
+    group is a release blocker: migrations apply, and
+    UPSERT/SELECT/DELETE roundtrip under the sqlite shim.
     """
 
     def test_sqlite_migration_and_pending_roundtrip(self):
@@ -501,14 +526,15 @@ class TestRetainBatchSQLiteBackend(unittest.TestCase):
                 self.assertEqual(data["batch_lines"], ["攒批第1句"])
                 self.assertEqual(int(data["rounds"]), 2)
 
-                # 回灌读回
+                # Refill read-back
                 inst._retain_pending.clear()
                 await inst._restore_retain_pending()
                 restored = inst._retain_pending.get(sid)
                 self.assertIsNotNone(restored, "回灌应恢复 pending")
                 self.assertEqual(int(getattr(restored, "_retain_rounds", 0)), 2)
 
-                # 删行（cutoff = 本行写入时间戳；无 cutoff 时按 P2 语义跳过）
+                # Delete the row (cutoff = this row's write timestamp;
+                # without a cutoff, skip per the P2 semantics)
                 await inst._delete_retain_pending(sid, inst._retain_row_ts.get(sid))
                 async with db.pool.acquire() as conn:
                     rows = await conn.fetch(
@@ -521,10 +547,12 @@ class TestRetainBatchSQLiteBackend(unittest.TestCase):
 
 
 class TestRetainBatchReviewFixes(unittest.TestCase):
-    """pr-agent review 修复批（PR #16）的回归锁。"""
+    """Regression locks for the pr-agent review fix batch (PR #16)."""
 
     def test_f4_first_batch_history_is_not_duplicated(self):
-        """F4：首轮批次的历史窗口合法为空时，不得回退到新批历史（内容重复）。"""
+        """F4: when the first batch's history window is legally empty,
+        it must not fall back to the new batch's history (duplicate
+        content)."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         captured: list[str] = []
@@ -545,13 +573,15 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
             )
 
     def test_f1_terminate_clears_inflight_registry(self):
-        """F1：terminate 必须清空在途批次登记（取消任务不经过 _drop_inflight）。"""
+        """F1: terminate must clear the in-flight batch registry
+        (cancelled tasks bypass _drop_inflight)."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
 
         async def scenario():
             await _turn(inst, ctx, dm, "在途批次", mid="inflight1")
-            # 模拟「已弹出并登记在途」的编码中状态
+            # Simulate the mid-encode state of "popped and registered
+            # in-flight"
             inst._retain_inflight[dm.sid] = [inst._retain_pending[dm.sid]]
             await inst.terminate()
 
@@ -560,17 +590,20 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertEqual(inst._retain_pending, {})
 
     def test_f2_kernel_missing_reseats_batch(self):
-        """F2：kernel 为空时攒批路径须回座（否则这批运行期不再被编码）。"""
+        """F2: with a missing kernel the batching path must reseat
+        (otherwise this batch is never encoded for the process
+        lifetime)."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
 
         async def scenario():
-            # 4 轮未满批：批次仍在 pending
+            # 4 turns, batch not yet full: still in pending
             for i in range(4):
                 await _turn(inst, ctx, dm, f"第{i + 1}句", mid=f"k{i + 1}")
                 await asyncio.gather(*inst._retain_tasks)
             await asyncio.gather(*inst._retain_tasks)
-            # kernel 缺席时到点 flush：批次弹出→在途→编码失败→必须回座
+            # Due flush with kernel missing: batch popped -> in-flight
+            # -> encode fails -> must reseat
             inst._memory_kernel = None
             await _turn(inst, ctx, dm, "第5句", mid="k5")
             await asyncio.gather(*inst._retain_tasks)
@@ -586,7 +619,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
     def test_f3_conditional_delete_keeps_newer_row(self):
-        """F3：条件删除只删不晚于 cutoff 的行（并发新回合的更新行不被抹掉）。"""
+        """F3: the conditional delete removes only rows no newer than
+        the cutoff (a concurrent newer turn's row is not wiped)."""
         import tempfile
 
         with tempfile.TemporaryDirectory(prefix="noriflow_batch_sqlite_") as tmp:
@@ -629,11 +663,12 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                 old_cutoff = inst._retain_row_ts.get(sid)
                 self.assertIsNotNone(old_cutoff, "写入须登记行时间戳")
 
-                # 模拟并发新回合写入了更新的行
+                # Simulate a concurrent newer turn having written a
+                # newer row
                 inst._retain_pending[sid] = _state("新批次行")
                 await inst._save_retain_pending(sid)
 
-                # 以旧 cutoff 删行：更新行必须存活
+                # Delete with the old cutoff: the newer row must survive
                 await inst._delete_retain_pending(sid, old_cutoff)
                 async with db.pool.acquire() as conn:
                     rows = await conn.fetch(
@@ -642,7 +677,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                     )
                 self.assertEqual(len(rows), 1, "更晚写入的行不应被旧 cutoff 删除")
 
-                # 以最新 cutoff 删行：本次写入的行应被删除
+                # Delete with the newest cutoff: the row written now
+                # should be deleted
                 await inst._delete_retain_pending(sid, inst._retain_row_ts.get(sid))
                 async with db.pool.acquire() as conn:
                     rows = await conn.fetch(
@@ -656,7 +692,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_r1_delete_failure_does_not_escape_task(self):
-        """R1：成功路径删行失败不得让编码任务带异常结束（DB 抖动兜底）。"""
+        """R1: a delete failure on the success path must not end the
+        encode task with an exception (DB jitter fallback)."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         original_delete = inst._delete_retain_pending
@@ -679,10 +716,14 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
             return results
 
         results = asyncio.run(scenario())
-        # 编码本身成功（表行仍在，属预期：删不掉留给下次刷新/重启覆盖）
+        # The encode itself succeeds (the table row remains, expected:
+        # an undeletable row is left for the next flush/restart to
+        # overwrite)
         self.assertEqual(len(inst._db.inserted_summaries), 1, "编码仍应成功")
-        # 显式断言：删行失败不得让编码任务带异常结束
-        # （_retain_tasks 的 done 回调会摘掉已完成任务，不能靠读集合判断）
+        # Explicit assertion: a delete failure must not end the encode
+        # task with an exception (the _retain_tasks done callback
+        # removes finished tasks, so the set cannot be inspected for
+        # this)
         self.assertFalse(
             [r for r in results if isinstance(r, BaseException)],
             "删行失败不得让编码任务带异常结束",
@@ -690,7 +731,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         inst._delete_retain_pending = original_delete
 
     def test_i3_cutoff_kept_when_conditional_delete_misses(self):
-        """I3：条件删除未命中（更新行仍在）时不得丢弃 cutoff。"""
+        """I3: when the conditional delete misses (the newer row still
+        exists), the cutoff must not be discarded."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         sid = "napcat:dm:10086"
 
@@ -711,7 +753,7 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
             )
             await inst._save_retain_pending(sid)
             old_cutoff = inst._retain_row_ts.get(sid)
-            # 更晚写入的行（并发新回合）
+            # The row written later (a concurrent newer turn)
             inst._retain_pending[sid] = inst._retain_state_from_payload(
                 {
                     "session_id": "10086",
@@ -729,7 +771,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
             await inst._save_retain_pending(sid)
             new_cutoff = inst._retain_row_ts.get(sid)
             self.assertGreater(new_cutoff, old_cutoff)
-            # 以旧 cutoff 删：未命中更新行 → cutoff 必须保留
+            # Delete with the old cutoff: it misses the newer row ->
+            # the cutoff must be kept
             await inst._delete_retain_pending(sid, old_cutoff)
             self.assertEqual(
                 inst._retain_row_ts.get(sid),
@@ -741,7 +784,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_n1_older_snapshot_does_not_overwrite_newer_row(self):
-        """N1：UPSERT 时间戳守卫——更旧的快照不得覆盖更新的行。"""
+        """N1: UPSERT timestamp guard -- an older snapshot must not
+        overwrite a newer row."""
         import tempfile
 
         with tempfile.TemporaryDirectory(prefix="noriflow_batch_sqlite_") as tmp:
@@ -786,7 +830,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                 self.assertEqual(len(rows), 1)
                 newer_payload = rows[0]["payload"]
                 newer_ts = rows[0]["updated_at"]
-                # 模拟乱序：更旧的快照后到（时间戳更早）
+                # Simulate out-of-order arrival: an older snapshot
+                # arrives later (earlier timestamp)
                 older = (
                     datetime.now(timezone.utc) - timedelta(minutes=5)
                 ).isoformat(timespec="microseconds")
@@ -811,7 +856,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
             asyncio.run(scenario())
 
     def test_n2_stopping_blocks_new_tasks_but_keeps_round(self):
-        """N2/U1：停机标志置位后不得派发新任务，但本轮内容不得被静默吞掉。"""
+        """N2/U1: after the stopping flag is set no new tasks may be
+        dispatched, but this turn's content must not be silently
+        swallowed."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
 
@@ -826,8 +873,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
         before, after = asyncio.run(scenario())
         self.assertEqual(after, before, "停机后不得派发新 retain 任务")
-        # 停机后那一轮的增量已入水位线——必须被保留（内存 pending / 表行），
-        # 不能因为门控直接 return 就静默丢弃
+        # The post-stop turn's delta already entered the watermark --
+        # it must be kept (memory pending / table row); it must not be
+        # silently dropped just because the gate returns early
         pending = inst._retain_pending.get(dm.sid)
         self.assertIsNotNone(pending, "停机后本轮批次不得丢失")
         self.assertIn(
@@ -841,11 +889,14 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertGreaterEqual(len(inserts), 2, "停机后那一轮应尽力落表行")
 
     def test_n3_interval_switch_merges_residual_batch(self):
-        """N3/X1：interval 调小（热切换）时，残留批次与本轮**合并为一批**编码。
+        """N3/X1: when the interval shrinks (hot switch), the residual
+        batch merges with this turn into ONE batch for encoding.
 
-        残留内容不丢，且不与本轮的 history 窗口重复——本轮 state 的 history
-        是用 _history_snapshot 生成的，其中已含残留批次的行；若残留单独
-        异步编码，同一段对话会被编码两次。
+        Residual content is not lost and does not duplicate this
+        turn's history window -- this turn's state history is produced
+        by _history_snapshot, which already contains the residual
+        batch's rows; encoding the residual asynchronously on its own
+        would encode the same conversation twice.
         """
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
@@ -858,7 +909,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                 await asyncio.gather(*inst._retain_tasks)
             await asyncio.gather(*inst._retain_tasks)
             self.assertEqual(captured, [], "3 轮未满批不应编码")
-            # 热切换：interval 5 -> 1（宿主配置页就地改同一 config 实例）
+            # Hot switch: interval 5 -> 1 (the host config page mutates
+            # the same config instance in place)
             inst._config.retain_interval_private = 1
             await _turn(inst, ctx, dm, "切换后一轮", mid="sw1")
             await asyncio.gather(*inst._retain_tasks)
@@ -877,7 +929,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertNotIn(dm.sid, inst._retain_pending, "编码后不得残留 pending")
 
     def test_x2_save_skips_stale_row_after_encode_completed(self):
-        """X2：等待连接期间编码完成 → 保存不得把已编码内容写成残留行。"""
+        """X2: if encoding completes while waiting for a connection, the
+        save must not write already-encoded content as a residual
+        row."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         sid = "napcat:dm:10086"
         waiting = asyncio.Event()
@@ -919,7 +973,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
             try:
                 task = asyncio.create_task(inst._save_retain_pending(sid))
                 await waiting.wait()
-                # 等待连接期间编码完成：未编码数据清空
+                # Encoding completed while waiting for the connection:
+                # unencoded data cleared
                 inst._retain_pending.clear()
                 inst._retain_inflight.clear()
                 release.set()
@@ -935,7 +990,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_p1_snapshot_write_does_not_block_turn_signal(self):
-        """P1：快照写入不得阻塞回合完成信号（DB 变慢时主链路不被拖住）。"""
+        """P1: snapshot writes must not block the turn-complete signal
+        (a slow DB must not drag the main path)."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         original_save = inst._save_retain_pending
@@ -953,7 +1009,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                     message=make_msg("u1", "慢 DB 的一轮", mid="slow1"), session=dm
                 )
             )
-            # 超时兜底：若信号真的 await 了快照写入，这里会超时而不是挂死
+            # Timeout fallback: if the signal truly awaited the snapshot
+            # write, this times out instead of hanging
             try:
                 await asyncio.wait_for(
                     ctx.event_bus.fire("session_memory_updated", {"session": dm.sid}),
@@ -963,8 +1020,10 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                 raise AssertionError(
                     "回合完成信号不得等待快照写入（快照应走后台任务）"
                 ) from None
-            # 判据：信号返回时快照写入任务**仍未完成** → 信号没有等它
-            # （不能只看 release 未置位：那只在 fire 返回后才置位，恒真）
+            # Criterion: when the signal returns the snapshot write task
+            # is still NOT done -> the signal did not wait for it
+            # (do not just check release being unset: it is only set
+            # after fire returns, so that would always hold)
             still_running = [t for t in inst._retain_tasks if not t.done()]
             slow["release"].set()
             await asyncio.gather(*inst._retain_tasks)
@@ -977,7 +1036,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
     def test_p2_delete_without_cutoff_keeps_row(self):
-        """P2：缺少行时间戳时跳过删除（留行比误删新快照安全）。"""
+        """P2: skip the delete when the row timestamp is missing
+        (keeping the row is safer than deleting a new snapshot by
+        mistake)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         sid = "napcat:dm:10086"
 
@@ -997,7 +1058,7 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                 }
             )
             await inst._save_retain_pending(sid)
-            # 无 cutoff：不得删除
+            # No cutoff: must not delete
             await inst._delete_retain_pending(sid)
             self.assertEqual(
                 inst._retain_row_ts.get(sid) is not None,
@@ -1010,13 +1071,16 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_q1_restore_precedes_signal_subscription(self):
-        """Q1：快照恢复必须先于回合完成信号订阅（恢复期间的回合不被覆盖）。"""
+        """Q1: snapshot restore must precede turn-complete signal
+        subscription (turns arriving during restore are not
+        overwritten)."""
         ctx = FakeCtx()
         observed: list[int] = []
         original = mod.NoriflowMemoryPlugin._restore_retain_pending
 
         async def observing_restore(self):
-            # 恢复进行中：此时信号处理器应尚未订阅
+            # Restore in progress: the signal handler should not be
+            # subscribed yet
             observed.append(len(ctx.event_bus.subs.get("session_memory_updated", [])))
             await original(self)
 
@@ -1034,7 +1098,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
     def test_q1_restore_merges_with_existing_pending(self):
-        """Q1：恢复不得覆盖内存里已有的批次（恢复期间到达的回合已开新批）。"""
+        """Q1: restore must not overwrite a batch already held in
+        memory (turns arriving during restore already opened a new
+        batch)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         sid = "napcat:dm:10086"
         restored = {
@@ -1074,7 +1140,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                 return _StubAcquire()
 
         async def scenario():
-            # 模拟恢复期间到达的回合已开新批
+            # Simulate a turn that arrived during restore and opened a
+            # new batch
             inst._retain_pending[sid] = inst._retain_state_from_payload(
                 {**restored, "batch_lines": ["内存行"], "rounds": 1}
             )
@@ -1092,7 +1159,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_s1_snapshot_merges_chronologically_after_older_reseat(self):
-        """S1：较旧批次失败回座后，表行快照按内容锚点顺序合并（历史窗口取最早批次）。"""
+        """S1: after an older batch fails and reseats, the table-row
+        snapshot merges in content-anchor order (the history window
+        takes the earliest batch)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         sid = "napcat:dm:10086"
         base = datetime.now(timezone.utc)
@@ -1115,14 +1184,18 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                 }
             )
 
-        # 较旧批次 A（其历史窗口 = 前置上下文）与较新批次 C（历史窗口已含 A 的行）
+        # Older batch A (its history window = the preceding context)
+        # and newer batch C (whose history window already contains A's
+        # rows)
         older = _mk(0, ["前置上下文"], ["A1", "A2"], 2)
         newer = _mk(10, ["前置上下文", "A1", "A2"], ["C1", "C2"], 2)
 
         async def scenario():
-            # 在途：A（较旧）与 C（较新）同时在编码
+            # In-flight: A (older) and C (newer) encoding at the same
+            # time
             inst._retain_inflight[sid] = [older, newer]
-            # A 失败回座：进 pending 槽（pending 槽本是「最新批次」位）
+            # A fails and reseats: enters the pending slot (the pending
+            # slot is the "newest batch" seat)
             await inst._reseat_pending_batch(sid, older)
             return inst._pending_snapshot_for_row(sid)
 
@@ -1139,7 +1212,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
     def test_s1_reseat_keeps_chronological_merge_order(self):
-        """S1：回座与已有 pending 合并时按内容锚点定先后（较旧在前）。"""
+        """S1: when a reseat merges with existing pending, order by
+        content anchor (older first)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         sid = "napcat:dm:10086"
         base = datetime.now(timezone.utc)
@@ -1162,8 +1236,10 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                 }
             )
 
-        # pending 槽里是较旧批次（同样来自失败回座），回座批次更新：
-        # 旧实现无条件把回座批次当作 old → 顺序倒置 + 历史窗口取错
+        # The pending slot holds the older batch (also from a failure
+        # reseat) and the reseated batch is newer: the old
+        # implementation unconditionally treated the reseated batch as
+        # old -> inverted order + wrong history window
         older = _mk(0, ["前置上下文"], ["A1"])
         newer = _mk(10, ["前置上下文", "A1"], ["C1"])
 
@@ -1178,7 +1254,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_t1_failed_flag_lands_on_kept_pending_object(self):
-        """T1：失败标记必须落在真正留在 pending 槽的对象上（合并会生成新对象）。"""
+        """T1: the failure flag must land on the object actually left
+        in the pending slot (merging creates a new object)."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         sid = dm.sid
@@ -1208,7 +1285,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
         async def scenario():
             _spy_encode(inst, captured)
-            # pending 槽已有较新批次；失败批次回座会与之合并（生成新对象）
+            # The pending slot already holds a newer batch; the failed
+            # batch reseats and merges with it (creating a new object)
             inst._retain_pending[sid] = pending
             await inst._reseat_pending_batch(sid, failed)
             kept = inst._retain_pending[sid]
@@ -1216,7 +1294,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                 getattr(kept, "_retain_failed", False),
                 "失败标记必须落在留在 pending 槽的对象上",
             )
-            # 下一轮触发：失败批次不得与新轮次混批
+            # Next turn trigger: the failed batch must not mix with the
+            # new turn
             await _turn(inst, ctx, dm, "新轮次内容", mid="t1n")
             await asyncio.gather(*inst._retain_tasks)
             await asyncio.gather(*inst._retain_tasks)
@@ -1228,7 +1307,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertNotIn("新轮次内容", captured[0], "新轮次不得混进失败批次")
 
     def test_t3_out_of_range_config_is_clamped(self):
-        """T3：越界配置值须钳到合法区间（否则 Pydantic 校验失败→记忆整体下线）。"""
+        """T3: out-of-range config values must clamp into the legal
+        range (otherwise Pydantic validation fails and memory goes
+        offline entirely)."""
         cfg = mod._build_config(
             {
                 "dsn": DSN,
@@ -1254,7 +1335,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertEqual(cfg_neg.flush_idle_s, 1.0)
 
     def test_t2_durable_default_is_false(self):
-        """T2：_do_retain 的 durable 默认值须为 False（未显式传参走改动前语义）。"""
+        """T2: _do_retain's durable default must be False (an
+        unparameterized call keeps the pre-change semantics)."""
         import inspect
 
         sig = inspect.signature(mod.NoriflowMemoryPlugin._do_retain)
@@ -1262,7 +1344,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_w1_restore_failure_triggers_retry_before_save(self):
-        """W1：恢复失败后必须在保存前补恢复，否则新快照 UPSERT 覆盖旧行（永久丢失）。"""
+        """W1: after a restore failure, re-restore before saving;
+        otherwise the new snapshot UPSERT overwrites the old row
+        (permanent loss)."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         sid = dm.sid
@@ -1285,7 +1369,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
             )
 
         async def scenario():
-            # 首次（初始化期）恢复失败 → 标记待补恢复
+            # First (init-time) restore failure -> flag a re-restore as
+            # pending
             inst._retain_restore_failed = True
             restored = _restored_state()
 
@@ -1297,19 +1382,22 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                 inst._retain_restore_failed = False
 
             inst._restore_retain_pending = fake_restore
-            # 第一次保存：补恢复仍失败 → 跳过写表（不覆盖未回灌的旧行）
+            # First save: the re-restore still fails -> skip the table
+            # write (do not overwrite the un-refilled old row)
             await inst._save_retain_pending(sid)
             first_inserts = len(
                 [s for s in _pending_sqls(inst) if s.lstrip().startswith("INSERT")]
             )
-            # 第二次保存（DB 恢复后）：补恢复成功 → 合并落表
+            # Second save (DB recovered): the re-restore succeeds ->
+            # merge and persist
             await inst._save_retain_pending(sid)
             return calls["n"], first_inserts
 
         calls_n, first_inserts = asyncio.run(scenario())
         self.assertGreaterEqual(calls_n, 2, "保存前必须补恢复")
         self.assertEqual(first_inserts, 0, "补恢复仍失败时不得写表行")
-        # 补回来的崩溃备份内容必须进了表行（不被新快照覆盖丢失）
+        # The recovered crash-backup content must have entered the
+        # table row (not lost to the new snapshot overwrite)
         payloads = [
             args[1]
             for kind, sql, args in inst._db.pool.conn.sqls
@@ -1323,7 +1411,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
     def test_w1_save_skipped_while_restore_still_failing(self):
-        """W1：补恢复仍失败时不得写表行（否则覆盖未回灌的崩溃备份行→旧内容永久丢失）。"""
+        """W1: while the re-restore still fails, no table row may be
+        written (otherwise the un-refilled crash-backup row is
+        overwritten and the old content is lost forever)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         sid = "napcat:dm:10086"
 
@@ -1360,7 +1450,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
     def test_v1_initialize_resets_stopping_flag(self):
-        """V1：装配期无条件复位停机标志（terminate 中途异常不得让标志粘住）。"""
+        """V1: assembly unconditionally resets the stopping flag (an
+        exception mid-terminate must not leave the flag stuck)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         inst._retain_stopping = True
         asyncio.run(inst._initialize_services(inst._db, inst._config))
@@ -1368,7 +1459,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_y1_concurrent_restore_retry_is_serialized(self):
-        """Y1：并发补恢复必须串行（否则同一批表行被合并两遍：内容翻倍 + 轮数虚高）。"""
+        """Y1: concurrent re-restores must serialize (otherwise the
+        same table rows merge twice: doubled content + inflated round
+        counts)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         calls = {"n": 0}
         release = asyncio.Event()
@@ -1392,10 +1485,13 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertEqual(calls["n"], 1, "并发补恢复必须串行（只补一次）")
 
     def test_y2_nickname_refresh_failure_does_not_leak_inflight(self):
-        """Y2：昵称刷新失败不得让 durable 批次的在途登记泄漏（批次须回座）。
+        """Y2: a nickname refresh failure must not leak the durable
+        batch's in-flight registration (the batch must reseat).
 
-        编码同时失败（注入），确保走的是**失败回座**分支——否则用例只会
-        走成功路径（_drop_inflight），锁不到「异常逃逸导致在途登记泄漏」。
+        Encoding also fails (injected), forcing the failure-reseat
+        branch -- otherwise the case would take the success path
+        (_drop_inflight) and never lock the "exception escape leaks
+        the in-flight registration" scenario.
         """
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
@@ -1430,7 +1526,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
     def test_y3_restore_retry_does_not_double_merge(self):
-        """Y3：半途失败的补恢复不得把同一行再合并一遍（内容翻倍 + 轮数虚高）。"""
+        """Y3: a re-restore that failed midway must not merge the same
+        row again (doubled content + inflated round counts)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         sid = "napcat:dm:10086"
         ts = datetime.now(timezone.utc).isoformat(timespec="microseconds")
@@ -1468,7 +1565,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
             inst._db = types.SimpleNamespace(pool=_StubPool())
             await inst._restore_retain_pending()
             first = inst._retain_pending[sid]
-            # 补恢复再跑一次（半途失败后的重试路径）
+            # Run the re-restore again (the retry path after a midway
+            # failure)
             await inst._restore_retain_pending()
             return first, inst._retain_pending[sid]
 
@@ -1487,7 +1585,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_z1_slow_call_sentinel_logs_warning(self):
-        """Z1：耗时观测超过阈值须升级 WARNING（慢查询哨兵，与上游 nori 口径一致）。"""
+        """Z1: a call exceeding the duration threshold must escalate to
+        WARNING (slow-call sentinel, consistent with upstream nori)."""
         import logging
 
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
@@ -1500,7 +1599,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
             return "注入文本"
 
         kernel._build_injection_text_impl = slow_impl
-        # 阈值降到 1ms，使 10ms 的调用必然越线（不依赖机器速度）
+        # Lower the threshold to 1ms so the 10ms call always crosses it
+        # (independent of machine speed)
         threshold = getattr(mk_mod, "SLOW_CALL_THRESHOLD_MS", 500.0)
         mk_mod.SLOW_CALL_THRESHOLD_MS = 1.0
         records: list[logging.LogRecord] = []
@@ -1530,19 +1630,23 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertTrue(warnings, "超阈值调用必须升级 WARNING（慢查询哨兵）")
 
     def test_z2_y2_test_covers_reseat_branch(self):
-        """Z2：Y2 回归锁必须真正覆盖失败回座分支（否则锁是空的）。"""
+        """Z2: the Y2 regression lock must truly cover the
+        failure-reseat branch (otherwise the lock is empty)."""
         import inspect
 
         src = inspect.getsource(
             TestRetainBatchReviewFixes.test_y2_nickname_refresh_failure_does_not_leak_inflight
         )
-        # 回座分支的触发条件：编码必须失败（否则走成功路径的 _drop_inflight）
+        # The reseat branch's trigger condition: encoding must fail
+        # (otherwise the success path's _drop_inflight runs)
         self.assertIn("failing_encode", src)
         self.assertIn("retain_encoded = failing_encode", src)
 
 
     def test_x3_merged_residual_batch_is_backed_up_to_table(self):
-        """X3：interval<=1 的残留合并路径必须先落表行（编码期间崩溃不丢本轮内容）。"""
+        """X3: the interval<=1 residual-merge path must persist the
+        table row first (a crash mid-encode must not lose this turn's
+        content)."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
 
@@ -1573,7 +1677,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
     def test_aa1_dirty_row_elements_are_coerced_to_str(self):
-        """AA1：脏表行的非字符串元素不得毒死链路（join 会抛 TypeError）。"""
+        """AA1: non-string elements of a dirty table row must not
+        poison the pipeline (join would raise TypeError)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         state = inst._retain_state_from_payload(
             {
@@ -1592,11 +1697,12 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertTrue(all(isinstance(x, str) for x in state.history_lines))
         self.assertTrue(all(isinstance(x, str) for x in state.batch_lines))
         self.assertTrue(all(isinstance(x, str) for x in state.bot_lines))
-        # join 不应抛
+        # join must not raise
         self.assertIsInstance("\n".join(state.history_lines), str)
 
     def test_aa2_restore_keeps_newer_pending_age(self):
-        """AA2：回灌不得用旧行龄期覆盖内存里更新的批次龄期（会被巡检提前冲刷）。"""
+        """AA2: refill must not overwrite a newer in-memory batch age
+        with the old row's age (the sweep would flush it early)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         sid = "napcat:dm:10086"
         old_ts = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(
@@ -1646,7 +1752,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
     def test_aa3_residual_pop_clears_pending_age(self):
-        """AA3：残留批次出 pending 槽时同步清掉龄期条目（不留悬空键）。"""
+        """AA3: when the residual batch leaves the pending slot, its
+        age entry is cleared in sync (no dangling keys)."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
 
@@ -1668,7 +1775,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_bb1_snapshot_merge_failure_keeps_row(self):
-        """BB1：成功路径的快照合并异常不得冒出任务，且须保守保留表行。"""
+        """BB1: a snapshot-merge exception on the success path must not
+        escape the task, and the table row must be conservatively
+        kept."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         sid = "napcat:dm:10086"
 
@@ -1693,7 +1802,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                 raise TypeError("合并失败（测试注入）")
 
             inst._pending_snapshot_for_row = boom
-            # 不抛异常（异常会变成 "Task exception was never retrieved"）
+            # Must not raise (an exception would become "Task exception
+            # was never retrieved")
             await inst._do_retain(inst._retain_pending[sid], sid, set(), True)
 
         asyncio.run(scenario())
@@ -1703,7 +1813,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertEqual(deletes, [], "合并失败时不得删表行（删了会丢未编码内容）")
 
     def test_bb2_dirty_rounds_is_clamped(self):
-        """BB2：脏行的 0/负数轮数须钳到 >=1（不改变攒批节奏）。"""
+        """BB2: a dirty row's 0/negative rounds must clamp to >=1
+        (batching cadence unchanged)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         for raw in (0, -3):
             state = inst._retain_state_from_payload(
@@ -1725,7 +1836,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
             )
 
     def test_bb3_mixed_timezone_anchors_are_comparable(self):
-        """BB3：naive 与 aware 锚点混用时比较/排序不得抛 TypeError。"""
+        """BB3: mixing naive and aware anchors must not raise TypeError
+        on comparison/sorting."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         sid = "napcat:dm:10086"
         naive = datetime.now()
@@ -1762,7 +1874,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_cc1_restore_does_not_rollback_newer_row_ts(self):
-        """CC1：回灌不得把已登记的较新行时间戳拉回（cutoff 回退会删不掉更新行）。"""
+        """CC1: refill must not pull a registered newer row timestamp
+        back (a regressed cutoff would fail to delete the newer
+        row)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         sid = "napcat:dm:10086"
         newer = datetime.now(timezone.utc)
@@ -1804,7 +1918,7 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
         async def scenario():
             inst._db = types.SimpleNamespace(pool=_StubPool())
-            # 并发保存已登记的较新时间戳
+            # A concurrent save already registered the newer timestamp
             inst._retain_row_ts[sid] = newer
             await inst._restore_retain_pending()
             return inst._retain_row_ts.get(sid)
@@ -1815,7 +1929,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
     def test_cc2_flush_idle_zero_uses_same_clamp_as_build(self):
-        """CC2：热切换 flush_idle_s=0 时，巡检阈值口径须与装配期一致（1.0 而非 1800）。"""
+        """CC2: on a hot switch to flush_idle_s=0, the sweep threshold
+        must match assembly time (1.0, not 1800)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5, flush_idle_s=1800.0))
         inst._config.flush_idle_s = 0
         self.assertEqual(inst._retain_flush_idle_s(), 1.0)
@@ -1825,7 +1940,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertEqual(inst._retain_flush_idle_s(), 60.0)
 
     def test_cc3_dirty_participants_are_not_split_into_chars(self):
-        """CC3：脏 participants 不得被拆成单字符元组（参与者信息静默损坏）。"""
+        """CC3: dirty participants must not be split into single-char
+        tuples (silent corruption of participant info)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         state = inst._retain_state_from_payload(
             {
@@ -1847,7 +1963,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertTrue(all(len(p) == 2 for p in state.participants))
 
     def test_cc4_merge_preserves_failed_flag(self):
-        """1061：合并必须传播 _retain_failed（否则失败批与新轮次混批）。"""
+        """1061: merging must propagate _retain_failed (otherwise the
+        failed batch mixes with new turns)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         base = {
             "session_id": "10086",
@@ -1877,7 +1994,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_dd1_scalar_container_payload_is_handled(self):
-        """DD1：payload 的容器字段是标量时不得逐字符迭代/抛异常（整行不该被跳过）。"""
+        """DD1: a scalar container field in the payload must not be
+        iterated per char or raise (the whole row should not be
+        skipped)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         state = inst._retain_state_from_payload(
             {
@@ -1886,7 +2005,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                 "group_id": "",
                 "user_id": "u1",
                 "timestamp": datetime.now().isoformat(),
-                # 容器是标量：字符串会被逐字符迭代，int 不可迭代
+                # Containers are scalars: a string would iterate per
+                # char, an int is not iterable
                 "participants": "u1",
                 "history_lines": "abc",
                 "batch_lines": 123,
@@ -1898,7 +2018,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertEqual(state.history_lines, [], "标量字符串不得逐字符迭代")
         self.assertEqual(state.batch_lines, [])
         self.assertEqual(state.bot_lines, [])
-        # 整行未被跳过：批次内容字段仍可承载有效数据
+        # The whole row was not skipped: the batch content field can
+        # still carry valid data
         ok_state = inst._retain_state_from_payload(
             {
                 "session_id": "10086",
@@ -1917,7 +2038,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_ee1_missing_timestamp_does_not_drop_row(self):
-        """EE1：payload 缺 timestamp 不得抛 KeyError（整行内容会被跳过）。"""
+        """EE1: a payload missing timestamp must not raise KeyError
+        (the whole row's content would be skipped)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         state = inst._retain_state_from_payload(
             {
@@ -1925,7 +2047,7 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                 "platform": "napcat",
                 "group_id": "",
                 "user_id": "u1",
-                # 无 timestamp
+                # no timestamp
                 "participants": [["napcat", "u1"]],
                 "history_lines": [],
                 "batch_lines": ["内容"],
@@ -1937,7 +2059,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertIsInstance(state.timestamp, datetime)
 
     def test_ee2_row_ts_registered_before_sql(self):
-        """EE2：写入失败也要登记行时间戳（登记窗口内条件删除拿不到 cutoff）。"""
+        """EE2: register the row timestamp even when the write fails
+        (a conditional delete inside the registration window would
+        find no cutoff)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         sid = "napcat:dm:10086"
 
@@ -1980,7 +2104,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertIsNotNone(ts, "写入失败也须登记行时间戳（cutoff 依据）")
 
     def test_ee3_non_numeric_rounds_does_not_drop_row(self):
-        """EE3：脏 rounds 非数字不得抛 ValueError（整行内容会被跳过）。"""
+        """EE3: dirty non-numeric rounds must not raise ValueError (the
+        whole row's content would be skipped)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         state = inst._retain_state_from_payload(
             {
@@ -2000,7 +2125,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertEqual(int(getattr(state, "_retain_rounds", 0)), 1)
 
     def test_ee4_terminate_waits_for_inflight_handler(self):
-        """EE4：terminate 须等在途回合处理器收尾（否则停机快照写落在已关闭池上）。"""
+        """EE4: terminate must wait for in-flight turn handlers to
+        finish (otherwise the shutdown snapshot write lands on a closed
+        pool)."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         release = asyncio.Event()
@@ -2016,7 +2143,7 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
             handler = asyncio.create_task(
                 ctx.event_bus.fire("session_memory_updated", {"session": dm.sid})
             )
-            await asyncio.sleep(0)  # 让 handler 进入等待
+            await asyncio.sleep(0)  # let the handler enter its wait
             terminate = asyncio.create_task(inst.terminate())
             await asyncio.sleep(0.1)
             self.assertFalse(
@@ -2032,7 +2159,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
     def test_ee5_post_write_recheck_deletes_stale_row(self):
-        """EE5：写入窗口内编码完成 → 写后复查应删掉装有已编码内容的残留行。"""
+        """EE5: if encoding completes inside the write window, the
+        post-write recheck should delete the residual row holding
+        already-encoded content."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         sid = "napcat:dm:10086"
         waiting = asyncio.Event()
@@ -2076,7 +2205,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
             inst._db = types.SimpleNamespace(pool=_SlowPool())
             task = asyncio.create_task(inst._save_retain_pending(sid))
             await waiting.wait()
-            # 写入窗口内同会话编码完成：未编码数据清空
+            # Encoding for the same session completed inside the write
+            # window: unencoded data cleared
             inst._retain_pending.clear()
             inst._retain_inflight.clear()
             release.set()
@@ -2091,7 +2221,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_ff1_stopping_turn_is_not_dropped_by_ready_gate(self):
-        """FF1：停机期间到达的回合必须走到 stopping 分支（不得被 _ready 门控吞掉）。"""
+        """FF1: a turn arriving during shutdown must reach the stopping
+        branch (not be swallowed by the _ready gate)."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
 
@@ -2101,7 +2232,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                     message=make_msg("u1", "停机窗口的一轮", mid="ff1m"), session=dm
                 )
             )
-            # 模拟 terminate 已置停机标志、_ready 已置 False
+            # Simulate terminate having set the stopping flag and
+            # _ready False
             inst._retain_stopping = True
             inst._ready = False
             await ctx.event_bus.fire("session_memory_updated", {"session": dm.sid})
@@ -2117,7 +2249,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
     def test_ff2_failed_flag_survives_restart(self):
-        """FF2：失败标记须随 payload 落盘并在恢复后读回（不与新轮次混批）。"""
+        """FF2: the failure flag must persist with the payload and be
+        read back after restore (no mixing with new turns)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         state = inst._retain_state_from_payload(
             {
@@ -2139,7 +2272,7 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
         payload = inst._retain_payload(state)
         self.assertTrue(payload.get("failed"), "payload 须带失败标记")
-        # 未标脏的批次不带该标记
+        # A clean batch does not carry the flag
         plain = inst._retain_state_from_payload(
             {
                 "session_id": "10086",
@@ -2158,7 +2291,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_gg1_broken_row_does_not_abort_restore_loop(self):
-        """GG1：一行坏掉只跳过自己，不得中断整轮恢复（后面的行永远回灌不了）。"""
+        """GG1: one broken row skips only itself and must not abort the
+        whole restore round (later rows would never refill)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         good_sid = "napcat:dm:good"
         good_payload = {
@@ -2181,7 +2315,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         class _StubConn:
             async def fetch(self, sql, *args):
                 return [
-                    # 坏行：取 session_key 时抛异常（合并/龄期计算同样可能抛）
+                    # Broken row: raises on session_key access (merge/
+                    # age computation could raise the same way)
                     {"session_key": _BadKey(), "payload": json.dumps(good_payload),
                      "updated_at": datetime.now(timezone.utc).isoformat()},
                     {"session_key": good_sid, "payload": json.dumps(good_payload),
@@ -2209,7 +2344,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertIn("好行内容", pending.batch_lines)
 
     def test_gg2_nan_flush_idle_falls_back_to_default(self):
-        """GG2：NaN/±inf 的空闲阈值须回退默认值（NaN 会让巡检把全部批次提前冲刷）。"""
+        """GG2: NaN/±inf idle thresholds must fall back to the default
+        (NaN would make the sweep flush every batch early)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5, flush_idle_s=1800.0))
         inst._config.flush_idle_s = float("nan")
         self.assertEqual(inst._retain_flush_idle_s(), 1800.0)
@@ -2222,7 +2358,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_hh1_nan_config_value_does_not_break_assembly(self):
-        """HH1：NaN/±inf 配置值不得让装配失败（LocalMemoryConfig 的 gt/ge 判失败→记忆下线）。"""
+        """HH1: NaN/±inf config values must not fail assembly (a gt/ge
+        failure in LocalMemoryConfig takes memory offline)."""
         cfg = mod._build_config(
             {
                 "dsn": DSN,
@@ -2234,12 +2371,13 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertEqual(cfg.flush_idle_s, 1800.0)
         self.assertEqual(cfg.backfill_interval_seconds, 300.0)
         self.assertEqual(cfg.merge_interval_hours, 6.0)
-        # 字符串形态同样拦下
+        # The string form is intercepted the same way
         cfg2 = mod._build_config({"dsn": DSN, "flush_idle_s": "nan"})
         self.assertEqual(cfg2.flush_idle_s, 1800.0)
 
     def test_hh2_empty_participant_is_skipped(self):
-        """HH2：空参与者项直接跳过（("", "") 会污染下游参与者列表）。"""
+        """HH2: empty participant entries are skipped outright
+        (("", "") would pollute the downstream participant list)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         state = inst._retain_state_from_payload(
             {
@@ -2258,7 +2396,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertEqual(state.participants, [("napcat", "u1")], "空参与者须跳过")
 
     def test_hh3_flush_reuses_task_spawn_helper(self):
-        """HH3：攒批冲刷须复用统一的任务创建入口（与逐轮路径同一收口集合）。"""
+        """HH3: batch flushing must reuse the unified task-spawn entry
+        (the same funnel set as the per-turn path)."""
         import inspect
 
         src = inspect.getsource(mod.NoriflowMemoryPlugin._flush_pending_batch)
@@ -2269,7 +2408,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_ii1_overflow_config_values_do_not_break_assembly(self):
-        """II1：OverflowError 脏值不得让装配失败（float(10**400)/int(inf)）。"""
+        """II1: OverflowError dirty values must not fail assembly
+        (float(10**400)/int(inf))."""
         cfg = mod._build_config(
             {
                 "dsn": DSN,
@@ -2283,7 +2423,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertEqual(cfg.pool_max, 8)
 
     def test_ii2_overflow_flush_idle_does_not_kill_sweep(self):
-        """II2：运行期脏阈值不得让巡检协程死掉（_retain_flush_idle_s 不抛）。"""
+        """II2: runtime dirty thresholds must not kill the sweep
+        coroutine (_retain_flush_idle_s does not raise)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         inst._config.flush_idle_s = 10 ** 400
         self.assertEqual(inst._retain_flush_idle_s(), 1800.0)
@@ -2292,7 +2433,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_jj1_infinite_interval_does_not_drop_turn(self):
-        """JJ1：热切换把间隔设成 inf 时 int() 抛 OverflowError，不得吞掉整轮对话。"""
+        """JJ1: a hot switch setting the interval to inf makes int()
+        raise OverflowError; the whole turn must not be swallowed."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         inst._config.retain_interval_private = float("inf")
@@ -2309,7 +2451,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
     def test_jj3_infinite_rounds_does_not_drop_row(self):
-        """JJ3：脏行 rounds=Infinity 不得让整行被当坏行跳过。"""
+        """JJ3: a dirty row with rounds=Infinity must not have the
+        whole row skipped as bad."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         state = inst._retain_state_from_payload(
             {
@@ -2329,7 +2472,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertEqual(int(getattr(state, "_retain_rounds", 0)), 1)
 
     def test_jj2_alias_upsert_is_bounded(self):
-        """JJ2：别名 upsert 不得把 handler 拖到 DB 超时（停机收口会切掉那一轮）。"""
+        """JJ2: the alias upsert must not drag the handler into a DB
+        timeout (shutdown closeout would cut that turn)."""
         import inspect
 
         src = inspect.getsource(mod.NoriflowMemoryPlugin._on_session_memory_updated_impl)
@@ -2341,7 +2485,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_kk2_dirty_failed_field_does_not_mark_batch_failed(self):
-        """KK2：脏 failed 字段（字符串 "false"）不得把正常批次误标为失败批。"""
+        """KK2: a dirty failed field (the string "false") must not mark
+        a healthy batch as failed."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         base = {
             "session_id": "10086",
@@ -2369,7 +2514,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
             )
 
     def test_kk1_shutdown_deadline_uses_monotonic_clock(self):
-        """KK1：停机等待预算须用单调时钟（墙钟回拨会让等待超时失控）。"""
+        """KK1: the shutdown wait budget must use a monotonic clock
+        (wall-clock rollback makes the wait timeout uncontrollable)."""
         import inspect
 
         src = inspect.getsource(mod.NoriflowMemoryPlugin.terminate)
@@ -2380,7 +2526,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_ll1_alias_upsert_handlers_are_split(self):
-        """LL1：别名 upsert 的超时（预期路径）不带堆栈，真异常才带。"""
+        """LL1: the alias-upsert timeout (expected path) logs no stack;
+        only real exceptions do."""
         import inspect
 
         src = inspect.getsource(mod.NoriflowMemoryPlugin._on_session_memory_updated_impl)
@@ -2390,12 +2537,14 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
             "TimeoutError 是 Exception 子类，元组写法纯属叠甲",
         )
         self.assertIn("except asyncio.TimeoutError:", src, "超时须单独捕获")
-        # 超时分支不得带 exc_info（预期路径刷堆栈会淹没真异常）
+        # The timeout branch must not carry exc_info (printing a stack
+        # on the expected path would drown real exceptions)
         timeout_branch = src.split("except asyncio.TimeoutError:")[1].split("except")[0]
         self.assertNotIn("exc_info", timeout_branch, "超时分支不应打印堆栈")
 
     def test_ll2_restore_log_reports_both_counts(self):
-        """LL2：恢复日志须区分「读到的表行数」与「内存 pending 会话数」。"""
+        """LL2: the restore log must distinguish "table rows read" from
+        "in-memory pending session count"."""
         import inspect
 
         src = inspect.getsource(mod.NoriflowMemoryPlugin._restore_retain_pending)
@@ -2406,7 +2555,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_mm1_initialize_resets_handler_counter(self):
-        """MM1：装配期须复位在途 handler 计数（terminate 超时残留会让下次停机白等 5s）。"""
+        """MM1: assembly must reset the in-flight handler count
+        (terminate-timeout residue would make the next shutdown wait 5s
+        for nothing)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         inst._retain_handler_active = 3
         asyncio.run(inst._initialize_services(inst._db, inst._config))
@@ -2414,7 +2565,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_nn1_snapshot_timestamp_never_goes_backwards(self):
-        """NN1：快照写入时间戳必须单调（墙钟回拨/同微秒不得让 UPSERT 守卫丢弃写入）。"""
+        """NN1: snapshot write timestamps must be monotonic
+        (wall-clock rollback / same-microsecond writes must not be
+        dropped by the UPSERT guard)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         sid = "napcat:dm:10086"
         future = datetime.now(timezone.utc) + timedelta(hours=1)
@@ -2434,7 +2587,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                     "rounds": 1,
                 }
             )
-            # 模拟「已登记的时间戳在未来」（墙钟回拨后写过一次）
+            # Simulate a registered timestamp in the future (one write
+            # after wall-clock rollback)
             inst._retain_row_ts[sid] = future
             await inst._save_retain_pending(sid)
             return inst._retain_row_ts.get(sid)
@@ -2444,7 +2598,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertGreater(ts, future, "写入时间戳必须单调前进（不得被墙钟回拨拉回）")
 
     def test_nn2_stale_handler_does_not_corrupt_new_generation_count(self):
-        """NN2：旧代 handler 收尾不得把新代计数减成负数（否则 terminate 误判无在途）。"""
+        """NN2: an old-generation handler finishing must not decrement
+        the new generation's count negative (terminate would misjudge
+        no in-flight work)."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         release = asyncio.Event()
@@ -2459,7 +2615,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                 ctx.event_bus.fire("session_memory_updated", {"session": dm.sid})
             )
             await asyncio.sleep(0)
-            # 重新装配（计数复位 + 代数递增），随后旧 handler 才收尾
+            # Reassemble (count reset + generation bump), then the old
+            # handler finishes
             await inst._initialize_services(inst._db, inst._config)
             release.set()
             await handler
@@ -2471,13 +2628,14 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_oo1_out_of_range_field_falls_back_individually(self):
-        """OO1：单个越界配置项只回退该项（其余用户配置保持不变）。"""
+        """OO1: a single out-of-range config key falls back alone
+        (other user config unchanged)."""
         cfg = mod._try_build_config(
             {
                 "dsn": DSN,
                 "storage_backend": "sqlite",
-                "pool_min": 0,          # 越界（ge=1）
-                "backfill_interval_seconds": 120.0,  # 正常值，须保留
+                "pool_min": 0,          # out of range (ge=1)
+                "backfill_interval_seconds": 120.0,  # valid value, kept
             }
         )
         self.assertNotEqual(cfg.pool_min, 0, "越界项不得原样生效")
@@ -2488,16 +2646,19 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertEqual(cfg.dsn, DSN)
 
     def test_oo3_reassembly_cancels_old_sweep_task(self):
-        """OO3：重新装配须先收掉旧巡检协程（覆盖句柄会让旧协程泄漏到下次停机）。"""
+        """OO3: reassembly must first collect the old sweep coroutine
+        (overwriting the handle leaks the old coroutine into the next
+        shutdown)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
 
         async def scenario():
-            # 模拟「上一次装配留下的巡检协程」
+            # Simulate the sweep coroutine left by the previous assembly
             old_sweep = asyncio.create_task(asyncio.sleep(3600))
             inst._retain_sweep_task = old_sweep
             await asyncio.sleep(0)
             await inst._initialize_services(inst._db, inst._config)
-            # 必须在 loop 关闭前判定：loop 收尾会取消残留任务，届时无法区分
+            # Must decide before the loop closes: loop teardown cancels
+            # leftover tasks, making them indistinguishable then
             return old_sweep.cancelled()
 
         cancelled = asyncio.run(scenario())
@@ -2506,11 +2667,13 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_pp1_restore_merge_uses_anchor_order(self):
-        """PP1：恢复合并必须按内容锚点定先后（硬编码「恢复行更旧」会致内容重复）。"""
+        """PP1: restore merging must order by content anchor
+        (hard-coding "restored rows are older" duplicates content)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         sid = "napcat:dm:10086"
         base = datetime.now(timezone.utc)
-        # 构造「恢复行反而更新」的情形：内存 pending 的内容更早
+        # Construct a "restored row is actually newer" case: the
+        # in-memory pending content is earlier
         older_ts = (base - timedelta(hours=1)).isoformat()
         newer_ts = base.isoformat()
 
@@ -2566,7 +2729,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
     def test_pp2_restore_age_uses_row_timestamp(self):
-        """PP2：恢复龄期须由行时间戳换算（两套时钟错位会让龄期偏旧）。"""
+        """PP2: restore age must be derived from the row timestamp
+        (two mismatched clocks make the age look older)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         sid = "napcat:dm:10086"
         row_ts = datetime.now(timezone.utc) - timedelta(seconds=120)
@@ -2613,8 +2777,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertIsNotNone(restored_at)
         age = time.time() - restored_at
         self.assertAlmostEqual(age, 120.0, delta=2.0, msg="龄期须等于行时间戳的年龄")
-        # 龄期必须由**已解析的行时间戳**换算（不用 now - _row_age_seconds：
-        # 那是两套时钟错位 + 循环耗时，偏旧会让巡检提前冲刷）
+        # The age must be derived from the PARSED row timestamp (not
+        # now - _row_age_seconds: that mixes two clocks plus loop
+        # overhead; reading older lets the sweep flush early)
         import inspect
 
         src = inspect.getsource(mod.NoriflowMemoryPlugin._restore_retain_pending)
@@ -2623,13 +2788,15 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_qq1_sweep_interval_read_is_guarded(self):
-        """QQ1：巡检间隔读取必须在 try 内（非预期异常不得让巡检协程死掉）。"""
+        """QQ1: the sweep-interval read must be inside the try
+        (unexpected exceptions must not kill the sweep coroutine)."""
         import inspect
 
         src = inspect.getsource(mod.NoriflowMemoryPlugin._retain_sweep_loop)
         self.assertIn("interval = max(5.0, min(300.0", src)
         self.assertIn("except asyncio.CancelledError:", src, "取消须原样上抛")
-        # 间隔读取不得直接作为 sleep 实参（异常会绕过 try）
+        # The interval read must not be the sleep argument directly
+        # (an exception would bypass the try)
         self.assertNotIn(
             "await asyncio.sleep(max(5.0, min(300.0",
             src,
@@ -2637,15 +2804,18 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
     def test_qq1_sweep_survives_interval_read_failure(self):
-        """QQ1/RR2：间隔读取抛异常时巡检**继续下一轮**（自愈），不退出循环。
+        """QQ1/RR2: when the interval read raises, the sweep CONTINUES
+        to the next round (self-healing) instead of leaving the loop.
 
-        断言必须覆盖「失败后仍在跑」——只断言读到 1 次的话，即使循环在首轮
-        后 break，用例照样通过（这是评审指出的空锁）。
+        The assertion must cover "still running after failure" --
+        asserting only a single read would pass even if the loop broke
+        after the first round (the vacuous lock the review flagged).
         """
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         state = {"n": 0}
         original_fallback = mod.RETAIN_SWEEP_FALLBACK_INTERVAL_S
-        # 回退周期调小：首轮读取失败后不至于要等 300s 才进入下一轮
+        # Fallback period shortened: after the first read fails, the
+        # next round arrives without waiting 300s
         mod.RETAIN_SWEEP_FALLBACK_INTERVAL_S = 0.01
 
         async def scenario():
@@ -2675,7 +2845,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         self.assertGreaterEqual(n, 2, "间隔读取失败后巡检必须继续下一轮（自愈）")
 
     def test_rr1_old_sweep_cancelled_before_restore(self):
-        """RR1：重新装配必须**先**取消旧巡检（恢复期间旧巡检仍在跑会与恢复交错）。"""
+        """RR1: reassembly must cancel the old sweep FIRST (an old
+        sweep running during restore interleaves with it)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         observed: dict = {}
 
@@ -2702,7 +2873,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_ss1_restore_skips_stale_snapshot_of_same_batch(self):
-        """SS1：表行是内存 pending 的旧快照时不得重复合并（内容/轮数翻倍）。"""
+        """SS1: when the table row is an older snapshot of the
+        in-memory pending batch, do not re-merge (doubled content and
+        rounds)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         sid = "napcat:dm:10086"
         base = datetime.now(timezone.utc)
@@ -2729,7 +2902,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                 return [
                     {
                         "session_key": sid,
-                        # 表行 = 内存 pending 的旧快照（1 轮 vs 内存 2 轮）
+                        # Table row = an older snapshot of the
+                        # in-memory pending batch (1 round vs the
+                        # memory's 2 rounds)
                         "payload": json.dumps(_payload(ts, "第1句", 1)),
                         "updated_at": ts,
                     }
@@ -2748,7 +2923,7 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
         async def scenario():
             inst._db = types.SimpleNamespace(pool=_StubPool())
-            # 内存 pending：同一批但已有 2 轮
+            # In-memory pending: the same batch but already 2 rounds
             inst._retain_pending[sid] = inst._retain_state_from_payload(
                 _payload(ts, "第1句", 2)
             )
@@ -2765,7 +2940,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
     def test_ss2_cancelled_encode_batch_is_reseated(self):
-        """SS2：取消的编码任务必须按失败语义回座（否则本进程内永不编码）。"""
+        """SS2: a cancelled encode task must reseat under failure
+        semantics (otherwise it is never encoded in this process)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         sid = "napcat:dm:10086"
 
@@ -2785,7 +2961,7 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
                 }
             )
             inst._retain_inflight[sid] = [state]
-            # 一个永不结束的编码任务（模拟 LLM 长耗时）
+            # A never-ending encode task (simulating a long LLM call)
             task = asyncio.create_task(asyncio.sleep(3600))
             inst._retain_tasks.add(task)
             await inst._stop_retain_backgrounds(task_timeout=0.05)
@@ -2802,7 +2978,9 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
 
     def test_tt1_reassembly_waits_for_old_handler_before_restore(self):
-        """TT1：重新装配必须先等旧代 handler 收尾（否则它会覆盖刚恢复的数据）。"""
+        """TT1: reassembly must first wait for the old-generation
+        handler to finish (otherwise it overwrites the just-restored
+        data)."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         observed: dict = {}
@@ -2810,7 +2988,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         release = asyncio.Event()
 
         async def scenario():
-            # 模拟旧代 handler 卡在 await（尚未收尾）
+            # Simulate an old-generation handler stuck in await (not
+            # finished yet)
             async def slow_handler(event):
                 await release.wait()
                 handler_done["v"] = True
@@ -2825,13 +3004,16 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
             original = inst._restore_retain_pending
 
             async def checking_restore():
-                # 判据用 handler 的**实际收尾**，不用计数（计数会被装配期
-                # 复位，旧实现同样会「看起来」已归零 → 假阳性）
+                # The criterion uses the handler's ACTUAL completion,
+                # not the count (assembly resets the count, and the old
+                # implementation would equally "look" zeroed ->
+                # false positive)
                 observed["old_handler_done"] = bool(handler_done.get("v"))
                 await original()
 
             inst._restore_retain_pending = checking_restore
-            # 装配在等旧 handler（最多 5s）→ 期间放行旧 handler
+            # Assembly waits for the old handler (up to 5s) -> release
+            # the old handler meanwhile
             task = asyncio.create_task(
                 inst._initialize_services(inst._db, inst._config)
             )
@@ -2847,7 +3029,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
     def test_tt2_reseat_failure_does_not_escape_task(self):
-        """TT2：失败回座抛异常不得冒出任务（要变成没人 retrieve 的任务异常）。"""
+        """TT2: a failure-reseat exception must not escape the task
+        (it would become a task exception nobody retrieves)."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
         kernel = inst._memory_kernel
@@ -2863,7 +3046,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
 
         async def scenario():
             results = []
-            # 5 轮（= interval）才会冲刷并真正走编码失败 → 回座路径
+            # Only 5 turns (= interval) flush and actually hit the
+            # encode failure -> reseat path
             for i in range(5):
                 await _turn(inst, ctx, dm, f"第{i + 1}句", mid=f"tt2{i + 1}")
                 results += await asyncio.gather(
@@ -2884,7 +3068,8 @@ class TestRetainBatchReviewFixes(unittest.TestCase):
         )
 
     def test_tt3_merge_copies_history_lines(self):
-        """TT3：合并批次必须拷贝历史行（原地修改旧 state 不得影响已合并批次）。"""
+        """TT3: merging must copy history lines (mutating the old state
+        in place must not affect the merged batch)."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(private=5))
         base = {
             "session_id": "10086",
@@ -2946,7 +3131,9 @@ class TestMultiReviewFixes(unittest.TestCase):
         self.assertEqual(captured[0].count("后到第二句"), 1)
 
     def test_group_batch_keeps_other_members_after_erase(self):
-        """擦除一个成员只脱敏其行；同批次其他成员的未编码内容不得丢。"""
+        """Erasing one member redacts only that member's lines; the
+        other members' unencoded content in the same batch must not be
+        lost."""
         inst, _ = _ready_plugin(mod, cfg=_cfg(group=3))
         sid = "napcat:gm:778899"
         line_u1 = mod.format_history_message(
@@ -2977,14 +3164,21 @@ class TestMultiReviewFixes(unittest.TestCase):
         self.assertNotIn(("napcat", "u1"), [tuple(p) for p in kept.participants])
 
     def test_user_erase_group_inflight_leaves_no_orphan_copy(self):
-        """群聊在途批次擦除脱敏：脱敏副本只回座 pending，不得残留孤儿在途登记。
+        """Group in-flight batch erasure redaction: the redacted copy
+        reseats only into pending, leaving no orphan in-flight
+        registration.
 
-        回归：原实现把脱敏副本同时放进 kept（写回 _retain_inflight）与
-        reseat（合并进 pending）。在途侧副本没有任务持有（原任务已被
-        取消，CancelledError 不走 _do_retain 清理分支），_drop_inflight
-        又只认原 state 对象——孤儿副本永远摘不掉：_pending_snapshot_for_row
-        把它与 pending 双份并进快照，表行条件删除永假（行删不掉），重启
-        恢复会把已编码内容再次编码。
+        Regression: the original implementation put the redacted copy
+        into both kept (written back to _retain_inflight) and reseat
+        (merged into pending). The in-flight-side copy has no owning
+        task (the original task was cancelled, and CancelledError does
+        not go through the _do_retain cleanup branch) while
+        _drop_inflight only recognizes the original state object --
+        the orphan copy can never be removed: _pending_snapshot_for_row
+        merges it with pending into the snapshot, the table-row
+        conditional delete is permanently false (the row never
+        deletes), and restart restore would encode the already-encoded
+        content again.
         """
         inst, _ = _ready_plugin(mod, cfg=_cfg(group=3))
         sid = "napcat:gm:778899"
@@ -3007,9 +3201,11 @@ class TestMultiReviewFixes(unittest.TestCase):
             await inst._erase_retain_for_user("napcat", "u1")
 
         asyncio.run(scenario())
-        # 脱敏副本不得残留在途登记（无任务持有的孤儿，永远摘不掉）
+        # The redacted copy must not remain in the in-flight registry
+        # (an orphan with no owning task can never be removed)
         self.assertNotIn(sid, inst._retain_inflight)
-        # 其他成员内容经回座进 pending（失败回座标记，待下一触发点重试）
+        # Other members' content reaches pending via reseat (with the
+        # failure-reseat flag, retrying at the next trigger point)
         pending = inst._retain_pending.get(sid)
         self.assertIsNotNone(pending, "其他成员的批次必须回座 pending")
         text = "\n".join(pending.batch_lines)
@@ -3018,7 +3214,8 @@ class TestMultiReviewFixes(unittest.TestCase):
         self.assertNotIn(("napcat", "u1"), [tuple(p) for p in pending.participants])
 
     def test_erase_during_alias_wait_drops_stale_turn(self):
-        """擦除发生在别名 await 期间：旧回合不得再进入 pending。"""
+        """Erasure during the alias await: the stale turn must not
+        enter pending."""
         inst, ctx = _ready_plugin(mod, cfg=_cfg(private=5))
         dm = FakeSession(sid="10086", stype="dm", adapter="napcat")
 

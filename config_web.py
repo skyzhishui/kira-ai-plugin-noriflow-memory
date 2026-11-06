@@ -24,32 +24,42 @@ from __future__ import annotations
 import json
 import math
 import re
-from typing import TYPE_CHECKING, Any, Literal, get_args, get_origin
+import types
+from typing import TYPE_CHECKING, Any, Literal, Union, get_args, get_origin
 
+from pydantic import ValidationError
 from pydantic_core import PydanticUndefined
 
-from .config import LocalMemoryConfig
+from .config import CROSS_FIELD_VALIDATED_KEYS, LocalMemoryConfig
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-# 掩码哨兵与敏感键判定（与 KiraAI 宿主 WebUI / 上游 nori 版同构）
+# Mask sentinel and sensitive-key judgment (isomorphic to the KiraAI
+# host WebUI / upstream nori version)
 _MASK = "••••••"
 _SENSITIVE_KEY_RE = re.compile(r"password|api_key|apikey|token|secret|dsn|cookie", re.I)
 
-# 装配期展开（组件构造时取值）的字段：改后需重初始化插件/重启进程才生效。
-# 其余字段 kernel/merge_agent/encoder/熔断器运行时按次读同一 LocalMemoryConfig
-# 实例，保存后立即生效（2026-09-11 热加载批改造）。
+# Fields expanded at assembly time (values read when components are
+# constructed): changing them requires re-initializing the plugin or
+# restarting the process. Other fields are read per operation at runtime
+# by kernel/merge_agent/encoder/circuit breaker from the same
+# LocalMemoryConfig instance, so saving takes effect immediately
+# (2026-09-11 hot-reload batch rework).
 _RESTART_FIELDS = frozenset({
     "storage_backend", "sqlite_path",
     "dsn", "pool_min", "pool_max", "db_command_timeout",
     "embedding_model", "embedding_dims",
     "recall_log_enabled", "recall_log_path",
     "alias_enabled", "alias_variant_cap", "alias_stopwords",
-    "rerank_enabled",  # 客户端装配于启动；kernel 运行时虽读开关，关→开仍需重初始化
+    # Assembled at startup: the kernel does read this switch per operation
+    # at runtime, but flipping off->on still requires re-initializing the
+    # client -- it looks like a hot-reloadable field but is not.
+    "rerank_enabled",
 })
 
-# 设置栏分组（与上游 nori 版对齐；KiraAI 特有字段并入对应组）
+# Settings-panel groups (aligned with the upstream nori version;
+# KiraAI-specific fields merged into the matching group)
 _CONFIG_GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
     ("conn", "连接与存储", (
         "storage_backend", "sqlite_path", "dsn", "pool_min", "pool_max",
@@ -70,6 +80,7 @@ _CONFIG_GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
         "score_start_high", "score_start_medium", "score_cap",
         "promote_threshold", "demote_threshold", "decay_factor",
         "decay_interval_days", "recent_expire_days", "recent_promote_threshold",
+        "naming_promote_threshold", "naming_prompt_enabled",
         "commitment_expire_days",
         "decay_requires_activity", "sticky_evidence_count", "pending_dead_days",
         "anchor_profile_size",
@@ -103,6 +114,11 @@ _CONFIG_GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
         "recent_rollout_enabled", "recent_rollout_batches",
         "recent_rollout_max_chars",
     )),
+    ("cross_session", "跨会话摘要", (
+        "cross_session_summary_enabled", "cross_session_summary_top_k",
+        "cross_session_summary_max_chars",
+        "cross_session_summary_max_age_days",
+    )),
     ("lifecycle", "摘要生命周期", (
         "summary_lifecycle_enabled", "summary_lifecycle_grace_days",
         "summary_lifecycle_half_life_days",
@@ -115,8 +131,39 @@ _CONFIG_GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
 ]
 
 
+# Union origins to strip when resolving an Optional annotation: `Optional[X]`
+# and `X | None` are both valid spellings (typing.Union / PEP 604
+# types.UnionType), and config.py may use either. getattr keeps the import
+# working on a Python without types.UnionType (3.9 and older).
+_UNION_ORIGINS: tuple = (Union, getattr(types, "UnionType", Union))
+
+
+def _unwrap_optional(annotation):
+    """Strip ``Optional[X]`` / ``Union[X, None]`` wrappers down to ``X``.
+
+    Fields whose "unset" state is meaningful (e.g. ``naming_promote_threshold``,
+    derived from score_start_high when None) are declared ``Optional[...]``.
+    Without unwrapping, such an annotation matches no scalar branch of
+    ``_field_type`` and falls through to the "list" fallback: it would be
+    rendered as a multi-line textarea whose empty value is submitted as
+    ``[]`` and 422-rejected by pydantic whenever the host config does not
+    carry the key yet (every save would be refused).
+
+    Nested wrappers (``Optional[Optional[X]]``, ``X | None | None``) are
+    stripped in a loop. A union with more than one non-None member is
+    returned untouched -- it has no single control type to map to.
+    """
+    while get_origin(annotation) in _UNION_ORIGINS:
+        members = [a for a in get_args(annotation) if a is not type(None)]
+        if len(members) != 1:
+            return annotation
+        annotation = members[0]
+    return annotation
+
+
 def _field_type(annotation) -> str:
-    """pydantic annotation -> frontend control type."""
+    """pydantic annotation -> frontend control type (Optional[X] is classified as X)."""
+    annotation = _unwrap_optional(annotation)
     if annotation is bool:
         return "bool"
     if annotation is int:
@@ -126,14 +173,20 @@ def _field_type(annotation) -> str:
     if annotation is str:
         return "str"
     if get_origin(annotation) is Literal:
-        # Literal["a", "b"] 是枚举字符串，不是列表——按 str 控件渲染，
-        # 可选值经 config_schema 的 options 透出（见 _literal_options）
+        # Literal["a", "b"] is an enum string, not a list — rendered as a
+        # str control; options are exposed via config_schema (see
+        # _literal_options)
         return "str"
     return "list"
 
 
 def _literal_options(annotation) -> list[str] | None:
-    """Optional values of a Literal annotation (None for non-Literal annotations)."""
+    """Optional values of a Literal annotation (None for non-Literal annotations).
+
+    ``Optional[Literal[...]]`` is unwrapped as well (None excluded from the
+    options): an enum field that may be unset still exposes its choices.
+    """
+    annotation = _unwrap_optional(annotation)
     if get_origin(annotation) is Literal:
         return [str(v) for v in get_args(annotation)]
     return None
@@ -150,7 +203,9 @@ def _numeric_bounds(field) -> tuple[Any, Any]:
     """
     lo: Any = None
     hi: Any = None
-    is_int = field.annotation is int
+    # Unwrap Optional so an Optional[int] field still gets the ±1 int nudge
+    # instead of the float ULP nudge
+    is_int = _unwrap_optional(field.annotation) is int
     for meta in field.metadata:
         ge = getattr(meta, "ge", None)
         gt = getattr(meta, "gt", None)
@@ -244,11 +299,47 @@ def build_payload(host_values: dict) -> dict:
     }
 
 
+def _same_value(a: Any, b: Any) -> bool:
+    """Compare config values, treating int/float as equal by numeric value.
+
+    Used only to decide whether a field was touched by this save. A type
+    difference (e.g. a direct API caller submitting "3" for a numeric field)
+    is deliberately treated as "touched": the constraint stays enforced
+    instead of being relaxed on a guess.
+    """
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a is b or a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return float(a) == float(b)
+    return a == b
+
+
+def _cross_field_groups(exc: ValidationError) -> tuple[set[str], list[tuple[str, ...]]]:
+    """Split a ValidationError into field-level keys and cross-field groups.
+
+    Mirrors main._cross_field_fallback_keys: a CrossFieldConfigError raised by
+    a model validator self-reports the keys it governs (pydantic places the
+    exception instance in ctx["error"]). An error without declared keys falls
+    back to the defensive CROSS_FIELD_VALIDATED_KEYS table, exactly like the
+    startup fallback path.
+    """
+    field_bad: set[str] = set()
+    groups: list[tuple[str, ...]] = []
+    for err in exc.errors():
+        loc = err.get("loc") or ()
+        if loc:
+            field_bad.add(str(loc[0]))
+            continue
+        declared = getattr((err.get("ctx") or {}).get("error"), "keys", None)
+        groups.append(tuple(declared) if declared else ())
+    return field_bad, groups
+
+
 def prepare_save(submitted: dict, host_values: dict) -> dict:
     """Validate and diff submitted values.
 
     Returns:
-        {"merged", "validated", "changed", "restart_required"}.
+        {"merged", "validated", "changed", "restart_required", "legacy_fallback"}.
 
     Raises:
         ValueError: validation failed (message includes pydantic details).
@@ -258,9 +349,11 @@ def prepare_save(submitted: dict, host_values: dict) -> dict:
     merged = unmask_values(
         {k: v for k, v in submitted.items() if k in schema}, host_values
     )
-    # dsn 非空守卫（双后端语义）：postgres 后端必须保留 dsn；auto 下
-    # 现值 dsn 非空说明实际运行在 postgres，清空会静默切到 sqlite，同样
-    # 拦截。仅 sqlite 后端（显式声明，或 auto 且本就无 dsn）放行。
+    # Non-empty dsn guard (dual-backend semantics): the postgres backend
+    # must keep its dsn; under auto, a non-empty current dsn means we are
+    # actually running on postgres — clearing it would silently switch to
+    # sqlite, so it is blocked too. Only the sqlite backend (explicitly
+    # declared, or auto with no dsn in the first place) passes.
     effective_backend = str(
         merged.get("storage_backend")
         if merged.get("storage_backend") not in (None, "")
@@ -275,14 +368,59 @@ def prepare_save(submitted: dict, host_values: dict) -> dict:
         raise SaveBlocked("dsn 不能清空（当前存储后端以数据库连接为存在前提；"
                           "停用请用插件总开关，或切换 storage_backend=sqlite）")
 
-    # 校验/热更新口径 = 现值 ∪ 缺键默认值，再叠提交值（partial 语义：
-    # 未提交字段沿用现值，模型默认值不得覆盖宿主与运行时现状）
+    # Validation / hot-update scope = current values ∪ defaults for
+    # missing keys, then overlaid with submitted values (partial
+    # semantics: unsubmitted fields keep current values; model defaults
+    # must not override host and runtime state)
     baseline = {k: f["default"] for k, f in schema.items()}
     baseline.update({k: v for k, v in host_values.items() if k in schema})
-    try:
-        validated = LocalMemoryConfig(**{**baseline, **merged})
-    except Exception as exc:
-        raise ValueError(f"配置校验失败：{exc}") from exc
+    input_values = {**baseline, **merged}
+    legacy_fallback: set[str] = set()
+    validated = None
+    # Round cap mirrors main._try_build_config: each round drops at least one
+    # group, so the input shrinks monotonically and the loop terminates.
+    for _ in range(6):
+        try:
+            validated = LocalMemoryConfig(**input_values)
+            break
+        except ValidationError as exc:
+            field_bad, groups = _cross_field_groups(exc)
+            if field_bad:
+                # Field-level violations are still pinpointed per field and
+                # rejected; only pre-existing cross-field conflicts may be
+                # tolerated (see below).
+                raise ValueError(f"配置校验失败：{exc}") from exc
+            group = next(
+                (set(g) for g in groups if g),
+                set(CROSS_FIELD_VALIDATED_KEYS) & set(input_values),
+            )
+            # Only a PRE-EXISTING conflict may be skipped: every key in the
+            # failing group must still carry its stored/default value. If the
+            # current save edits any key of the group, the full constraint is
+            # enforced (the validator message explains the illegal
+            # combination) -- constraints are never blindly relaxed.
+            touched = {
+                k for k in group
+                if not _same_value(merged.get(k, baseline.get(k)), baseline.get(k))
+            }
+            if touched or not group:
+                raise ValueError(f"配置校验失败：{exc}") from exc
+            # Reuse the startup fallback style (main._try_build_config): drop
+            # only the invalid legacy group so saving unrelated fields is not
+            # blocked by a combination that was legal before this validator
+            # existed. The keys are untouched by this save, so they stay out
+            # of ``changed`` and the host keeps its raw values; validation
+            # uses the same defaults the startup path would have applied.
+            for k in group:
+                input_values.pop(k, None)
+            # Report only keys the host actually stores: a default-valued
+            # member of the group was not a stored legacy value.
+            legacy_fallback |= {k for k in group if k in host_values}
+            continue
+        except Exception as exc:
+            raise ValueError(f"配置校验失败：{exc}") from exc
+    if validated is None:  # pragma: no cover - only reachable on loop exhaustion
+        raise ValueError("配置校验失败：跨字段校验未收敛")
 
     # Persist the VALIDATED value, not the raw submitted one: direct API
     # callers may submit strings for numeric fields; storing those would
@@ -291,12 +429,23 @@ def prepare_save(submitted: dict, host_values: dict) -> dict:
     changed = {}
     for k, v in merged.items():
         if k in schema and baseline.get(k) != v:
-            changed[k] = getattr(validated, k)
+            # A submitted null means "clear back to unset". Persist the null
+            # itself instead of the validated value: Optional fields with a
+            # meaningful unset state (naming_promote_threshold) derive their
+            # effective value at model construction, so writing that derived
+            # number here would freeze it -- later score_start_high changes
+            # would no longer re-derive. Keeping null (or the key absent)
+            # preserves the lazy derivation on every config load.
+            changed[k] = None if v is None else getattr(validated, k)
     return {
         "merged": merged,
         "validated": validated,
         "changed": changed,
         "restart_required": sorted(k for k in changed if k in _RESTART_FIELDS),
+        # Legacy cross-field keys ignored for validation only (not persisted):
+        # the WebUI can explain why a save of unrelated fields succeeded while
+        # these stored values remain untouched.
+        "legacy_fallback": sorted(legacy_fallback),
     }
 
 

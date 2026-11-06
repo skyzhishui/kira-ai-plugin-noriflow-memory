@@ -47,27 +47,103 @@ if TYPE_CHECKING:
 
 logger = get_logger("noriflow_memory.encoder", "cyan")
 
-# category 值域（画像 8 维度：主动 6（identity/stable/preference/commitment/
-# interaction/naming）+ 系统 2（recent/uncertain，编码器按证据强度/时间性落））
+# category value domain (8 profile dimensions: 6 active
+# (identity/stable/preference/commitment/interaction/naming) + 2 system
+# (recent/uncertain; the encoder assigns by evidence strength /
+# timeliness))
 _VALID_CATEGORIES = frozenset(
     {
         "identity", "stable", "preference", "commitment",
         "interaction", "naming", "recent", "uncertain",
     }
 )
-# confidence 值域
+# confidence value domain
 _VALID_CONFIDENCES = frozenset({"high", "medium"})
-# 事实陈述长度上限（截断保留，对照关系通道 ≤200 的量级；簇
-# canonical_statement 直接继承该值，不设限会放大簇表与裁定 prompt 体积）
+
+# ---------------------------------------------------------------------------
+# Half-sentence truncation guard (ported from nori #26). Under guided
+# decoding with response_format=json_object the upstream LLM occasionally stops
+# early: the summary breaks mid-sentence, the JSON closes itself, and
+# finish_reason is still stop (no truncation signal, budget not exhausted) --
+# the half-sentence JSON is valid, so the parse layer cannot notice, and
+# writing it as-is yields a "recallable but broken memory" (that turn's facts
+# are all lost).
+# The check is a reverse whitelist (killing a complete summary costs a retry
+# plus a possible whole-turn downgrade, which outweighs missing a
+# half-sentence, so it prefers under-detecting). Only strong structural
+# signals count -- the last char's script does not:
+# - Last char is in the comma family (，、：；,;:): a trailing comma is always
+#   a half-sentence, in any script;
+# - Last char is an opening bracket/quote (（「『“‘《【(['): opened but never
+#   closed is always a half-sentence.
+# Conversely, a last char that is a CJK ideograph is NOT a signal: a complete
+# multi-line summary whose closing line simply carries no sentence-final
+# punctuation (a label or a short phrase) ends on an ideograph as well, and
+# flagging it downgraded semantically complete summaries (review Minor #4).
+# Sentence-final punctuation (。！？…”』」～!?.)), ASCII letters or digits
+# ("查ID", "version 2"), half-width ~, emoji and the like are never treated as
+# truncation either (the old whitelist wrongly killed 4 complete summaries
+# among the 190 suspect nori production rows: 3 ending on ~, 1 on ASCII
+# letters).
+# ---------------------------------------------------------------------------
+_CLAUSE_MID_PUNCT = frozenset("，、：；,;:")
+_OPENING_BRACKETS = frozenset("（「『“‘《【(['")
+
+
+def _looks_truncated(summary: str) -> bool:
+    """Whether the summary looks stopped early (half-sentence truncation).
+
+    Rules (see the module comment above; reverse whitelist):
+    - The comma-family / opening-bracket check runs before the line-count
+      branch and applies to single-line **and** multi-line summaries alike;
+    - Multi-line summary (first line "【话题】" anchor + sectioned body):
+      never truncated on the last char alone -- a CJK ideograph ending is
+      normal for a complete summary;
+    - Single-line summary: the pure anchor form "【话题】XXX" the prompt asks
+      for is legal; truncation only when the last char is in the comma or
+      opening-bracket family, or the anchor is empty (not even the topic was
+      written).
+
+    Known residual (deliberate trade-off): a single-line result truncated
+    exactly inside the first-line anchor is indistinguishable from the legal
+    pure-anchor form, so it is let through by design -- 0 anchor-mid
+    truncations in 12495 nori production lines, and retrying the learner for
+    every legal anchor summary is not worth removing this residual.
+    """
+    text = (summary or "").strip()
+    if not text:
+        return True
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return True
+    last_char = lines[-1][-1]
+    if last_char in _CLAUSE_MID_PUNCT or last_char in _OPENING_BRACKETS:
+        return True
+    if len(lines) == 1:
+        # Empty anchor ("【话题】" or the prefix only): the topic itself was
+        # never written, so it must be truncated
+        return text.rstrip("】").endswith("【话题")
+    # Multi-line body without a comma-family / opening-bracket tail is taken
+    # as complete: a CJK ideograph last char is not truncation evidence
+    return False
+
+
+# Fact statement length cap (truncate and keep; cf. the relation
+# channel's <=200 magnitude; cluster canonical_statement inherits this
+# value directly -- an uncapped value would bloat the cluster table and
+# the arbitration prompt size)
 _FACT_STATEMENT_MAX_CHARS = 200
 
-# 解码提示词模板文件（不含 .prompt 后缀）
+# Encoding prompt template file (without the .prompt suffix)
 _ENCODE_PROMPT_NAME = "memory_encode"
-# P2 关系提取扩展节模板（relations_enabled 时附加在编码提示词尾部）
+# P2 relation-extraction extension section template (appended after the
+# encoding prompt tail when relations_enabled is on)
 _RELATIONS_PROMPT_NAME = "memory_relations"
+_NAMING_PROMPT_NAME = "memory_encode_naming"
 
-# 编码结果 JSON Schema（tool calling 强制出口；与提示词输出格式及
-# _parse_payload 校验字段一致——校验仍以 _parse_payload 为准）
+# Encoding-result JSON schema (forced exit via tool calling; fields match
+# the prompt output format and the _parse_payload validation --
+# _parse_payload remains the authority for validation)
 _ENCODE_RESULT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -122,7 +198,8 @@ _ENCODE_RESULT_SCHEMA = {
     "required": ["summary", "facts"],
 }
 
-# 强制调用的提交工具名（LLM 将编码结果放入其 arguments）
+# Forced-call submission tool name (the LLM puts the encoding result
+# into its arguments)
 _ENCODE_TOOL_NAME = "submit_memory_encoding"
 
 
@@ -144,6 +221,7 @@ class MemoryEncoder:
         prompt_dir: Optional[str | Path] = None,
         input_max_chars: int = 0,
         relations_enabled: bool = False,
+        naming_enabled: bool = True,
         config: Optional["LocalMemoryConfig"] = None,
     ) -> None:
         """Initialize the encoder.
@@ -163,17 +241,28 @@ class MemoryEncoder:
                 encoding prompt tail (an independent relations array); when
                 off, the prompt is verbatim-identical to existing behavior
                 (grayscale regression guarantee).
+            naming_enabled: naming (address preference) extension-section
+                switch; when on, a memory_encode_naming verdict section is
+                appended after the encoding prompt tail (evidence grades
+                a-f: record only how the person wants to be addressed /
+                forms they explicitly dislike; another person's naming
+                habit is extractable only with signs the person accepted
+                it; self-address / how others call the bot / pure relation
+                titles are never extracted). When off, the prompt carries
+                no such section and naming extraction falls back to the
+                base-rules behavior.
             config: Plugin runtime config (optional): when provided,
-                input_max_chars / relations_enabled read this instance per
-                call at runtime, taking effect immediately after saving config
-                on the maintenance page; constructor params are the default
-                fallback.
+                input_max_chars / relations_enabled / naming_enabled read
+                this instance per call at runtime, taking effect immediately
+                after saving config on the maintenance page; constructor
+                params are the default fallback.
         """
         self.llm = llm
         self.prompt_dir = Path(prompt_dir or (Path(__file__).resolve().parent / "prompts"))
         self._config = config
         self._static_input_max_chars = max(int(input_max_chars or 0), 0)
         self._static_relations_enabled = bool(relations_enabled)
+        self._static_naming_enabled = bool(naming_enabled)
         self._loader = PromptLoader(self.prompt_dir)
 
     @property
@@ -190,6 +279,14 @@ class MemoryEncoder:
             return bool(self._config.relation_extract_enabled)
         return self._static_relations_enabled
 
+    @property
+    def naming_enabled(self) -> bool:
+        """naming extension-section switch (read at runtime from config when
+        provided, hot-effective)."""
+        if self._config is not None:
+            return bool(self._config.naming_prompt_enabled)
+        return self._static_naming_enabled
+
     async def encode(
         self,
         conversation_text: str,
@@ -204,7 +301,9 @@ class MemoryEncoder:
         return (conversation_text, [], [], False) with a warning logged, and
         the caller takes the single-channel old behavior (raw text written
         to the summary table marked summarized=false, not participating in
-        recall). encoded_ok=False lets the caller distinguish "encoded
+        recall). A summary that still looks half-sentence-truncated after
+        one retry follows the same degrade path (truncation guard, nori #26).
+        encoded_ok=False lets the caller distinguish "encoded
         product" from "degraded raw text": degraded-raw rows get re-encoded
         by the merge agent's backfill pass after the LLM recovers (relations
         are lost alongside facts and restored on backfill).
@@ -231,8 +330,10 @@ class MemoryEncoder:
         if not conversation_text:
             return "", [], [], False
 
-        # 超长输入截断（尾部丢弃 + 标记行告知 LLM）：防用户粘贴超长文本
-        # 造成编码必败 → 降级原文入库 → 补编码遍毒丸行队首阻塞
+        # Over-long input truncation (tail dropped + a marker line tells
+        # the LLM): prevents user-pasted over-long text from making
+        # encoding certain to fail -> degrade to raw-text storage -> the
+        # backfill pass's poison-pill row blocking the queue head
         if self.input_max_chars and len(conversation_text) > self.input_max_chars:
             dropped = len(conversation_text) - self.input_max_chars
             conversation_text = (
@@ -245,6 +346,46 @@ class MemoryEncoder:
                 self.input_max_chars,
             )
 
+        # Half-sentence truncation guard (ported from nori #26): retry once on
+        # suspicion; a second truncation degrades to the raw-text-only channel
+        # (summarized=false, not recallable, re-encoded by the merge agent's
+        # backfill pass) -- a half-sentence summary is never written as a
+        # complete memory
+        for attempt in (1, 2):
+            result = await self._encode_once(conversation_text, bot_nickname, bot_user_id)
+            if result is None:
+                return conversation_text, [], [], False
+            summary, facts, relations = result
+            if _looks_truncated(summary):
+                tail = summary[-40:]
+                if attempt == 1:
+                    logger.warning(
+                        "编码摘要疑似半句截断（上游提前终止），重试一次，末 40 字: %r",
+                        tail,
+                    )
+                    continue
+                logger.warning(
+                    "编码摘要重试后仍疑似截断，降级原文单通道（补编码遍重编码），"
+                    "末 40 字: %r",
+                    tail,
+                )
+                return conversation_text, [], [], False
+            return summary, facts, relations, True
+        return conversation_text, [], [], False  # pragma: no cover - loop always returns
+
+    async def _encode_once(
+        self,
+        conversation_text: str,
+        bot_nickname: str,
+        bot_user_id: str,
+    ) -> Optional[tuple[str, list[EncodedFact], list[EncodedRelation]]]:
+        """One encoding attempt: prompt render -> LLM -> parse -> payload.
+
+        Returns:
+            (summary, facts, relations); None on any hard failure (LLM call
+            failure / unparseable output / missing summary) -- the failure is
+            logged here and the caller degrades to the raw single channel.
+        """
         try:
             system_prompt = self._loader.render(
                 _ENCODE_PROMPT_NAME,
@@ -257,6 +398,22 @@ class MemoryEncoder:
                     bot_nickname=bot_nickname,
                     bot_user_id=bot_user_id or "未知",
                 )
+            if self.naming_enabled:
+                # The naming verdict section is optional: a missing template
+                # degrades to skip + warning (main encoding is unaffected and
+                # falls back to the base rules), same pattern as the relations
+                # section
+                try:
+                    system_prompt += "\n\n" + self._loader.render(
+                        _NAMING_PROMPT_NAME,
+                        bot_nickname=bot_nickname,
+                        bot_user_id=bot_user_id or "未知",
+                    )
+                except Exception:
+                    logger.warning(
+                        "naming 扩展段模板缺失/渲染失败，跳过该段（退回基础规则）",
+                        exc_info=True,
+                    )
             raw = await self.llm.run_structured(
                 system_prompt=system_prompt,
                 user_prompt=conversation_text,
@@ -265,7 +422,7 @@ class MemoryEncoder:
             )
         except Exception:
             logger.warning("记忆编码 LLM 调用失败，降级为原文单通道", exc_info=True)
-            return conversation_text, [], [], False
+            return None
 
         parsed = safe_parse_llm_json(raw)
         if not isinstance(parsed, dict):
@@ -273,14 +430,15 @@ class MemoryEncoder:
                 "记忆编码输出无法解析为 JSON 对象，降级为原文单通道: %r",
                 (raw or "")[:200],
             )
-            return conversation_text, [], [], False
+            return None
 
         summary, facts, relations = self._parse_payload(parsed)
         if not summary:
-            # summary 缺失时降级为原文（chat_summary 通道永不丢原材料）
+            # Degrade to raw text when summary is missing (the
+            # chat_summary channel never loses the raw material)
             logger.warning("记忆编码未产出 summary，降级为原文单通道")
-            return conversation_text, [], [], False
-        return summary, facts, relations, True
+            return None
+        return summary, facts, relations
 
     def _parse_payload(
         self, payload: dict

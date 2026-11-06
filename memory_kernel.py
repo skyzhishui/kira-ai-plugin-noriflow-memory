@@ -93,8 +93,9 @@ from .vector_ops import EmbeddingService
 
 logger = get_logger("noriflow_memory.kernel", "cyan")
 
-# 慢调用哨兵阈值（毫秒）：超过则把耗时观测从 DEBUG 升级为 WARNING
-# （与上游 nori 口径一致：500ms）
+# Slow-call sentinel threshold (milliseconds): elapsed-time observations
+# above it escalate from DEBUG to WARNING (same convention as upstream
+# nori: 500ms)
 SLOW_CALL_THRESHOLD_MS = 500.0
 
 _T = TypeVar("_T")
@@ -113,7 +114,7 @@ class MemoryDBUnavailable(RuntimeError):
     while never actually being persisted, a silent loss.
     """
 
-# scope 合法值
+# Valid scope values
 _VALID_SCOPES = frozenset({"session", "user", "user_session"})
 
 
@@ -172,8 +173,11 @@ class _EntityDirectory:
 
     _TTL_SECONDS = 600.0
     _MAX_SESSIONS = 256
-    _MIN_NAME_LEN = 2  # 单字名（"阿"/"好"）误命中率过高，不入词典
-    _MAX_HINT_ENTRIES = 4  # 单轮命中条目上限（防重名/常用词昵称候选风暴）
+    _MIN_NAME_LEN = 2  # single-char names ("阿"/"好") mis-hit too often,
+                       # not admitted into the directory
+    _MAX_HINT_ENTRIES = 4  # per-round hit-entry cap (guards candidate
+                           # storms from duplicate names / common-word
+                           # nicknames)
 
     def __init__(self, source: Optional[Callable[[str], Awaitable[list[tuple[str, str, str]]]]]):
         self._source = source
@@ -201,9 +205,10 @@ class _EntityDirectory:
                     exc_info=True,
                 )
                 return []
-            # 键 -> {pair: 该 pair 自己的观测原名}——同归一化键多 uid 时
-            # 命中条目各带各的称呼，不串贴他人原名（与 AliasStore.
-            # _display_by_pair 同款口径）
+            # key -> {pair: that pair's own observed raw name} -- with
+            # multiple uids under one normalized key, hit entries each
+            # carry their own addressing and never paste someone else's
+            # raw name (same convention as AliasStore._display_by_pair)
             names: dict[str, dict[tuple[str, str], str]] = {}
             for raw_name, platform, uid in pairs or []:
                 name = (raw_name or "").strip()
@@ -299,8 +304,10 @@ class LocalMemoryKernel:
         # (kernel.bot_platform = <adapter name>) once it learns the bot
         # identity; empty string when unknown.
         self.bot_platform: str = ""
-        # bot uid 形态备忘（含平台 uid 副形态；make_recall_hints 学习式
-        # 回填——写侧 is_bot_edge 与读侧场景 C 匹配共用，见 bot_uid_set）
+        # bot uid form memo (includes the platform-uid secondary form;
+        # learned/backfilled by make_recall_hints -- shared by the
+        # write-side is_bot_edge and the read-side scenario C matching,
+        # see bot_uid_set)
         self._bot_uid_forms: set[str] = set()
         self.encoder = encoder
         self.bot_nickname = bot_nickname
@@ -308,9 +315,11 @@ class LocalMemoryKernel:
         self._history_window_provider = history_window_provider
         self._host_tz_provider = host_tz_provider
         self._recall_log = recall_log
-        # 实体词典（实体命中用——画像候选/P3 节点匹配；source 为 None 时恒空）
+        # Entity directory (for entity hits -- persona candidates / P3
+        # node matching; always empty when source is None)
         self._entity_directory = _EntityDirectory(directory_source)
-        # 持久实体别名层（窗口词典之后的持久命中来源；alias_enabled 关闭时恒空）
+        # Persistent entity alias layer (persistent hit source after the
+        # window dictionary; always empty when alias_enabled is off)
         self._alias_store: AliasStore | None = (
             AliasStore(
                 db,
@@ -320,26 +329,49 @@ class LocalMemoryKernel:
             if config.alias_enabled
             else None
         )
-        # P3 边注入的邻居画像服务（main 装配后回填；None 时边注入只出
-        # 陈述行、不拼画像——画像预算独立于宿主画像注入）
+        # Neighbor profile service for P3 edge injection (backfilled once
+        # main assembles it; when None, edge injection emits statement
+        # lines only and assembles no profiles -- the profile budget is
+        # independent of host profile injection)
         self.persona_service = None
         self._local_tz_cache = None
-        # 召回访问强化在飞任务（011 生命周期）：持引用防 GC 中途取消；
-        # 正常路径任务自清（finally 中丢弃）
+        # Recall access-reinforcement in-flight tasks (011 lifecycle):
+        # references are held to keep GC from cancelling them midway; on
+        # the normal path tasks clean themselves up (discarded in finally)
         self._reinforce_tasks: set = set()
-        # 滚动补回去重 memo：{session_id: (已注入 document_id 列表, monotonic 时间)}
-        # 同轮 recall/主动检索据此排除已注入行；TTL 覆盖单轮 pipeline 时长
+        # Rolling rollout fill-back dedup memo:
+        # {session_id: (list of injected document_ids, monotonic time)};
+        # same-round recall / active retrieval excludes injected rows by
+        # it; the TTL covers one pipeline round
         self._rollout_memo: dict[str, tuple[list[str], float]] = {}
-        # 两阶段提交的暂存区（build_recent_rollout_text 写入，commit_
-        # rollout_memo 落实）：构建与最终注入之间 prompt 装配可能被丢弃，
-        # 未落实的 id 不得进入 memo（否则既不出现在补回、又被 recall 排除，
-        # TTL 全程双不可见）
+        # Cross-session injection dedup memo:
+        # {(platform, session_type, session_id, turn_id):
+        #      (injected document_ids, monotonic time)}
+        # Shares the retrieval exclusion channel with rolling fill-back.
+        # The turn_id half (host event id) isolates concurrent rounds of one
+        # session: each round clears/registers only its own key, so round B
+        # cannot wipe round A's exclusions before A's recall consumes them.
+        # platform + session_type separate contexts that share a bare
+        # session_id (the host does not guarantee its uniqueness across
+        # platforms or between a DM and a group chat), so one context's
+        # entry clear/registration never leaks into another's recall.
+        # Empty context fields keep the legacy shared key for callers/tests
+        # that pass neither.
+        self._cross_session_memo: dict[tuple, tuple[list[str], float]] = {}
+        # Two-phase commit staging area (written by
+        # build_recent_rollout_text, committed by commit_rollout_memo):
+        # prompt assembly may be dropped between build and final
+        # injection; uncommitted ids must never enter the memo (else they
+        # would no longer appear in the fill-back while still being
+        # excluded by recall -- invisible in both channels for the whole
+        # TTL)
         self._rollout_pending: dict[str, tuple[list[str], float]] = {}
-        # 宿主窗口块数为 0 的一次性告警旗标（见 _derive_window_batches）
+        # One-shot warn flag for a host window block count of 0 (see
+        # _derive_window_batches)
         self._window_zero_warned = False
 
     # ------------------------------------------------------------------
-    #  写入链路
+    #  Write path
     # ------------------------------------------------------------------
 
     async def ingest(
@@ -421,21 +453,28 @@ class LocalMemoryKernel:
             participant_user_ids=participant_user_ids,
         )
 
-        # 熔断明确拒绝期直接失败（peek 非消费式，恢复探测名额留给下方
-        # 真实的写入）：旧契约拒绝后仍返回 document_id，retain 批次会被
-        # 标已消费而实际未落库（静默丢失）；且 embed_one 在拒绝前执行
-        # 会白烧一次向量化调用
+        # Fail directly during a circuit-open rejection period (peek is
+        # non-consuming; the recovery-probe quota is left for the real
+        # write below): the old contract still returned document_id after
+        # a rejection, so retain batches got marked consumed without ever
+        # being persisted (a silent loss); and embed_one running ahead of
+        # the rejection would burn one vectorization call for nothing
         if not await self.circuit_breaker.peek_available():
             raise MemoryDBUnavailable("记忆库熔断拒绝期，写入被拒绝")
 
-        # 写入时向量化（fail-open：失败置 NULL，补算任务回填）
+        # Vectorize at write time (fail-open: on failure set NULL, the
+        # backfill task fills it in)
         embedding = await self.embedding_service.embed_one(content)
 
-        # 写入侧近重去重（仅 retain 编码摘要路径）：与同会话最近
-        # write_dedup_window 批已编码摘要比对，cosine ≥ 阈值跳过写入——
-        # 抑制历史上下文泄漏进摘要导致的同事件重复行（6705/6707 类）。
-        # 窗口限制同会话近期，久远/跨会话相似事件不误杀；查询失败
-        # fail-open 继续写入（宁重复不丢失）
+        # Write-side near-duplicate dedup (retain encoded-summary path
+        # only): compare against the last write_dedup_window batches of
+        # encoded summaries in the same session; a cosine >= threshold
+        # skips the write -- suppressing same-event duplicate rows caused
+        # by history context leaking into summaries (the 6705/6707 class).
+        # The window is limited to this session's recent batches, so
+        # distant / cross-session similar events are not wrongly killed; a
+        # query failure is fail-open and writing continues (prefer
+        # duplication over loss)
         if (
             apply_write_dedup
             and summarized
@@ -543,7 +582,7 @@ class LocalMemoryKernel:
             # Guard before the encoder-None branch: an empty input must be a
             # no-op for BOTH paths (the degraded single-channel ingest below
             # would otherwise persist an empty-content summary row).
-            return []  # 无编码输入，无内容可写
+            return []  # no encoding input, nothing to write
 
         if self.encoder is None:
             logger.debug(
@@ -564,18 +603,25 @@ class LocalMemoryKernel:
                 summarized=False,
             )]
 
-        # 熔断明确拒绝期：写路径全拒，原文直写是空转且会静默丢批（ingest
-        # 旧契约拒绝后仍返回 document_id，批次被标已消费即永久丢失）。
-        # 直接失败让调用方（_do_retain）回滚水位线，本批消息留给下一轮
-        # 信号重编码（内容不丢）；编码 LLM 与向量化调用均不白烧。
-        # peek 非消费式——恢复探测名额由恢复后的真实写入消费
+        # Circuit-open rejection period: the write path rejects outright;
+        # writing the raw text anyway is busywork and would silently lose
+        # the batch (the ingest old contract still returned document_id
+        # after a rejection; once the batch is marked consumed the loss is
+        # permanent). Failing directly lets the caller (_do_retain) roll
+        # back the watermark, leaving this batch of messages to be
+        # re-encoded on the next signal round (content is not lost); the
+        # encoding LLM and vectorization calls burn nothing. peek is
+        # non-consuming -- the recovery-probe quota is consumed by the
+        # real write after recovery
         if not await self.circuit_breaker.peek_available():
             raise MemoryDBUnavailable(
                 "记忆库熔断拒绝期：retain 失败（调用方回滚水位线，待下轮重编码）"
             )
 
-        # 端侧编码（fail-open：任何失败返回 (conversation_text, [], False)）；
-        # 此处再兜一层，保证 encoder 实现意外抛异常时同样降级为原文单通道
+        # On-endpoint encoding (fail-open: any failure returns
+        # (conversation_text, [], False)); one more fallback layer here so
+        # an unexpected exception from the encoder implementation also
+        # degrades to the raw-text single channel
         effective_bot_id = (bot_id or self.bot_id).strip()
         try:
             summary, facts, relations, encoded_ok = await self.encoder.encode(
@@ -589,10 +635,14 @@ class LocalMemoryKernel:
             )
             summary, facts, relations, encoded_ok = conversation_text, [], [], False
 
-        # 确定性防线：bot 自身不得成为画像主体。编码提示词排除项已约束，
-        # 但用户发言中 @bot / 提及 bot 名称与号码时 LLM 仍可能把 bot 提取为
-        # 事实主体（user_id 填 bot 的平台 ID，形成 bot 画像）——此处按
-        # bot_id 硬过滤兜底，发生在向量化之前（被丢弃条目不消耗 embedding）。
+        # Deterministic defense line: the bot itself must never become a
+        # profile subject. The encoding prompt's exclusion clause already
+        # constrains this, but when user speech @-mentions the bot /
+        # mentions its name and number, the LLM may still extract the bot
+        # as a fact subject (user_id filled with the bot's platform ID,
+        # forming a bot profile) -- this hard filter by bot_id is the
+        # fallback, and it runs before vectorization (dropped entries
+        # consume no embedding).
         if effective_bot_id and facts:
             kept = []
             dropped = 0
@@ -600,8 +650,10 @@ class LocalMemoryKernel:
                 if f.user_id.strip() == effective_bot_id:
                     dropped += 1
                     continue
-                # related 集合同步剔除 bot（关系事实参与方含 bot 时，
-                # 其复合键会随簇传播进候选检索匹配）
+                # Strip the bot from the related set in sync (when a bot
+                # participates in a relation fact, its composite key would
+                # propagate into candidate retrieval matching along with
+                # the cluster)
                 if f.related_user_ids:
                     cleaned = [
                         r for r in f.related_user_ids
@@ -620,13 +672,18 @@ class LocalMemoryKernel:
 
         doc_ids: list[str] = []
 
-        # 通道顺序（facts -> relations -> summary，summary 殿后——失败方向
-        # 安全，对齐合并 agent 补编码遍的写入顺序）：summary 落库前任何失败
-        # 上抛 → 调用方（_do_retain）回滚消息水位线，本批下轮信号从零
-        # 重编码重放，无半提交残留；若 summary 先行，facts/relations 失败
-        # 回滚水位线后重编码产出不同摘要文本会落成第二行（document_id
-        # 含内容哈希，文本漂移即重复行）——facts/relations 幂等键则保证
-        # 重试不重复（同语句 ON CONFLICT 跳过/合并）。
+        # Channel order (facts -> relations -> summary, summary last --
+        # failure-direction safe, aligned with the merge agent backfill
+        # pass's write order): any failure before the summary lands
+        # propagates up -> the caller (_do_retain) rolls back the message
+        # watermark, and this batch is re-encoded and replayed from zero on
+        # the next signal round with no half-committed residue; if summary
+        # went first, a facts/relations failure after the watermark
+        # rollback would re-encode into different summary text and land a
+        # second row (document_id embeds a content hash -- text drift means
+        # a duplicate row) -- while the facts/relations idempotency keys
+        # guarantee retries do not duplicate (same-statement ON CONFLICT
+        # skip/merge).
         if facts:
             doc_ids.extend(
                 await self._ingest_facts(
@@ -638,9 +695,11 @@ class LocalMemoryKernel:
                 )
             )
 
-        # 通道 1.5（P2 关系边）：结构化关系三元组零 LLM 合并落边表；
-        # 提取开关关闭时丢弃（encoder 未附加扩展节，正常恒空——此处
-        # 兜底防旧提示词缓存/手改配置的残余输出）
+        # Channel 1.5 (P2 relation edges): structured relation triples land
+        # in the edge table with zero LLM merging; dropped when the
+        # extraction switch is off (the encoder appends no extension
+        # section, so normally always empty -- this fallback guards against
+        # residual output from a stale prompt cache / hand-edited config)
         if relations and self.config.relation_extract_enabled:
             doc_ids.extend(
                 await self._ingest_relations(
@@ -652,9 +711,12 @@ class LocalMemoryKernel:
                 )
             )
 
-        # 通道 2：summary 走 chat_summary（复用 ingest 的幂等/participants 策略）；
-        # 编码降级时（encoded_ok=False，content 为原文）标记 summarized=false
-        # 不参与召回，由合并 agent 补编码遍重编码；编码摘要启用写入侧近重去重
+        # Channel 2: summary goes through chat_summary (reusing ingest's
+        # idempotency/participants strategy); on encoding degradation
+        # (encoded_ok=False, content is the raw text) it is marked
+        # summarized=false, stays out of recall, and is re-encoded by the
+        # merge agent's backfill pass; encoded summaries enable write-side
+        # near-duplicate dedup
         doc_ids.append(await self.ingest(
             content=summary or conversation_text,
             session_id=session_id,
@@ -702,7 +764,7 @@ class LocalMemoryKernel:
         scoring.
 
         Semantic constraints (caller-guaranteed): category is limited to the
-        active six dimensions (system dimensions recent/uncertain do not go
+        active dimensions (system dimensions recent/uncertain do not go
         through this channel); ownership is pinned to the parameter user_id
         (the tool layer locks the scope to the trigger user, preventing
         unauthorized proxy writes).
@@ -714,15 +776,35 @@ class LocalMemoryKernel:
         if not await self.circuit_breaker.peek_available():
             raise MemoryDBUnavailable("记忆库熔断拒绝期，主动事实写入被拒绝")
         occurred = self._to_local(occurred_at or datetime.now())
-        evidence_key = self._build_evidence_key(session_id, occurred)
+        # Timestamp clamping: future tool input is untrusted, and the recent
+        # section orders by occurred_at first, so a future value would pin
+        # itself to the top until the wall clock catches up. The idempotency
+        # key (evidence_key / document_id prefix) keeps the original input
+        # time -- using the clamped now in the key would give two calls with
+        # the same future timestamp different keys across days, breaking
+        # idempotent dedup and double-scoring. The clamped value is used only
+        # for storage and profile ordering (naive-local and aware-local paths
+        # each compare against a now of the same kind)
+        key_occurred = occurred
+        now_local = (
+            datetime.now(tz=self._local_tz())
+            if occurred.tzinfo is not None
+            else datetime.now()
+        )
+        if occurred > now_local:
+            occurred = now_local
+        evidence_key = self._build_evidence_key(session_id, key_occurred)
         embedding = await self.embedding_service.embed_one(statement)
-        base_prefix = fact_document_id([user_id], session_id, occurred)
+        base_prefix = fact_document_id([user_id], session_id, key_occurred)
         content_hash = hashlib.md5(statement.encode()).hexdigest()[:12]
         document_id = f"{base_prefix}-{content_hash}"
         if embedding is None:
-            # fail-open 落库等补算回填（与 retain 编码路径同哲学：主动
-            # 写入因向量故障被拒 = 对话滑走后内容永丢）；embedded 标志让
-            # 工具层如实告知「稍后才可检索」，不静默违约立即生效承诺
+            # fail-open persist, waiting for the backfill task's fill-in
+            # (same philosophy as the retain encoded path: rejecting an
+            # active write over a vector failure = content lost forever
+            # once the conversation scrolls away); the embedded flag lets
+            # the tool layer honestly report "searchable later" instead of
+            # silently defaulting on the immediate-effect promise
             logger.warning(
                 "主动事实写入向量化失败（embedding 不可用），"
                 "置 NULL 落库等补算回填: %s", document_id
@@ -780,6 +862,7 @@ class LocalMemoryKernel:
                     score_cap=cfg.score_cap,
                     promote_threshold=cfg.promote_threshold,
                     recent_promote_threshold=cfg.recent_promote_threshold,
+                    naming_promote_threshold=cfg.naming_promote_threshold,
                 )
 
             if not await self._guarded(
@@ -793,10 +876,15 @@ class LocalMemoryKernel:
             summary.get("action") == "skipped"
             and replaces_cluster_id is not None
         ):
-            # 同日改回旧说法：原语句当日已写入且行已消费，乐观锁拒绝
-            # 再次成簇——更正语义优先于同日重复去重。换更正作用域的
-            # 幂等键（语句+目标簇）重落一行完成替换；该键也已消费
-            # （同一更正当日重复执行）时维持 skipped，工具层如实报告
+            # Same-day correction back to an older statement: the original
+            # statement was written today and its row is already consumed,
+            # so the optimistic lock rejects re-clustering -- correction
+            # semantics take precedence over same-day duplicate dedup.
+            # Re-land one row under a correction-scoped idempotency key
+            # (statement + target cluster) to complete the replace; when
+            # that key is also consumed (the same correction executed
+            # repeatedly in one day), stay skipped and let the tool layer
+            # report it honestly
             correct_hash = hashlib.md5(
                 f"{statement}#r{replaces_cluster_id}".encode()
             ).hexdigest()[:12]
@@ -846,7 +934,8 @@ class LocalMemoryKernel:
         occurred_at = self._to_local(timestamp or datetime.now())
         evidence_key = self._build_evidence_key(session_id, occurred_at)
 
-        # 批量向量化（fail-open：失败整批 None，补算任务回填）
+        # Batch vectorization (fail-open: on failure the whole batch is
+        # None, the backfill task fills it in)
         vectors = await self.embedding_service.embed_batch(
             [fact.statement for fact in facts]
         )
@@ -877,8 +966,11 @@ class LocalMemoryKernel:
                 description=f"事实写入 {document_id}",
             )
             if not ok:
-                # 上抛而非跳过：summary 通道尚未写入（facts 先行），回滚
-                # 重试无半提交、无重复；旧语义在熔断期会永久丢失整批事实
+                # Raise instead of skipping: the summary channel has not
+                # been written yet (facts go first), so rollback + retry
+                # leaves no half-commit and no duplicates; the old
+                # semantics would permanently lose the whole batch of facts
+                # during a circuit-open period
                 raise MemoryDBUnavailable(f"事实写入失败: {document_id}")
             doc_ids.append(document_id)
         await self._register_fact_code_aliases(
@@ -966,9 +1058,11 @@ class LocalMemoryKernel:
         alias = self._alias_store
 
         def _endpoint_name(uid: str, llm_name: str) -> str:
-            # 占位名守卫：LLM 偶发输出"未知"/uid 兜底形，用别名视图的
-            # 最新名顶替；未命中留空（upsert 语句保旧名，读侧图谱解析
-            # 再兜底显示）
+            # Placeholder-name guard: the LLM occasionally outputs
+            # "未知"/uid fallback forms; substitute the alias view's latest
+            # name, or leave empty on no hit (the upsert statement keeps
+            # the old name, and read-side graph resolution falls back for
+            # display)
             if not is_placeholder_name(llm_name):
                 return llm_name
             return alias.name_for(platform, uid) if alias is not None else ""
@@ -1010,7 +1104,7 @@ class LocalMemoryKernel:
         return doc_ids
 
     # ------------------------------------------------------------------
-    #  recall 检索（M3，管线见开发方案 §9.2.2）
+    #  recall retrieval (M3; pipeline in dev plan section 9.2.2)
     # ------------------------------------------------------------------
 
     async def search(
@@ -1028,6 +1122,9 @@ class LocalMemoryKernel:
         per_user: bool = False,
         entity_user_keys: Optional[list[str]] = None,
         entity_user_ids: Optional[list[str]] = None,
+        turn_id: str = "",
+        session_type: str = "",
+        memo_platform: str = "",
     ) -> list[MemoryItem]:
         """Search memory (vector + rerank pipeline).
 
@@ -1148,6 +1245,15 @@ class LocalMemoryKernel:
             entity_user_keys: List of entity-hit composite keys for
                 ask-about-others recall (consumed only by scope=session).
             entity_user_ids: Corresponding list of bare uids.
+            turn_id: Turn identifier (host event id) scoping the injected-id
+                exclusion memo. Empty keeps the legacy per-session memo.
+            session_type: Session type (host session_type, e.g. dm/gm)
+                scoping the cross-session exclusion memo together with
+                platform (see _cross_session_memo_key).
+            memo_platform: Platform used only for the exclusion-memo key when
+                the caller cannot pass the filtering platform (scope=user
+                tool search keeps its legacy owner-only user filter); empty
+                falls back to platform.
 
         Returns:
             List of memory items (at most top_k rows; per_user mode at most
@@ -1158,8 +1264,10 @@ class LocalMemoryKernel:
         if not query.strip():
             return []
 
-        # query 向量化是 HTTP 调用（检索延迟大头），扩选键/近时排除边界
-        # 在其飞行期间并行完成（一条索引查询 + 一次宿主配置读取）
+        # Query vectorization is an HTTP call (the bulk of retrieval
+        # latency); the expansion keys / recent-range exclusion boundary
+        # are computed in parallel during its flight (one index query + one
+        # host config read)
         embed_task = asyncio.create_task(self.embedding_service.embed_one(query))
         try:
             window_batches = self._derive_window_batches()
@@ -1174,7 +1282,8 @@ class LocalMemoryKernel:
             # harvests the result via the await below.
             embed_task.cancel()
             raise
-        # query 实时向量化（fail-open：失败返回空，不阻断注入链路）
+        # Real-time query vectorization (fail-open: on failure return
+        # empty, never blocking the injection path)
         query_vec = await embed_task
         if query_vec is None:
             logger.warning("recall 查询向量化失败（embedding 不可用），返回空结果")
@@ -1185,10 +1294,12 @@ class LocalMemoryKernel:
             self.config.rerank_candidates if use_rerank else 0, top_k * 4
         )
 
-        # 用户参数归一：uid 列表 + 对应复合键。
-        # scope=session（框架路径）对齐 hindsight 语义：platform 与 user 均非空才
-        # 启用用户过滤组——planner 主动召回不传 platform，应全会话检索；
-        # user/user_session 模式以用户过滤为主体，允许裸 uid 回退
+        # Normalize user params: uid list + corresponding composite keys.
+        # scope=session (framework path) aligns with hindsight semantics:
+        # the user filter group is enabled only when platform and user are
+        # both non-empty -- planner active recall passes no platform and
+        # should search the whole session; user/user_session modes are
+        # user-filter-centric and allow a bare-uid fallback
         uids = [u for u in (user_ids or ([user_id] if user_id else [])) if u]
         keys = [f"{platform}:{u}" for u in uids] if platform else []
         if scope == "session" and not platform:
@@ -1196,12 +1307,27 @@ class LocalMemoryKernel:
 
         is_per_user = bool(per_user and uids)
         if is_per_user:
-            # 候选池按用户数放大：配额截断作用于重排后的单池，池被单一
-            # 用户的行占满时配额无法凭空补位（放大缓解，非保底）
+            # Scale the candidate pool by the user count: quota truncation
+            # acts on the single post-rerank pool, and when the pool is
+            # filled by one user's rows the quota cannot conjure slots out
+            # of thin air (scaling mitigates, it is no guarantee)
             n_candidates = max(n_candidates, top_k * 4 * len(uids))
 
-        # 单池检索（per_user 同路——完整管线过滤/扩选/排除/混合在此生效，
-        # 配额只在截断阶段引入；with_participants 供归属判定）
+        # Lazy embedding fetch (perf P2): when not per_user and the DB exposes
+        # fetch_embeddings_by_ids, the retrieval SELECT carries no embedding --
+        # dedup consumes vectors only for the rows it actually visits, fetched
+        # precisely by id in paged chunks (head chunk up front, further chunks
+        # on demand; avoiding transfer + JSON parsing of 2 x n_candidates rows
+        # x ~18KB of vector text). Older DB implementations/test stubs without
+        # this method keep the old behavior (rows ship their own embedding) for
+        # cross-version compatibility.
+        fetch_embeddings_by_id = getattr(self.db, "fetch_embeddings_by_ids", None)
+        lazy_embeddings = not is_per_user and fetch_embeddings_by_id is not None
+
+        # Single-pool retrieval (per_user shares the route -- the full
+        # pipeline of filtering/expansion/exclusion/hybrid applies here,
+        # quota is introduced only at the truncation stage;
+        # with_participants supports ownership judgment)
         rows = await self._guarded_call(
             lambda: self.db.search_chat_summaries(
                 query_vec=query_vec,
@@ -1222,8 +1348,16 @@ class LocalMemoryKernel:
                 query_text=query,
                 hybrid=self.config.hybrid_search_enabled,
                 rrf_k=self.config.hybrid_rrf_k,
-                exclude_document_ids=self._rollout_excluded_ids(session_id),
-                with_embedding=self.config.dedup_similarity_threshold > 0,
+                exclude_document_ids=self._injected_excluded_ids(
+                    session_id,
+                    turn_id,
+                    memo_platform or platform,
+                    session_type,
+                ),
+                with_embedding=(
+                    self.config.dedup_similarity_threshold > 0
+                    and not lazy_embeddings
+                ),
                 with_participants=is_per_user,
             ),
             description="recall 检索",
@@ -1239,7 +1373,8 @@ class LocalMemoryKernel:
             )
             return []
 
-        # 重排序（失败退化纯向量序；rerank 分数即最终相关度）
+        # Rerank (on failure degrade to plain vector order; the rerank
+        # score is the final relevance)
         score_is_absolute = False
         if use_rerank:
             try:
@@ -1248,7 +1383,8 @@ class LocalMemoryKernel:
                 )
                 score_by_index = dict(ranked)
                 for idx, row in enumerate(rows):
-                    # 未返回的候选置 -1 排到队尾（保留候选不静默丢弃）
+                    # Candidates not returned get -1 and queue at the tail
+                    # (candidates are kept, never silently dropped)
                     row["score"] = score_by_index.get(idx, -1.0)
                 rows.sort(key=lambda r: float(r["score"]), reverse=True)
                 score_is_absolute = True
@@ -1258,10 +1394,13 @@ class LocalMemoryKernel:
         else:
             rows = self._sort_by_relevance(rows)
 
-        # 相关度阈值过滤（rerank 分数或 cosine 相似度，统一作用于 score）。
-        # 仅混合检索的降级序（rerank 关闭/失败且行携带 RRF 融合分）跳过：
-        # RRF 是 ~0.01-0.03 量级的相对排名分，套用绝对分阈值会全量误杀；
-        # 纯向量降级序（cosine）刻度不变，照常过滤
+        # Relevance threshold filter (rerank score or cosine similarity,
+        # uniformly applied to score). Skipped only for the hybrid
+        # retrieval's degraded order (rerank off/failed and rows carry RRF
+        # fused scores): RRF is a relative ranking score of ~0.01-0.03
+        # magnitude, and an absolute-score threshold would kill everything;
+        # the pure-vector degraded order (cosine) keeps the same scale and
+        # is filtered as usual
         threshold_dropped = 0
         threshold = self.config.recall_relevance_threshold
         score_is_rrf = (
@@ -1281,9 +1420,11 @@ class LocalMemoryKernel:
             threshold_dropped = len(rows) - len(kept_threshold)
             rows = kept_threshold
 
-        # 时间衰减（可选）：语义阈值过滤之后、截断之前叠加
-        # score × 2^(-age/H) 并重排——只改排序不过滤；occurred_at 缺失
-        # 视为未知年龄不降权（系数 1.0）；未来时间戳（时钟偏移）钳为 0
+        # Time decay (optional): applied after the semantic threshold
+        # filter and before truncation, score x 2^(-age/H) then reorder --
+        # reorders only, never filters; a missing occurred_at counts as
+        # unknown age and is not down-weighted (factor 1.0); future
+        # timestamps (clock skew) are clamped to 0
         if self.config.recall_time_decay_enabled and rows:
             half_life = self.config.recall_time_decay_half_life_days
             now = self._now()
@@ -1295,23 +1436,76 @@ class LocalMemoryKernel:
                 row["score"] = float(row["score"]) * (2.0 ** (-age_days / half_life))
             rows.sort(key=lambda r: float(r["score"]), reverse=True)
 
-        # 近重复去重（最终序贪心扫描）：与已保留条目 embedding cosine ≥ 阈值
-        # 的丢弃——相邻轮次摘要高度重叠，不去重时 top_k 会被同一事件的连续
-        # 快照占满。凑满 top_k 即停（后续行反正进不了截断结果，省点积
-        # 开销）；per_user 无提前停——配额截断在去重之后，会被配额丢弃的
-        # 行同样占用去重扫描位，提前停会把队尾的公共位行（bot_self 等）
-        # 错杀在去重阶段。向量缺失的行不参与比对也不会被丢弃（保底可见）。
-        # per_user 同样参与去重（完整管线）——跨用户近重复（同一场对话的
-        # 双视角摘要）保留其一即可。
+        # Near-duplicate dedup (greedy scan in the final order): drop rows
+        # whose embedding cosine against a kept entry is >= the threshold
+        # -- adjacent-round summaries overlap heavily, and without dedup
+        # top_k would be filled by consecutive snapshots of the same event.
+        # Stop once top_k is reached (later rows cannot make the truncation
+        # result anyway, saving dot-product work); per_user has no early
+        # stop -- quota truncation runs after dedup, and rows that quota
+        # would drop also occupy dedup scan slots, so an early stop would
+        # wrongly kill the shared-slot rows at the queue tail (bot_self
+        # etc.) during the dedup stage. Rows with a missing vector neither
+        # join the comparison nor get dropped (guaranteed visible). per_user
+        # joins dedup too (full pipeline) -- cross-user near-duplicates
+        # (dual-perspective summaries of one conversation) need only keep
+        # one.
         dedup_dropped = 0
         sim_threshold = self.config.dedup_similarity_threshold
+        # Lazy embedding loading (P2, paged): the retrieval SELECT carries no
+        # embedding; dedup fetches vectors by id only for the rows it actually
+        # consumes, chunk by chunk (chunk = top_k*4, min 16). The head chunk
+        # is loaded up front; dropped rows do not count toward top_k, so a
+        # long near-duplicate run can push the loop past the loaded boundary
+        # -- further chunks are then fetched on demand, so beyond-window
+        # near-duplicates still get deduped instead of silently kept. Rows
+        # whose vector is missing or failed to fetch follow the existing
+        # "missing vector" semantics (not compared, never dropped); fetch
+        # failures fail open via the shared guarded call (breaker accounting
+        # same as the retrieval leg) and do not block recall.
+        dedup_chunk = max(top_k * 4, 16)
+        loaded_upto = 0
+        # Stop paging on the first failed chunk fetch (dedup_fetch_dead):
+        # failed chunk fetches happen back-to-back with no retrieval success
+        # in between, so without this latch a pool spanning many chunks with
+        # a persistently failing fetch would accumulate breaker failures
+        # within one round and trip the shared breaker, silently killing the
+        # whole recall (review). With the latch, one round counts at most one
+        # fetch failure (the next round's retrieval success resets the
+        # counter), and the un-fetched rows keep missing-vector semantics.
+        dedup_fetch_dead = False
+        if lazy_embeddings and sim_threshold > 0 and rows:
+            # A failed FIRST chunk cannot trigger paging in any reachable
+            # state: the lazy path only runs on the non-per-user branch
+            # (keep_bound = top_k < dedup_chunk) and vector-less rows are
+            # always kept, so kept_rows reaches top_k before idx crosses
+            # the chunk boundary. The latch below therefore only ever
+            # engages for genuine mid-pool paging failures.
+            await self._load_dedup_vectors(
+                rows, 0, dedup_chunk, fetch_embeddings_by_id
+            )
+            loaded_upto = min(len(rows), dedup_chunk)
         keep_bound = len(rows) if is_per_user else top_k
         if sim_threshold > 0 and rows:
             kept_rows: list[dict] = []
             kept_unit_vecs: list[list[float]] = []
-            for row in rows:
+            for idx, row in enumerate(rows):
                 if len(kept_rows) >= keep_bound:
                     break
+                if (
+                    lazy_embeddings
+                    and not dedup_fetch_dead
+                    and idx >= loaded_upto
+                ):
+                    fetched = await self._load_dedup_vectors(
+                        rows,
+                        loaded_upto,
+                        idx + dedup_chunk,
+                        fetch_embeddings_by_id,
+                    )
+                    if not fetched:
+                        dedup_fetch_dead = True
+                    loaded_upto = min(idx + dedup_chunk, len(rows))
                 vec = parse_vector(row.get("embedding"))
                 is_dup = False
                 if vec:
@@ -1351,7 +1545,8 @@ class LocalMemoryKernel:
                 )
             rows = kept_rows
 
-        # 截断：per_user 模式按用户配额 + 公共位（重排/去重之后），否则全局 top_k
+        # Truncation: per_user mode applies per-user quota + shared slots
+        # (after rerank/dedup), otherwise global top_k
         if is_per_user:
             rows = self._truncate_per_user_quota(
                 rows, uids=uids, platform=platform, top_k=top_k
@@ -1359,10 +1554,12 @@ class LocalMemoryKernel:
         else:
             rows = rows[:top_k]
 
-        # 访问强化（011 生命周期，对齐 iris batch_update_access 语义）：
-        # 只对最终注入集（截断后）刷新——这一批是真正喂给模型的记忆，
-        # 被截掉的候选行不算"被想起"。fire-and-forget：写库挂后台任务，
-        # 失败仅告警，绝不拖慢/阻断召回返回。
+        # Access reinforcement (011 lifecycle, semantics aligned with iris
+        # batch_update_access): refresh only the final injected set (after
+        # truncation) -- this batch is what is actually fed to the model;
+        # candidate rows cut by truncation do not count as "recalled".
+        # fire-and-forget: the write runs as a background task, failure
+        # only warns, never slowing/blocking the recall return.
         self._fire_reinforcement(rows)
 
         self._log_search(
@@ -1414,7 +1611,8 @@ class LocalMemoryKernel:
                 await self._alias_store.refresh_if_due()
                 alias_hits, skipped = self._alias_store.match(text, window_pairs)
             except Exception:
-                # 持久层失败不拖累窗口路（fail-open）
+                # A persistent-layer failure must not drag down the window
+                # route (fail-open)
                 logger.warning(
                     "持久别名层匹配失败（本轮仅窗口词典生效）", exc_info=True
                 )
@@ -1500,6 +1698,8 @@ class LocalMemoryKernel:
         user_ids: Optional[list[str]] = None,
         per_user: bool = False,
         hints: Optional[RecallHints] = None,
+        turn_id: str = "",
+        session_type: str = "",
     ) -> str:
         started = time.perf_counter()
         try:
@@ -1516,6 +1716,8 @@ class LocalMemoryKernel:
                 user_ids=user_ids,
                 per_user=per_user,
                 hints=hints,
+                turn_id=turn_id,
+                session_type=session_type,
             )
         finally:
             elapsed_ms = (time.perf_counter() - started) * 1000
@@ -1524,7 +1726,8 @@ class LocalMemoryKernel:
                 elapsed_ms,
             )
             if elapsed_ms > SLOW_CALL_THRESHOLD_MS:
-                # 慢查询哨兵（与上游 nori 口径一致：>500ms 升级 WARNING）
+                # Slow-query sentinel (same convention as upstream nori:
+                # >500ms escalates to WARNING)
                 logger.warning(
                     "build_injection_text 慢调用 %.3f ms（session=%s）",
                     elapsed_ms,
@@ -1545,6 +1748,8 @@ class LocalMemoryKernel:
         user_ids: Optional[list[str]] = None,
         per_user: bool = False,
         hints: Optional[RecallHints] = None,
+        turn_id: str = "",
+        session_type: str = "",
     ) -> str:
         """Build the memory text to inject into the LLM.
 
@@ -1606,6 +1811,11 @@ class LocalMemoryKernel:
             scope/user_ids/per_user: Same semantics as search.
             hints: Recall hints (entity_user_keys consumed as the
                 ask-about-others recall key group).
+            turn_id: Turn identifier (host event id) scoping the injected-id
+                exclusion memo (see search).
+            session_type: Session type scoping the cross-session exclusion
+                memo (see search); pass the host session's session_type so
+                this recall matches the injection-registered entry.
         """
         # Asking-about-others recall keys: explicit hints win (adapter matched
         # the batch text); otherwise self-match once on the query (in-memory
@@ -1642,10 +1852,14 @@ class LocalMemoryKernel:
             per_user=per_user,
             entity_user_keys=entity_keys or None,
             entity_user_ids=entity_uids or None,
+            turn_id=turn_id,
+            session_type=session_type,
         )
 
-        # P3 边注入（场景 A/C）：关系陈述行小节，独立于 recall 主路——
-        # 主路无命中时小节仍可独立产出（fail-open，不影响既有注入）
+        # P3 edge injection (scenarios A/C): the relation statement-line
+        # section, independent of the recall main route -- the section can
+        # still be produced on its own when the main route has no hits
+        # (fail-open, existing injection unaffected)
         relation_section = ""
         if hints is not None and self.config.relation_inject_enabled:
             try:
@@ -1662,9 +1876,11 @@ class LocalMemoryKernel:
         if not items:
             return relation_section
 
-        # 话题黑名单二次防线：主排除在 search 候选层（SQL content NOT LIKE
-        # ALL，黑名单行不占 top_k 名额）；此处兜桩件/词形差异漏网（正常
-        # 恒 0 命中），防止单一话题污染 prompt
+        # Topic blacklist second line of defense: the primary exclusion
+        # sits at the search candidate layer (SQL content NOT LIKE ALL;
+        # blacklist rows do not consume top_k slots); this catches leaks
+        # from fragment/word-form differences (normally always 0 hits),
+        # preventing a single topic from polluting the prompt
         blacklist = self.config.topic_blacklist
         blacklist_dropped = 0
         if blacklist:
@@ -1687,14 +1903,21 @@ class LocalMemoryKernel:
             )
             return relation_section
 
-        # token 预算截断：按字符数保守估算（CJK 近似 1 字符=1 token）；
-        # 首条允许超预算（避免单条超长时返回全空），其后累加超限即止
+        # Token budget truncation: conservatively estimated by character
+        # count (CJK approximated as 1 char = 1 token); the first entry may
+        # exceed the budget (avoids returning all-empty when a single entry
+        # is over-long); afterwards, stop once the running sum overflows
         budget = self.config.recall_max_tokens
-        # 归因/时态导语全部前置（不用尾注）：planner 主动检索会向既有
-        # memory_context 末尾追加 bullet，规则若置尾会被追加行截断错位；
-        # 前置保证追加后规则恒在列表上方、结构不破。
-        # 时间指代按标注开关动态选措辞：关闭时条目行无尾部时间标注，
-        # 导语若仍称"条目末尾标注的时间"会指挥模型找不存在的标注。
+        # The attribution/tense preamble always goes up front (no trailing
+        # note): the planner's active retrieval appends a bullet to the end
+        # of the existing memory_context, and a rule placed at the tail
+        # would be clipped out of alignment by the appended line; being up
+        # front keeps the rule above the list after appending, structure
+        # intact.
+        # Time references pick their wording dynamically by the labeling
+        # switch: when off, entry lines carry no trailing time label, and a
+        # preamble still saying "the time labeled at the end of the entry"
+        # would direct the model to look for labels that do not exist.
         time_phrase = (
             "各条目中发言者的言行都发生在条目末尾标注的时间，"
             if self.config.recall_time_label_enabled
@@ -1712,8 +1935,9 @@ class LocalMemoryKernel:
         injected: list[dict] = []
         previews: list[str] = []
         truncated = False
-        # 相对时间标注（本地时区）：让 LLM 可区分"昨天"与"三个月前"，
-        # 避免把久远记忆当作近况使用
+        # Relative time labels (local timezone): let the LLM tell "yesterday"
+        # from "three months ago", so distant memories are not used as
+        # recent happenings
         label_enabled = self.config.recall_time_label_enabled
         for item in items:
             content = item.content.strip()
@@ -1734,7 +1958,7 @@ class LocalMemoryKernel:
                 break
             lines.append(line)
             injected.append({"id": item.id, "label": label})
-            # debug 注入明细：id + 每条截断 100 字
+            # debug injection detail: id + each entry truncated to 100 chars
             previews.append(f"{item.id}:{content[:100]}")
             used += cost
             appended += 1
@@ -1782,9 +2006,11 @@ class LocalMemoryKernel:
             return ""
         # Composite node keys ("platform:uid") — kept whole for matching.
         node_keys = [k for k in hints.entity_user_keys if k]
-        # 场景 C 双形态匹配：bot 端点 uid 在边表有会话标识/平台 uid 两种
-        # 形态（bot_uid_set 语义），复合键 = 形态 × 当前会话平台；
-        # 门槛 = AT/引用 bot 的轮次才取 bot 端点边
+        # Scenario C dual-form matching: a bot endpoint uid exists in the
+        # edge table in two forms (session identifier / platform uid,
+        # bot_uid_set semantics); composite key = form x current session
+        # platform; gate = only rounds that AT/reference the bot fetch
+        # bot-endpoint edges
         bot_uids = self._bot_uid_forms_all(
             hints.bot_user_id or (bot_id or self.bot_id)
         )
@@ -1816,11 +2042,15 @@ class LocalMemoryKernel:
         )
         if not selected:
             return ""
-        # 端点名规范解析：边表冗余名是"最后一次证据时"的名字快照，会过期
-        # （存量审计：57/65 active 边端点名 ≠ 别名表最新规范名）。
-        # 别名表最新非占位名优先（按选中边端点过滤，(platform, uid) 索引
-        # 命中而非全表扫），边名兜底；bot 端点不入别名表，由
-        # relation_statement_line 内部回退 bot 昵称。
+        # Canonical endpoint-name resolution: the edge table's redundant
+        # name is a snapshot of the name "at the time of the last evidence"
+        # and goes stale (stock audit: 57/65 active edge endpoint names !=
+        # the alias table's latest canonical name). The alias table's
+        # latest non-placeholder name wins (filtered by the selected edges'
+        # endpoints, hitting the (platform, uid) index instead of a full
+        # scan), with the edge name as fallback; bot endpoints are not in
+        # the alias table, and relation_statement_line falls back to the
+        # bot nickname internally.
         owners: set[tuple[str, str]] = set()
         for edge in selected:
             eplat = str(edge.get("platform") or "")
@@ -1924,7 +2154,7 @@ class LocalMemoryKernel:
         return f"截至{local.month}月{local.day}日"
 
     # ------------------------------------------------------------------
-    #  内部工具
+    #  Internal helpers
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -1961,10 +2191,14 @@ class LocalMemoryKernel:
             logger.warning("宿主历史窗口块数读取失败（跳过近时排除）", exc_info=True)
             return 0
         if value <= 0 and not self._window_zero_warned:
-            # 宿主截断 memory[-0:] 等于全列表——max_memory_length=0 实为
-            # 无限窗口（全部历史可见），而插件按 0=锚定不可得关闭了近时
-            # 排除与滚动补回，当前会话近期摘要可能与窗口内容成对注入。
-            # 根治在宿主（对 0 取 max(...,1) 或启动期校验拒绝）
+            # The host truncating memory[-0:] equals the whole list --
+            # max_memory_length=0 is effectively an infinite window (all
+            # history visible), while the plugin treats 0 = anchor
+            # unavailable and disables recent-range exclusion and rolling
+            # rollout fill-back, so this session's recent summaries could be
+            # injected in pairs with window content. The real fix lives in
+            # the host (clamp 0 via max(..., 1) or reject at startup
+            # validation)
             self._window_zero_warned = True
             logger.warning(
                 "宿主 bot.max_memory_length=%s：窗口锚定为 0，近时排除/滚动"
@@ -2029,12 +2263,20 @@ class LocalMemoryKernel:
                 uids.append(uid)
         return keys, uids
 
-    # 滚动补回去重 memo 的 TTL：覆盖单轮 pipeline 时长（MemoryStage 装配
-    # → planner 主动检索 → replyer 注入），并留余量给超长 agent 委派轮
-    # （委派期间不产生新轮刷新 memo，过短会双注入）
+    # TTL of the rolling rollout fill-back dedup memo: covers one pipeline
+    # round (MemoryStage assembly -> planner active retrieval -> replyer
+    # injection), with headroom for extra-long agent delegation rounds
+    # (delegation produces no new round to refresh the memo; too short a
+    # TTL would double-inject)
     _ROLLOUT_MEMO_TTL_SECONDS = 1800.0
-    # memo 容量上限（超出时清理过期项；防长期运行慢累积）
+    # memo capacity cap (expired entries are pruned beyond it; guards slow
+    # accumulation over long runs)
     _ROLLOUT_MEMO_MAX_SESSIONS = 64
+    # Cross-session memo in-flight protection window: capacity pruning never
+    # evicts a round younger than this (its recall may still be pending);
+    # only rounds older than the window are capacity-eviction candidates.
+    # TTL (above) remains the hard lifetime bound.
+    _CROSS_SESSION_MEMO_INFLIGHT_SECONDS = 300.0
 
     def _rollout_excluded_ids(self, session_id: str) -> list[str] | None:
         """Get this session's already-injected rolling-fill-back block
@@ -2057,6 +2299,203 @@ class LocalMemoryKernel:
             self._rollout_memo.pop(session_id, None)
             return None
         return ids or None
+
+    @staticmethod
+    def _cross_session_memo_key(
+        session_id: str,
+        turn_id: str = "",
+        platform: str = "",
+        session_type: str = "",
+    ) -> tuple:
+        """Memo key: (platform, session_type, session_id, turn_id).
+
+        A non-empty turn_id (the host event id) isolates one pipeline round;
+        concurrent rounds of the same session therefore never clear or
+        replace each other's exclusions. platform + session_type separate
+        contexts that share a bare session_id: the host does not guarantee
+        session_id uniqueness across adapters, and a DM with a user and a
+        group chat can carry the same id, so without them one context's
+        entry clear / registration would wipe another's exclusions and leak
+        rows into recall. Empty fields keep the legacy shared key for
+        callers/tests that pass none.
+        """
+        return (platform or "", session_type or "", session_id, turn_id or "")
+
+    def _prune_cross_session_memo(self) -> None:
+        """Drop expired entries, then cap only rounds that are no longer in
+        flight.
+
+        Per-turn keys multiply across turns, so the TTL alone is not a hard
+        bound under sustained traffic. A plain newest-N cap is not safe
+        either: a burst of N later rounds registering their ids before an
+        older round runs its recall would evict that older round's
+        exclusions, and its recall could re-return summaries already
+        injected into the prompt. Capacity pruning therefore only evicts
+        entries older than _CROSS_SESSION_MEMO_INFLIGHT_SECONDS (rounds
+        younger than that may still be executing); the TTL sweep still
+        removes everything eventually. Under an extreme burst the memo may
+        transiently exceed the cap by the number of rounds started within
+        the in-flight window -- bounded by traffic, and later pruned once
+        those rounds age out -- rather than dropping live exclusions.
+        """
+        now_m = time.monotonic()
+        live = {
+            key: value
+            for key, value in self._cross_session_memo.items()
+            if now_m - value[1] <= self._ROLLOUT_MEMO_TTL_SECONDS
+        }
+        if len(live) > self._ROLLOUT_MEMO_MAX_SESSIONS:
+            protected = {
+                key: value
+                for key, value in live.items()
+                if now_m - value[1] <= self._CROSS_SESSION_MEMO_INFLIGHT_SECONDS
+            }
+            candidates = sorted(
+                (
+                    (key, value)
+                    for key, value in live.items()
+                    if now_m - value[1] > self._CROSS_SESSION_MEMO_INFLIGHT_SECONDS
+                ),
+                key=lambda kv: kv[1][1],
+                reverse=True,
+            )
+            room = max(self._ROLLOUT_MEMO_MAX_SESSIONS - len(protected), 0)
+            kept = dict(candidates[:room])
+            kept.update(protected)
+            live = kept
+        self._cross_session_memo = live
+
+    def refresh_cross_session_memo(
+        self,
+        session_id: str,
+        document_ids: list[str],
+        turn_id: str = "",
+        platform: str = "",
+        session_type: str = "",
+    ) -> None:
+        """Replace this round's cross-session injected ids; empty clears.
+
+        Synchronous (no await). The injection hook calls it at entry with an
+        empty list (clear -- so no early return can leave stale exclusions
+        for the same round) and again after a *successful* injection
+        (register only the ids actually rendered; budget-dropped rows stay
+        retrievable). With the feature disabled the register call never
+        fires -- the clear at entry is the only per-round call.
+
+        turn_id scopes the entry to one pipeline round: concurrent rounds of
+        the same session hold independent memos, so round B's entry clear /
+        registration can no longer wipe the exclusions round A still needs
+        for its planner recall / tool search. platform + session_type
+        separate contexts sharing a bare session_id (see
+        _cross_session_memo_key); callers must pass the same context on
+        lookup. Mirrors the rollout memo TTL/capacity semantics.
+        """
+        if not session_id:
+            return
+        key = self._cross_session_memo_key(
+            session_id, turn_id, platform, session_type
+        )
+        if not document_ids:
+            self._cross_session_memo.pop(key, None)
+            return
+        unique = list(dict.fromkeys(str(doc_id) for doc_id in document_ids if doc_id))
+        if not unique:
+            self._cross_session_memo.pop(key, None)
+            return
+        self._cross_session_memo[key] = (unique, time.monotonic())
+        if len(self._cross_session_memo) > self._ROLLOUT_MEMO_MAX_SESSIONS:
+            self._prune_cross_session_memo()
+
+    def _cross_session_excluded_ids(
+        self,
+        session_id: str,
+        turn_id: str = "",
+        platform: str = "",
+        session_type: str = "",
+    ) -> list[str] | None:
+        """Cross-session memo ids within TTL (None when absent/expired)."""
+        if not session_id:
+            return None
+        key = self._cross_session_memo_key(
+            session_id, turn_id, platform, session_type
+        )
+        entry = self._cross_session_memo.get(key)
+        if not entry:
+            return None
+        ids, at = entry
+        if time.monotonic() - at > self._ROLLOUT_MEMO_TTL_SECONDS:
+            self._cross_session_memo.pop(key, None)
+            return None
+        return ids or None
+
+    def _injected_excluded_ids(
+        self,
+        session_id: str,
+        turn_id: str = "",
+        platform: str = "",
+        session_type: str = "",
+    ) -> list[str] | None:
+        """Union of every already-injected memo (rollout fill-back +
+        cross-session summaries) for this session, deduped.
+
+        The shared retrieval path (recall + active memory_search) consumes
+        this: rows already presented to the model this round are excluded so
+        the same summary cannot be both injected and recalled (double
+        exposure), while budget-dropped rows stay searchable. turn_id scopes
+        the cross-session half to the current pipeline round and platform +
+        session_type to the current context (see
+        refresh_cross_session_memo).
+        """
+        ids = [
+            *(self._rollout_excluded_ids(session_id) or []),
+            *(
+                self._cross_session_excluded_ids(
+                    session_id, turn_id, platform, session_type
+                )
+                or []
+            ),
+        ]
+        return list(dict.fromkeys(ids)) or None
+
+    async def fetch_recent_cross_session_summaries(
+        self,
+        *,
+        current_session_id: str,
+        user_keys: list[str],
+        limit: int,
+        max_age_days: int = 0,
+        current_platform: str = "",
+        current_session_type: str = "",
+    ) -> list[dict]:
+        """Fetch recent cross-session summaries through the shared guarded
+        call (fail-open: a DB failure logs and returns []).
+
+        Args:
+            current_session_id: bare session id to exclude.
+            user_keys: composite identity keys ("platform:uid") of the user.
+            limit: max rows.
+            max_age_days: drop rows older than this (0 = unlimited).
+            current_platform: platform tag of the current session (scopes the
+                current-session exclusion).
+            current_session_type: "dm" / "gm" of the current session (scopes
+                the current-session exclusion: the bare id alone collides
+                between a DM with a user and a group chat).
+
+        Returns:
+            Dict rows (document_id / session_id / content / occurred_at).
+        """
+        rows = await self._guarded_call(
+            lambda: self.db.fetch_recent_cross_session_summaries(
+                current_session_id=current_session_id,
+                user_keys=user_keys,
+                limit=limit,
+                max_age_days=max_age_days,
+                current_platform=current_platform,
+                current_session_type=current_session_type,
+            ),
+            description="跨会话摘要查询",
+        )
+        return rows or []
 
     async def build_recent_rollout_text(
         self, session_id: str, platform: str = ""
@@ -2116,9 +2555,12 @@ class LocalMemoryKernel:
         if not rows:
             return ""
 
-        # 预算挑选新→旧（rows 已按 occurred_at DESC）：最新批次是紧邻
-        # history 窗口的桥接批，超预算时丢弃更旧批次；单批超预算时截断
-        # 该批（避免空块）。呈现顺序旧→新（衔接 history 时间线）
+        # Budget selection newest -> oldest (rows already sorted by
+        # occurred_at DESC): the newest batch is the bridge batch adjacent
+        # to the history window; over budget, drop older batches; when a
+        # single batch exceeds the budget, truncate it (avoids an empty
+        # block). Presentation order oldest -> newest (splices into the
+        # history timeline)
         budget = self.config.recent_rollout_max_chars
         label_enabled = self.config.recall_time_label_enabled
         kept_rows: list[dict] = []
@@ -2129,8 +2571,8 @@ class LocalMemoryKernel:
                 continue
             if used + len(content) > budget:
                 if kept_rows:
-                    break  # 已有批次：丢弃更旧批次
-                row = {**row, "content": content[:budget] + "…"}  # 单批超预算截断
+                    break  # already have batches: drop older ones
+                row = {**row, "content": content[:budget] + "…"}  # batch cut
                 content = row["content"]
             kept_rows.append(row)
             used += len(content)
@@ -2325,8 +2767,9 @@ class LocalMemoryKernel:
         try:
             task = asyncio.get_running_loop().create_task(_reinforce())
         except RuntimeError:
-            # 无运行中的事件循环（同步上下文直接调 search 的场景）：
-            # 放弃异步派发，强化是尽力而为语义
+            # No running event loop (the case of calling search directly
+            # from a sync context): give up async dispatch; reinforcement
+            # is best-effort semantics
             return
         self._reinforce_tasks.add(task)
 
@@ -2430,8 +2873,10 @@ class LocalMemoryKernel:
                 or f"{platform}:{u}" in participants
             ]
             if matched:
-                # 可归属行：归属者中取先有配额者；全部配额已满则丢弃
-                # （不占公共位——公共位是给无归属行的，不是溢出区）
+                # Attributable row: take the first owner that still has
+                # quota; when every quota is full, drop it (it does not
+                # take a shared slot -- shared slots are for unattributable
+                # rows, not an overflow area)
                 owner = next(
                     (u for u in matched if quota.get(u, 0) > 0), None
                 )
@@ -2467,6 +2912,55 @@ class LocalMemoryKernel:
             row["score"] = row.get("rrf", row["relevance"])
         rows.sort(key=lambda r: float(r["score"]), reverse=True)
         return rows
+
+    async def _load_dedup_vectors(
+        self,
+        rows: list[dict],
+        start: int,
+        end: int,
+        fetch_embeddings_by_id: Callable[..., Awaitable[dict[int, object]]] | None,
+    ) -> bool:
+        """Attach embeddings to rows[start:end] in place, fetched by primary
+        key in one batch (lazy dedup loading, perf P2).
+
+        Fail-open: the fetch goes through the shared guarded call; a failure
+        (circuit-open included, which returns None) or an id missing from the
+        returned mapping leaves the row vector-less -- "missing vector"
+        semantics (not compared in dedup, never dropped), recall unblocked.
+        Rows with a None id cannot be fetched and stay vector-less.
+
+        Args:
+            rows: recall candidate rows (mutated in place).
+            start/end: half-open row index range to load (end is clamped to
+                len(rows); a degenerate range is a no-op).
+            fetch_embeddings_by_id: the backend's fetch_embeddings_by_ids
+                coroutine (the caller only invokes this helper on the lazy
+                path, where it is not None).
+
+        Returns:
+            True when the guarded fetch succeeded (rows attached, the mapping
+            itself may be empty); False on failure or circuit-open skip -- the
+            caller stops paging for the rest of the round, so one recall
+            round counts at most one breaker failure and the paging loop
+            cannot trip the shared breaker on its own.
+        """
+        end = min(end, len(rows))
+        if end <= start:
+            return True
+        ids = [r["id"] for r in rows[start:end] if r.get("id") is not None]
+        if not ids:
+            return True
+        embed_by_id = await self._guarded_call(
+            lambda: fetch_embeddings_by_id(ids=ids),
+            description="去重向量取回",
+        )
+        if embed_by_id is None:
+            return False
+        for row in rows[start:end]:
+            embedding = embed_by_id.get(row.get("id")) if embed_by_id else None
+            if embedding is not None:
+                row["embedding"] = embedding
+        return True
 
     async def _guarded_call(
         self, operation: Callable[[], Awaitable[_T]], description: str
@@ -2578,7 +3072,8 @@ class LocalMemoryKernel:
         """
         content_hash = hashlib.md5(content.encode()).hexdigest()[:12]
         if kind == "chat_summary":
-            # session_id 已含 bot_id（如 group-{gid}-{bot_id}），无需重复
+            # session_id already embeds bot_id (e.g. group-{gid}-{bot_id});
+            # no need to repeat it
             return summary_document_id(session_id, content)
         if kind == "bot_self":
             return f"bot-self-{content_hash}"

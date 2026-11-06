@@ -25,7 +25,7 @@ semantics; this layer lets exceptions propagate unchanged.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import asyncpg
@@ -139,6 +139,13 @@ class MemoryDatabase(MemoryBackend):
         dsn: connection string (contains the password; never log it).
         pool: asyncpg connection pool (available after connect).
     """
+
+    # Latched once a query proves the tsv column (migration 015) is missing
+    # (e.g. the schema was rolled back manually): the BM25 leg then goes
+    # straight to the expression form instead of paying one failed query per
+    # recall. Class-level default so instances built via __new__ (tests)
+    # inherit it; recovery happens on restart (migrations re-run at startup).
+    _bm25_tsv_missing = False
 
     def __init__(self, config: LocalMemoryConfig) -> None:
         """Initialize (no connection is made yet).
@@ -321,7 +328,19 @@ class MemoryDatabase(MemoryBackend):
                 degraded encode, excluded from recall until the merge
                 agent's catch-up pass re-encodes it back to true; bot_self
                 raw text is by-design and always passes true).
+
+        Future occurred_at is clamped to now before persistence (same
+        untrusted-time guard as insert_persona_fact_raw): the cross-session
+        and recent sections order by occurred_at first, so a future value
+        would pin itself to the top until wall time catches up. document_id
+        keeps the original input time (it is the idempotency key; rebasing
+        it on the clamped now would change the key across days and break
+        dedup).
         """
+        occurred_at = _ensure_tz(occurred_at)
+        now = datetime.now().astimezone()
+        if occurred_at > now:
+            occurred_at = now
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
@@ -340,7 +359,7 @@ class MemoryDatabase(MemoryBackend):
                 user_id,
                 participants,
                 content,
-                _ensure_tz(occurred_at),
+                occurred_at,
                 vector_literal(embedding),
                 summarized,
                 build_search_text(content),
@@ -382,7 +401,19 @@ class MemoryDatabase(MemoryBackend):
             evidence_key: scoring dedup key "{session_id}|{occurred_at:date}".
             occurred_at: occurrence time (this round's trigger message time).
             embedding: statement vector; None writes NULL (backfilled later).
+
+        Future occurred_at is clamped to now before persistence (same
+        untrusted-time guard as the active tool write path): the recent
+        section orders by occurred_at first, so a future value would pin
+        itself to the top until wall time catches up. document_id /
+        evidence_key keep the original input time (they are idempotency
+        keys; rebasing them on the clamped now would change the key across
+        days and break dedup).
         """
+        occurred_at = _ensure_tz(occurred_at)
+        now = datetime.now().astimezone()
+        if occurred_at > now:
+            occurred_at = now
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
@@ -404,7 +435,7 @@ class MemoryDatabase(MemoryBackend):
                 session_id,
                 group_id,
                 evidence_key,
-                _ensure_tz(occurred_at),
+                occurred_at,
                 vector_literal(embedding),
             )
 
@@ -500,12 +531,17 @@ class MemoryDatabase(MemoryBackend):
 
         Hybrid search (hybrid=True with non-empty query_text, plan A):
         - Vector leg: cosine order LIMIT limit (the original path);
-        - BM25 leg: same where + to_tsvector('simple', search_text) @@
-          to_tsquery('simple', OR-joined token query) (AND-joining a whole
-          sentence's bigrams would only match near-verbatim repeats), in
-          ts_rank order LIMIT limit; legacy rows with NULL search_text
-          simply skip the BM25 leg (no impact until the backfill pass fills
-          them);
+        - BM25 leg: same where + tsv @@ to_tsquery('simple', OR-joined token
+          query) (AND-joining a whole sentence's bigrams would only match
+          near-verbatim repeats), in ts_rank(tsv, ...) order LIMIT limit.
+          tsv is the stored generated column introduced by migration 015
+          (GENERATED ALWAYS AS to_tsvector('simple', search_text) STORED):
+          filtering and ranking both read the column, eliminating per-row
+          re-tokenization (13.5k rows measured: ~160ms -> ~30ms per leg).
+          Legacy rows with NULL search_text have a NULL tsv and simply skip
+          the BM25 leg (no impact until the backfill pass fills them). On a
+          schema without migration 015 (column missing) the leg degrades to
+          the to_tsvector expression form -- latched until restart;
         - The two legs fuse via RRF (score = Σ 1/(rrf_k + rank), merged and
           deduplicated by id); the fused score lands in the "rrf" field and
           rows return in its descending order. With rerank enabled the fused
@@ -773,16 +809,47 @@ class MemoryDatabase(MemoryBackend):
             if not tokens:
                 return vec_rows
             q_ph = p.add(" | ".join(tokens))
-            bm25_sql = (
-                f"SELECT {select_cols} "
-                f"FROM {CHAT_SUMMARY_TABLE} "
-                f"WHERE embedding IS NOT NULL AND ({where}) "
-                f"AND to_tsvector('simple', search_text) @@ "
-                f"to_tsquery('simple', {q_ph}) "
-                f"ORDER BY ts_rank(to_tsvector('simple', search_text), "
-                f"to_tsquery('simple', {q_ph})) DESC LIMIT {limit_ph}"
+
+            def _bm25_sql(expr: str) -> str:
+                return (
+                    f"SELECT {select_cols} "
+                    f"FROM {CHAT_SUMMARY_TABLE} "
+                    f"WHERE embedding IS NOT NULL AND ({where}) "
+                    f"AND {expr} @@ to_tsquery('simple', {q_ph}) "
+                    f"ORDER BY ts_rank({expr}, "
+                    f"to_tsquery('simple', {q_ph})) DESC LIMIT {limit_ph}"
+                )
+
+            # The BM25 leg reads the materialized tsv column (migration 015,
+            # applied at startup in the same release); if the column is absent
+            # (schema rolled back manually / DDL failed then memory re-enabled
+            # without a restart), degrade to the expression form instead of
+            # failing the whole leg -- correct results, slower, latched so a
+            # broken schema does not cost one failed query per recall
+            expr = (
+                "to_tsvector('simple', search_text)"
+                if self._bm25_tsv_missing
+                else "tsv"
             )
-            bm25_rows = [dict(r) for r in await conn.fetch(bm25_sql, *p.values)]
+            try:
+                bm25_rows = [
+                    dict(r) for r in await conn.fetch(_bm25_sql(expr), *p.values)
+                ]
+            except asyncpg.UndefinedColumnError:
+                self._bm25_tsv_missing = True
+                logger.warning(
+                    "tsv 列不可用（migration 015 未生效），BM25 腿回退 "
+                    "to_tsvector 表达式形态（结果正确、性能回退）；"
+                    "重启重跑迁移后恢复",
+                    exc_info=True,
+                )
+                bm25_rows = [
+                    dict(r)
+                    for r in await conn.fetch(
+                        _bm25_sql("to_tsvector('simple', search_text)"),
+                        *p.values,
+                    )
+                ]
         return _rrf_fuse(vec_rows, bm25_rows, rrf_k)
 
     async def fetch_recent_session_participants(
@@ -816,6 +883,130 @@ class MemoryDatabase(MemoryBackend):
                 *([platform] if platform else []),
             )
         return [dict(r) for r in rows]
+
+    async def fetch_recent_cross_session_summaries(
+        self,
+        *,
+        current_session_id: str,
+        user_keys: list[str],
+        limit: int,
+        max_age_days: int = 0,
+        current_platform: str = "",
+        current_session_type: str = "",
+    ) -> list[dict]:
+        """Recent encoded summaries of the user's other sessions (cross-session
+        injection source), newest first.
+
+        Row contract mirrors the recall summary shape (summarized
+        chat_summary, not archived); ``participants && $2`` overlaps any of
+        the user's identity keys ("platform:uid" composite keys, linked
+        accounts merged by the caller). Rows of the current session are
+        excluded. None/blank keys are dropped before the array bind
+        (str(None) == 'None' is truthy and would pollute the match).
+
+        Current-session exclusion is scoped, not bare: the host stores the
+        bare user/group id in session_id (Session.sid = adapter:type:id is
+        the unique key), so a DM with a user and a group chat on one adapter
+        can share the same bare id -- excluding on session_id alone would
+        drop the user's own group-chat summaries from a DM injection.
+        chat_summary has no session_type column, but the write side encodes
+        it: group_id = session_id for a group chat, '' for a DM.
+
+        Future-dated rows (clock skew / a bad upstream timestamp) are always
+        dropped: occurred_at DESC would otherwise put them first, let them
+        eat top_k slots and inject "a summary from the future". The upper
+        bound is the application clock (a bound parameter), not the DB's
+        now(), so the future guard and the age window share one clock domain
+        with the SQLite backend.
+
+        Args:
+            current_session_id: bare session id to exclude.
+            user_keys: composite identity keys of the current user.
+            limit: max rows (callers bound by cross_session_summary_top_k).
+            max_age_days: drop rows older than this (0 = unlimited; the
+                cutoff is derived from the same application now).
+            current_platform: platform tag of the current session (empty =
+                no platform scoping, legacy callers).
+            current_session_type: "dm" / "gm" of the current session (any
+                other value falls back to the bare-id exclusion).
+
+        Returns:
+            Dict rows (document_id / session_id / content / occurred_at),
+            occurred_at DESC, id DESC.
+        """
+        keys = [
+            stripped
+            for key in user_keys
+            if key is not None and (stripped := str(key).strip())
+        ]
+        if not keys:
+            return []
+        now = _ensure_tz(datetime.now().astimezone())
+        params: list[object] = [current_session_id, keys]
+        excluded_sql = "session_id <> $1"
+        if current_session_type in ("dm", "gm"):
+            plat_sql = ""
+            if current_platform:
+                params.append(current_platform)
+                plat_sql = f" AND platform = ${len(params)}"
+            type_sql = (
+                "group_id <> ''"
+                if current_session_type == "gm"
+                else "group_id = ''"
+            )
+            excluded_sql = f"NOT (session_id = $1{plat_sql} AND {type_sql})"
+        age_sql = ""
+        if int(max_age_days) > 0:
+            params.append(now - timedelta(days=int(max_age_days)))
+            age_sql = f" AND occurred_at >= ${len(params)}"
+        params.append(now)
+        now_ph = f"${len(params)}"
+        params.append(int(limit))
+        limit_ph = f"${len(params)}"
+        sql = (
+            f"SELECT document_id, session_id, content, occurred_at "
+            f"FROM {CHAT_SUMMARY_TABLE} "  # noqa: S608 -- whitelist constant table names
+            "WHERE summarized AND kind = 'chat_summary' AND NOT archived "
+            f"AND {excluded_sql} AND participants && $2"
+            f"{age_sql} AND occurred_at <= {now_ph}"
+            f" ORDER BY occurred_at DESC, id DESC LIMIT {limit_ph}"
+        )
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+        return [dict(r) for r in rows]
+
+    async def fetch_embeddings_by_ids(self, *, ids: list[int]) -> dict[int, object]:
+        """Fetch embeddings by primary key in one batch (lazy recall dedup,
+        perf P2).
+
+        The retrieval SELECT no longer ships the vector text with every row
+        (with asyncpg's pgvector codec unregistered that is ~18KB of
+        '[...]' text per row; two legs x rerank_candidates is ~1.8MB at the
+        default 50 candidates, ~0.7MB at 20 -- transfer plus JSON parsing).
+        Near-duplicate dedup only consumes the
+        vectors of the truncated head rows, so they are fetched precisely
+        here by id
+        (~1ms localhost RTT). Rows whose embedding is NULL do not appear in
+        the returned dict; callers treat them as missing vectors (excluded
+        from comparisons, never dropped).
+
+        Args:
+            ids: primary keys of the rows whose vectors are needed.
+
+        Returns:
+            {id: embedding} mapping (embedding is the underlying transport
+            form, str or list, normalized by parse_vector).
+        """
+        clean = sorted({int(i) for i in ids if i is not None})
+        if not clean:
+            return {}
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT id, embedding FROM {CHAT_SUMMARY_TABLE} "  # noqa: S608 -- whitelist constant table names
+                "WHERE id = ANY($1) AND embedding IS NOT NULL",
+                clean,
+            )
+        return {r["id"]: r["embedding"] for r in rows}
 
     async def fetch_recent_summary_scores(
         self, *, query_vec: list[float], session_id: str, limit: int, platform: str = ""
@@ -1197,6 +1388,7 @@ class MemoryDatabase(MemoryBackend):
         score_cap: float,
         promote_threshold: float,
         recent_promote_threshold: float,
+        naming_promote_threshold: float = 3.0,
         contradict_cluster_ids: list[int] | None = None,
     ) -> dict:
         """Dispose of one raw fact in a single transaction
@@ -1349,7 +1541,14 @@ class MemoryDatabase(MemoryBackend):
                              source_fact_ids, last_evidence_at, occurred_at,
                              related_user_ids, embedding)
                         SELECT f.platform, f.user_id, f.category, f.statement,
-                               $2, 'active', 1, ARRAY[f.evidence_key], ARRAY[f.id],
+                               $2,
+                               CASE WHEN $2 >= CASE WHEN f.category = 'recent'
+                                                     THEN $4::real
+                                                     WHEN f.category = 'naming'
+                                                     THEN $5::real
+                                                     ELSE $3::real END
+                                    THEN 'profiled' ELSE 'active' END,
+                               1, ARRAY[f.evidence_key], ARRAY[f.id],
                                f.occurred_at, f.occurred_at, f.related_user_ids,
                                f.embedding
                         FROM memory_persona_fact_raw f
@@ -1358,9 +1557,36 @@ class MemoryDatabase(MemoryBackend):
                         """,
                         fact_id,
                         start_score,
+                        promote_threshold,
+                        recent_promote_threshold,
+                        naming_promote_threshold,
                     )
                     if row is None:
                         raise RuntimeError(f"建簇来源事实不存在: fact_id={fact_id}")
+                    if row["status"] == "profiled":
+                        # Immediate promote on cluster creation (nori
+                        # 96214f4 parity): when the start score already
+                        # meets the dimension threshold (one explicit naming
+                        # statement scores 3.0) the cluster is created as
+                        # profiled and its profile row is written in the same
+                        # transaction, without relying on the promotion
+                        # pass. This avoids the timing window where the same
+                        # cycle's decay pass first pushes the score below the
+                        # threshold (run_cycle order: fact disposition ->
+                        # decay -> promote). Below-threshold creation is
+                        # unchanged (active)
+                        await conn.execute(
+                            PROFILE_UPSERT_SQL.format(
+                                source=(
+                                    "SELECT platform, user_id, category, id, "
+                                    "canonical_statement, score, "
+                                    "related_user_ids FROM memory_fact_cluster "
+                                    "WHERE id = $1"
+                                ),
+                                updated_at="now()",
+                            ),
+                            row["id"],
+                        )
                     return {"action": "create", "cluster_id": row["id"],
                             "score": row["score"], "status": row["status"]}
 
@@ -1377,13 +1603,16 @@ class MemoryDatabase(MemoryBackend):
                            LEAST($3, GREATEST($2, c.score))::real,
                            CASE WHEN LEAST($3, GREATEST($2, c.score))
                                       >= CASE WHEN f.category = 'recent'
-                                              THEN $5::real ELSE $4::real END
+                                              THEN $5::real
+                                              WHEN f.category = 'naming'
+                                              THEN $6::real
+                                              ELSE $4::real END
                                 THEN 'profiled' ELSE 'active' END,
                            1, ARRAY[f.evidence_key], ARRAY[f.id],
                            f.occurred_at, f.occurred_at, f.related_user_ids,
                            f.embedding
                     FROM memory_persona_fact_raw f
-                    JOIN memory_fact_cluster c ON c.id = $6
+                    JOIN memory_fact_cluster c ON c.id = $7
                     WHERE f.id = $1
                     RETURNING id, score, status
                     """,
@@ -1392,6 +1621,7 @@ class MemoryDatabase(MemoryBackend):
                     score_cap,
                     promote_threshold,
                     recent_promote_threshold,
+                    naming_promote_threshold,
                     cluster_id,
                 )
                 if row is None:
@@ -1650,17 +1880,22 @@ class MemoryDatabase(MemoryBackend):
         }
 
     async def promote_pass(
-        self, *, promote_threshold: float, recent_promote_threshold: float
+        self,
+        *,
+        promote_threshold: float,
+        recent_promote_threshold: float,
+        naming_promote_threshold: float = 3.0,
     ) -> int:
         """Promotion pass: active clusters reaching the threshold become
         profiled with a profile-table upsert (single-transaction CTE).
 
-        The recent dimension uses its own lower threshold
-        (recent_promote_threshold).
+        The recent / naming dimensions use their own lower thresholds
+        (recent_promote_threshold / naming_promote_threshold).
 
         Args:
             promote_threshold: profile threshold.
             recent_promote_threshold: recent-dimension profile threshold.
+            naming_promote_threshold: naming-dimension profile threshold.
 
         Returns:
             Clusters promoted in this run.
@@ -1685,7 +1920,10 @@ class MemoryDatabase(MemoryBackend):
                         SET status = 'profiled', updated_at = now()
                         WHERE c.status = 'active'
                           AND c.score >= CASE WHEN c.category = 'recent'
-                                              THEN $2::real ELSE $1::real END
+                                              THEN $2::real
+                                              WHEN c.category = 'naming'
+                                              THEN $3::real
+                                              ELSE $1::real END
                         RETURNING c.id, c.platform, c.user_id, c.category,
                                   c.canonical_statement, c.score,
                                   c.related_user_ids
@@ -1694,6 +1932,7 @@ class MemoryDatabase(MemoryBackend):
                     """,
                     promote_threshold,
                     recent_promote_threshold,
+                    naming_promote_threshold,
                 )
         return row["promoted"]
 
@@ -1816,9 +2055,11 @@ class MemoryDatabase(MemoryBackend):
             )
         return [
             (r["platform"], r["canonical_statement"],
-             # None 仅在两时间列双 NULL 时出现（当前 schema occurred_at NOT
-             # NULL 不可达）；兜底最旧防 None 流入 alias_upsert 抛错毒化整
-             # 批——与 sqlite 版 fetch_fact_code_sources 口径一致
+             # None only appears when both time columns are NULL (unreachable
+             # under the current schema, occurred_at NOT NULL); the oldest-
+             # time fallback keeps None out of alias_upsert, where a raised
+             # error would poison the whole batch — same semantics as the
+             # sqlite fetch_fact_code_sources
              r["last_seen"] or datetime.min.replace(tzinfo=timezone.utc))
             for r in rows
         ]
@@ -1844,7 +2085,8 @@ class MemoryDatabase(MemoryBackend):
                 for graph write-side directory builds etc.).
         """
         async with self.pool.acquire() as conn:
-            # None=全表(原语义);空列表/过滤后空=无待解析 owner 返回 {}
+            # None = whole table (original semantics); empty list / empty
+            # after filtering = no owners to resolve, return {}
             if owners is not None:
                 pairs = [(str(p or ""), str(u or "")) for p, u in owners if u]
                 if not pairs:
@@ -2166,9 +2408,11 @@ class MemoryDatabase(MemoryBackend):
             Edge rows (id/platform/endpoints/names/label/statement/
             evidence_count/last_seen/occurred_at).
         """
-        # 字符串/字节串会被逐元素迭代成 ['q','q',':',...] 静默空结果——
-        # 静默 miss 正是本函数要根除的形态，故 fail fast 而非归一兼容
-        # （空串 falsy 天然迭代为空，保持旧容忍）
+        # A str/bytes would be iterated element-wise into ['q','q',':',...]
+        # yielding a silently empty result — silent misses are exactly what
+        # this function exists to eradicate, so fail fast instead of
+        # normalizing for compatibility (empty strings are falsy and
+        # naturally iterate to empty; old tolerance kept)
         if (isinstance(node_keys, (str, bytes)) and node_keys) or (
             isinstance(bot_keys, (str, bytes)) and bot_keys
         ):
@@ -2549,9 +2793,13 @@ class MemoryDatabase(MemoryBackend):
         injecting the related side's profile would drop the subject and
         misattribute; the related side's profile is covered by facts
         previously extracted about them from the owner's viewpoint). The
-        ordering is fixed: score DESC -> updated_at DESC -> id ASC (the id
-        tiebreaker guarantees identical output order for identical table
-        contents — part of profile determinism), capped per section.
+        ordering is fixed: the recent section sorts time-first
+        (COALESCE(cluster.occurred_at, updated_at) DESC — cluster
+        occurred_at is the latest-mention time, advanced by GREATEST on
+        re-merge), every other section keeps score DESC -> updated_at DESC
+        -> id ASC (the id tiebreaker guarantees identical output order for
+        identical table contents — part of profile determinism), capped
+        per section.
 
         Args:
             platform: platform tag.
@@ -2570,7 +2818,10 @@ class MemoryDatabase(MemoryBackend):
                            c.occurred_at AS occurred_at,
                            row_number() OVER (
                                PARTITION BY m.category
-                               ORDER BY m.score DESC, m.updated_at DESC, m.id ASC
+                               ORDER BY CASE WHEN m.category = 'recent'
+                                        THEN COALESCE(c.occurred_at, m.updated_at)
+                                   END DESC NULLS LAST,
+                                        m.score DESC, m.updated_at DESC, m.id ASC
                            ) AS rn
                     FROM memory_user_profile m
                     LEFT JOIN memory_fact_cluster c ON c.id = m.cluster_id
@@ -2637,10 +2888,24 @@ class MemoryDatabase(MemoryBackend):
         Keys pair up as parallel arrays (platforms[i], user_ids[i]);
         ownership matching is owner-only (same as the single-key version;
         related ids do not join injection); ordering and per-section caps
-        match the single-key version (global score DESC -> updated_at DESC
-        -> id ASC ordering, then per-section caps), and identical statement
-        texts across keys dedup order-preservingly with non-null
-        occurred_at preferred.
+        match the single-key version (global window ordering — recent
+        time-first, others score DESC -> updated_at DESC -> id ASC — then
+        per-section caps).
+
+        Cross-key dedup happens BEFORE the per-section cap: identical
+        statement texts are collapsed within a category (one representative
+        per statement, preferring non-null / latest occurred_at), then
+        row_number truncates. Deduplicating after the cap let one statement
+        present on several linked accounts consume several slots and push an
+        older distinct event out of the section entirely.
+
+        Ranking of the deduped row uses the MAX score of the statement's
+        duplicate group, not the representative row's score: the
+        representative is chosen by newest occurred_at, so a newer but
+        lower-scored copy would otherwise demote the whole statement below
+        less relevant distinct rows and push it out of the per-section cap.
+        The representative row (and its occurred_at, the displayed time)
+        still comes from the latest copy.
 
         Args:
             platforms: platform tag array (paired 1:1 with user_ids).
@@ -2655,17 +2920,36 @@ class MemoryDatabase(MemoryBackend):
             rows = await conn.fetch(
                 """
                 SELECT category, statement, occurred_at FROM (
-                    SELECT m.category, m.statement,
-                           c.occurred_at AS occurred_at,
+                    SELECT category, statement, occurred_at,
                            row_number() OVER (
-                               PARTITION BY m.category
-                               ORDER BY m.score DESC, m.updated_at DESC, m.id ASC
+                               PARTITION BY category
+                               ORDER BY CASE WHEN category = 'recent'
+                                        THEN sort_ts
+                                   END DESC NULLS LAST,
+                                        best_score DESC, updated_at DESC, id ASC
                            ) AS rn
-                    FROM memory_user_profile m
-                    LEFT JOIN memory_fact_cluster c ON c.id = m.cluster_id
-                    JOIN unnest($1::text[], $2::text[]) AS k(platform, user_id)
-                      ON m.platform = k.platform
-                     AND m.user_id = k.user_id
+                    FROM (
+                        SELECT m.category, m.statement,
+                               c.occurred_at AS occurred_at,
+                               COALESCE(c.occurred_at, m.updated_at) AS sort_ts,
+                               m.score, m.updated_at, m.id,
+                               max(m.score) OVER (
+                                   PARTITION BY m.category, m.statement
+                               ) AS best_score,
+                               row_number() OVER (
+                                   PARTITION BY m.category, m.statement
+                                   ORDER BY (c.occurred_at IS NULL),
+                                            c.occurred_at DESC,
+                                            m.score DESC,
+                                            m.updated_at DESC, m.id ASC
+                               ) AS dup_rn
+                        FROM memory_user_profile m
+                        LEFT JOIN memory_fact_cluster c ON c.id = m.cluster_id
+                        JOIN unnest($1::text[], $2::text[]) AS k(platform, user_id)
+                          ON m.platform = k.platform
+                         AND m.user_id = k.user_id
+                    ) d
+                    WHERE dup_rn = 1
                 ) t
                 WHERE rn <= $3
                 ORDER BY category, rn

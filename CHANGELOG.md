@@ -2,6 +2,402 @@
 
 ## Unreleased
 
+- 本 PR 的发布版本保持为 `1.18.5`；当前代码已包含此前评审阶段记录中标为 v1.18.9 的 raw-only 用户空分数显示修复，以及下方本轮修复内容。`v1.18.6`～`v1.18.9` 标题仅用于记录开发/评审阶段，不代表已正式发布的插件版本。
+- 统一 PostgreSQL/SQLite 跨会话摘要的应用时钟边界，并钳制未来时间摘要，避免时钟偏差导致召回不一致。
+- 兼容保存含历史跨字段冲突的配置；主动修改冲突字段时仍严格校验。
+- 防止簇/摘要弹窗重复提交；回填状态连续获取失败后保持操作按钮禁用，需重新探测后恢复。
+
+## v1.18.9 (2026-11-05)
+
+- 修复 raw-only 用户列表的最高分为空时显示为 `null`；无画像分数现在显示为 `—`。
+
+## v1.18.8 (2026-11-05)
+
+PR #9 CodeRabbit 第三轮评审修复：20 条行内反馈、1 条 body-only 反馈，以及上一轮确认遗漏的 3 项。
+
+### fix: 后端与数据一致性
+
+- naming 阈值校验改为 `naming_promote_threshold * decay_factor >= demote_threshold`，与实际衰减顺序一致；同步更新 schema 提示；
+- 多账号画像去重排序纳入分组最高分，PG/SQLite 保持一致；
+- 用户 scope 查询补齐 `session_id + turn_id`；跨会话 memo 键加入 platform、session type，并保护执行中的轮次不被容量清理；
+- 用户列表纳入只有原始事实、尚未成簇的用户；关系图数据补齐 `superseded_at`；
+- 补充配置、memo、画像排序、raw-only 用户和关系图字段回归测试。
+
+### fix: WebUI 与可访问性
+
+- 大图斥力改为空间网格近似，避免 stride 采样遗漏节点；SVG 卸载后停止残留 rAF；簇列表增加请求序号守卫；
+- 弹窗增加焦点陷阱、背景 inert、关闭后焦点恢复；画像行、关系行、图节点和边支持键盘操作；图谱平移改用 `getScreenCTM().inverse()`；
+- 修复簇修正保存时 status 被旧值回写、分类筛选缺少 preference/commitment、评分提示阈值写死、图标按钮缺少 aria-label 等问题；
+- 图谱加载失败显示重试入口，补编码轮询首次基线与连续失败恢复，使用服务端 `Date` 消除 finished_at 时钟偏差，并显示边降级时间；
+- 支持运行中动态切换 reduced-motion；修复卡片/横幅/弹窗多层背景语法和关系图命中线样式；
+- raw-only 用户显示“未成簇”，用户列表标题改为“有记忆用户”。
+
+Docstring Coverage 门禁在本地无对应配置/工具，无法复现；本轮新增公共接口未引入无意义文档占位，保留现状并记录待 CI 反馈。
+
+## v1.18.7 (2026-11-05)
+
+PR #9 CodeRabbit 第二轮评审（16 行内 + 2 follow-up + 4 nitpick）修复：后端 7 项、WebUI JS 9 项、
+CSS 可访问性 2 项、测试补强 2 条 nitpick；2 条迁移类 nitpick 评估后不改（014 CONCURRENTLY 需改
+迁移执行器且有 INVALID 索引风险，015 为部署期测量建议非代码缺陷）。
+
+### fix: 后端（评审二轮）
+
+- **清空 naming_promote_threshold 恢复派生**：可选字段空值此前按省略键保存，旧显式值永续；提交
+  null 时派生值被写死、之后刻度变化不再跟随。现 `prepare_save` 对 null 持久化 null 本身，加载时
+  重新从 score_start_high 懒派生（前端配合：default 为 null 的 float 字段空输入提交 null）；
+- **新增装配校验 `naming_promote_threshold >= demote_threshold`**：低于降级线的 naming 簇晋档后
+  会在下一次衰减遍被立即降级删除（画像反复抖动、称呼承诺静默丢失）。显式路径自报
+  (naming_promote_threshold, demote_threshold)、派生路径自报 (score_start_high, demote_threshold)，
+  回退必收敛；注意：现网已存在该组合的显式配置保存将被拒、启动期回退重置相关键；
+- **rerank_candidates 缺省恢复 50**：候选池先 SQL 截断再近重复去重，20 条在近重复密集时去重后
+  不足 top_k；config/main 兜底/schema/README 四处同步（惰性向量取回保证扩池不增传输开销）；
+- **insert_persona_fact_raw 双后端持久化前钳制未来 occurred_at**（与工具写入路径同款不可信时间
+  守卫），document_id/evidence_key 保留原始时间（幂等键不随钳制漂移）；
+- **跨会话注入 memo 按轮次隔离**：键改 (session_id, turn_id)（宿主 event_id），同会话并发轮不再
+  互相清空/覆盖排除集合；新增 TTL 清理 + 64 条硬上限防按轮次键无限增长；空 turn_id 保留旧会话级
+  语义（旧宿主/测试兼容）；
+- **多账号画像先去重后截断**：`fetch_profile_sections_multi`（PG/SQLite 对齐）改为 SQL 内先按
+  (category, statement) 去重（非空/最新 occurred_at 优先）再 row_number 截断，跨账号相同
+  statement 不再挤占 per_section_limit 名额。
+
+### fix: WebUI（评审二轮）
+
+- 弹窗关闭竞态：旧保存请求的 close 回调不再清空已替换的新弹窗（仅本弹窗仍挂载时清空）；
+- **主导航 tab 改为 `<button>`（Major）**：Tab/Enter/Space 键盘可达，active 项 aria-current="page"，
+  切换后焦点保持在当前 tab；CSS 补 UA reset 与 :focus-visible 焦点环，渲染盒模型不变；
+- **按钮对比度达标 WCAG AA**：`.btn` 渐变端点局部加深（亮色 #0d6d9c→#6a4ed6 白字，暗色保留发光
+  渐变翻转为墨色文字，与 active tab 星标同构），danger 变体同步修复，全部主题×端点组合 ≥4.5:1
+  （全局 --sky/--violet 未动）；
+- 原始事实/注入语料列表筛选与翻页请求加序号守卫，先发后至不再覆盖最新结果；
+- 回填轮询连续 5 次失败放弃时恢复按钮可用并隐藏进度条，不再永久卡死；
+- 注入语料页补编码周期结束自动刷新摘要列表（running→idle 跃迁 + finished_at 变化双通道检测），
+  空闲时以 10s 续轮询覆盖后台自发的合并周期（切页/断连自动停止）；
+- Kira 记忆迁入增加源路径版本守卫：改路径即清空旧预览并禁用「开始迁入」，迟到的扫描/迁入响应
+  不得回写新路径的界面状态；
+- 关系图谱首次状态轮询不再吞掉快照之后完成的关系回填（completedAfterSnapshot 判定，自终止无
+  循环重载）；
+- 可选 float 字段清空提交 null 恢复派生（见后端第一条）。
+
+### test: 评审二轮 nitpick 补强
+
+- test_recall_lazy_embeddings：启用 rerank stub 使 use_rerank=True、断言候选池 limit==20、stub
+  按 limit 截断贴近真实后端；
+- 新增 DM 跨会话注入 hook 端到端用例：启用 cross_session_summary_enabled，断言注入块存在且 memo
+  登记与注入一致（此前测试不经过 hook，登记调用被删/调换不会被发现）。
+
+全量 14 测试套件通过；web 改动以 node --check + 手工验收步骤覆盖。
+
+## v1.18.6 (2026-11-04)
+
+PR #9 CodeRabbit 评审轮（2 Major + 7 Minor）9 项修复：维护页控件类型、跨会话查询边界与排除范围、截断判定、naming 提示词口径、WebUI 四项。
+
+### fix: 评审确认的缺陷（9 项）
+
+- **维护页 Optional 字段控件误判**（Major）：`_field_type` 现解包 `Optional[X]`/`X | None`
+  （含嵌套与 PEP 604）后按内层类型分类，`naming_promote_threshold`（`Optional[float]`）不再
+  落入 "list" 兜底被渲染成多行文本——宿主无该键时表单回存提交 `[]` 必被 422 拒绝的问题随之
+  消失；`_literal_options` 与 `_numeric_bounds` 的 int 判定同步解包。全 88 字段程序化审计
+  仅此 1 个分类变化，无误伤；
+- **未来时间戳摘要注入**：`fetch_recent_cross_session_summaries`（PG/SQLite 行为对齐）无条件加
+  `occurred_at <= now()` 上界（与 max_age_days 是否启用无关），未来发生的摘要不再按 DESC 排最前
+  占据 top_k 名额；
+- **跨会话排除裸 session_id 误伤**：排除当前会话改用 platform + 会话类型复合条件（类型经
+  group_id 判别：gm→`group_id <> ''`、dm→`group_id = ''`），同适配器下私聊与群聊裸 ID 相同时
+  群聊摘要不再被误排除；调用链 main.py → memory_kernel → 双后端透传
+  current_platform/current_session_type，未传类型的旧调用保留裸 ID 排除回退；
+- **截断判定误杀完整摘要**：`_looks_truncated` 收紧为强信号（逗号族/开括号收尾、空锚点），多行
+  摘要末字为 CJK 汉字不再判截断，语义完整但末行无句末标点的摘要不再被重试后降级原文单通道
+  （`_CJK_IDEOGRAPH_RE` 死代码一并移除）；
+- **naming 提示词规则自相矛盾**：分级 b 与示例第 2/3 条统一——接受迹象只认本人的实际应答，
+  "未纠正/沉默"不再构成接受迹象，杜绝无应答的本人被提取为称呼偏好并晋档入画像；
+- **图谱点击必清空选择**（Major）：setPointerCapture 把 pointerup 事件目标重定向到 SVG 自身，
+  closest 命中判定失效——pointerdown 记录手势起始目标供 pointerup 使用；pointercancel 手势
+  取消不再改动选中状态；
+- **画像卡竞态与删除残留**：画像请求加单调序号丢弃过期响应，删除用户仅清空正展示该用户的卡片，
+  删除后才返回的在途响应不再回填已删用户画像；
+- **回填空闲分支只轮询一次**：空闲时每 5s 续轮询（切页/断连自动停止），其他标签页启动或完成的
+  回填不再被本页漏检（与注释声称的等待行为一致）；
+- **设置页整数项静默截断**：`parseInt` 会把 "1e3"/"1.5" 截成 1 后无提示热生效，现改 `Number` +
+  严格整数校验，非法输入 toast 报错并中止保存（float 分支行为不变）。
+
+全量 14 测试套件通过；web 四项无自动化覆盖（node --check + 手工路径推演验收）。
+
+## v1.18.5 (2026-11-04)
+
+存量中文注释/docstring 全面英文化（历史清理批）。
+
+### docs: 存量注释英文化
+
+- v1.18.4 评审批仅覆盖 1.18.0→1.18.3 增量行；本批清理此前全部存量：
+  54 个文件、+3377/-2036 行
+- 38 个 Python 文件 ~1740 中文注释/docstring 行全部译为英文；16 个
+  SQL 迁移文件 106 行 `--` 注释译为英文（DDL 剥注释后与原版逐字节一致，
+  迁移执行器无 checksum 校验）
+- 「只动注释」由 token 级校验机械化兜底：全部改动文件的非 docstring
+  字符串字面量与代码 token 流与改动前逐字节一致（日志/断言消息/UI
+  文案/提示词/桩数据零改动）
+- 9 处字符集数据样例有意保留：守卫/清洗 regex 的匹配对象本身（逗号族、
+  开括号族、【话题】锚点、"查ID"、单字名"阿"/"好"、"未知"占位词）
+- 术语与 v1.18.4 增量批统一（promote/profile/recall/rolling rollout
+  fill-back/circuit breaker/dedup/idempotency key 等）；引用标记
+  （nori #NN、PR、commit hash、迁移号、评审轮次）原样保留
+- 全量 14 测试套件通过（纯注释变更，行为零变化）
+
+## v1.18.4 (2026-11-03)
+
+v1.18.0→v1.18.3 增量的自主评审批（缺陷/注释合规/测试精简/冗余/一致性五维）。
+
+### fix: 评审确认的三项缺陷
+
+- **跨会话条目 session_name 死字段**（D1）：DB 层从不返回该列，条目恒渲染
+  「（未命名会话）」白耗预算——条目收敛为三行（session_id/时间/内容），
+  移除死常量与死分支；
+- **MemoryBackend ABC 契约缺口**（D3）：补 `fetch_recent_cross_session_
+  summaries` / `fetch_embeddings_by_ids` 两条 @abstractmethod 声明（其余
+  53 个 fetch_* 均在案，唯二漏声明；缺方法时被 fail-open 静默掩盖）；
+- **naming 派生下界守卫**（D4）：`score_start_high<=0`（字段级合法）时派生
+  0 绕过 `gt=0`、任何 naming 提取建簇即晋档——改为拒绝并要求显式设置
+  （自报键 `("naming_promote_threshold","score_start_high")` 回退后必然
+  收敛），新增 test_16d 双分支；
+- **评审 D2 复核证伪**：懒向量首块失败续取在所有可达状态不可达
+  （`lazy_embeddings = not is_per_user`；非 per-user 路径 keep_bound=top_k
+  < chunk 且缺向量行必 kept）——原「每轮至多一次取回失败」不变式成立，
+  成立依据固化进注释（不加死防御代码）。
+
+### refactor: 冗余收敛（R1/R2）
+
+- 细粒度相对时间标注下沉 `time_labels.relative_time_precise`（该模块自述
+  使命即避免实现漂移），main.py 删除平行实现；
+- `_cross_session_parse_ts` 删除，复用 `db.base.sqlite_parse_ts`
+  （`db/__init__` 已再出口；naive 分支实际不可达，严格解析足够）。
+
+### docs: 新增注释英文化（175 块）
+
+v1.18.0→1.18.3 增量新增注释/docstring 违反工作区规则（All new code
+comments must be written in English）——全部译为英文（web 62 + Python
+113），术语统一（promote/profile/recall/rolling rollout fill-back/
+circuit breaker/dedup 等），引用标记保留；有意保留 7 行字符集数据样例
+（截断守卫的逗号族/开括号族/【话题】锚点字面量，即 regex 匹配对象本身）。
+既有历史中文注释（范围外）不在本批处理。
+
+### test: 精简与加固（B1-B5）
+
+- B1：装配器预算用例动态构造——钉死「截断后放弃」「截断保留」两分支
+  （原硬编码 260 与 120 同走 room<=0 分支，截断分支零覆盖），补中间态
+  memo 契约（次条预算裁剪不登记）；
+- B3：fail_open 补熔断计数断言（原断言对失败路径不敏感）；
+- B4/B5：懒向量两用例合并、31b/31c 合并为 `test_31b_profile_fetch_sql_
+  shape`（一次捕获三方法×两后端，断言零丢失并补齐 SQLite 形式）；
+- B2：重复 `db.close()` 删除；test_16d 新增。
+
+### docs: 注释与代码一致性修正（A2-A7）
+
+「每轮两次调用」措辞修正、残量阈值注明含省略号、单行截断口径补开括号族、
+migration 015 头注更新（014 已落地）、encode() 降级枚举补截断路径、
+`_cfg_float` 注解 `float | None`、fetch_embeddings_by_ids 传输量估算随
+rerank 缺省 50→20 更新。
+
+## v1.18.3 (2026-11-03)
+
+同步 nori 上游 #34：用户画像「近期动态」栏改时间优先排序——窗口首键
+`COALESCE(cluster.occurred_at, updated_at) DESC`（occurred_at 为最近提及
+时间，合并 GREATEST 推进），其余分栏保持 `score DESC -> updated_at DESC
+-> id ASC` 旧序（CASE 首键恒 NULL 被跳过，确定性契约不变），早期高分
+recent 条目不再挤占每栏 5 条限量、把新近动态顶出画像。随带：双后端
+（PG/SQLite）单键与 multi 四处查询同构修改；`write_fact` 未来时间戳
+钳制到 now 且幂等键（evidence_key / document_id 前缀）保留原始入参
+日期（钳后 now 跨日漂移会击穿同日去重，上游评审二轮结论）；维护页
+簇/事实筛选下拉与画像栏卡片补 preference/commitment；修正
+test_31b owner-only SQL 断言取错位（原取 args 元组，恒真空转）。存量
+数据核查：本部署 SQLite 库 1399 簇 future occurred_at = 0，无需迁移。
+
+## v1.18.2 (2026-11-02)
+
+同步 nori 上游（nori_plugin_noriflow_memory）四项：跨会话近期摘要注入（#31）、
+称呼偏好低门槛入库（#32）、编码摘要半句截断防护（#26）、记忆工具准则单面注入
+收敛（#29）；维护页换装「记忆星图 / Memory Atlas」改版（#32，去品牌化）。
+
+### feat(cross-session): 跨会话近期摘要注入（同步 nori #31 + migration 014）
+
+- 私聊回合前置当前用户在**其他会话**的近期已编码摘要（时间线置于滚动补回/
+  召回之前）：补充"这个人最近在别处聊了什么"的背景，补齐跨会话记忆面；
+  仅 `session_type != gm` 注入，`cross_session_summary_enabled` 缺省**关闭**；
+- 新增 `migrations/014_cross_session_time_index.sql` + `migrations_sqlite/`
+  同构版（部分索引 `idx_mcs_cross_session_time`，SQLite 支持部分索引、布尔
+  列 0/1 真值语义一致）——编号 014 正是 1.18.1 迁移头注预留的坑位；
+- 双后端新增 `fetch_recent_cross_session_summaries`：PG `participants &&`
+  数组重叠 + `make_interval` 陈旧窗口；SQLite 走 `json_each` EXISTS 同语义、
+  陈旧窗口按写侧 `sqlite_format_ts` 同构 TEXT 截止值比较；
+- kernel 新增跨会话注入去重 memo（与滚动补回同构的 TTL/容量语义）：入口
+  **无条件清空**本轮 memo（任何提前返回不残留上轮排除项——残留项会在 TTL
+  窗口内错误排除 recall/检索结果）；共享检索排除通道升级为
+  `_injected_excluded_ids = 滚动补回 ∪ 跨会话`，recall 与 memory_search
+  同轮排除已注入行，防双通道重复暴露；
+- **防重契约**：memo 只登记实际呈现给模型的行（前言计入整块预算、超限丢
+  旧条、首条超限截断且正文残留 < 10 字符整条放弃）——被预算裁剪的行保持
+  可检索，否则本轮既看不到又召不回，形成召回盲区；
+- 身份归并：宿主暂无跨平台身份服务，按单复合键（platform:uid）回退（与
+  nori 侧身份未命中时的回退同构）；会话名暂无目录服务，统一「（未命名
+  会话）」；
+- 新增四配置键（enabled/top_k/max_chars/max_age_days），config.py / main.py
+  兜底 / schema.json / config_web / README 五处口径一致。
+
+### feat(naming): 称呼偏好低门槛入库（同步 nori #32 + 96214f4）
+
+- 新增 `naming_promote_threshold`（缺省 3.0，需 ≤ `score_start_high`）：
+  naming 维度按专属低阈值晋档——本人明确称呼要求（"叫我X""别叫我Y"，
+  confidence=high 起步分 3.0）**单次即可入画像**，不再需要 4-5 次证据累积；
+- **建簇即时晋档**（nori 96214f4 同款，双后端）：`apply_fact_merge` create
+  路径起步分已达维度阈值（recent/naming 各自低阈值，其余通用）时建簇即
+  `profiled` 并**同事务写画像行**，不再依赖晋档遍——堵住同周期衰减遍先把
+  分数打到阈值之下的时序窗口（run_cycle 顺序：事实处置 → 衰减 → 晋档）；
+  replace 路径与晋档遍的维度阈值 CASE 同步加 naming 臂；
+- 新增 `naming_prompt_enabled`（缺省开）：编码提示词附加
+  `prompts/memory_encode_naming.prompt` 判定节——证据分级 a-f：仅记录本人
+  希望被如何称呼/明确反感的称呼（a 档）；他人称呼习惯须有本人接受迹象才可
+  提取且最高 medium（b 档，bot 行仅作语境）；自称/对 bot 的叫法/纯关系
+  身份称谓（"主人""爸爸"类）/推断一律不提取；模板缺失自动降级跳过并告警；
+- 维度阈值经 `apply_fact_merge` / `promote_pass` 全链路下渗（主动写入、
+  合并处置、晋档遍三处调用点），PG 与 SQLite 行为逐字对齐；`naming_promote_threshold`
+  纳入 `_promote_thresholds_within_cap` 装配期校验与 `CROSS_FIELD_VALIDATED_KEYS`
+  （> `score_cap` 即拒——单次晋档与晋档遍两路都够不到阈值，称呼偏好会静默
+  进不了画像）。**缺省派生**（评审修收：避免升级级联连坐）——不设/留空时从
+  `score_start_high` 派生：「本人明确表态（high 证据起步分 = score_start_high）
+  单次晋档」承诺在任何评分刻度下按构造成立（缺省刻度即 3.0），缩放刻度的既有
+  部署不设新键时派生值天然合法，**不会**触发跨字段回退把合法的显式评分键连坐
+  复位；显式设置时按本值生效（高于 score_start_high 属合法保守形态，退化为
+  二次证据累积，不硬拒）；
+
+### fix(encoder): 编码摘要半句截断防护（同步 nori #26）
+
+- 上游 LLM 在 `response_format=json_object` 引导解码下会**间歇性提前终止**：
+  摘要停在半句、JSON 由上游自行闭合、`finish_reason` 仍为 stop（无截断
+  信号）——半句 JSON 合法，解析层无从察觉，照单写入即成为可召回的残缺
+  记忆（该轮 facts 全丢）。Kira 侧同款 learner 链路同样暴露；
+- 新增 `_looks_truncated`（反向白名单口径）：多行摘要末字为汉字/逗号族/
+  开括号判截断；单行纯锚点形态合法，仅空锚点或逗号族收尾判截断；ASCII
+  字母/数字/半角 ~/emoji/句末标点收尾一律不判（nori 生产 190 条疑似中旧
+  白名单口径曾误杀 4 条完整摘要）；
+- 疑似截断**重试一次**，仍截断则降级原文单通道（summarized=false 不参与
+  召回，由合并 agent 补编码遍重编码）——半句摘要绝不作为完整记忆写入；
+  encode 主流程重构为 `_encode_once`（渲染→调用→解析→装配）+ 重试外环，
+  硬失败降级语义不变。
+
+### chore(tools): 记忆工具准则单面注入收敛（同步 nori #29）
+
+- `:tools` 准则块撤下逐工具路由复述（"memory_lookup 查…memory_write 仅
+  在…"六件套 + memory_search 参数形态）——各工具 description 已是准确
+  唯一口径，准则复述会随实现漂移（nori #29"幻影能力"教训）；准则保留
+  跨工具行为守则（不重复检索已注入内容/不假装记得/不提工具名/跨会话时间
+  与当事人/答应记住自然应下）并显式声明"以工具自身说明为准"；
+- 新增锁定测试：准则块不得出现任何工具名（防回潮）。
+
+### feat(web): 维护页换装「记忆星图 / Memory Atlas」（同步 nori #32 改版）
+
+- 维护页从单文件朴素版换装 nori 侧星图改版（模块化 `memory.js` /
+  `memory.css` / `ambient.js` + 星系视觉），API base 适配 Kira 路由
+  （`/api/plugin/kira-ai-plugin-noriflow-memory/memory/...`），认证改为
+  宿主同源 Cookie、主题跟随宿主 plugin-bridge `data-theme`；
+- **去品牌化**：移除 nori 人像立绘/头像与全部品牌文案，拟人语气（喵~）
+  泛化为中性文案，标题改为「记忆星图 · MEMORY ATLAS」；
+- 原 Kira 专有功能块（Kira 记忆迁入 / 宿主库迁入 / 手动补编码，对应 6
+  条端点）移植进新页设置区，无功能丢失；页面引用的 17 个唯一端点全部
+  在 `@register.api` 注册表内核对。
+
+### 核对结论（未改动项）
+
+- nori #23（retain 写入门控——仅 bot 参与轮次写入）：Kira 架构性已满足
+  ——`session_memory_updated` 仅由 IM finalize 阶段（bot 回复落库后）发射，
+  未参与轮次永不触发编码；历史窗口仍含未参与消息作上下文，语义一致；
+- nori #20（memory_search 关系边归并）：Kira 已包含——工具 description
+  明确"查某成员时 fact 结果一并返回该成员的确切人际关系边"，无独立
+  category=relation 维度；
+- nori #30（计划任务履约观测）：平台依赖（订阅 nori 调度插件
+  `task_triggered` 事件，Kira 无对应事件源），暂缓。
+
+### 测试
+
+- 新增 `tests/test_cross_session_naming.py`（9 用例）：PG/SQLite 查询形状
+  与行为、memo 排除接线、装配器预算语义、naming 即时晋档/晋档遍维度臂、
+  截断判定矩阵、重试-降级链路、判定节开关、准则无工具名锁定；
+- `test_sqlite_backend.py`：迁移列表补 014；建簇即时晋档后晋档遍期望归零；
+- 全量 14 套件本地全绿（Python 3.12，CI 同款逐脚本直跑）。
+
+## v1.18.1 (2026-11-02)
+
+### perf(recall): BM25 物化 tsv 生成列 + 去重向量按 id 惰性取回
+
+- **BM25 物化（P1）**：新增 `migrations/015_bm25_materialize.sql`（仅 PostgreSQL，
+  编号跳过 014 预留 nori-core 侧 `014_cross_session_time_index` 移植位）——
+  `memory_chat_summary` 增加 stored 生成列 `tsv = to_tsvector('simple', search_text)`
+  （to_tsvector(regconfig, text) 为 immutable，PG12+ 可用于生成列），BM25 腿的
+  过滤与 `ts_rank` 排序均改读该列，表达式 GIN 索引 `idx_mcs_fts` 退役、由
+  `GIN(tsv)`（`idx_mcs_tsv`）接管。实测 13,515 行语料：BM25 腿 ~160ms → ~30ms
+  （原 ORDER BY `ts_rank(to_tsvector(...))` 对每条命中行重复分词 ~400 字正文，
+  高选择率下 planner 弃 GIN 走 Parallel Seq Scan；拆分测量 GIN 过滤单独 24ms、
+  预截断 token 后 2.4ms——~135ms 为重复分词）。回滚兼容：旧代码（表达式形态）
+  在无 `idx_mcs_fts` 时退化为 Seq Scan，变慢但结果正确；SQLite 路径不涉及；
+- **去重向量惰性取回（P2，按需分页）**：召回检索 SELECT 不再随行携带向量（asyncpg
+  未注册 pgvector codec 时每行 ~18KB `'[...]'` 文本，两路 × rerank_candidates 约
+  1.8MB 传输 + JSON 解析）——去重循环只为其**实际消费**的行按主键批量补取向量：
+  首块 = `top_k * 4`（至少 16 行）启动前取回，循环越过已加载边界时按需续取下一块
+  （被丢行不占 `top_k` 名额，长近重复段会把循环推过头块——窗外近重复必须继续比对
+  去重，不得静默保留）。PG/SQLite 双后端新增 `fetch_embeddings_by_ids`（PG 走
+  `id = ANY($1)` 精确批量，SQLite 走 `IN` 占位符批查，均跳过 NULL embedding 行）；
+  健康（早停）路径仍只付一次批量取回。取回失败 fail-open（经共享 `_guarded_call`，
+  失败计入熔断），缺向量行沿用"不比对、永不误删"语义；旧版 DB 实现/测试桩无该
+  方法时自动保持旧行为（检索行自带向量），跨版本兼容；
+- **`rerank_candidates` 缺省 50→20**：`config.py` 模型缺省、`main.py` 宿主配置
+  兜底、`schema.json` 维护页展示与 README 配置表四处口径一致。已显式配置该键的
+  部署不受影响（宿主配置优先于模型缺省），仅新装/缺键部署生效。
+- **评审收尾（neko 建议，PR #19）**：
+  - BM25 腿迁移前兜底——`tsv` 列缺失（schema 被手动回滚等 migration 015 未生效
+    场景）时精确捕获 `asyncpg.UndefinedColumnError` 并**闩锁**回退 to_tsvector
+    表达式形态（结果正确、仅变慢；重启重跑迁移后恢复），不再让 `UndefinedColumn`
+    打挂整条召回与熔断；闩锁避免每轮召回都付一次失败查询，健康路径零额外开销；
+  - 去重向量惰性取回纳入熔断口径——`fetch_embeddings_by_ids` 改经共享
+    `_guarded_call` 调用（失败计入熔断、与检索腿同口径）。熔断按**连续失败**
+    计数：检索腿每轮成功即清零计数，惰性取回单独失败最多累计 1 次、不会独自
+    打开熔断（只有检索腿自身连续失败——真库不可用——才会熔断短路召回，属预期
+    行为）；单轮取回失败 fail-open 退回"缺向量不比对"语义，对外行为不变。
+  - 评审测试桩修正——`_NoTsvConn` 按 SQL 内容分流向量腿/表达式 BM25 腿/tsv
+    探测（原实现不区分，向量腿被喂入 BM25 桩行、融合断言空转通过）；断言
+    加强为向量腿空结果下命中行只能来自表达式回退腿。
+  - 去重窗口缺口（neko 第二轮 review，重要）——原惰性实现只为头部窗
+    （`top_k*4`，至少 16 行）取向量，而被丢行不占 `top_k` 名额、去重循环可越过
+    窗口：窗外近重复因无向量被静默保留（相对旧全量比对行为是质量回归）。改为
+    按循环实际消费**分页补取**（新增 `_load_dedup_vectors`：首块启动前取，
+    越界即续取下一块并继续比对），窗外照常去重；健康（早停）路径仍只付一次
+    批量取回，最坏情况（候选池全重复）续取次数以池大小为界，仍远小于旧行为的
+    全量向量传输 + JSON 解析。
+  - 分页熔断累计（neko 第五轮 review，成立）——分页续取使"单轮最多 1 次取回
+    失败"的前提失效：同轮多块连续失败（中间无检索腿成功清零）可在单轮内累到
+    `failure_threshold`（缺省 5）打开共享熔断，下一轮召回被整体短路为空。
+    修复：任一分页块取回失败即停止本轮后续分页（`dedup_fetch_dead` 闩锁，
+    `_load_dedup_vectors` 返回成败），单轮计入熔断的取回失败恒 ≤1 次；未取到
+    的行保持"缺向量不比对"语义，且不再重复无效探测（每轮一次告警）。
+  - 用例注册遗漏（neko 第五轮 review，成立）——`test_recall.py` 的 `main()`
+    漏注册 `test_bm25_tsv_missing_falls_back_and_latches`，直跑方式下零执行
+    （重蹈上文 runner 空转覆辙）；注册后真实运行立即揪出测试桩路由错误——
+    两腿 SELECT 列都含余弦距离表达式 `embedding <=>`，原按该片段分流会把
+    BM25 查询误判为向量腿，改按 FTS 算子判别（先判表达式形态、再判 tsv
+    探测）后用例方才真实通过。
+  - `tests/test_recall_lazy_embeddings.py` 补上缺失的 `__main__` runner——该文件
+    是唯一没有 runner 的测试套件，CI 逐脚本直跑方式下实际零执行（退出码恒 0），
+    此前"全绿"对该文件为空转；补齐后惰性/兼容/迁移守卫用例首次真正运行并通过，
+    分页续取用例即在其中。
+  - **migration 015 锁与重写评估（neko 第三轮 review，结论：无代码改动）**：
+    `ADD COLUMN ... GENERATED ALWAYS ... STORED` 确会一次性整表重写并持
+    ACCESS EXCLUSIVE 锁（13.5k 行毫秒级；数百万行历史表会拉长启动窗口），
+    但：执行器按脚本**单事务**包裹（`apply_migrations`），DROP/CREATE 索引
+    原子、中途失败全回滚，不存在"无 FTS 索引窗口"；语句受池级
+    `db_command_timeout`（缺省 60s）约束，超时干净回滚、记忆功能关闭并在
+    下次启动重试，不会半途无限持锁。`CREATE INDEX CONCURRENTLY` 无法在
+    事务内运行（需改造执行器），"普通列 + 触发器 + 分批回填"会引入永久写
+    放大（写路径性能回退），均不采纳。大表部署可在升级前**手工预执行**本
+    迁移（全幂等：三处 `IF NOT EXISTS`；旧代码不读 `tsv`，仅 BM25 腿短暂
+    退化为 Seq Scan，见迁移头注），避开启动重写窗口。
+
 ### feat(config): 画像评分缺省值对齐长周期陪伴场景（promote 10→6 / demote 3→2 / decay 0.8→0.9）
 
 - 缺省值改动：`promote_threshold` 10→6、`demote_threshold` 3→2、`decay_factor` 0.8→0.9

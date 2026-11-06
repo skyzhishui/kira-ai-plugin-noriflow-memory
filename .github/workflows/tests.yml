@@ -48,13 +48,34 @@ jobs:
 
       # Suites are self-contained direct-run scripts (python tests/test_x.py),
       # not pytest collections; each exits non-zero on the first failed check.
+      # Per-suite timeout bounds a hung suite (named via ::error in the log)
+      # instead of stalling the whole job; failures aggregate into the final
+      # exit code so a mid-loop failure cannot be masked by later suites.
       - name: Run test suites
         run: |
+          rc_all=0
           for f in tests/test_*.py; do
             echo "::group::python $f"
-            python "$f"
+            if command -v timeout >/dev/null 2>&1; then
+              timeout -k 15 300 python "$f" || {
+                rc=$?
+                echo "::endgroup::"
+                echo "::error::suite $f exited $rc (124 = timed out after 300s)"
+                rc_all=1
+                continue
+              }
+            else
+              python "$f" || {
+                rc=$?
+                echo "::endgroup::"
+                echo "::error::suite $f exited $rc"
+                rc_all=1
+                continue
+              }
+            fi
             echo "::endgroup::"
           done
+          exit $rc_all
 
   tests-gitea:
     name: tests-gitea (${{ matrix.tag }})
