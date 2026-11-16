@@ -2857,9 +2857,15 @@ class MemoryDatabase(MemoryBackend):
             user_id: user id (bare uid).
             limit: cap.
 
+        Ordering is time-first (occurred_at DESC -> score DESC -> updated_at
+        DESC -> id ASC), same semantics as the recent slot: a fresh
+        low-score entry must outrank an old high-score one, otherwise the
+        per-slot cap lets stale entries crowd out fresh sway/demotion
+        content (synced with nori upstream #36).
+
         Returns:
-            (canonical statement, occurred_at) list (score DESC ->
-            updated_at DESC -> id ASC).
+            (canonical statement, occurred_at) list (occurred_at DESC ->
+            score DESC -> updated_at DESC -> id ASC).
         """
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
@@ -2869,7 +2875,7 @@ class MemoryDatabase(MemoryBackend):
                 WHERE platform = $1
                   AND user_id = $2
                   AND status IN ('pending_uncertain', 'replaced')
-                ORDER BY score DESC, updated_at DESC, id ASC
+                ORDER BY occurred_at DESC, score DESC, updated_at DESC, id ASC
                 LIMIT $3
                 """,
                 platform,
@@ -2970,6 +2976,9 @@ class MemoryDatabase(MemoryBackend):
         """Uncertain-info rows with multi-account keys merged (ordering/
         dedup/ownership semantics identical to the single-key version);
         dedup prefers non-null occurred_at across same-text entries.
+        Rows arrive time-first (occurred_at DESC), so the first occurrence
+        of a same-text entry is its newest row — Python-side dedup keeps
+        it without re-sorting (synced with nori upstream #36).
 
         Args:
             platforms: platform tag array (paired 1:1 with user_ids).
@@ -2977,8 +2986,9 @@ class MemoryDatabase(MemoryBackend):
             limit: cap.
 
         Returns:
-            (canonical statement, occurred_at) list (score DESC ->
-            updated_at DESC -> id ASC, deduplicated across keys).
+            (canonical statement, occurred_at) list (occurred_at DESC ->
+            score DESC -> updated_at DESC -> id ASC, deduplicated across
+            keys).
         """
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
@@ -2989,7 +2999,8 @@ class MemoryDatabase(MemoryBackend):
                   ON m.platform = k.platform
                  AND m.user_id = k.user_id
                 WHERE m.status IN ('pending_uncertain', 'replaced')
-                ORDER BY m.score DESC, m.updated_at DESC, m.id ASC
+                ORDER BY m.occurred_at DESC, m.score DESC, m.updated_at DESC,
+                         m.id ASC
                 LIMIT $3
                 """,
                 platforms,

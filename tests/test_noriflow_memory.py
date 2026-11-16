@@ -1464,6 +1464,40 @@ class TestPersonaService(unittest.TestCase):
                 self.assertLess(
                     tail.index("updated_at DESC"), tail.index("id ASC")
                 )
+            # Uncertain time-first ordering anti-drift (synced with nori
+            # upstream #36): a fresh low-score entry must outrank an old
+            # high-score one, or the per-slot cap lets stale entries crowd
+            # out fresh sway/demotion content. Relative-order assertions
+            # (plain existence would not catch key swaps); "occurred_at
+            # DESC" also matches the m.-prefixed multi form.
+            tail = sqls[2][sqls[2].index("ORDER BY"):]
+            self.assertLess(
+                tail.index("occurred_at DESC"), tail.index("score DESC")
+            )
+            self.assertLess(
+                tail.index("score DESC"), tail.index("updated_at DESC")
+            )
+            self.assertLess(
+                tail.index("updated_at DESC"), tail.index("id ASC")
+            )
+            # Multi-account uncertain query: same time-first order
+            asyncio.run(
+                db.fetch_uncertain_statements_multi(["napcat"], ["90001"], 5)
+            )
+            multi_uncertain = [
+                s[1] for s in pool.conn.sqls if s[0] == "fetch"
+            ][-1]
+            self.assertIn("pending_uncertain", multi_uncertain)
+            tail = multi_uncertain[multi_uncertain.index("ORDER BY"):]
+            self.assertLess(
+                tail.index("occurred_at DESC"), tail.index("score DESC")
+            )
+            self.assertLess(
+                tail.index("score DESC"), tail.index("updated_at DESC")
+            )
+            self.assertLess(
+                tail.index("updated_at DESC"), tail.index("id ASC")
+            )
             # Multi-account query only: dedup must run before the
             # per-section cap (duplicate statements must not consume slots)
             multi_sql = sqls[1]
