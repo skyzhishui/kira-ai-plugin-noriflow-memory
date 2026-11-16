@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.18.6 (2026-11-16)
+
+### fix: persona 待定信息栏时间优先排序（同步 nori 上游 #36）
+
+- 单键/多键、PG/SQLite 四处取数 ORDER BY 改为 `occurred_at DESC, score DESC, updated_at DESC, id ASC`：新近低分条目先于早期高分条目入选，防旧高分挤占每栏 5 条限量、把新近摇摆/降级内容顶出画像（与 recent 栏时间优先同语义）；
+- 多键 Python 去重（`_dedupe_keep_time`）在时间倒序下首个出现即最新行，语义自洽无需调整；
+- 测试：test_31b 双后端钉死待定栏单键/多键四键相对顺序；仅读侧变更，schema/数据零迁移。
+
+### test/CI: Python 3.10 兼容修复 + 套件级超时护栏（#25）
+
+- `test_memory_tools_sqlite`：`fromisoformat` 显式处理 `Z` 后缀（Python < 3.11 不接受 `Z` 后缀，`sqlite_format_ts` 落库串带 `Z`——3.10 CI 必败）；
+- CI Run test suites：每套件 `timeout -k 15 300`（挂起套件以 `::error` 命名并终止 job，不再无限阻塞）；失败聚合计入最终退出码（原循环中途失败被后续套件与最后一个套件的退出码掩盖）；
+- `timeout` 命令存在性探测（无 GNU timeout 的运行环境直接运行，失败仍计聚合并报 `::error`）。
+
 ## v1.18.5 (2026-11-06)
 
 PR #9（`v1.18.1`–`v1.18.5`：检索性能优化、上游功能移植、评审修复与注释合规）正式发布，插件版本号保持 `1.18.5`。

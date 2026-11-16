@@ -2566,13 +2566,16 @@ class SQLiteMemoryDatabase(MemoryBackend):
     ) -> list[tuple[str, object]]:
         """Uncertain-info section source: pending_uncertain and replaced
         (halved-score) clusters, with occurred_at (NOT NULL column) for
-        the time label."""
+        the time label. Ordering is time-first (occurred_at DESC ->
+        score DESC -> updated_at DESC -> id ASC), same semantics as the
+        recent slot and the pg backend (synced with nori upstream #36)."""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 f"SELECT canonical_statement, occurred_at FROM {FACT_CLUSTER_TABLE} "  # noqa: S608
                 "WHERE platform = $1 AND user_id = $2 "
                 "AND status IN ('pending_uncertain', 'replaced') "
-                "ORDER BY score DESC, updated_at DESC, id ASC LIMIT $3",
+                "ORDER BY occurred_at DESC, score DESC, updated_at DESC, "
+                "id ASC LIMIT $3",
                 platform,
                 user_id,
                 limit,
@@ -2652,7 +2655,10 @@ class SQLiteMemoryDatabase(MemoryBackend):
     ) -> list[tuple[str, object]]:
         """Uncertain-info rows with multi-account keys merged (ordering/
         dedup/ownership semantics as in the single-key version); dedup
-        prefers non-null occurred_at across same-text entries."""
+        prefers non-null occurred_at across same-text entries. Rows
+        arrive time-first (occurred_at DESC), so the first occurrence of
+        a same-text entry is its newest row (synced with nori
+        upstream #36)."""
         pairs = list(zip(platforms, user_ids))
         async with self.pool.acquire() as conn:
             if not pairs:
@@ -2667,7 +2673,8 @@ class SQLiteMemoryDatabase(MemoryBackend):
                 FROM {FACT_CLUSTER_TABLE} m
                 WHERE (m.platform, m.user_id) IN ({pair_sql})
                   AND m.status IN ('pending_uncertain', 'replaced')
-                ORDER BY m.score DESC, m.updated_at DESC, m.id ASC
+                ORDER BY m.occurred_at DESC, m.score DESC, m.updated_at DESC,
+                         m.id ASC
                 LIMIT {p.add(limit)}
                 """,  # noqa: S608
                 *p.values,

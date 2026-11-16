@@ -128,6 +128,50 @@ async def main_async() -> None:
 
     now = datetime(2026, 9, 12, 12, 0, 0, tzinfo=timezone.utc)
 
+    # ---- uncertain-info slot: time-first ordering behavior (synced with
+    # nori upstream #36) — real-data check, not SQL-shape assertion: fresh
+    # low-score entries must outrank old high-score ones and the oldest
+    # high-score entry is pushed out at the per-slot cap; single-key and
+    # multi-key paths agree. Rows are seeded for a dedicated user and
+    # removed right after (keep global table state unchanged). ----
+    _u = "u_uncertain_order"
+    _specs = [
+        ("想换工作", 1, 2.0, "pending_uncertain"),
+        ("在学游泳", 7, 3.0, "replaced"),
+        ("想养狗", 60, 9.0, "pending_uncertain"),
+        ("学过吉他", 90, 8.0, "replaced"),
+        ("想搬家", 91, 7.5, "pending_uncertain"),
+        ("剪过短发", 92, 9.5, "pending_uncertain"),  # oldest, 2nd-highest score
+    ]
+    async with db.pool.acquire() as conn:
+        for _stmt, _days, _score, _status in _specs:
+            await conn.execute(
+                "INSERT INTO memory_fact_cluster (platform, user_id, category,"
+                " canonical_statement, score, status, occurred_at)"
+                " VALUES ('qq', $1, 'stable', $2, $3, $4, $5)",
+                _u, _stmt, _score, _status,
+                (now - timedelta(days=_days)).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            )
+    try:
+        _rows = await db.fetch_uncertain_statements("qq", _u, 5)
+        _rows_m = await db.fetch_uncertain_statements_multi(["qq"], [_u], 5)
+        _expect = [s for s, _, _, _ in _specs[:5]]
+        check(
+            "uncertain_time_priority_single",
+            [s for s, _ in _rows] == _expect,
+            str([s for s, _ in _rows]),
+        )
+        check(
+            "uncertain_time_priority_multi",
+            [s for s, _ in _rows_m] == _expect,
+            str([s for s, _ in _rows_m]),
+        )
+    finally:
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM memory_fact_cluster WHERE user_id = $1", _u
+            )
+
     # ---- Write path: summaries + idempotency ----
     await db.insert_chat_summary(
         document_id="10086-aaaa1111",
